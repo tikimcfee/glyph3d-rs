@@ -196,8 +196,11 @@ impl GlyphScene {
         // layout may have fallen back (a Derived or Visible load past the
         // slot lanes — `layout_hyper::derived_lane_limits` — emits Instanced
         // and says so), and a host arena has no table for a Visible field
-        // (text and engine-text scenes, a recording verify run). The probe
-        // reads `field.mode()`, so the panel and the HUD show what was built.
+        // (text and agent-session scenes, a recording verify run), so a
+        // Visible request there builds Derived — the field whose shader the
+        // Visible field draws through, and the default (since 2026-10-11;
+        // Instanced until then). The probe reads `field.mode()`, so the
+        // panel and the HUD show what was built.
         let built_mode = match (arena.device_slots(), arena.visible_staging()) {
             (Some(dev), _) if dev.format != field_mode => {
                 log::warn!(
@@ -208,9 +211,9 @@ impl GlyphScene {
             }
             (None, None) if field_mode == GlyphFieldMode::Visible => {
                 log::warn!(
-                    "field mode visible requested, but this scene staged host records (no line table) — building an instanced field"
+                    "field mode visible requested, but this scene staged host records (no line table) — building a derived field"
                 );
-                GlyphFieldMode::Instanced
+                GlyphFieldMode::Derived
             }
             _ => field_mode,
         };

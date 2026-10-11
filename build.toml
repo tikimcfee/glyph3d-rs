@@ -25,21 +25,24 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 372
+test_floor = 374
 # Every golden view is rendered again under each of these and must match the
-# SAME baseline byte for byte (2026-10-09, C20). The Derived field renders
-# every golden frame identically to Instanced (measured on vulkan-nvidia and
-# metal-apple), so this covers its upload, storage, vertex-stage Y/Z and edit
-# paths without a second golden set to adopt. Until then no golden ran it,
-# and a Derived edit bug that emptied the frame (C19) was invisible.
+# SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
+# Derived field, the default since 2026-10-11 (Instanced retirement step 1);
+# until then they rendered Instanced and the Derived field was held here as
+# `--field-mode derived` — the two render every golden frame identically
+# (measured on vulkan-nvidia and metal-apple), which is why the default could
+# move with no pixel moving. `--field-mode instanced` (2026-10-11) holds the
+# Instanced field byte-equal to the same frames until step 3 deletes it.
 # `--field-mode visible` (M4, 2026-10-10): the Visible field lays every frame
 # out on the GPU per frame; held here to the same baselines where it can be
 # — repo-highlight for real (visible mode, byte-equal), the --render-file
-# views by their fall-back to Instanced (no line table), demo with no field —
-# and EXEMPT, with its why on the view, where it cannot: the five
-# syntax-painted repo views, which visible mode renders flat by decision
-# (`[[golden_view.exempt]]`; rendered and reported, never judged).
-golden_equivalents = ["--field-mode derived", "--field-mode visible"]
+# views by their fall-back to Derived (no line table; Instanced until
+# 2026-10-11), demo with no field — and EXEMPT, with its why on the view,
+# where it cannot: the five syntax-painted repo views, which visible mode
+# renders flat by decision (`[[golden_view.exempt]]`; rendered and reported,
+# never judged).
+golden_equivalents = ["--field-mode instanced", "--field-mode visible"]
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -253,10 +256,11 @@ equivalent = "--field-mode visible"
 why = "visible mode paints no syntax (by decision): this frame under it is the stored modes' --color-mode flat render byte for byte, 29,181 px of token colour short of the baseline on vulkan-nvidia, 29,178 on metal-apple; the sequence pass itself (families, flags, keycaps, the fallbacks) lays out the same glyphs"
 # The highlight sidecar (2026-10-09) — the byte-range styling entry point the
 # AST/LSP colouring will arrive through, which no frame had seen. alpha.rs
-# whole, six spans recoloured over syntax paint. Under the Derived equivalent
-# it is the witness for C19 (Derived placement edits zeroed the row and
-# emptied this frame); the IMMUTABLE sidecar is deliberately out of byte
-# order, which is what found the sort the parser lacked.
+# whole, six spans recoloured over syntax paint. It is the witness for C19
+# (Derived placement edits zeroed the row and emptied this frame) — under the
+# Derived equivalent until 2026-10-11, in the plain frame since Derived became
+# the default; the IMMUTABLE sidecar is deliberately out of byte order, which
+# is what found the sort the parser lacked.
 [[golden_view]]
 name = "repo-highlight"
 cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 1 --color-mode syntax --highlight fixtures/highlight-alpha.tsv"
@@ -440,8 +444,8 @@ name = "pixel-ab"
 scope = "render"
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode derived, --field-mode visible) against the same baseline; a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
-blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — today the five syntax-painted repo views under --field-mode visible, which visible mode renders flat by decision (their reported distance is the token colours and nothing else, measured); and what the visible equivalent reaches: the --render-file views fall back to Instanced under it (no line table) and demo has no field, so repo-highlight is the one frame held to visible mode's own pixels (visible-row-off-by-one proves it)"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced, --field-mode visible) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
+blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — today the five syntax-painted repo views under --field-mode visible, which visible mode renders flat by decision (their reported distance is the token colours and nothing else, measured); and what the visible equivalent reaches: the --render-file views fall back to Derived under it (no line table; to Instanced until 2026-10-11) and demo has no field, so repo-highlight is the one frame held to visible mode's own pixels (visible-row-off-by-one proves it)"
 
 # ── Declared mutations ───────────────────────────────────────────────────
 # `glyph mutate` applies each of these, requires the named gate to go red
@@ -635,8 +639,8 @@ expect = "cargo-clippy — 2 warnings"
 [[mutation]]
 name = "coverage-scale"
 gate = "pixel-ab"
-why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other"
-file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
+why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other. Targets the Derived field's shader since 2026-10-11, when Derived became the default and so the plain frames' field (the Visible field draws through it too); the Instanced shader is held by the --field-mode instanced equivalent alone until step 3 deletes it"
+file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
@@ -659,12 +663,12 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "derived-placement-row-zeroed"
 gate = "pixel-ab"
-why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight under the --field-mode derived equivalent, and nothing else: the plain frames are Instanced, and no other view edits placements after load"
+why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load, the --field-mode instanced equivalent runs the other field and the visible equivalent keys its edits by (item, byte)"
 file = "crates/glyph-field-derived/src/field.rs"
 op = "replace"
 find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
 with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
-expect = "repo-highlight.png diverges from baseline under --field-mode derived"
+expect = "repo-highlight.png diverges from baseline — the renderer changed"
 rebuild = "cargo build --release"
 
 [[mutation]]
@@ -681,8 +685,8 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "emoji-uv-flip"
 gate = "pixel-ab"
-why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet"
-file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
+why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet. Targets the Derived field's shader since 2026-10-11 (the default, so the plain frame's field); the Instanced copy is held by the --field-mode instanced equivalent until step 3"
+file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
 with = "        let t = vec2<f32>(c.x, c.y);"
@@ -1162,7 +1166,7 @@ rebuild = "cargo build --release"
 [[mutation]]
 name = "visible-row-off-by-one"
 gate = "pixel-ab"
-why = "M4 (2026-10-10): the visible equivalent must redden when visible mode breaks a frame. Every glyph the visible kernel lays out one row down moves every pixel of repo-highlight under --field-mode visible — the one view that renders visible mode for real and is held to its baseline — while the plain frame and the Derived equivalent stay byte-equal (the stored modes never run the kernel) and the exempt views only report a larger distance. CONSUMED BY: the slot's row lane the kernel writes (visible_layout.wgsl), read by the Derived draw's derive_yz. The shader is include_str!'d, so the renderer rebuilds"
+why = "M4 (2026-10-10): the visible equivalent must redden when visible mode breaks a frame. Every glyph the visible kernel lays out one row down moves every pixel of repo-highlight under --field-mode visible — the one view that renders visible mode for real and is held to its baseline — while the plain frame (Derived) and the Instanced equivalent stay byte-equal (the stored modes never run the kernel) and the exempt views only report a larger distance. CONSUMED BY: the slot's row lane the kernel writes (visible_layout.wgsl), read by the Derived draw's derive_yz. The shader is include_str!'d, so the renderer rebuilds"
 file = "crates/glyph-field-visible/shaders/visible_layout.wgsl"
 op = "replace"
 find = "let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"

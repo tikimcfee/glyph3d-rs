@@ -258,7 +258,7 @@ impl Default for RepoParams {
             cluster_mode: crate::fold::ClusterMode::Leader,
             layout_mode: RepoLayoutMode::Shelf,
             color_mode: ColorMode::Flat,
-            field_mode: glyph_field::GlyphFieldMode::Instanced,
+            field_mode: glyph_field::GlyphFieldMode::default(),
         }
     }
 }

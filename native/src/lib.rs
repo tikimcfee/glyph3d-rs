@@ -112,7 +112,7 @@ impl Default for SceneCullOptions {
             greeking: true,
             greek_pure: true,
             greek_onset_px: None,
-            field_mode: glyph_scene::GlyphFieldMode::Instanced,
+            field_mode: glyph_scene::GlyphFieldMode::default(),
             debug_tint: 0,
             environment: config::settings().environment.mode,
             ground_y: None,
@@ -151,7 +151,8 @@ pub fn build_scene_with_options(
 /// callers that OWN their content (the seam's envelope path: bytes through
 /// `repo::load_items` + `into_staged`, `PickContext::content` injected by
 /// the caller). No probe: this is the offscreen/linked-embedder shape.
-/// Builds the Instanced field; [`build_scene_from_staged_mode`] takes the mode.
+/// Builds the default field (Derived since 2026-10-11);
+/// [`build_scene_from_staged_mode`] takes the mode.
 pub fn build_scene_from_staged(
     ctx: &GpuContext,
     color_format: wgpu::TextureFormat,
@@ -160,7 +161,7 @@ pub fn build_scene_from_staged(
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
-    build_scene_from_staged_mode(ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::Instanced)
+    build_scene_from_staged_mode(ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::default())
 }
 
 /// [`build_scene_from_staged`] with the field mode threaded through: the

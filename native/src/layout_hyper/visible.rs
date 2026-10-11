@@ -238,8 +238,9 @@ mod tests {
             assert_eq!(staging.seeds[i].slot_count, want.slot_count);
             assert_eq!(staging.seeds[i].byte_len as usize, items[i].bytes.len());
         }
-        // The same engine asked for Instanced stages host records, as before.
-        let mut plain = crate::layout_hyper::HyperLayout::with_field_mode(GlyphFieldMode::Instanced);
+        // The same engine asked for a stored mode (Derived, the default)
+        // stages host records, as before.
+        let mut plain = crate::layout_hyper::HyperLayout::with_field_mode(GlyphFieldMode::Derived);
         let mut host = GlyphArena::new();
         plain.layout_items(&items, &mut host).unwrap();
         assert!(!host.is_visible() && !host.is_device());
