@@ -500,3 +500,130 @@ And the iteration lever for agents, which is selection, not speed:
 `--since <ref>` (mutations whose file changed on the branch, plus every
 mutation of a gate whose own implementation changed) would make "prove what
 this branch touched" one flag; the unscoped run stays the landing bar.
+
+## Prove, halved: what landed, measured (2026-10-11, night)
+
+The section above projected ~58 minutes and named the levers. Ivan: "go
+right ahead, this is quite important". What landed on `tooling`, in order:
+
+- **ecb9596**: the seed test walks each line once. 47.9 s -> 0.14 s, the same
+  269,082 seeds checked (both forms run side by side on one build); the
+  counter the replay inflated now counts what it stood for. Nothing had
+  proved the test could fail: `seed-cut-resets-segment-advance` does, and
+  hyper-oracle's visible tier reddens on it too, so the test is the fast
+  field-level witness and the gate the end-to-end one.
+- **53ba53f, 7513de4**: no mutation declares a `rebuild` any more (47 in
+  all). The cargo-test ones served a restore that C21's stamp drop does; the
+  renderer-gate ones repeated `ensure_products`; dead-doc-link built the
+  renderer for cargo-doc; the runner's five made the mutant runner run its
+  own gate (`cargo test` never relinks target/release/glyph, measured).
+- **1c113c7**: a fix found by the test scout. A mutant that failed to build
+  its gate's products made prove return BEFORE restoring, leaving the
+  mutant in the tree; unreached while every such mutation declared a
+  rebuild. Witnessed with a temporary non-compiling mutation.
+- **7513de4** also re-anchors four expects that matched more than their
+  class (two doc links that a compile error matched, a bare `FAILED`, a
+  `ROCKET` the rocket's own PASS line carries).
+- **8393bd1, 55a2156**: `prove --since <ref>` and `--list`. Selects by
+  target file, by the gate's script, and by new or edited declarations in
+  build.toml (compared as TOML with the merge-base's), so a branch proves
+  the mutations it added. Against the maintenance branch: 39 of 95.
+
+| | before (another session's run, 2026-10-11) | after (this branch) |
+|---|---|---|
+| full prove | 3,502 s over 88 (9 pixel-ab skipped, red) | 1,720 s over all 95, every one reddened |
+| cargo-test gate per mutation | 56.8 s | 20.6 s |
+| clean cargo-test gate | ~62 s | 14.5 s |
+| pixel-ab per mutation | (skipped) | 23.7 s |
+| cargo-doc per mutation | 17.5 s | 8.0 s |
+
+The after run overlapped another session's unscoped prove for part of its
+length, so it reads slow if anything. What is left is ~60 mutant builds at
+~15 s (457 s of the 1,720) and the gates themselves; the build-setting
+levers in the section above are still unmeasured.
+
+## Two scouts' findings, triaged (2026-10-11)
+
+Ivan asked for more cleanup. Two read-only agents swept the tree, one over
+the test suite and manifest, one over cruft; every claim acted on was
+re-checked first. Landed: 0840eb5 (six stale doc claims), 30905e1
+(.gitignore duplicates and a dead pixi exception, checked over 2,009 paths;
+pixi `check-gen`), 1c113c7 and 7513de4 above, 7f93109 (visible_verbs renders its 14
+distinct frames side by side, 4.8 s -> 2.5 s, both its mutations still
+redden) and c6cee2b (glyph-field-visible's unused `encase`; glam's unused
+`approx` and `mint` features).
+
+**For Ivan to decide** (not done):
+- `tools/preview_glyphs.py` cannot run: it imports `daimon_runtime`, a
+  module foreign to this repo. FORMAT.md and AGENTS.md point at it, and its
+  output `assets/atlas/preview.png` predates the 2026-09-20 atlas. Fix
+  (plain matplotlib; not in pixi) or delete all three.
+- 34 tracked files in `out/` referenced by nothing, history included
+  (crop_*, g-*, stageC_*, f-*, test_*.txt, hand-check.txt, …), and
+  `native/out/stageA.png`. And `.gitignore` ignores `out/*.png` while 52 are
+  tracked, so every new proof PNG needs `git add -f`.
+- `tools/decode-slug-core.mjs`: referenced only by out/history.
+- `native/.cargo/mutants.toml`: cargo-mutants reads the workspace root's
+  `.cargo/`, so since the 2026-09-06 workspace move this file is probably
+  read by nothing (unverified; the tool is not installed), and its globs are
+  native-relative. Move it to `.cargo/` with `native/src/...` globs if
+  cargo-mutants is wanted later (the work log lists it as "by hand"), or
+  delete it; its findings are worth keeping in either case.
+- `glyph` alone pins `toml = "0.8"` (native uses 1.x): four duplicate crates.
+  A dependency bump, its own commit.
+- `node` runs in two gates and is declared nowhere (not in pixi.toml; the
+  README lists only Rust).
+- derived_verbs (7 serial launches, 1.5 s), visible_repeat (5, 1.2 s) and
+  library_regions (4, 0.9 s) render serially as visible_verbs did.
+  derived_verbs compares against the Instanced field, which retirement step
+  3 deletes, so it was left for that rewrite.
+- pixel-ab renders its 30 frames serially; ~10 runs per full prove.
+- 13 of 15 hyper-oracle mutations expect only `hyper-oracle FAIL`, which a
+  refused or empty corpus also prints; the per-tier first-difference lines
+  are indented, so prove cannot see which tier reddened. Prefixing them
+  `FAIL ` and anchoring each expect to its tier would make the "only the
+  device tier can see" claims checked rather than stated.
+- pick-oracle reports a pick that resolved to the neighbouring glyph as "no
+  pick line": the script finds a probe's output by the RESOLVED row/col the
+  renderer prints. The gate reddens for the right reason under
+  pick-off-by-one; the message misnames it.
+- Unproven and load-bearing: `text::reference_layout` (the independent
+  lineage), the naga WGSL tests, and `tests/view_registry.rs` (its header
+  says prove cannot reach it: the lib test fails first).
+- Every renderer launch maps the 378 MB emoji-sheet.cache, emoji or not
+  (~70 launches per cargo test). Measure with the load's own timing first.
+
+Measured and not worth it: `doctest = false` (the doc-test phase is 0.5 s,
+and runs only after every other binary passed); the quadratic
+`max_line_cols` test (0.9 s, but other tests in its binary take as long,
+so the binary's wall time would not move).
+
+## Merging `tooling` into maintenance-and-things (2026-10-11)
+
+Agreed with the maintenance session: it merges this branch itself, once,
+and runs the battery once; `tooling` is frozen after this commit. A dry run
+(`git merge-tree`) against its tip a0634b6 found one conflicted file,
+build.toml, four hunks:
+
+1. `test_floor`: 385 there, 379 here. Take 385; the first cargo test's NOTE
+   names the merged count (one test is new here,
+   since_selects_by_target_or_gate_script).
+2. The syntax-heuristic mutations (hyper-cut-head/tail-own-share,
+   hyper-comment-line-indent-painted, colorizer-*): take theirs, the
+   deletion. This side only dropped their `rebuild` lines.
+3. render-file-copies-stacked / tile-block-drops-pen-row /
+   visible-item-bytes-by-item-index: take theirs (step 2's rework).
+4. visible-slot-order-atomic and visible-stale-segment-tail: take theirs.
+
+Then the `rebuild` lines their side still carries can go (eight in the
+merged file; on cargo-test each costs ~8 s a prove and buys nothing), and
+two attributes the new lints reject:
+
+- `native/src/layout_hyper/pass2_host.rs:621`,
+  `#[allow(clippy::too_many_arguments)]` on scan_item_max_row_extent (tab
+  stops): seven parameters, so it suppresses nothing. Delete it.
+- `native/src/repo.rs:576`, the same on load_views (step 2): nine
+  parameters, a real suppression. `#[expect(..., reason = "...")]`.
+
+The orphans gate needs `pixi run setup` once per checkout (cargo-modules).
+Then `cargo glyph test`, with the fixes folded into the merge commit.
