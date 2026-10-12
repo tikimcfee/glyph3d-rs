@@ -188,10 +188,15 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   mutations are unprovable until the set is re-adopted.
   A mutation's gate can BUILD a product from the mutated source (`cargo test
   --release` links the renderer): after restoring, the prover drops the stamp
-  of every product the file feeds and rebuilds it, and a mutation of the
-  runner declares `rebuild`, because every later gate is spawned from
-  `target/release/glyph` (2026-10-09: before this, a prove left the mutant
-  behind a stamp reading current).
+  of every product the file feeds and rebuilds it (2026-10-09: before this, a
+  prove left the mutant behind a stamp reading current). Before a gate that
+  `needs` a product, the prover builds it from the mutated tree itself, and a
+  mutant that does not compile is reported and restored. So a mutation
+  declares `rebuild` only when its gate runs something no product covers —
+  today, nothing: since 2026-10-11 no mutation declares one. (The runner's
+  own mutations are seen by its unit tests; `cargo test` never relinks
+  `target/release/glyph`, measured, so a declared runner rebuild only made the
+  mutant runner run its own gate.)
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 

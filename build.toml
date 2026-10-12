@@ -512,9 +512,6 @@ op = "replace"
 find = "    if selected == 0 {\n        return (false,"
 with = "    if selected == usize::MAX {\n        return (false,"
 expect = "empty_gate_selection_is_refused"
-# cargo-test relinks target/release/glyph from the mutated source, and every
-# later gate in the run is spawned from that path (self_exe): restore it.
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "prove-restale-blind"
@@ -525,7 +522,6 @@ op = "replace"
 find = ".filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))"
 with = ".filter(|(_, a)| a.inputs.is_empty() && expand(\"\").contains(&f))"
 expect = "mutated_inputs_name_the_products_they_feed"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "corpus-shrink"
@@ -642,8 +638,7 @@ file = "native/src/layout.rs"
 op = "replace"
 find = "/// A layout backend. Bytes and params in, instances into the arena, placements"
 with = "/// A layout backend, see [`GlyphArena::no_such_method`]. Bytes and params in, instances into the arena, placements"
-expect = "FAIL  cargo-doc"
-rebuild = "cargo build --release"
+expect = "unresolved link to `GlyphArena::no_such_method`"
 
 [[mutation]]
 name = "dead-doc-link-crate"
@@ -653,7 +648,7 @@ file = "crates/glyph-field/src/lib.rs"
 op = "replace"
 find = "//! The glyph field's mode-neutral contract.\n"
 with = "//! The glyph field's mode-neutral contract, see [`GlyphFieldMode::NoSuchMode`].\n"
-expect = "FAIL  cargo-doc"
+expect = "unresolved link to `GlyphFieldMode::NoSuchMode`"
 
 [[mutation]]
 name = "tests-mod-dropped"
@@ -692,7 +687,6 @@ op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "depth-write-off"
@@ -705,7 +699,6 @@ find = """            // flat page blends in exactly the order it did before.
 with = """            // flat page blends in exactly the order it did before.
             depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-placement-row-zeroed"
@@ -716,7 +709,6 @@ op = "replace"
 find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
 with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "sidecar-runs-unsorted"
@@ -727,7 +719,6 @@ op = "replace"
 find = "        runs.sort_by_key(|r| r.range.start);"
 with = "        let _ = runs;"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "emoji-uv-flip"
@@ -738,7 +729,6 @@ op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
 with = "        let t = vec2<f32>(c.x, c.y);"
 expect = "emoji.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "cluster-static-zero-off"
@@ -749,7 +739,6 @@ op = "replace"
 find = "            if crate::fold::is_static_zero_cp(cp) {"
 with = "            if false && crate::fold::is_static_zero_cp(cp) {"
 expect = "emoji-cluster.png diverges from baseline"
-rebuild = "cargo build --release"
 
 
 
@@ -764,7 +753,6 @@ find = """            if r.row() == row {
 with = """            if r.row() == row {
                 if r.col() == col.wrapping_add(1) {"""
 expect = "PICK ORACLE CHECK: FAILURES"
-rebuild = "cargo build --release"
 
 
 # ── reference-port, hyper-oracle (re-gated 2026-10-09) ─────
@@ -782,7 +770,6 @@ with = """    pub fn advance(&self, id: usize) -> f32 {
         0.0
     }"""
 expect = "FAIL  full fold"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "phantom-row"
@@ -793,7 +780,6 @@ op = "replace"
 find = "        (length - 1) / wrap + 1"
 with = "        length / wrap + 1"
 expect = "FAIL  full fold"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "fixture-deleted"
@@ -812,7 +798,6 @@ op = "replace"
 find = "return resolved(slot, bitmap_adv, height, false);"
 with = "return resolved(slot, bitmap_adv * 0.5, height, false);"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-keycap-lookahead-dropped"
@@ -823,7 +808,6 @@ op = "replace"
 find = "&& !(fast.seq_lead && cluster && bytes"
 with = "&& !(fast.seq_lead && !cluster && bytes"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-leader-mode-ignored"
@@ -834,7 +818,6 @@ op = "replace"
 find = "    p.cluster_mode == ClusterMode::Cluster"
 with = "    matches!(p.cluster_mode, ClusterMode::Cluster | ClusterMode::Leader)"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-leader-mode-ignored"
@@ -845,7 +828,6 @@ op = "replace"
 find = "    let cluster = super::char_resolve::clusters(p);"
 with = "    let cluster = { let _ = p; true };"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-newline-page"
@@ -856,7 +838,6 @@ op = "replace"
 find = "let right = nl_x + trie.fast_byte_table[b'\\n' as usize].advance;"
 with = "let right = nl_x;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-page-scroll-sign"
@@ -867,7 +848,6 @@ op = "replace"
 find = "let screen_row = row - self.scroll;"
 with = "let screen_row = row + self.scroll;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-x-page-dropped"
@@ -878,7 +858,6 @@ op = "replace"
 find = "                            x_page = (seg_offset / page_cols) as i64;"
 with = "                            x_page = 0;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-page-cols-run"
@@ -899,7 +878,6 @@ op = "replace"
 find = "if (si < span_end && q >= spans[si].start) { color = spans[si].color; }"
 with = "if (si < span_end && q > spans[si].start) { color = spans[si].color; }"
 expect = "(visible kernel, spans)"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-keycap-lookahead-dropped"
@@ -910,7 +888,6 @@ op = "replace"
 find = "            if (i >= trailer_until && !((e & PK_SEQ_FIRST) != 0u && cluster && next_non_ascii)) {"
 with = "            if (i >= trailer_until) {"
 expect = "visible kernel"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-override-lane-unshifted"
@@ -984,7 +961,6 @@ with = """    if c_end > c0 {
         return (c_end % fold_unit) as f32 * fu_to_world(1229, rctx.em_height_fu);
     }"""
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-chunk-cut-splits-sequences"
@@ -995,7 +971,6 @@ op = "replace"
 find = "None => match bytes[target_offset..].iter().position(|&b| b < 0x80) {"
 with = "None => match bytes[target_offset..].iter().position(|&b| (b & 0xC0) != 0x80) {"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-continued-line-unmeasured"
@@ -1006,7 +981,6 @@ op = "replace"
 find = "    if wanted.is_empty() {\n        return;\n    }"
 with = "    if !wanted.is_empty() {\n        return;\n    }"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "windowed-emoji-scratch-skipped"
@@ -1057,7 +1031,6 @@ op = "replace"
 find = "        line_colors.extend_from_slice(&cut.head);"
 with = "        crate::text::colorize_line_into(&bytes[..memchr::memchr(b'\\n', bytes).unwrap_or(bytes.len())], &mut line_colors);"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-cut-tail-own-share"
@@ -1068,7 +1041,6 @@ op = "replace"
 find = "let cut_tail = if nl_offset.is_none() && !cut.tail.is_empty() {"
 with = "let cut_tail = if false && nl_offset.is_none() && !cut.tail.is_empty() {"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-comment-line-indent-painted"
@@ -1081,7 +1053,6 @@ find = """                    // does (C17; a space has no ink, so no pixel move
 with = """                    // does (C17; a space has no ink, so no pixel moved).
                     is_comment_line = counts[4] > 0 && counts[4] as usize + line_bytes.iter().take_while(|&&b| b == b' ').count() == line_len;"""
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "colorizer-fills-any-word-colour"
@@ -1146,7 +1117,6 @@ op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline under --field-mode instanced"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "prove-ambiguous-find-accepted"
@@ -1157,7 +1127,6 @@ op = "replace"
 find = "        text.matches(find).count()\n"
 with = "        text.matches(find).count().min(1)\n"
 expect = "mutation_finds_are_unambiguous"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "since-matches-whole-gate-command"
@@ -1168,7 +1137,6 @@ op = "replace"
 find = "        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.files.contains(word)))\n"
 with = "        || gate_cmd.is_some_and(|cmd| changed.files.contains(cmd))\n"
 expect = "since_selects_by_target_or_gate_script"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "nested-alias-unstripped"
@@ -1179,7 +1147,6 @@ op = "replace"
 find = "    while args.len() > n && args[1..=n]"
 with = "    while false && args.len() > n && args[1..=n]"
 expect = "doubled_alias_is_stripped"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "atlas-pin-moved"
@@ -1189,7 +1156,7 @@ file = "tools/check_atlas.py"
 op = "replace"
 find = "    expect(0x1F680, 4759, 2458, 2,"
 with = "    expect(0x1F680, 4758, 2458, 2,"
-expect = "ROCKET"
+expect = "FAIL  'ROCKET'"
 
 [[mutation]]
 name = "atlas-glyphmap-disagreement"
@@ -1270,7 +1237,6 @@ op = "replace"
 find = "let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
 with = "let slot = DerivedSlot(x, pack_row(row + 1u, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
 expect = "diverges from baseline under --field-mode visible"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "lod-ignores-group-scale"
@@ -1351,7 +1317,6 @@ op = "replace"
 find = "        groups[g + 2u] = vec4<f32>(app.tint.xyz, alpha);"
 with = "        groups[g + 2u] = vec4<f32>(app.tint.xyz * 0.5, alpha);"
 expect = "text.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "group-adopt-takes-unchanged-appearance"
@@ -1411,7 +1376,7 @@ file = "native/src/library/runtime.rs"
 op = "replace"
 find = "(0..at.len()).filter(|&i| at[i] != target(i))"
 with = "(0..at.len()).filter(|&i| at[i] == target(i))"
-expect = "FAILED"
+expect = "a_page_turn_moves_one_volume_and_settles_on_the_slot_law"
 
 [[mutation]]
 name = "library-drag-offset-forgotten"
