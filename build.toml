@@ -25,7 +25,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 378
+test_floor = 379
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1156,6 +1156,17 @@ op = "replace"
 find = "        text.matches(find).count()\n"
 with = "        text.matches(find).count().min(1)\n"
 expect = "mutation_finds_are_unambiguous"
+rebuild = "cargo build --release -p glyph"
+
+[[mutation]]
+name = "since-matches-whole-gate-command"
+gate = "cargo-test"
+why = "2026-10-11: prove --since selects a gate's mutations when the script that gate runs changed, by finding the script's path among the command's words. Comparing the whole command string to the path instead never matches (`python3 tools/check_atlas.py` is not a file), so an edit to a check script would re-prove nothing of its gate and the scoped run would still print green. CONSUMED BY: touches in glyph/src/prove.rs, via since_selects_by_target_or_gate_script"
+file = "glyph/src/prove.rs"
+op = "replace"
+find = "        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.contains(word)))\n"
+with = "        || gate_cmd.is_some_and(|cmd| changed.contains(cmd))\n"
+expect = "since_selects_by_target_or_gate_script"
 rebuild = "cargo build --release -p glyph"
 
 [[mutation]]

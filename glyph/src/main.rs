@@ -82,9 +82,20 @@ enum Cmd {
         #[arg(long = "mutation")]
         mutations: Vec<String>,
         /// Only mutations whose target file differs from HEAD — "prove what
-        /// I touched". Combines with --gate/--mutation by intersection.
-        #[arg(long)]
+        /// I touched" before committing. The same as `--since HEAD`.
+        /// Combines with --gate/--mutation by intersection.
+        #[arg(long, conflicts_with = "since")]
         changed: bool,
+        /// Only mutations whose target file differs between the working tree
+        /// and the merge-base of REF and HEAD — "prove what this branch
+        /// touched", committed or not — plus every mutation of a gate whose
+        /// own script changed. Combines with --gate/--mutation by intersection.
+        #[arg(long, value_name = "REF")]
+        since: Option<String>,
+        /// Print the selected mutations and their gates, then stop: what a
+        /// run would prove, before paying for it. Builds and mutates nothing.
+        #[arg(long)]
+        list: bool,
     },
     /// Run a single check by name. Used by `prove`, and useful on its own.
     Gate { name: String },
@@ -224,8 +235,9 @@ fn main() -> ExitCode {
         }
         Cmd::Test { scope, frozen } => cmd_test(&m, scope, frozen),
         Cmd::Run { args } => cmd_run(&m, &args),
-        Cmd::Prove { gate, mutations, changed } => {
-            cmd_prove(&m, gate.as_deref(), &mutations, changed)
+        Cmd::Prove { gate, mutations, changed, since, list } => {
+            let since = if changed { Some("HEAD") } else { since.as_deref() };
+            cmd_prove(&m, gate.as_deref(), &mutations, since, list)
         }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),

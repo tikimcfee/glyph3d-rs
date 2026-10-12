@@ -171,9 +171,17 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   `--mutation <name>` (repeatable) proves exactly the named mutations, and
   `--changed` proves only mutations whose target file differs from HEAD —
   "prove what you touched" (a mutation you MOVED keeps its name and is
-  selected by its file). A scoped run's verdict names its scope ("a scoped
+  selected by its file). `--since <ref>` (2026-10-11) is the same against the
+  merge-base of `<ref>` and HEAD, committed work included — "prove what this
+  branch touched" — and also selects every mutation of a gate whose own
+  script changed (`--changed` is `--since HEAD`). `--list` prints a
+  selection and stops, so a run's size is known before it is paid for.
+  A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
-  landing bar. A mutation whose gate is ALREADY red cannot prove anything and
+  landing bar. Where its time goes: every mutation prints its build, gate
+  and restore seconds and the run ends with a TIME line naming the slowest.
+  A test that turns slow is paid once per mutation that reaches its binary
+  (one quadratic test was 48 s of a 62 s cargo-test until 2026-10-11). A mutation whose gate is ALREADY red cannot prove anything and
   the prover says so — on a host whose pixel set is stale, the pixel-ab
   mutations are unprovable until the set is re-adopted.
   A mutation's gate can BUILD a product from the mutated source (`cargo test
