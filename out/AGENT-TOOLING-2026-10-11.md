@@ -451,3 +451,52 @@ not the earlier counts (which double-counted lib and lib-test builds):
 M2 (Homebrew Rust; `cargo install` of naga-cli and cargo-modules is the
 untested step), then the full battery there; here, uninstall the
 `~/.cargo/bin` copies of naga and cargo-modules that pixi now supersedes.
+
+## Why prove takes an hour, and what would halve it (2026-10-11, measured)
+
+Ivan: mutation runs take 20-30 minutes per iteration, too slow for anyone.
+Measured against a full prove another session was running (93 mutations,
+read from its log, not perturbed) and one clean `cargo test --release`:
+
+- **Projected full prove: ~58 minutes.** On 2026-10-09 it was 724 s for 51
+  mutations (C21). Per Rust mutation the mutant build is ~15 s, as it was;
+  the cargo-test gate under a mutation went from ~10 s to ~60 s.
+- **One test is 48 of those seconds.**
+  `layout_hyper::line_table::tests::seeds_obey_the_cut_rule_and_the_fold_state`
+  takes 47.9 s (nextest); every other test in the renderer's lib binary
+  takes 1.1 s or less, and the whole suite's other 31 binaries take ~13 s.
+  It replays each line from byte 0 to every seed, seeds every 32 bytes, on
+  corpus lines past 64 KiB, under 3 wraps x 2 cluster modes: quadratic in
+  line length. libtest runs every test in a binary even after one fails, so
+  every cargo-test mutation that reaches that binary (~35 of 47) pays it,
+  and so does every battery run.
+  **Fix:** one forward walk per line, checking each seed as the walk passes
+  its cut (the seeds are asserted sorted). Same assertions; the
+  `sequences_near_cuts` counter, which the quadratic replay inflated, becomes
+  "seeds with a sequence earlier on their line", its floor re-measured.
+- **14 cargo-test mutations declare `rebuild = "cargo build --release"`
+  that buys nothing.** The gate needs no product and every integration test
+  reaches the renderer through `CARGO_BIN_EXE_glyph3d-native`, so `cargo
+  test` builds it anyway; the separate build serialises lib and lib-test
+  compiles that cargo would overlap (~8 s each, measured as the difference
+  between mutations with and without it). The 4 that mutate `glyph/` keep
+  theirs: every later gate is spawned from the runner binary.
+
+Projected with both: **~25 minutes.** What remains is ~60 mutant builds at
+~15 s each, the next lever, all unmeasured (they need a quiet machine and a
+pixel-ab run to confirm output-neutral):
+
+- `split-debuginfo = "unpacked"` in `[profile.release]` (Linux link time
+  with `debug = true`; the binary's code is unchanged).
+- Release incremental during prove only (`CARGO_INCREMENTAL=1`): re-optimises
+  only the codegen units a one-line mutation touches, but changes rustc's
+  arguments, so the first build under it is a full one.
+- Sharding mutations over two or three warm worktrees (32 cores here):
+  the largest possible win and the largest change; one warm target dir per
+  shard.
+
+And the iteration lever for agents, which is selection, not speed:
+`--changed` reads `git diff HEAD`, so after a commit it selects nothing. A
+`--since <ref>` (mutations whose file changed on the branch, plus every
+mutation of a gate whose own implementation changed) would make "prove what
+this branch touched" one flag; the unscoped run stays the landing bar.
