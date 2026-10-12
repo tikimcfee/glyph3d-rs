@@ -957,6 +957,20 @@ with = '''    } else if l > 0 {
 expect = "pagination_agrees_on_every_tier"
 
 [[mutation]]
+name = "seed-cut-resets-segment-advance"
+gate = "cargo-test"
+why = "2026-10-11: line_table's seed test had no mutation, so nothing showed it could fail. A cut treated as a fold-unit boundary: Pass 1's line walk records every seed with its segment advance zeroed, so Visible mode lays the segment after each cut in a wrapped or column-paged line from x 0. The unit test names the seed and the field; hyper-oracle's visible tier also reddens, on wide.txt and chunk-cut.txt, as kernel slots at the wrong x (measured 2026-10-11). CONSUMED BY: the seed push in Pass 1's per-line walk (non-ASCII lines), read by seeds_obey_the_cut_rule_and_the_fold_state at a 32-byte segment under wraps 0, 7 and 100"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = '''                        col: line_col as u32,
+                        seg_adv,
+                        cells,'''
+with = '''                        col: line_col as u32,
+                        seg_adv: 0.0,
+                        cells,'''
+expect = "seeds_obey_the_cut_rule_and_the_fold_state"
+
+[[mutation]]
 name = "hyper-chunk-seed-product"
 gate = "hyper-oracle"
 why = "C15 put back: a continuation chunk's segment advance is seeded as (col % fold_unit) * ascii_adv, a product, not the fold's running f32 sum, so its first partial segment sits an ulp (or, after non-ASCII advances, much more) off. Only the device Pass 2 reads the seed: the host Pass 2 walks the whole item. CONSUMED BY: continued_segment_advance, the seed of every chunk after an intra-line cut on a wrapped item; reached by g-pick-repo/wide.txt (65 slots, the original finding) and chunk-cut.txt (non-ASCII before each cut)"
