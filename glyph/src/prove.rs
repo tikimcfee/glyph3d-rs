@@ -112,32 +112,76 @@ fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
     Ok(before)
 }
 
+/// The files that differ between the working tree and the merge-base of `since`
+/// and HEAD, repo-relative (git runs at the root). Against the merge-base, not
+/// `since` itself, so commits that landed on `since` after the branch left it
+/// do not count as this branch's changes. `None`, said why, if git refuses.
+fn files_changed_since(since: &str) -> Option<(String, BTreeSet<String>)> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root())
+            .output()
+            .map_err(|e| e.to_string())
+            .and_then(|o| {
+                if o.status.success() {
+                    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+                } else {
+                    Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
+                }
+            })
+    };
+    let base = match git(&["merge-base", since, "HEAD"]) {
+        Ok(b) => b.trim().to_string(),
+        Err(e) => {
+            println!("FAIL  --since {since}: git merge-base refused: {e}");
+            return None;
+        }
+    };
+    match git(&["diff", "--name-only", &base]) {
+        Ok(out) => Some((base, out.lines().map(str::to_string).collect())),
+        Err(e) => {
+            println!("FAIL  --since {since}: git diff refused: {e}");
+            None
+        }
+    }
+}
+
+/// Whether a change set touches a mutation: its target file changed, or the
+/// script its gate runs did. The second clause is what makes a gate's own
+/// edit re-prove the gate: a change to `tools/check-orphans.sh` cannot
+/// weaken a mutation's target, but it can stop the gate noticing it. Gates
+/// built into the runner (cargo, cargo-test, golden) name no script; a change
+/// to the runner itself selects the mutations that target `glyph/`.
+fn touches(mu: &Mutation, gate_cmd: Option<&str>, changed: &BTreeSet<String>) -> bool {
+    changed.contains(&mu.file)
+        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.contains(word)))
+}
+
 pub(crate) fn cmd_prove(
     m: &Manifest,
     only: Option<&str>,
     only_mutations: &[String],
-    changed: bool,
+    since: Option<&str>,
+    list: bool,
 ) -> bool {
     let covered: BTreeSet<&str> = m.mutation.iter().map(|mu| mu.gate.as_str()).collect();
     let uncovered: Vec<&str> =
         m.gate.iter().map(|g| g.name.as_str()).filter(|n| !covered.contains(n)).collect();
     let mut fail = false;
 
-    // --changed: the mutation set whose target files differ from HEAD.
-    // Repo-relative paths on both sides (git runs at the root).
-    let changed_files: Option<std::collections::BTreeSet<String>> = changed.then(|| {
-        let out = Command::new("git")
-            .args(["diff", "--name-only", "HEAD"])
-            .current_dir(root())
-            .output()
-            .expect("git diff --name-only runs");
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    });
+    // --since REF (and --changed, which is --since HEAD): the mutations the
+    // change set touches.
+    let changed_files: Option<(String, BTreeSet<String>)> = match since {
+        Some(r) => match files_changed_since(r) {
+            Some(c) => Some(c),
+            None => return false,
+        },
+        None => None,
+    };
+    let gate_cmd = |gate: &str| m.gate.iter().find(|g| g.name == gate).and_then(|g| g.cmd.as_deref());
 
-    let scoped = only.is_some() || !only_mutations.is_empty() || changed;
+    let scoped = only.is_some() || !only_mutations.is_empty() || since.is_some();
     let selected: Vec<&Mutation> = m
         .mutation
         .iter()
@@ -146,19 +190,31 @@ pub(crate) fn cmd_prove(
         .filter(|mu| {
             changed_files
                 .as_ref()
-                .is_none_or(|cf| cf.contains(&mu.file))
+                .is_none_or(|(_, cf)| touches(mu, gate_cmd(&mu.gate), cf))
         })
         .collect();
     if scoped {
+        let since_note = match (since, &changed_files) {
+            (Some(r), Some((base, cf))) => {
+                format!(", {} files changed since {r} (merge-base {})", cf.len(), &base[..base.len().min(10)])
+            }
+            _ => String::new(),
+        };
         println!(
-            "prove (scoped: {} of {} mutations{})",
+            "prove (scoped: {} of {} mutations{since_note})",
             selected.len(),
             m.mutation.len(),
-            if changed { ", files changed vs HEAD" } else { "" },
         );
         if selected.is_empty() {
             println!("  nothing selected — no mutation targets those files/names");
         }
+    }
+    if list {
+        for mu in &selected {
+            println!("  {:<44} {:<20} {}", mu.name, mu.gate, mu.file);
+        }
+        println!("LIST      {} of {} mutations selected; nothing was built or mutated", selected.len(), m.mutation.len());
+        return true;
     }
 
     // Whether a gate reads a built product (the renderer). `needs_met` only
@@ -392,6 +448,32 @@ pub(crate) fn cmd_prove(
 mod tests {
     use super::*;
     use crate::load;
+
+    /// `--since` selects a mutation when its target changed, or when the script
+    /// its gate runs did — and never on a path that is merely a prefix or a
+    /// substring of a word in the command.
+    #[test]
+    fn since_selects_by_target_or_gate_script() {
+        let mu = |file: &str| Mutation {
+            name: "m".into(),
+            gate: "g".into(),
+            why: None,
+            file: file.into(),
+            op: "replace".into(),
+            expect: "x".into(),
+            arg: None,
+            find: None,
+            with_: None,
+            rebuild: None,
+        };
+        let changed: BTreeSet<String> = ["native/src/text.rs", "tools/check_atlas.py"].iter().map(|s| s.to_string()).collect();
+        assert!(touches(&mu("native/src/text.rs"), None, &changed), "its target changed");
+        assert!(!touches(&mu("native/src/fold.rs"), None, &changed), "nothing it reads changed");
+        assert!(touches(&mu("assets/atlas/codepoints.bin"), Some("python3 tools/check_atlas.py"), &changed), "its gate's script changed");
+        assert!(!touches(&mu("assets/atlas/codepoints.bin"), Some("python3 tools/check_atlas.py.bak"), &changed), "a word, not a substring");
+        assert!(!touches(&mu("assets/atlas/codepoints.bin"), Some("clippy"), &changed), "a built-in gate names no script");
+        assert!(!touches(&mu("native/src/text.rs"), None, &BTreeSet::new()), "an empty change set selects nothing");
+    }
 
     /// A mutation's find must name ONE place (C11), and no declared one names two.
     #[test]
