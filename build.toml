@@ -940,7 +940,6 @@ op = "replace"
 find = "        origin_z: start_pos[2],"
 with = "        origin_z: 0.0,"
 expect = "derived_positions_match_the_staged_ones"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-pass1-stride-after-advance"
@@ -1017,7 +1016,6 @@ op = "replace"
 find = "                if !inputs.prepasses[item].has_emoji {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());"
 with = "                if true {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut, &cut_colors[c]), Vec::new());"
 expect = "windowed_emission_matches_unwindowed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "windowed-chunk-order-reversed"
@@ -1028,7 +1026,6 @@ op = "replace"
 find = "        for (out, pairs) in done {"
 with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "egui-use-ungated"
@@ -1049,10 +1046,6 @@ op = "replace"
 find = "    let body = size - size % FAST_COPY_ALIGN;"
 with = "    let body = size;"
 expect = "split_body_is_fast_aligned_and_covers_the_size"
-# cargo test --release builds the renderer bin too (integration tests), so
-# without a restore rebuild prove would leave the MUTATED renderer in
-# target/release under an unchanged input hash (found 2026-10-09).
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-cut-head-own-share"
@@ -1110,7 +1103,6 @@ with = """                let wc = word_color_packed(&bytes[word_start_byte..id]
             }
             color = palette::C_PUNCT;"""
 expect = "colorize_pure_ascii_line_matches_colorize_line_into"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "colorizer-last-word-unflushed"
@@ -1123,7 +1115,6 @@ find = """    if word_start_byte != usize::MAX {
 with = """    if word_start_byte == usize::MAX - 1 {
         let wc = word_color_packed(&bytes[word_start_byte..]);"""
 expect = "colorizers_agree_on_truncated_leads_and_unterminated_words"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-curve-cap-128"
@@ -1134,7 +1125,6 @@ op = "replace"
 find = "const MAX_CURVES: u32 = 512u;"
 with = "const MAX_CURVES: u32 = 128u;"
 expect = "every_glyph_shader_covers_the_largest_outline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "render-file-copies-share-group-0"
@@ -1145,7 +1135,6 @@ op = "replace"
 find = "                        group_row: copy,"
 with = "                        group_row: 0 * copy,"
 expect = "copies_tile_in_the_default_field"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "instanced-coverage-scale"
@@ -1209,7 +1198,6 @@ op = "replace"
 find = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32"
 with = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / (em_height_fu + 1) as f64) as f32"
 expect = "fu_to_world_is_the_nearest_f32"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-verb-keyed-off-by-one-byte"
@@ -1220,7 +1208,6 @@ op = "replace"
 find = "        let byte = g.byte_off as u32;\n        let key = (item, byte);"
 with = "        let byte = g.byte_off as u32 + 1;\n        let key = (item, byte);"
 expect = "visible_verbs_address_the_glyph_the_slot_did"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "wash-width-doubled"
@@ -1231,7 +1218,6 @@ op = "replace"
 find = "    let wash_w = f32(line.width_cells) * frame.lod.w;"
 with = "    let wash_w = 2.0 * f32(line.width_cells) * frame.lod.w;"
 expect = "the_wash_box_spans_exactly_what_the_glyphs_span"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "wash-depth-flat"
@@ -1242,7 +1228,6 @@ op = "replace"
 find = "    var w = Wash(it_idx, row_lane, wash_x0, wash_w, 0u, c.rows, 0.0, 0u, depth);"
 with = "    var w = Wash(it_idx, row_lane, wash_x0, wash_w, 0u, c.rows, 0.0, 0u, 1u);"
 expect = "the_wash_box_spans_exactly_what_the_glyphs_span"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-slot-order-atomic"
@@ -1253,7 +1238,6 @@ op = "replace"
 find = "    let slot_base = base.y;"
 with = "    let slot_base = atomicAdd(&counters[15u], line.glyph_count);"
 expect = "a_visible_frame_repeats_and_is_drawn_in_arena_order"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-item-cull-ignores-group"
@@ -1264,7 +1248,6 @@ op = "replace"
 find = "    let b = to_world(gbase, lb);"
 with = "    let b = lb;"
 expect = "a_moved_item_is_drawn_where_it_went"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-row-off-by-one"
