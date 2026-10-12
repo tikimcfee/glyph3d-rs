@@ -140,30 +140,73 @@ struct VerbCase {
     min_spread: i32,
 }
 
-fn run_case(case: &VerbCase, dir: &Path) {
-    let verb_arg = match case.rgb {
-        Some(rgb) => format!("{} {rgb}", case.verb),
-        None => case.verb.to_string(),
-    };
+const MODES: [&str; 2] = ["derived", "visible"];
+
+/// Every frame the cases compare, by (mode, name): "plain" (the pick
+/// alone), "plain-nopick" (nothing: the selection case's baseline), and one
+/// per case under its verb's name.
+type Frames = std::collections::HashMap<(&'static str, String), (image::RgbaImage, String)>;
+
+/// The ops of a case's own frame: the pick, then its verb ("selection" is the
+/// pick alone).
+fn case_ops(case: &VerbCase) -> Vec<String> {
+    let mut ops: Vec<String> = PICK.iter().map(|s| s.to_string()).collect();
+    if case.verb != "selection" {
+        ops.push("--verb".into());
+        ops.push(match case.rgb {
+            Some(rgb) => format!("{} {rgb}", case.verb),
+            None => case.verb.to_string(),
+        });
+    }
+    ops
+}
+
+/// Render every frame the cases read, once each, side by side as
+/// view_registry does: per mode the two plain frames and one per case (14
+/// launches; rendering per case took 20 one after another, the same plain
+/// frame four times per mode, and was this crate's slowest test binary).
+/// One mode per wave, so at most seven renderers hold a device at once.
+fn render_frames(cases: &[VerbCase], dir: &Path) -> Frames {
+    let mut frames = Frames::new();
+    for mode in MODES {
+        let mut jobs: Vec<(String, Vec<String>)> = vec![
+            ("plain".to_string(), PICK.iter().map(|s| s.to_string()).collect()),
+            ("plain-nopick".to_string(), Vec::new()),
+        ];
+        jobs.extend(cases.iter().map(|c| (c.verb.to_string(), case_ops(c))));
+        let wave: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = jobs
+                .iter()
+                .map(|(name, ops)| {
+                    s.spawn(move || {
+                        let ops: Vec<&str> = ops.iter().map(String::as_str).collect();
+                        // A distinct file per (mode, frame): no two threads write one path.
+                        ((mode, name.clone()), render(mode, &dir.join(format!("{mode}-{name}.png")), &ops))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("render thread")).collect()
+        });
+        frames.extend(wave);
+    }
+    frames
+}
+
+fn run_case(case: &VerbCase, frames: &Frames) {
     let selection_case = case.verb == "selection";
-    let (plain_ops, ops, reply_prefix): (Vec<&str>, Vec<&str>, String) = if selection_case {
-        (Vec::new(), PICK.to_vec(), "pick:".to_string())
-    } else {
-        let mut ops = PICK.to_vec();
-        ops.extend(["--verb", verb_arg.as_str()]);
-        (PICK.to_vec(), ops, format!("verb {}", case.verb))
-    };
+    let plain_name = if selection_case { "plain-nopick" } else { "plain" };
+    let reply_prefix = if selection_case { "pick:".to_string() } else { format!("verb {}", case.verb) };
     let mut masks: Vec<Vec<(u32, u32)>> = Vec::new();
-    for mode in ["derived", "visible"] {
-        let (plain, _) = render(mode, &dir.join(format!("{mode}-plain{}.png", if selection_case { "-nopick" } else { "" })), &plain_ops);
-        let (verbed, log) = render(mode, &dir.join(format!("{mode}-{}.png", case.verb)), &ops);
+    for mode in MODES {
+        let (plain, _) = &frames[&(mode, plain_name.to_string())];
+        let (verbed, log) = &frames[&(mode, case.verb.to_string())];
         let reply = log.lines().find(|l| l.starts_with(&reply_prefix)).unwrap_or("").to_string();
-        let changed = changed_pixels(&plain, &verbed);
+        let changed = changed_pixels(plain, verbed);
         let (x0, y0, x1, y1) = bbox(&changed);
         let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
         let colour = case.rgb.map(|rgb| {
             let channel = dominant(hex(rgb));
-            let (spread, px) = best_spread(&verbed, &changed, channel);
+            let (spread, px) = best_spread(verbed, &changed, channel);
             (rgb, channel, spread, px)
         });
         println!(
@@ -248,8 +291,9 @@ fn visible_verbs_address_the_glyph_the_slot_did() {
         // slot. Same glyph, same pixels.
         VerbCase { verb: "selection", rgb: None, max_w: 200, max_h: 220, max_changed: 20_000, min_spread: i32::MIN },
     ];
+    let frames = render_frames(&cases, &dir);
     for case in &cases {
-        run_case(case, &dir);
+        run_case(case, &frames);
     }
 }
 
@@ -269,9 +313,12 @@ fn a_moved_item_is_drawn_where_it_went() {
     let dir = scratch();
     let camera = ["--cam-pose", "21", "-190", "40", "0", "0"];
     let ops = ["--pick-file", "long.md", "--verb", "move-group -12.7 -167.8 -20"];
-    let (derived_still, _) = render_at("derived", &dir.join("moved-derived-still.png"), &camera, &[]);
-    let (derived, _) = render_at("derived", &dir.join("moved-derived.png"), &camera, &ops);
-    let (visible, log) = render_at("visible", &dir.join("moved-visible.png"), &camera, &ops);
+    let ((derived_still, _), (derived, _), (visible, log)) = std::thread::scope(|s| {
+        let still = s.spawn(|| render_at("derived", &dir.join("moved-derived-still.png"), &camera, &[]));
+        let moved = s.spawn(|| render_at("derived", &dir.join("moved-derived.png"), &camera, &ops));
+        let visible = s.spawn(|| render_at("visible", &dir.join("moved-visible.png"), &camera, &ops));
+        (still.join().expect("render thread"), moved.join().expect("render thread"), visible.join().expect("render thread"))
+    });
     let reply = log.lines().find(|l| l.starts_with("verb move-group")).unwrap_or("");
     assert!(reply.contains("long.md group 2 offset -> (5.0,-167.8,-20.0)"), "the move landed where planned: {reply:?}");
     let arrived = changed_pixels(&derived_still, &derived);
