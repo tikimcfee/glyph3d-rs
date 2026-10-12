@@ -969,9 +969,9 @@ paint forced flat by a scratch toggle): 32,489 / 43,726 / 31,419 px of token
 colour short of the plain frame, 32,490 / 44,983 / 30,698 px off the
 baseline. Candidates, diff images and the same table:
 `out/tooling-ab/sweep/candidates/step2-render-file/vulkan-nvidia/`
-(untracked). Nothing under `out/tooling-ab/baseline/` was touched; pixel-ab
-is red on these three, plain and under both equivalents, until a human
-adopts them (and metal-apple's candidates must be rendered on the M2).
+(untracked). **Adopted on vulkan-nvidia 2026-10-11**, together with § 10's
+frames; the block stays measured by ink (Ivan: "the ink is the width").
+metal-apple's set is still to be rendered and adopted on the M2.
 
 *The first measurement (before the rebase, one-cell tabs), for the record:*
 `text` 71,020 px, all T — a tab advanced one trie advance where the stager
@@ -1083,7 +1083,8 @@ paint its command asked for never reached a pixel. Step 2's C cause for
 painted COMMENT any more. The five `[[golden_view.exempt]]` entries are
 gone; the visible equivalent holds every frame but `demo`. Candidates and
 `ATTRIBUTION.txt`: `out/tooling-ab/sweep/candidates/syntax-retired/vulkan-nvidia/`
-(untracked; nothing under `out/tooling-ab/baseline/` touched).
+(untracked). **Adopted on vulkan-nvidia 2026-10-11** with § 9's frames, one
+adoption; metal-apple pending.
 
 **Left open.** Every repo backdrop now takes the extension tint, so the
 slot-colour backdrop tint fold that served the syntax loads (Pass 2's

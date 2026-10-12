@@ -578,9 +578,14 @@ commit that culled `long.md`'s far lines (`048d403`, repaired by `9c96ad1`)
 and per-chunk syntax colouring (`8b28f1f`, C17). A red gate stops seeing the
 NEXT change too).
 
-**Red on three frames since step 2 (2026-10-11), on purpose.** `--render-file`
-became a one-item repo load, which moved `text`, `emoji` and `emoji-cluster`
-on vulkan-nvidia and left every other frame byte-equal. Every moved pixel is
+**Re-adopted on vulkan-nvidia 2026-10-11 (step 2 and C33); metal-apple
+pending.** Two changes moved frames, and one adoption took both. The syntax
+heuristic's retirement (C33) took the token colour out of eight frames, each
+new frame byte-equal to the old code's flat render, so nothing but colour
+moved (the table is § 10 of
+`out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md`). Step 2 — `--render-file`
+became a one-item repo load — moved `text`, `emoji` and `emoji-cluster`
+beyond colour, attributed as follows. Every moved pixel is
 attributed, each cause measured by toggling it, in
 `out/DESIGN-VIEWS-SLABS-POSES-2026-10-11.md` § 9 (re-measured 2026-10-11
 after `--render-file` took 4-cell tab stops, `[layout]
@@ -589,12 +594,11 @@ it was 71,020 at one-cell tabs), the fold's f32 running-sum x and the camera
 fit an ulp wider from it acting together, neither moving a pixel alone;
 `emoji` 3,372 px of edge flips from the same two causes; `emoji-cluster`
 2,217 px (1,121 the shared colouriser's `#` comment painting `bare:` after a
-keycap, the rest the same summation). No tab-stop pixel remains. Candidates and diff images are in
-`out/tooling-ab/sweep/candidates/step2-render-file/vulkan-nvidia/`
-(untracked; metal-apple's must be rendered on that host). Until a human
-adopts them the gate is red on those three plain and under both
-equivalents, and `glyph prove` reports every pixel-ab mutation's gate
-ALREADY RED.
+keycap, the rest the same summation). No tab-stop pixel remains. The camera fit stays measured by ink, not rounded to whole
+cells: the ink is the width (Ivan, at adoption). All nine pixel-ab mutations
+were re-proven against the new frames. **The metal-apple set has not been
+re-adopted**: on that host the gate is red on the same eight frames until
+it is, and every pixel-ab mutation's gate reads ALREADY RED there.
 
 **One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
 renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
