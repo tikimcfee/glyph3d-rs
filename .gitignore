@@ -1,12 +1,10 @@
-# pixi environments
-/.pixi
+# pixi environments (pixi's template: the env is ignored, a per-checkout
+# .pixi/config.toml is not)
 .pixi/*
 !.pixi/config.toml
 
-# Personal launch config (copy launch_config.example.toml)
-/launch_config.toml
-
-# Rust build artifacts
+# Rust build artifacts: the workspace's target/ (native/target before
+# 2026-09-06) and experiments/'s own workspace's
 target/
 
 # Compiled native binaries / libs (rebuilt from source)
@@ -36,9 +34,6 @@ out/windowed-shot-*.png
 # Claude Code loads, which are tracked links into .agents/skills/.
 /.claude/*
 !/.claude/skills/
-
-# one workspace, one target dir (was native/target before 2026-09-06)
-/target/
 
 # Derived atlas mip cache
 assets/atlas/*.cache
