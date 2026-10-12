@@ -174,7 +174,9 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   selected by its file). `--since <ref>` (2026-10-11) is the same against the
   merge-base of `<ref>` and HEAD, committed work included — "prove what this
   branch touched" — and also selects every mutation of a gate whose own
-  script changed (`--changed` is `--since HEAD`). `--list` prints a
+  script changed, and every mutation whose `build.toml` declaration, or
+  whose gate's, is new or edited, so a mutation proves itself on the branch
+  that adds it (`--changed` is `--since HEAD`). `--list` prints a
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the

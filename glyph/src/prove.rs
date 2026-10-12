@@ -116,7 +116,7 @@ fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
 /// and HEAD, repo-relative (git runs at the root). Against the merge-base, not
 /// `since` itself, so commits that landed on `since` after the branch left it
 /// do not count as this branch's changes. `None`, said why, if git refuses.
-fn files_changed_since(since: &str) -> Option<(String, BTreeSet<String>)> {
+fn changed_since(since: &str) -> Option<(String, ChangeSet)> {
     let git = |args: &[&str]| {
         Command::new("git")
             .args(args)
@@ -138,24 +138,70 @@ fn files_changed_since(since: &str) -> Option<(String, BTreeSet<String>)> {
             return None;
         }
     };
-    match git(&["diff", "--name-only", &base]) {
-        Ok(out) => Some((base, out.lines().map(str::to_string).collect())),
+    let files: BTreeSet<String> = match git(&["diff", "--name-only", &base]) {
+        Ok(out) => out.lines().map(str::to_string).collect(),
         Err(e) => {
             println!("FAIL  --since {since}: git diff refused: {e}");
-            None
+            return None;
         }
-    }
+    };
+    let (mutations, gates) = if files.contains("build.toml") {
+        let current = std::fs::read_to_string(root().join("build.toml")).unwrap_or_default();
+        let before = git(&["show", &format!("{base}:build.toml")]).ok();
+        declarations_changed(before.as_deref(), &current)
+    } else {
+        Default::default()
+    };
+    Some((base, ChangeSet { files, mutations, gates }))
 }
 
-/// Whether a change set touches a mutation: its target file changed, or the
-/// script its gate runs did. The second clause is what makes a gate's own
-/// edit re-prove the gate: a change to `tools/check-orphans.sh` cannot
-/// weaken a mutation's target, but it can stop the gate noticing it. Gates
-/// built into the runner (cargo, cargo-test, golden) name no script; a change
-/// to the runner itself selects the mutations that target `glyph/`.
-fn touches(mu: &Mutation, gate_cmd: Option<&str>, changed: &BTreeSet<String>) -> bool {
-    changed.contains(&mu.file)
-        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.contains(word)))
+/// What a change set touches. Files are repo-relative paths; `declarations`
+/// names the `[[mutation]]` and `[[gate]]` entries of build.toml that are new
+/// or differ from the base.
+struct ChangeSet {
+    files: BTreeSet<String>,
+    mutations: BTreeSet<String>,
+    gates: BTreeSet<String>,
+}
+
+/// The `[[mutation]]` and `[[gate]]` entries of `current` that are new or
+/// differ from `base`, by name. Read as plain TOML, not as the manifest: the
+/// base may predate a schema change and must still be comparable. A base
+/// that does not parse (or has no build.toml) makes every entry new.
+fn declarations_changed(base: Option<&str>, current: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let entries = |text: Option<&str>, key: &str| -> std::collections::BTreeMap<String, toml::Value> {
+        text.and_then(|t| t.parse::<toml::Table>().ok())
+            .and_then(|t| t.get(key).and_then(|v| v.as_array()).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v)))
+            .collect()
+    };
+    let changed = |key: &str| {
+        let before = entries(base, key);
+        entries(Some(current), key)
+            .into_iter()
+            .filter(|(name, v)| before.get(name) != Some(v))
+            .map(|(name, _)| name)
+            .collect()
+    };
+    (changed("mutation"), changed("gate"))
+}
+
+/// Whether a change set touches a mutation: its target file changed, the
+/// script its gate runs did, or its own declaration or its gate's did. The
+/// script clause is what makes a gate's own edit re-prove the gate: a change
+/// to `tools/check-orphans.sh` cannot weaken a mutation's target, but it can
+/// stop the gate noticing it. The declaration clauses are what make a NEW
+/// mutation, or an edited one, prove itself on the branch that adds it,
+/// whether or not its target file changed. Gates built into the runner
+/// (cargo, cargo-test, golden) name no script; a change to the runner itself
+/// selects the mutations that target `glyph/`.
+fn touches(mu: &Mutation, gate_cmd: Option<&str>, changed: &ChangeSet) -> bool {
+    changed.files.contains(&mu.file)
+        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.files.contains(word)))
+        || changed.mutations.contains(&mu.name)
+        || changed.gates.contains(&mu.gate)
 }
 
 pub(crate) fn cmd_prove(
@@ -172,8 +218,8 @@ pub(crate) fn cmd_prove(
 
     // --since REF (and --changed, which is --since HEAD): the mutations the
     // change set touches.
-    let changed_files: Option<(String, BTreeSet<String>)> = match since {
-        Some(r) => match files_changed_since(r) {
+    let changed_files: Option<(String, ChangeSet)> = match since {
+        Some(r) => match changed_since(r) {
             Some(c) => Some(c),
             None => return false,
         },
@@ -195,9 +241,13 @@ pub(crate) fn cmd_prove(
         .collect();
     if scoped {
         let since_note = match (since, &changed_files) {
-            (Some(r), Some((base, cf))) => {
-                format!(", {} files changed since {r} (merge-base {})", cf.len(), &base[..base.len().min(10)])
-            }
+            (Some(r), Some((base, cf))) => format!(
+                ", {} files, {} mutation and {} gate declarations changed since {r} (merge-base {})",
+                cf.files.len(),
+                cf.mutations.len(),
+                cf.gates.len(),
+                &base[..base.len().min(10)]
+            ),
             _ => String::new(),
         };
         println!(
@@ -449,9 +499,9 @@ mod tests {
     use super::*;
     use crate::load;
 
-    /// `--since` selects a mutation when its target changed, or when the script
-    /// its gate runs did — and never on a path that is merely a prefix or a
-    /// substring of a word in the command.
+    /// `--since` selects a mutation when its target changed, when the script
+    /// its gate runs did (a word of the command, never a substring of one), or
+    /// when its own declaration or its gate's is new or edited.
     #[test]
     fn since_selects_by_target_or_gate_script() {
         let mu = |file: &str| Mutation {
@@ -466,13 +516,32 @@ mod tests {
             with_: None,
             rebuild: None,
         };
-        let changed: BTreeSet<String> = ["native/src/text.rs", "tools/check_atlas.py"].iter().map(|s| s.to_string()).collect();
+        let set = |files: &[&str], mutations: &[&str], gates: &[&str]| ChangeSet {
+            files: files.iter().map(|s| s.to_string()).collect(),
+            mutations: mutations.iter().map(|s| s.to_string()).collect(),
+            gates: gates.iter().map(|s| s.to_string()).collect(),
+        };
+        let changed = set(&["native/src/text.rs", "tools/check_atlas.py"], &[], &[]);
         assert!(touches(&mu("native/src/text.rs"), None, &changed), "its target changed");
         assert!(!touches(&mu("native/src/fold.rs"), None, &changed), "nothing it reads changed");
         assert!(touches(&mu("assets/atlas/codepoints.bin"), Some("python3 tools/check_atlas.py"), &changed), "its gate's script changed");
         assert!(!touches(&mu("assets/atlas/codepoints.bin"), Some("python3 tools/check_atlas.py.bak"), &changed), "a word, not a substring");
         assert!(!touches(&mu("assets/atlas/codepoints.bin"), Some("clippy"), &changed), "a built-in gate names no script");
-        assert!(!touches(&mu("native/src/text.rs"), None, &BTreeSet::new()), "an empty change set selects nothing");
+        assert!(!touches(&mu("native/src/text.rs"), None, &set(&[], &[], &[])), "an empty change set selects nothing");
+        assert!(touches(&mu("native/src/fold.rs"), None, &set(&["build.toml"], &["m"], &[])), "its declaration changed");
+        assert!(touches(&mu("native/src/fold.rs"), None, &set(&["build.toml"], &[], &["g"])), "its gate's declaration changed");
+
+        // Declarations are compared as TOML values, by name.
+        let base = "[[gate]]\nname = \"g\"\ncmd = \"a\"\n[[gate]]\nname = \"h\"\n\
+                    [[mutation]]\nname = \"same\"\nfile = \"f\"\n[[mutation]]\nname = \"edited\"\nfile = \"f\"\n";
+        let current = "[[gate]]\nname = \"g\"\ncmd = \"b\"\n[[gate]]\nname = \"h\"\n\
+                       [[mutation]]\nname = \"same\"\nfile = \"f\"\n[[mutation]]\nname = \"edited\"\nfile = \"F\"\n\
+                       [[mutation]]\nname = \"new\"\nfile = \"f\"\n";
+        let (mutations, gates) = declarations_changed(Some(base), current);
+        assert_eq!(mutations.into_iter().collect::<Vec<_>>(), ["edited", "new"]);
+        assert_eq!(gates.into_iter().collect::<Vec<_>>(), ["g"]);
+        let (mutations, gates) = declarations_changed(None, current);
+        assert_eq!((mutations.len(), gates.len()), (3, 2), "no base: every declaration is new");
     }
 
     /// A mutation's find must name ONE place (C11), and no declared one names two.
