@@ -204,8 +204,10 @@ rebuilt, put one back.
 ## Style discipline
 
 - **Zero warnings** from `cargo build` and `cargo clippy`, always. Fix lints
-  properly; `#[allow]` only when the lint is genuinely wrong for the code,
-  with a one-line justification comment.
+  properly; suppress only when the lint is genuinely wrong for the code, as
+  `#[expect(lint, reason = "...")]` (root `Cargo.toml` `[workspace.lints]`
+  makes a bare `#[allow]` and a missing reason warnings, and an expectation
+  that stops being met is one too).
 - **Fail-loud panics**: this is a binary, not a library. `expect("...")` /
   `assert!` with a diagnostic message is the documented convention — do NOT
   convert to error-returning style. Bare `unwrap()` only in `#[cfg(test)]`.
@@ -251,7 +253,7 @@ its staging text predates C22). Key touchpoints:
 - **Golden Pixel Keys**:
   - Golden baselines are keyed per rasterizer in `out/tooling-ab/baseline/<key>/`; sets exist for `metal-apple` and `vulkan-nvidia`. Any other key (e.g. `vulkan-amd`) is red until a human adopts its set.
 - **Pure Rust Portability**:
-  - Zero target-specific inline assembly or architecture-specific intrinsics. LLVM auto-vectorizes clean slice loops to AVX2/AVX-512 on x86_64 and NEON on ARM64. Numerical pick checks (`tools/check-pick-oracle.sh`) are 100% bit-exact across platforms.
+  - No inline assembly, and one use of architecture intrinsics: `text::is_pure_printable_ascii` checks 16 bytes at a time with NEON on aarch64 (`std::arch::aarch64`); the 8-byte SWAR loop after it takes the tail there and the whole input on every other target (this line claimed zero until 2026-10-11). Otherwise LLVM auto-vectorizes clean slice loops to AVX2/AVX-512 on x86_64 and NEON on ARM64. Numerical pick checks (`tools/check-pick-oracle.sh`) are 100% bit-exact across platforms.
 
 ## Debug env vars
 

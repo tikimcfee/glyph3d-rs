@@ -20,6 +20,23 @@ members = ["native", "glyph", "crates/glyph-field", "crates/glyph-field-instance
 # sees Zed. See zed_integration_experiments/docs/seam.md.
 exclude = ["experiments"]
 
+# The one place lint levels are set (2026-10-11); every member opts in with
+# `[lints] workspace = true`. cargo-build and cargo-clippy are zero-warning
+# gates, so a lint at "warn" here is red until its last site is fixed: each
+# lint arrives in the same commit as all of its fixes, never as a standing
+# warning. Not the cast lints: they fight the f32/u32 index maths everywhere.
+[workspace.lints.rust]
+
+[workspace.lints.clippy]
+# Every #[allow] says why, in the attribute where rustc carries it (2026-10-11).
+allow_attributes_without_reason = "warn"
+# #[expect] over #[allow]: an expectation the lint stops meeting is itself a
+# warning, so a suppression cannot outlive its cause (2026-10-11).
+allow_attributes = "warn"
+# Every unsafe block and impl states the invariant it relies on, checked on
+# Linux and, cross-target, on macOS, whose Metal path is cfg-gated (2026-10-11).
+undocumented_unsafe_blocks = "warn"
+
 [profile.release]
 # Keep debug info in release so future profiling stages stay sane.
 debug = true

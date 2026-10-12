@@ -404,6 +404,8 @@ fn stage_host_memory<E: SlotEmit>(
         std::mem::align_of::<E::Slot>().max(64),
     )
     .expect("valid host staging layout");
+    // SAFETY: the layout's size is non-zero (`alloc_size >= plan.slot_bytes`, one
+    // slot); null is checked next, and it is freed below with this same layout.
     let host_ptr = unsafe { std::alloc::alloc(layout) };
     assert!(!host_ptr.is_null(), "failed to allocate host staging memory");
 
@@ -489,6 +491,12 @@ fn stage_host_memory<E: SlotEmit>(
                     let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
                     // Parallel: one thread copied at ~15-19 GB/s, under the
                     // box's copy bandwidth (C22). Same bytes, same places.
+                    // SAFETY: `src_offset + written + slice_len <= src_offset +
+                    // copy_bytes <= plan.total_bytes <= alloc_size`, every byte of it
+                    // written by `inputs.run` above (Pass 2 emits every slot Pass 1
+                    // counted; see layout_pass2_chunk's `out_ptr`); `slice_len <=
+                    // STAGING_BYTES`, the staging buffer's mapped size. Host heap and
+                    // mapped staging cannot overlap.
                     let (src, dst) = unsafe {
                         (
                             std::slice::from_raw_parts(host_ptr.add(src_offset + written), slice_len),
@@ -549,6 +557,8 @@ fn stage_host_memory<E: SlotEmit>(
     drop(sp_stream);
     drop(staging_buf);
 
+    // SAFETY: `host_ptr` came from `alloc(layout)` above with this same layout, and
+    // nothing refers to it after the copy loop.
     unsafe {
         std::alloc::dealloc(host_ptr, layout);
     }

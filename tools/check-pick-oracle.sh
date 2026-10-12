@@ -99,7 +99,8 @@ check alpha.rs 4 4
 # 1995 -> 8). The `down` block below still exercises the row-per-wrap geometry,
 # so making one mode default did not retire coverage of the other.
 #
-# THE ROW NUMBERS MOVED on 2026-09-04 (the phantom-row fix, engine/delta/):
+# THE ROW NUMBERS MOVED on 2026-09-04 (the phantom-row fix; its engine/delta/
+# note went with the Mojo engine in b22fd92):
 # six of wide.txt's nine lines have glyph counts that are exact multiples of
 # 100, and each used to claim one blank row. These four probes name the SAME
 # BYTES as before — only the row they sit on changed (3 -> 2, 600 -> 596,

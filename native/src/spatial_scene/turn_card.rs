@@ -35,7 +35,7 @@ pub struct AgentTurnCard {
 
 impl SpatialScene {
     /// Spawn a 2-page Agent Turn/Beat Card container with Left (Spec) and Right (Artifact) pages.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a spawn constructor: its parameters are the card's fields")]
     pub fn spawn_agent_turn_card(
         &mut self,
         parent: Entity,

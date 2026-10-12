@@ -5,6 +5,11 @@ edition = "2021"
 publish = false
 description = "Where agent harnesses keep their session transcripts: one table of per-app default locations, shared by the renderer's session browser and its launcher."
 
-# std only, deliberately: `glyph` (the build tool) depends on this, and the
-# build tool must never depend on the renderer it builds and reports on.
+# std only, deliberately. Written for `glyph` (the build tool), which must
+# never depend on the renderer it builds; since the launcher moved into the
+# renderer (C27, 2026-10-10) only glyph3d-native reads it, and std-only keeps
+# it free for either.
 [dependencies]
+
+[lints]
+workspace = true

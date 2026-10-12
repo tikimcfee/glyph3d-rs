@@ -15,3 +15,6 @@ encase = "0.12"
 # Validate this crate's WGSL with the compiler wgpu 30 bundles (as
 # native/tests/wgsl.rs does for native/src/shaders).
 naga = { version = "30", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

@@ -6,7 +6,7 @@ the checks themselves (what each gate runs and cannot see) live in the root
 `AGENTS.md`; where this file and that one disagree, `AGENTS.md` wins.
 
 ## 1. Static Analysis and Lints
-- **Zero Warnings**: the battery's `cargo-clippy` gate runs `cargo clippy --release --all-targets` (default lint set, tests included) and is red on any warning; `cargo-build` and `cargo-doc` are zero-warning too. `clippy::pedantic` is NOT configured. An `#[allow(...)]` needs a comment saying why.
+- **Zero Warnings**: the battery's `cargo-clippy` gate runs `cargo clippy --release --all-targets` (default lint set, tests included) and is red on any warning; `cargo-build` and `cargo-doc` are zero-warning too. Lint levels live in the root `Cargo.toml`'s `[workspace.lints]`; `clippy::pedantic` is NOT configured. A suppression is `#[expect(lint, reason = "...")]`: a bare `#[allow]` and a missing reason are warnings, and so is an expectation that stops being met.
 - **Fail-Loud Panics**: This is a binary, not a library. Do not bubble up errors when a hard failure is appropriate. However, do NOT use a bare `.unwrap()` outside of `#[cfg(test)]`. Instead, use `.expect("...")` or `assert!(..., "...")` with a clear diagnostic message explaining *why* it failed.
 
 ## 2. Observability
@@ -21,7 +21,7 @@ the checks themselves (what each gate runs and cannot see) live in the root
 
 ## 4. Testing
 - `pixi run test` (`cargo nextest run --workspace`) is fine for a fast manual loop.
-- Green means `cargo glyph test`, never `cargo build`. `cargo glyph test rust` covers the compiler, lints, docs and tests but no pixels; `cargo glyph test render` is the golden check. The testing skill (`.agents/skills/glyph-engine-testing/SKILL.md`) has the procedure.
+- Green means `cargo glyph test`, never `cargo build`. `cargo glyph test rust` covers the compiler, lints, docs, orphan modules and tests but no pixels; `cargo glyph test render` is the golden check. The testing skill (`.agents/skills/glyph-engine-testing/SKILL.md`) has the procedure.
 
 ## 5. Tooling
 - `pixi.toml` is the one tool declaration (root `AGENTS.md` § Tools); Rust and rust-analyzer are per host. The entry point is `cargo glyph` (`build.toml` declares every gate); pixi tasks are thin doors onto it. Do not add new ad-hoc shell entry points or `wasm-pack` workflows: a new check is a gate in `build.toml` (several existing gates are `tools/*.sh` scripts the runner calls).

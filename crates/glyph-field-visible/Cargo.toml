@@ -9,8 +9,10 @@ glyph-field = { path = "../glyph-field" }
 glyph-field-derived = { path = "../glyph-field-derived" }
 wgpu = "30"
 bytemuck = { version = "1", features = ["derive"] }
-encase = "0.12"
 log = "0.4"
 
 [dev-dependencies]
 naga = { version = "30", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

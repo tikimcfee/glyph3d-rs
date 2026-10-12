@@ -395,7 +395,6 @@ pub fn load_repo(
 /// (`WalkResult::from_files`, the P1-live envelope path): the fold is a pure
 /// function of (bytes, params) either way, and only the bytes' provenance
 /// differs.
-#[allow(clippy::too_many_arguments)]
 pub fn load_items(
     walk: WalkResult,
     _walk_dur: Duration,
@@ -458,7 +457,7 @@ pub fn prefetch_repo(
 /// `gpu` is the renderer's device when one exists — HyperLayout emits
 /// straight into its buffers; `None` is the no-GPU door
 /// (`--repo-scan-only`), where layout fills a host arena.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
@@ -493,7 +492,7 @@ pub fn load_repo_from_walk(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_prefetched(
     root: &Path,
     prefetched: PrefetchedRepo,
@@ -574,7 +573,7 @@ enum Placement {
 }
 
 /// The loader proper, over a [`ViewPlan`].
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the loader behind the repo-load entry points: the walk, the plan and each input its callers choose (device, arena, folds), passed apart")]
 fn load_views(
     root: &Path,
     prefetched: PrefetchedRepo,
@@ -1390,9 +1389,10 @@ fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
 }
 
 #[cfg(test)]
-// A one-element slice of fold ranges is a real input here (one fold), not a
-// mistyped `(a..b).collect()` — the shape this lint exists to catch.
-#[allow(clippy::single_range_in_vec_init)]
+#[expect(
+    clippy::single_range_in_vec_init,
+    reason = "a one-element slice of fold ranges is a real input here (one fold), not a mistyped (a..b).collect()"
+)]
 mod tests {
     use super::*;
     use crate::layout::GlyphRecord;

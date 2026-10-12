@@ -47,7 +47,7 @@ pub(crate) trait SlotEmit: Sync {
     /// The general path: one glyph, every field it can carry. A constructor —
     /// its arguments ARE the slot's fields, so a struct of them would be a
     /// second copy of the slot (C3 keeps this allow on purpose).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "a constructor: its arguments are the slot's fields, and a struct of them would be a second copy of the slot (C3)")]
     fn emit(
         pos_x: f32,
         pos_y: f32,
@@ -68,6 +68,8 @@ pub(crate) trait SlotEmit: Sync {
         color: u32,
         frame: RowFrame,
     ) -> Self::Slot;
+    /// # Safety
+    /// `dest` must be valid for writes of 8 consecutive slots.
     unsafe fn emit_burst8(
         dest: *mut Self::Slot,
         pos_xs: [f32; 8],
@@ -75,6 +77,8 @@ pub(crate) trait SlotEmit: Sync {
         colors: [u32; 8],
         frame: RowFrame,
     );
+    /// # Safety
+    /// `dest` must be valid for writes of 4 consecutive slots.
     unsafe fn emit_burst4(
         dest: *mut Self::Slot,
         pos_xs: [f32; 4],
@@ -335,7 +339,20 @@ fn layout_pass2_chunk<E: SlotEmit>(
     let mut survivor_out = 0usize;
     let mut trailer_until = 0usize;
 
-    let out_ptr = unsafe { (dest_addr as *mut E::Slot).add(slot_base as usize) };
+    // Offset in integers, then cast. `dest_addr` is slot 0's address, which
+    // the windowed and emoji-scratch paths rebase below their buffer
+    // (`window_addr - start * size`): only this chunk's own slots lie inside
+    // it, so `ptr::add` from slot 0 would start outside any allocation, which
+    // is undefined even though the result lands inside (2026-10-11). Wrapping,
+    // to invert the rebase's `wrapping_sub` exactly.
+    //
+    // Every write below lands in this chunk's range, `out_ptr .. out_ptr + n`
+    // with `n` Pass 1's survivor count for the chunk: each write is a survivor
+    // (a non-blank glyph), and Pass 2 emits exactly the survivors Pass 1
+    // counted, by the same resolution and the same blank rule. Held by
+    // hyper-oracle, which compares every slot of every device tier; checked at
+    // run time only on the emoji-scratch path (`chunk {c} emitted ...`).
+    let out_ptr = dest_addr.wrapping_add(slot_base as usize * std::mem::size_of::<E::Slot>()) as *mut E::Slot;
     let flat_color = if let Paint::Flat(c) = item.paint { Some(c) } else { None };
     let per_record_colors = if let Paint::PerRecord(c) = item.paint { Some(c) } else { None };
     let mut file_s0 = 0.0f64;
@@ -636,6 +653,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                 (def, def, def, def, def, def, def, def)
                             };
 
+                            // SAFETY: all eight glyphs survive (the guard above), so
+                            // these are this chunk's next eight slots, inside its
+                            // range; see the note at `out_ptr`.
                             unsafe {
                                 E::emit_burst8(
                                     out_ptr.add(survivor_out),
@@ -774,6 +794,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
                                 )
                             };
 
+                            // SAFETY: all four glyphs survive (the guard above), so
+                            // these are this chunk's next four slots, inside its range;
+                            // see the note at `out_ptr`.
                             unsafe {
                                 E::emit_burst4(
                                     out_ptr.add(survivor_out),
@@ -852,6 +875,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                             let color = get_color(char_idx);
 
+                            // SAFETY: a survivor (`g0 != 0`), so slot `survivor_out` is
+                            // inside this chunk's range; see the note at `out_ptr`.
                             unsafe {
                                 out_ptr.add(survivor_out).write(E::emit_fast(
                                     pos_x,
@@ -931,6 +956,9 @@ fn layout_pass2_chunk<E: SlotEmit>(
 
                             let color = get_color(char_idx);
 
+                            // SAFETY: a survivor (`glyph_id != 0`), so slot
+                            // `survivor_out` is inside this chunk's range; see the note
+                            // at `out_ptr`.
                             unsafe {
                                 out_ptr.add(survivor_out).write(E::emit_fast(
                                     pos_x,
@@ -1227,6 +1255,8 @@ fn layout_pass2_chunk<E: SlotEmit>(
             if E::USES_LINES && row > max_row_seen {
                 max_row_seen = row;
             }
+            // SAFETY: a survivor (`r.glyph_id != 0`), so slot `survivor_out` is inside
+            // this chunk's range; see the note at `out_ptr`.
             unsafe {
                 out_ptr.add(survivor_out).write(E::emit(
                     pos_x,
@@ -1557,6 +1587,9 @@ pub(crate) fn emit_windows<E: SlotEmit>(
                 for slot in slots {
                     pairs.extend_from_slice(&E::tint_pair(slot));
                 }
+                // SAFETY: `scratch` holds exactly `count` initialised slots (asserted
+                // above), the window holds this chunk's slots at `base`, and a fresh
+                // heap Vec cannot overlap the mapped window.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         scratch_addr as *const u8,
@@ -1606,6 +1639,9 @@ pub(crate) fn emoji_tint_pairs<E: SlotEmit>(
                 return Vec::new();
             }
             let base = dest_addr as *const E::Slot;
+            // SAFETY: `dest_addr` is the start of the destination `EmitInputs::run`
+            // wrote (never a rebased window), and `pl` covers its slots `slot_base ..
+            // slot_base + slot_count`, every one written by Pass 2.
             let slots = unsafe {
                 std::slice::from_raw_parts(base.add(pl.slot_base as usize), pl.slot_count as usize)
             };

@@ -353,6 +353,10 @@ impl HyperLayout {
                 em_height_fu,
                 SendPtr(tail_ptr),
             );
+            // SAFETY: `layout_pass2_host` wrote all `total_survivors` slots: each
+            // item's Pass 1 survivors, contiguous from its slot base (Pass 1's prefix
+            // sums). Held by hyper-oracle's host tier, which compares every instance;
+            // nothing checks the count at run time.
             unsafe {
                 arena.commit(total_survivors);
             }
@@ -477,7 +481,7 @@ fn ascii_line_max_x(l: usize, terminated: bool, fu: usize, seg_adv_table: &[f32]
 /// `lines`: when `Some`, the chunk's lines and long-line cuts are collected
 /// for the line table (`line_table.rs`), cuts planned every `segment_bytes`;
 /// the layout counts are the same either way.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "one chunk's bytes plus the per-load constants Pass 1 reads (trie, metrics, segment-advance table), passed apart; not yet bundled")]
 pub(crate) fn pass1_prepass_chunk_bytes(
     bytes: &[u8],
     p: &crate::layout::ItemParams,
@@ -507,7 +511,7 @@ pub(crate) fn pass1_prepass_chunk_bytes(
 // instead of two specialised walks (the M2 measured it: +0.7 ms of an 11 ms
 // Pass 1, 2026-10-10). As separate functions the `false` walk is the old one.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the monomorphized body of pass1_prepass_chunk_bytes, with its parameters")]
 fn pass1_prepass_chunk_walk<const COLLECT: bool>(
     bytes: &[u8],
     p: &crate::layout::ItemParams,
@@ -848,7 +852,6 @@ pub(crate) fn pass1_prepass_chunks(
 }
 
 /// [`pass1_over_chunks`] without a line table.
-#[allow(clippy::too_many_arguments)]
 fn pass1_over_chunks(
     chunks: &[chunk::LayoutChunk<'_>],
     item_chunk_ranges: &[std::ops::Range<usize>],
@@ -872,7 +875,7 @@ fn chunk_continues_line(item_bytes: &[u8], byte_offset: usize) -> bool {
 /// parallel, the serial aggregation, then the continued lines measured.
 /// With `line_segment_bytes` the walk also collects the line table
 /// (`line_table.rs`), cuts planned at that spacing.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the chunk list plus the per-load constants Pass 1 reads, passed apart; not yet bundled")]
 pub(crate) fn pass1_over_chunks_with_lines(
     chunks: &[chunk::LayoutChunk<'_>],
     item_chunk_ranges: &[std::ops::Range<usize>],

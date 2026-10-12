@@ -57,6 +57,7 @@ impl<'a> SegTintAccum<'a> {
         for g in instances {
             let gid = g.glyph_id as usize;
             if gid < slot_ink.len() {
+                // SAFETY: `gid < slot_ink.len()`, checked by the enclosing `if`.
                 if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
                     s0 += ink[0] as f64;
                     s1 += ink[1] as f64;
@@ -91,6 +92,7 @@ impl<'a> SegTintAccum<'a> {
         for &[gi, color] in pairs.as_chunks::<2>().0 {
             let gid = gi as usize;
             if gid < slot_ink.len() {
+                // SAFETY: `gid < slot_ink.len()`, checked by the enclosing `if`.
                 if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
                     s0 += ink[0] as f64;
                     s1 += ink[1] as f64;
@@ -124,6 +126,7 @@ impl<'a> SegTintAccum<'a> {
         for s in slots {
             let gid = s.glyph_id as usize;
             if gid < slot_ink.len() {
+                // SAFETY: `gid < slot_ink.len()`, checked by the enclosing `if`.
                 if let Some(ink) = unsafe { slot_ink.get_unchecked(gid) } {
                     s0 += ink[0] as f64;
                     s1 += ink[1] as f64;
