@@ -41,7 +41,7 @@ tool; re-baselining is a human act (root `AGENTS.md` § pixel-ab).
   slot formats, paint, and the visible kernel against Pass 2) over the
   fixture corpus, `g-pick-repo`, `g-cluster-repo` and the chunk-cut fixtures.
 - `pixel-ab`: the golden views byte-compared per rasterizer key, plain and
-  under each `golden_equivalents` entry (`--field-mode derived`,
+  under each `golden_equivalents` entry (`--field-mode instanced`,
   `--field-mode visible`; five syntax views are exempt from the visible one,
   by name, and their distance is still printed).
 
