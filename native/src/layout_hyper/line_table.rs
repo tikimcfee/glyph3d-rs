@@ -221,7 +221,7 @@ pub(crate) fn cells_of(advance: f32, cell_adv: f32) -> u32 {
 /// `chunk_initial` is the aggregation's (col, seg_adv, line_adv) at each
 /// chunk's start, which seeds the chunk-cut seed and the replay of the
 /// continuation's own seeds.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn assemble(
     chunk_lines: &[ChunkLines],
     item_chunk_ranges: &[std::ops::Range<usize>],
@@ -329,7 +329,7 @@ pub(crate) fn assemble(
 /// its start with the aggregation's initial (col, seg_adv, line_adv) and
 /// snapshot the state at each of that line's cuts. In parallel over such
 /// chunks; nothing runs for a corpus with no intra-line chunk cut.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn seed_continued_lines(
     t: &mut LineTable,
     chunks: &[LayoutChunk<'_>],
@@ -461,7 +461,7 @@ pub(crate) fn seed_continued_lines(
 /// chunk's, and the entry takes the larger of what its head measured and
 /// this. In parallel over the continuing chunks; nothing runs for a corpus
 /// with no intra-line chunk cut.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "Pass 1's per-chunk aggregation arrays (initial cols, segment and line advances), passed apart; not yet bundled")]
 pub(crate) fn measure_continued_line_widths(
     t: &mut LineTable,
     chunks: &[LayoutChunk<'_>],
@@ -760,7 +760,7 @@ mod tests {
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em);
         let cell_adv = fu_to_world(trie.metrics.advance_fu as i32, em);
         let mut seeds_checked = 0usize;
-        let mut sequences_near_cuts = 0usize;
+        let mut cuts_after_a_sequence = 0usize;
         // A small segment so every corpus line of any length carries cuts,
         // under both wrap shapes (the fold unit decides the seg_adv resets).
         for mode in [ClusterMode::Cluster, ClusterMode::Leader] {
@@ -773,49 +773,63 @@ mod tests {
                         let (t, _) = table_of(&it.bytes, &params, 32);
                         let fold_unit = if wrap > 0 { wrap as i64 } else if params.has_page { params.page_cols as i64 } else { 0 };
                         let rctx = ResolveCtx { trie: &trie, bitmap_adv, em_height_fu: em, cluster: char_resolve::clusters(&params) };
-                        let mut prev = (u32::MAX, 0u32);
-                        for s in &t.seeds {
-                            assert!((s.line, s.byte_offset) > prev || prev.0 == u32::MAX, "{}: seeds sorted", it.label);
-                            prev = (s.line, s.byte_offset);
-                            let e = t.entries[s.line as usize];
-                            let len = t.byte_len(s.line as usize, it.bytes.len());
+                        for w in t.seeds.windows(2) {
+                            assert!((w[0].line, w[0].byte_offset) < (w[1].line, w[1].byte_offset), "{}: seeds sorted", it.label);
+                        }
+                        // One walk per line, the fold's own state, checked at each
+                        // cut as the walk reaches it. (Until 2026-10-11 this
+                        // replayed the line from its start for EVERY seed:
+                        // quadratic in line length on the 64 KiB+ corpus lines,
+                        // 48 s of a ~60 s cargo-test, paid by every prove
+                        // mutation that reached this binary.)
+                        for line_seeds in t.seeds.chunk_by(|a, b| a.line == b.line) {
+                            let li = line_seeds[0].line as usize;
+                            let e = t.entries[li];
+                            let len = t.byte_len(li, it.bytes.len());
                             let line = &it.bytes[e.byte_start as usize..e.byte_start as usize + len];
-                            let cut = s.byte_offset as usize;
-                            assert!(cut > 0 && cut < len, "{}: cut {cut} inside line of {len}", it.label);
-                            assert!(line[cut] < 0x80, "{}: cut before a non-ASCII byte at {cut}", it.label);
-                            // Replay the line to the cut: the fold's own state.
                             let mut col = 0i64;
                             let mut seg = 0.0f32;
                             let mut line_adv = 0.0f64;
                             let mut trailer_until = 0usize;
-                            for pos in 0..cut {
-                                let Some(r) = char_resolve::resolve_byte_char(line, pos, rctx, &mut trailer_until) else { continue };
-                                if trailer_until > pos {
-                                    sequences_near_cuts += 1;
-                                }
-                                col += 1;
-                                line_adv += r.advance as f64;
-                                if fold_unit > 0 {
-                                    if col % fold_unit == 0 {
-                                        seg = 0.0;
-                                    } else {
-                                        seg += r.advance;
+                            let mut pos = 0usize;
+                            let mut sequence_since_last_cut = false;
+                            for s in line_seeds {
+                                let cut = s.byte_offset as usize;
+                                assert!(cut > 0 && cut < len, "{}: cut {cut} inside line of {len}", it.label);
+                                assert!(line[cut] < 0x80, "{}: cut before a non-ASCII byte at {cut}", it.label);
+                                while pos < cut {
+                                    if let Some(r) = char_resolve::resolve_byte_char(line, pos, rctx, &mut trailer_until) {
+                                        sequence_since_last_cut |= trailer_until > pos;
+                                        col += 1;
+                                        line_adv += r.advance as f64;
+                                        if fold_unit > 0 {
+                                            if col % fold_unit == 0 {
+                                                seg = 0.0;
+                                            } else {
+                                                seg += r.advance;
+                                            }
+                                        }
                                     }
+                                    pos += 1;
                                 }
+                                assert!(trailer_until <= cut, "{}: a sequence spans the cut at {cut}", it.label);
+                                assert_eq!(s.col as i64, col, "{}: col at cut {cut} of line {}", it.label, s.line);
+                                assert_eq!(s.seg_adv.to_bits(), seg.to_bits(), "{}: seg_adv at cut {cut} of line {}", it.label, s.line);
+                                assert_eq!(s.cells as f64 * cell_adv as f64, line_adv, "{}: cells at cut {cut}", it.label);
+                                assert_eq!(s.cells as f32 * cell_adv, line_adv as f32, "{}: cells narrow as the fold does", it.label);
+                                seeds_checked += 1;
+                                cuts_after_a_sequence += sequence_since_last_cut as usize;
+                                sequence_since_last_cut = false;
                             }
-                            assert!(trailer_until <= cut, "{}: a sequence spans the cut at {cut}", it.label);
-                            assert_eq!(s.col as i64, col, "{}: col at cut {cut} of line {}", it.label, s.line);
-                            assert_eq!(s.seg_adv.to_bits(), seg.to_bits(), "{}: seg_adv at cut {cut} of line {}", it.label, s.line);
-                            assert_eq!(s.cells as f64 * cell_adv as f64, line_adv, "{}: cells at cut {cut}", it.label);
-                            assert_eq!(s.cells as f32 * cell_adv, line_adv as f32, "{}: cells narrow as the fold does", it.label);
-                            seeds_checked += 1;
                         }
                     }
                 }
             }
         }
-        assert!(seeds_checked > 20_000, "the corpora stopped carrying cuts: {seeds_checked}");
-        assert!(sequences_near_cuts > 100, "no sequence ever preceded a cut: {sequences_near_cuts}");
+        // 269,082 seeds and 447 cuts with a sequence since the cut before on
+        // 2026-10-11 (both cluster modes, three wraps).
+        assert!(seeds_checked > 200_000, "the corpora stopped carrying cuts: {seeds_checked}");
+        assert!(cuts_after_a_sequence > 300, "too few cuts follow a sequence: {cuts_after_a_sequence}");
     }
 
     #[test]

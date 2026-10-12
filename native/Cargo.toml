@@ -31,16 +31,15 @@ bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 image = "0.25"
 # Stage I: 0.30 → 0.33 bump (its own gated mini-stage — see out/history/STAGE_I_REPORT.md).
-# Feature flags from Stage H carried over; all three names verified to still
-# exist in the published 0.33.6 manifest (docs.rs/crate/glam/0.33.6/features):
-#   approx            — epsilon-compare traits for oracle-style tests (additive
-#                       trait impls; existing bit-exact compares stay the standard)
-#   debug-glam-assert — extra validation asserts in debug builds only
-#   mint              — interop shim for future math-typed crates
+# Feature flags: debug-glam-assert, extra validation asserts in debug builds
+# only. Stage H also enabled `approx` (epsilon-compare traits) and `mint` (an
+# interop shim) for code that never came; both were dropped 2026-10-11, used
+# by nothing (no import or trait use in the tree; glyph3d-native was the only
+# crate enabling either).
 # 0.33.2 moved look_at/look_to/perspective off the matrix types into
 # glam::camera::{rh,lh}::{view,proj::*} free functions (old methods deprecated);
 # call sites use the WebGPU-convention directx projection module.
-glam = { version = "0.33", features = ["approx", "debug-glam-assert", "mint"] }
+glam = { version = "0.33", features = ["debug-glam-assert"] }
 # Stage H: real CLI (generated --help/errors/completions) replacing the
 # hand-rolled parser. Op-stream interleaving order is preserved via clap
 # occurrence indices — see build_ops() and the parity tests in main.rs.
@@ -99,3 +98,6 @@ egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
 # compiler wgpu 30 bundles (naga 30.0.1 is already in the tree via wgpu, so
 # version pairing is automatic). Test-only — never ships in release bins.
 naga = { version = "30", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

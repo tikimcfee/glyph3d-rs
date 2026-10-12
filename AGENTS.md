@@ -182,17 +182,32 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   `--mutation <name>` (repeatable) proves exactly the named mutations, and
   `--changed` proves only mutations whose target file differs from HEAD —
   "prove what you touched" (a mutation you MOVED keeps its name and is
-  selected by its file). A scoped run's verdict names its scope ("a scoped
+  selected by its file). `--since <ref>` (2026-10-11) is the same against the
+  merge-base of `<ref>` and HEAD, committed work included — "prove what this
+  branch touched" — and also selects every mutation of a gate whose own
+  script changed, and every mutation whose `build.toml` declaration, or
+  whose gate's, is new or edited, so a mutation proves itself on the branch
+  that adds it (`--changed` is `--since HEAD`). `--list` prints a
+  selection and stops, so a run's size is known before it is paid for.
+  A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
-  landing bar. A mutation whose gate is ALREADY red cannot prove anything and
+  landing bar. Where its time goes: every mutation prints its build, gate
+  and restore seconds and the run ends with a TIME line naming the slowest.
+  A test that turns slow is paid once per mutation that reaches its binary
+  (one quadratic test was 48 s of a 62 s cargo-test until 2026-10-11). A mutation whose gate is ALREADY red cannot prove anything and
   the prover says so — on a host whose pixel set is stale, the pixel-ab
   mutations are unprovable until the set is re-adopted.
   A mutation's gate can BUILD a product from the mutated source (`cargo test
   --release` links the renderer): after restoring, the prover drops the stamp
-  of every product the file feeds and rebuilds it, and a mutation of the
-  runner declares `rebuild`, because every later gate is spawned from
-  `target/release/glyph` (2026-10-09: before this, a prove left the mutant
-  behind a stamp reading current).
+  of every product the file feeds and rebuilds it (2026-10-09: before this, a
+  prove left the mutant behind a stamp reading current). Before a gate that
+  `needs` a product, the prover builds it from the mutated tree itself, and a
+  mutant that does not compile is reported and restored. So a mutation
+  declares `rebuild` only when its gate runs something no product covers —
+  today, nothing: since 2026-10-11 no mutation declares one. (The runner's
+  own mutations are seen by its unit tests; `cargo test` never relinks
+  `target/release/glyph`, measured, so a declared runner rebuild only made the
+  mutant runner run its own gate.)
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -216,7 +231,7 @@ earlier agents' picks that no gate used). `pixi install` brings up what
 conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
 ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
 tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
-cargo-modules. Under `pixi run` both sets are on PATH. **Rust and
+cargo-modules (the orphans gate's tool). Under `pixi run` both sets are on PATH. **Rust and
 rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
 (`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
 Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
@@ -230,8 +245,11 @@ Reading and editing, in order of preference (measured 2026-10-11,
   rename. A cold start indexes for about 30 s, and an empty answer before then
   means nothing. `documentSymbol` puts a symbol on its doc comment's first line,
   where a position query finds nothing, so aim at the item's own line. Its
-  check-on-save builds into `target/debug`, which the cargo-doc gate also uses,
-  so a gate can wait on that lock.
+  check-on-save builds into `target/debug`. Every gate runs `--release` (or its
+  own target dir), so no gate waits on rust-analyzer's lock. A project
+  `rust-analyzer.toml` cannot move that check: rust-analyzer reads its flycheck
+  config with no source root, which skips project files
+  (`out/AGENT-TOOLING-2026-10-11.md`).
 - **`pixi run outline <file.rs>`**: every item with its exact start-end lines
   (`tools/ast-grep/outline.yml`).
 - **ast-grep** for syntactic sweeps and rewrites: a dry run by default, `-U`
@@ -249,7 +267,7 @@ Reading and editing, in order of preference (measured 2026-10-11,
 
 ## What the checks actually do
 
-Fifteen gates (2026-10-09), in `build.toml` order. For each: what it compares, what makes it
+Seventeen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -323,6 +341,22 @@ whether the oracle is *correct* — it proves reproducibility, not truth. And
 it only proves the corpus is what it was: whether the Rust layout still
 AGREES with the corpus is the job of the reference-port gate (below).
 
+**atlas-verify** (`tools/verify_atlas.py`, gated 2026-10-11). The other half
+of what the atlas MEANS: the curve texture (header, width, two texels per
+curve, payload sized to the curve count, coordinates that fit u16, zero row
+padding), the glyph-map texture (every outline range inside the curve count,
+`curveStart` monotonic, bitmap entries of the one shape), `glyphs.bin` against
+the glyph map texel for texel, `codepoints.bin`'s section layout (the sequence
+section ending exactly where the class section starts, and that section equal
+to `cluster-classes.bin` byte for byte), the sequence rows, a handful of
+lookups, and every bitmap slot's cell inside the emoji sheet. The script had
+asserted all of this since the export was written and was run by nothing: the
+previous version of this file listed it under "What the whole battery cannot
+see". `atlas-glyphmap-disagreement` proves it. Blind to what a curve DRAWS
+(the texture is checked for shape and range, never rendered: only pixel-ab
+sees a glyph), to which curves the glyph map assigns to which glyph, and, like
+atlas-tables, to every codepoint outside its lookups.
+
 **vendor-hashes.** The hashes of the vendored + derived files
 (`vendor-manifest.py --check`; the two `hb.*` files are additionally re-derived
 from their ref sources and byte-compared — a semantic pin, not just a hash;
@@ -334,7 +368,8 @@ happened here, and is caught today only by the fixture rebuild above.
 
 **cargo-build.** `cargo build --release`, zero warnings. Red on any
 warning rustc emits; a build ERROR is fatal (the battery stops). Blind to
-anything silenced with `#[allow(...)]`.
+anything silenced with `#[expect(..., reason)]` (an expectation that stops
+being met is itself a warning, so a silence cannot outlive its cause).
 
 **cargo-check-no-ui** (2026-10-09). `cargo check` of the renderer with
 `--no-default-features` (no egui overlay), all targets, zero warnings, in its
@@ -347,14 +382,34 @@ RUNS correctly — it is checked, not executed.
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
 until then 14 test-only lints had piled up unseen, one of them deny-level.
-Blind to anything silenced with `#[allow(...)]`.
+Lint levels live in the root `Cargo.toml`'s `[workspace.lints]` (2026-10-11),
+one lint per commit with all of its fixes. Blind to anything silenced with
+`#[expect(..., reason)]`; a bare `#[allow]` is itself a warning.
 
-**cargo-doc.** `cargo doc --no-deps`, zero warnings. Red when a doc comment names
+**cargo-doc.** `cargo doc --workspace --release --no-deps`, zero warnings (every
+workspace crate since 2026-10-11; before that the renderer alone, so a dead
+link in `crates/` or `glyph/` was read by nothing: `dead-doc-link-crate`
+measured 0 warnings under the old command and 2 under the new one). Red when a doc comment names
 a symbol that no longer exists, or leaves an HTML tag open. It exists because
 renames are constant here and this was the one class the battery could not see:
 two links to `Engine::records` survived its rename to `read_back` through a full
 green run. Blind to whether the prose is TRUE — it checks that the symbols named
 still exist, not that the sentence around them is current.
+
+**orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
+declaration reaches is not compiled at all, and rustc says nothing about it.
+cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
+lists the files under `src/` it never reaches. It covers the 7 lib targets
+plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
+loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
+and until this gate only the cargo-test floor might have noticed, by count.
+`tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
+the gate runs under `pixi run`. cargo-modules runs its own `cargo check
+--compile-time-deps` (build scripts, proc macros), so the gate gives it
+`target/orphans`, as cargo-check-no-ui has `target/no-ui`. Blind to a file reached only under a cfg the
+host does not set (target_os branches; non-default features, of which there
+are none today). Also blind to glyph3d-native's own bin: its modules all live
+in the lib, so cargo-modules reports every one of them as an orphan of the bin.
 
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
@@ -791,12 +846,11 @@ and the union is not:
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
 - **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its world rows to the CPU reference after each case.
-- **`tools/verify_atlas.py`, `preview_glyphs.py`, `repro_pick_oblique.py`** are
-  manual tools, run by **zero** checks (atlas-tables covers the lookup tables'
-  consistency and pins, nothing of the curves or glyph map). So the atlas bins' structural and semantic
-  correctness, and the oblique-pick repro, are exercised by nothing in the battery
-  — the atlas is only ever checked for being byte-identical to what it was, which
-  says nothing about whether what it was is right.
+- **`tools/preview_glyphs.py` and `repro_pick_oblique.py`** are manual tools,
+  run by **zero** checks, so the oblique-pick repro is exercised by nothing in
+  the battery. (`tools/verify_atlas.py` was on this list until 2026-10-11; it
+  is the atlas-verify gate now. What the atlas's curves DRAW is still seen by
+  pixel-ab alone.)
 - **`--layout-mode library` renders in no golden view** (2026-10-10; a
   probe, `native/src/library.rs`). Its arithmetic is held to the JS
   scheme's numbers and its scene binding (group rows, page turns) by

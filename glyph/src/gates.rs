@@ -17,8 +17,12 @@ fn gate_cargo(g: &Gate) -> bool {
         // see: `[`Engine::records`]` kept pointing at a method that had been
         // renamed to `read_back`, through a full green run, because rustdoc is
         // never invoked. Found by an audit 2026-09-07, not by a check.
-        // `--no-deps` keeps it to this crate's own prose.
-        Some("doc") => "cargo doc -p glyph3d-native --no-deps",
+        // `--no-deps` keeps it to the workspace's own prose; `--workspace`
+        // since 2026-10-11 (it documented the renderer alone, so links in
+        // crates/ and glyph/ were never read). `--release`, like every other
+        // cargo gate, so it never shares target/debug, and its lock, with an
+        // editor's rust-analyzer, which checks there.
+        Some("doc") => "cargo doc --workspace --release --no-deps",
         // The renderer without its default features (no egui overlay): a
         // supported build that nothing compiled until 2026-10-09, when it
         // was found broken (C24). Its own target dir, so the changed feature

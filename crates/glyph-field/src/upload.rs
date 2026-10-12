@@ -62,7 +62,10 @@ impl<S> Clone for SendPtr<S> {
     }
 }
 impl<S> Copy for SendPtr<S> {}
+// SAFETY: only an address crosses threads; every write through it is an unsafe block of
+// its own, and `transcode_into`'s parallel writers take disjoint slot ranges.
 unsafe impl<S> Send for SendPtr<S> {}
+// SAFETY: shared, it is only copied; see Send.
 unsafe impl<S> Sync for SendPtr<S> {}
 impl<S> SendPtr<S> {
     #[inline(always)]
@@ -88,6 +91,10 @@ impl ChunkSources<'_> {
 
     /// Transcode every piece into `dest_ptr`, then zero the slots no piece
     /// covers.
+    ///
+    /// # Safety
+    /// `dest_ptr` must be valid for writes of `self.count` slots, and nothing
+    /// else may access them during the call.
     unsafe fn transcode_into<T: Transcode>(&self, dest_ptr: *mut T::Slot, transcode: &T) {
         let dest = SendPtr(dest_ptr);
         for &(dst_off, slice) in &self.pieces {
@@ -97,16 +104,25 @@ impl ChunkSources<'_> {
                     .par_chunks(CHUNK_SIZE)
                     .enumerate()
                     .for_each(|(chunk_idx, chunk)| {
+                        // SAFETY: this chunk of the piece lies inside `dest_ptr`'s
+                        // slots: `dst_off + chunk_idx * CHUNK_SIZE + chunk.len() <=
+                        // dst_off + slice.len() <= self.written <= self.count`.
                         let out_ptr = unsafe { dest.add(dst_off + chunk_idx * CHUNK_SIZE) };
                         for (k, g) in chunk.iter().enumerate() {
+                            // SAFETY: `k < chunk.len()`, so the slot is inside this
+                            // chunk's range (above), which no other task writes.
                             unsafe {
                                 transcode.transcode(g, out_ptr.add(k));
                             }
                         }
                     });
             } else {
+                // SAFETY: the piece lies inside `dest_ptr`'s slots: `dst_off +
+                // slice.len() <= self.written <= self.count`.
                 let out_ptr = unsafe { dest.0.add(dst_off) };
                 for (k, g) in slice.iter().enumerate() {
+                    // SAFETY: `k < slice.len()`, so the slot is inside the piece's
+                    // range (above).
                     unsafe {
                         transcode.transcode(g, out_ptr.add(k));
                     }
@@ -115,6 +131,8 @@ impl ChunkSources<'_> {
         }
         // Pad any remainder (e.g. mapped-empty arena zeroed slot):
         for k in self.written..self.count {
+            // SAFETY: `self.written <= k < self.count`: inside `dest_ptr`'s slots, past
+            // every piece.
             unsafe {
                 std::ptr::write(dest_ptr.add(k), <T::Slot as bytemuck::Zeroable>::zeroed());
             }
@@ -136,8 +154,13 @@ impl ChunkSources<'_> {
 #[cfg(target_os = "macos")]
 pub fn create_mapped_slot_buffer(device: &wgpu::Device, size: u64, label: &str) -> (*mut u8, wgpu::Buffer) {
     use wgpu::hal::Device as HalDevice;
+    // SAFETY: the hal device is used only within this call, while `device` is alive, to
+    // create and map one buffer that goes straight back to wgpu; nothing here destroys
+    // it.
     let hal_dev = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }
         .expect("Metal profile behind a non-Metal device");
+    // SAFETY: a valid descriptor: non-zero size (a chunk binds at least one slot) and
+    // usages Metal supports together. wgpu takes ownership below and frees it.
     let hal_buf = unsafe {
         hal_dev.create_buffer(&wgpu::hal::BufferDescriptor {
             label: Some(label),
@@ -150,8 +173,15 @@ pub fn create_mapped_slot_buffer(device: &wgpu::Device, size: u64, label: &str) 
         })
     }
     .expect("hal slot buffer");
+    // SAFETY: the buffer was created MAP_READ (Metal: StorageModeShared) and the range
+    // is all of it; it is mapped once and never unmapped (Metal's hal unmap is a no-op;
+    // see above).
     let mapping = unsafe { hal_dev.map_buffer(&hal_buf, 0..size) }.expect("hal slot map");
     let ptr = mapping.ptr.as_ptr();
+    // SAFETY: `hal_buf` came from this device, and the descriptor matches it: the same
+    // size, and usages it was created for (MAP_READ on a storage buffer is
+    // MAPPABLE_PRIMARY_BUFFERS, which the Metal caller enables). wgpu sees it unmapped
+    // while hal keeps the shared mapping `ptr` points into.
     let buf = unsafe {
         device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
             hal_buf,
@@ -175,6 +205,8 @@ fn upload_direct_metal<T: Transcode>(
     transcode: &T,
 ) -> wgpu::Buffer {
     let (ptr, buf) = create_mapped_slot_buffer(device, chunk.size::<T::Slot>(), label);
+    // SAFETY: `ptr` maps the whole new buffer, `chunk.size()` bytes = `chunk.count`
+    // slots, page-aligned, and nothing reads it before this returns.
     unsafe {
         chunk.transcode_into(ptr as *mut T::Slot, transcode);
     }
@@ -212,6 +244,9 @@ fn upload_staged_discrete<T: Transcode>(
             .get_mapped_range_mut()
             .expect("staging mapped range");
         let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr() as *mut T::Slot;
+        // SAFETY: the mapping is writable and at least `chunk.count` slots long
+        // (`padded_staging_size(size) >= size`), and starts at wgpu's MAP_ALIGNMENT
+        // (8), enough for any slot.
         unsafe {
             chunk.transcode_into(dest_ptr, transcode);
         }

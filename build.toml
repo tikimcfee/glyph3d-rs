@@ -3,7 +3,8 @@
 # Consumed by `glyph` (glyph/src/, entry main.rs; `cargo glyph --help`). This file is
 # the single account of WHICH artifacts exist, WHAT they are built from, and
 # WHICH instruments run over them — the thing that used to live only as line
-# order in tools/check-all.sh. Root AGENTS.md ("Verification") explains what
+# order in tools/check-all.sh (a thin door onto `cargo glyph test` now). Root
+# AGENTS.md ("What the checks actually do") explains what
 # each gate compares, what makes it red, and what it cannot see; the per-gate
 # `blind_to` lines below are one-line reminders, not the full account.
 #
@@ -25,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 385
+test_floor = 386
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -297,6 +298,20 @@ pass_line = "ATLAS TABLES OK"
 needs = []
 compare = "codepoints.bin against glyphs.bin (magic, version, shape, upem, missing-block metrics, sequence slots = slotCount - sequences), pinned lookups ('A' 34, ' ' 1, RAT 3839, ROCKET 4759, TAG SPACE missing, the ZWJ family -> 6819), and every entry one em tall with block 0 the missing block"
 blind_to = "any codepoint or sequence outside the pins: it proves the tables are self-consistent and right where pinned, not right everywhere. The font-unit -> world conversion is fu_to_world's unit test, not this. Committed-artifacts proves the bins are what they were; this proves what they MEAN where it can"
+# The other half of the atlas's meaning: the curve and glyph-map textures,
+# glyphs.bin against them, the trie's section layout and the sequence and
+# class sections. tools/verify_atlas.py had asserted all of it since the export
+# was written and was run by nothing (root AGENTS.md listed it as a blind spot
+# until 2026-10-11). 0.14 s.
+[[gate]]
+name = "atlas-verify"
+scope = "corpus"
+kind = "cmd"
+cmd = "python3 tools/verify_atlas.py"
+pass_line = "VERIFY OK"
+needs = []
+compare = "curves.bin (header, 1024-wide texture, 2 texels per curve, payload sized to curveCount, coords fit u16, zero row padding), glyphmap.bin (texels sized to entryCount, every outline range inside [0, curveCount), curveStart monotonic, bitmap entries [0,0,1,cell]), glyphs.bin against the glyphmap texel for texel (record sizes 64/56, slot 0 blank, primaryUpem = font 0), codepoints.bin's section layout (block index, blocks, sequence section ending exactly at the G3CC class section, which equals cluster-classes.bin byte for byte; bitmap advance = 2 x primary), sequence rows (lengths in [2, seqMax], slots consecutive, the ZWJ family -> 6819), lookups ('A' outline, ' ' blank, a bitmap codepoint past the web's 4,431 slots, tag space missing), and every bitmap slot's emojiCell inside emoji-sheet.bin's cell count"
+blind_to = "what a curve DRAWS (the texture is checked for shape and range, never rendered: only pixel-ab sees a glyph), the glyph map's choice of which curves make which glyph, and every codepoint outside its handful of lookups. Like atlas-tables it reads the bins as committed, so it is a statement about this export, not about the font"
 [[gate]]
 name = "vendor-hashes"
 scope = "corpus"
@@ -330,7 +345,7 @@ kind = "cargo"
 cmd = "clippy"
 needs = []
 compare = "clippy warning count vs zero, all targets (tests included)"
-blind_to = "anything silenced with #[allow(...)]"
+blind_to = "anything silenced with #[expect(..., reason)] — a stale expectation, and any bare #[allow], is itself a warning ([workspace.lints])"
 
 [[gate]]
 name = "cargo-doc"
@@ -338,8 +353,20 @@ scope = "rust"
 kind = "cargo"
 cmd = "doc"
 needs = []
-compare = "rustdoc warning count vs zero — intra-doc links resolve, HTML in prose is closed"
+compare = "rustdoc warning count vs zero over every workspace crate (the renderer alone until 2026-10-11) — intra-doc links resolve, HTML in prose is closed"
 blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment names still exists, not that the sentence around it is current"
+
+# A .rs file no `mod` declaration reaches is not compiled, and rustc says
+# nothing (2026-10-11). cargo-modules comes from `pixi run setup`.
+[[gate]]
+name = "orphans"
+scope = "rust"
+kind = "cmd"
+cmd = "pixi run bash tools/check-orphans.sh"
+pass_line = "ORPHANS OK"
+needs = []
+compare = "every .rs file under each target's src/ vs the files its module tree reaches (cargo-modules, #[cfg(test)] enabled), over the 7 lib targets plus the glyph and resolve-bench bins"
+blind_to = "a file reached only under a cfg the host does not set (cfg(test) is analysed; target_os branches and non-default features are not — every feature is default today); the glyph3d-native bin, whose modules all live in the lib and read as orphans of the bin; experiments/, its own workspace"
 
 [[gate]]
 name = "cargo-test"
@@ -487,9 +514,6 @@ op = "replace"
 find = "    if selected == 0 {\n        return (false,"
 with = "    if selected == usize::MAX {\n        return (false,"
 expect = "empty_gate_selection_is_refused"
-# cargo-test relinks target/release/glyph from the mutated source, and every
-# later gate in the run is spawned from that path (self_exe): restore it.
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "prove-restale-blind"
@@ -500,7 +524,6 @@ op = "replace"
 find = ".filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))"
 with = ".filter(|(_, a)| a.inputs.is_empty() && expand(\"\").contains(&f))"
 expect = "mutated_inputs_name_the_products_they_feed"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "corpus-shrink"
@@ -617,8 +640,27 @@ file = "native/src/layout.rs"
 op = "replace"
 find = "/// A layout backend. Bytes and params in, instances into the arena, placements"
 with = "/// A layout backend, see [`GlyphArena::no_such_method`]. Bytes and params in, instances into the arena, placements"
-expect = "FAIL  cargo-doc"
-rebuild = "cargo build --release"
+expect = "unresolved link to `GlyphArena::no_such_method`"
+
+[[mutation]]
+name = "dead-doc-link-crate"
+gate = "cargo-doc"
+why = "dead-doc-link's twin outside the renderer: until 2026-10-11 the gate documented glyph3d-native alone, so a dead link in crates/ or glyph/ was read by nothing. CONSUMED BY: rustdoc over glyph-field, reached only through --workspace"
+file = "crates/glyph-field/src/lib.rs"
+op = "replace"
+find = "//! The glyph field's mode-neutral contract.\n"
+with = "//! The glyph field's mode-neutral contract, see [`GlyphFieldMode::NoSuchMode`].\n"
+expect = "unresolved link to `GlyphFieldMode::NoSuchMode`"
+
+[[mutation]]
+name = "tests-mod-dropped"
+gate = "orphans"
+why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the transcript parsers' suite; only the cargo-test floor could see its loss, and only by count. CONSUMED BY: cargo-modules' walk of glyph3d-native's lib module tree under --cfg-test"
+file = "native/src/agent_transcript.rs"
+op = "replace"
+find = "#[cfg(test)]\nmod tests;\n"
+with = ""
+expect = "FAIL  orphans glyph3d-native --lib"
 
 [[mutation]]
 name = "clippy-lint"
@@ -647,7 +689,6 @@ op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "depth-write-off"
@@ -660,7 +701,6 @@ find = """            // flat page blends in exactly the order it did before.
 with = """            // flat page blends in exactly the order it did before.
             depth_write_enabled: Some(false),"""
 expect = "repo-back-oblique.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-placement-row-zeroed"
@@ -671,7 +711,6 @@ op = "replace"
 find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
 with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "sidecar-runs-unsorted"
@@ -682,7 +721,6 @@ op = "replace"
 find = "        runs.sort_by_key(|r| r.range.start);"
 with = "        let _ = runs;"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "emoji-uv-flip"
@@ -693,7 +731,6 @@ op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
 with = "        let t = vec2<f32>(c.x, c.y);"
 expect = "emoji.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "cluster-static-zero-off"
@@ -704,7 +741,6 @@ op = "replace"
 find = "    if is_static_zero_cp(cp) {"
 with = "    if false && is_static_zero_cp(cp) {"
 expect = "emoji-cluster.png diverges from baseline"
-rebuild = "cargo build --release"
 
 
 
@@ -719,7 +755,6 @@ find = """            if r.row() == row {
 with = """            if r.row() == row {
                 if r.col() == col.wrapping_add(1) {"""
 expect = "PICK ORACLE CHECK: FAILURES"
-rebuild = "cargo build --release"
 
 
 # ── reference-port, hyper-oracle (re-gated 2026-10-09) ─────
@@ -737,7 +772,6 @@ with = """    pub fn advance(&self, id: usize) -> f32 {
         0.0
     }"""
 expect = "FAIL  full fold"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "phantom-row"
@@ -748,7 +782,6 @@ op = "replace"
 find = "        (length - 1) / wrap + 1"
 with = "        length / wrap + 1"
 expect = "FAIL  full fold"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "fixture-deleted"
@@ -767,7 +800,6 @@ op = "replace"
 find = "return resolved(slot, bitmap_adv, height, false);"
 with = "return resolved(slot, bitmap_adv * 0.5, height, false);"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-keycap-lookahead-dropped"
@@ -778,7 +810,6 @@ op = "replace"
 find = "&& !(fast.seq_lead && cluster && bytes"
 with = "&& !(fast.seq_lead && !cluster && bytes"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-leader-mode-ignored"
@@ -789,7 +820,6 @@ op = "replace"
 find = "    p.cluster_mode == ClusterMode::Cluster"
 with = "    matches!(p.cluster_mode, ClusterMode::Cluster | ClusterMode::Leader)"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-leader-mode-ignored"
@@ -800,7 +830,6 @@ op = "replace"
 find = "    let cluster = super::char_resolve::clusters(p);"
 with = "    let cluster = { let _ = p; true };"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-newline-page"
@@ -811,7 +840,6 @@ op = "replace"
 find = "let right = nl_x + trie.fast_byte_table[b'\\n' as usize].advance;"
 with = "let right = nl_x;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-page-scroll-sign"
@@ -822,7 +850,6 @@ op = "replace"
 find = "let screen_row = row - self.scroll;"
 with = "let screen_row = row + self.scroll;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-x-page-dropped"
@@ -833,7 +860,6 @@ op = "replace"
 find = "                            x_page = (seg_offset / page_cols) as i64;"
 with = "                            x_page = 0;"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-page-cols-run"
@@ -854,7 +880,6 @@ op = "replace"
 find = "if (si < span_end && q >= spans[si].start) { color = spans[si].color; }"
 with = "if (si < span_end && q > spans[si].start) { color = spans[si].color; }"
 expect = "(visible kernel, spans)"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-keycap-lookahead-dropped"
@@ -865,7 +890,6 @@ op = "replace"
 find = "            if (i >= trailer_until && !((e & PK_SEQ_FIRST) != 0u && cluster && next_non_ascii)) {"
 with = "            if (i >= trailer_until) {"
 expect = "visible kernel"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-override-lane-unshifted"
@@ -896,7 +920,6 @@ op = "replace"
 find = "        origin_z: start_pos[2],"
 with = "        origin_z: 0.0,"
 expect = "derived_positions_match_the_staged_ones"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-pass1-stride-after-advance"
@@ -913,6 +936,20 @@ with = '''    } else if l > 0 {
 expect = "pagination_agrees_on_every_tier"
 
 [[mutation]]
+name = "seed-cut-resets-segment-advance"
+gate = "cargo-test"
+why = "2026-10-11: line_table's seed test had no mutation, so nothing showed it could fail. A cut treated as a fold-unit boundary: Pass 1's line walk records every seed with its segment advance zeroed, so Visible mode lays the segment after each cut in a wrapped or column-paged line from x 0. The unit test names the seed and the field; hyper-oracle's visible tier also reddens, on wide.txt and chunk-cut.txt, as kernel slots at the wrong x (measured 2026-10-11). CONSUMED BY: the seed push in Pass 1's per-line walk (non-ASCII lines), read by seeds_obey_the_cut_rule_and_the_fold_state at a 32-byte segment under wraps 0, 7 and 100"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = '''                        col: line_col as u32,
+                        seg_adv,
+                        cells,'''
+with = '''                        col: line_col as u32,
+                        seg_adv: 0.0,
+                        cells,'''
+expect = "seeds_obey_the_cut_rule_and_the_fold_state"
+
+[[mutation]]
 name = "hyper-chunk-seed-product"
 gate = "hyper-oracle"
 why = "C15 put back: a continuation chunk's segment advance is seeded as (col % fold_unit) * ascii_adv, a product, not the fold's running f32 sum, so its first partial segment sits an ulp (or, after non-ASCII advances, much more) off. Only the device Pass 2 reads the seed: the host Pass 2 walks the whole item. CONSUMED BY: continued_segment_advance, the seed of every chunk after an intra-line cut on a wrapped item; reached by g-pick-repo/wide.txt (65 slots, the original finding) and chunk-cut.txt (non-ASCII before each cut)"
@@ -926,7 +963,6 @@ with = """    if c_end > c0 {
         return (c_end % fold_unit) as f32 * fu_to_world(1229, rctx.em_height_fu);
     }"""
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-chunk-cut-splits-sequences"
@@ -937,7 +973,6 @@ op = "replace"
 find = "None => match bytes[target_offset..].iter().position(|&b| b < 0x80) {"
 with = "None => match bytes[target_offset..].iter().position(|&b| (b & 0xC0) != 0x80) {"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-continued-line-unmeasured"
@@ -948,7 +983,6 @@ op = "replace"
 find = "    if wanted.is_empty() {\n        return;\n    }"
 with = "    if !wanted.is_empty() {\n        return;\n    }"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "windowed-emoji-scratch-skipped"
@@ -959,7 +993,6 @@ op = "replace"
 find = "                if !inputs.prepasses[item].has_emoji {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut), Vec::new());"
 with = "                if true {\n                    return (layout_pass2_chunk::<E>(inputs, c, dest_addr, lut), Vec::new());"
 expect = "windowed_emission_matches_unwindowed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "windowed-chunk-order-reversed"
@@ -970,7 +1003,6 @@ op = "replace"
 find = "        for (out, pairs) in done {"
 with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "egui-use-ungated"
@@ -991,10 +1023,6 @@ op = "replace"
 find = "    let body = size - size % FAST_COPY_ALIGN;"
 with = "    let body = size;"
 expect = "split_body_is_fast_aligned_and_covers_the_size"
-# cargo test --release builds the renderer bin too (integration tests), so
-# without a restore rebuild prove would leave the MUTATED renderer in
-# target/release under an unchanged input hash (found 2026-10-09).
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "derived-curve-cap-128"
@@ -1005,7 +1033,6 @@ op = "replace"
 find = "const MAX_CURVES: u32 = 512u;"
 with = "const MAX_CURVES: u32 = 128u;"
 expect = "every_glyph_shader_covers_the_largest_outline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "render-file-copies-stacked"
@@ -1016,7 +1043,6 @@ op = "replace"
 find = "        view.offset = [column as f32 * (block_width + gap), -(row as f32 * (block_height + gap)), 0.0];"
 with = "        view.offset = [0.0 * column as f32 * (block_width + gap), -(0.0 * row as f32 * (block_height + gap)), 0.0];"
 expect = "tile_views_frame_copies_as_the_text_stager_did"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "tile-block-drops-pen-row"
@@ -1027,7 +1053,6 @@ op = "replace"
 find = "+ if newline_ended { line_height } else { 0.0 });"
 with = "+ if newline_ended { 0.0 } else { 0.0 });"
 expect = "tile_views_frame_copies_as_the_text_stager_did"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-item-bytes-by-item-index"
@@ -1038,7 +1063,6 @@ op = "replace"
 find = "(0..staging.items.len()).map(|item| staging.item_bytes(item)).collect();"
 with = "(0..staging.items.len()).map(|item| staging.buffer_bytes[item].as_slice()).collect();"
 expect = "copies_tile_in_every_field"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "instanced-coverage-scale"
@@ -1049,7 +1073,6 @@ op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
 with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
 expect = "text.png diverges from baseline under --field-mode instanced"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "prove-ambiguous-find-accepted"
@@ -1060,7 +1083,16 @@ op = "replace"
 find = "        text.matches(find).count()\n"
 with = "        text.matches(find).count().min(1)\n"
 expect = "mutation_finds_are_unambiguous"
-rebuild = "cargo build --release -p glyph"
+
+[[mutation]]
+name = "since-matches-whole-gate-command"
+gate = "cargo-test"
+why = "2026-10-11: prove --since selects a gate's mutations when the script that gate runs changed, by finding the script's path among the command's words. Comparing the whole command string to the path instead never matches (`python3 tools/check_atlas.py` is not a file), so an edit to a check script would re-prove nothing of its gate and the scoped run would still print green. CONSUMED BY: touches in glyph/src/prove.rs, via since_selects_by_target_or_gate_script"
+file = "glyph/src/prove.rs"
+op = "replace"
+find = "        || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.files.contains(word)))\n"
+with = "        || gate_cmd.is_some_and(|cmd| changed.files.contains(cmd))\n"
+expect = "since_selects_by_target_or_gate_script"
 
 [[mutation]]
 name = "nested-alias-unstripped"
@@ -1071,7 +1103,6 @@ op = "replace"
 find = "    while args.len() > n && args[1..=n]"
 with = "    while false && args.len() > n && args[1..=n]"
 expect = "doubled_alias_is_stripped"
-rebuild = "cargo build --release -p glyph"
 
 [[mutation]]
 name = "atlas-pin-moved"
@@ -1081,7 +1112,17 @@ file = "tools/check_atlas.py"
 op = "replace"
 find = "    expect(0x1F680, 4759, 2458, 2,"
 with = "    expect(0x1F680, 4758, 2458, 2,"
-expect = "ROCKET"
+expect = "FAIL  'ROCKET'"
+
+[[mutation]]
+name = "atlas-glyphmap-disagreement"
+gate = "atlas-verify"
+why = "2026-10-11: tools/verify_atlas.py gated after a year run by hand. glyphs.bin and glyphmap.bin are two files written by one export (tools/export-atlas.mjs) that must agree record for texel; an export change that moved one and not the other is the class this gate exists for, and nothing else reads both. Moving the checker's expectation off zero mismatches stands for that drift. CONSUMED BY: the record-vs-texel walk in tools/verify_atlas.py over glyphs.bin and glyphmap.bin"
+file = "tools/verify_atlas.py"
+op = "replace"
+find = "check(mismatch == 0, f\"glyphs.bin records agree with glyphmap texels"
+with = "check(mismatch == 1, f\"glyphs.bin records agree with glyphmap texels"
+expect = "glyphs.bin records agree with glyphmap texels"
 
 [[mutation]]
 name = "fu-to-world-wrong-denominator"
@@ -1092,7 +1133,6 @@ op = "replace"
 find = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32"
 with = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / (em_height_fu + 1) as f64) as f32"
 expect = "fu_to_world_is_the_nearest_f32"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-verb-keyed-off-by-one-byte"
@@ -1103,7 +1143,6 @@ op = "replace"
 find = "        let byte = g.byte_off as u32;\n        let key = (item, byte);"
 with = "        let byte = g.byte_off as u32 + 1;\n        let key = (item, byte);"
 expect = "visible_verbs_address_the_glyph_the_slot_did"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "wash-width-doubled"
@@ -1114,7 +1153,6 @@ op = "replace"
 find = "    let wash_w = f32(line.width_cells) * frame.lod.w;"
 with = "    let wash_w = 2.0 * f32(line.width_cells) * frame.lod.w;"
 expect = "the_wash_box_spans_exactly_what_the_glyphs_span"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "wash-depth-flat"
@@ -1125,7 +1163,6 @@ op = "replace"
 find = "    var w = Wash(it_idx, row_lane, wash_x0, wash_w, 0u, c.rows, 0.0, 0u, depth);"
 with = "    var w = Wash(it_idx, row_lane, wash_x0, wash_w, 0u, c.rows, 0.0, 0u, 1u);"
 expect = "the_wash_box_spans_exactly_what_the_glyphs_span"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-slot-order-atomic"
@@ -1136,7 +1173,6 @@ op = "replace"
 find = "    let slot_base = base.y;"
 with = "    let slot_base = atomicAdd(&counters[15u], line.glyph_count);"
 expect = "a_shrinking_segment_list_lays_out_no_stale_entry"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-stale-segment-tail"
@@ -1147,7 +1183,6 @@ op = "replace"
 find = "    let dispatched_end = min(((seg_count + WG - 1u) / WG) * WG, frame.u1.y);"
 with = "    let dispatched_end = seg_count;"
 expect = "a_shrinking_segment_list_lays_out_no_stale_entry"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-item-cull-ignores-group"
@@ -1158,7 +1193,6 @@ op = "replace"
 find = "    let b = to_world(gbase, lb);"
 with = "    let b = lb;"
 expect = "a_moved_item_is_drawn_where_it_went"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "visible-row-off-by-one"
@@ -1169,7 +1203,6 @@ op = "replace"
 find = "let slot = DerivedSlot(x, pack_row(row, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
 with = "let slot = DerivedSlot(x, pack_row(row + 1u, x_page), glyph | ((wrap_segment & 0xFFFFu) << 16u), color, lane);"
 expect = "diverges from baseline under --field-mode visible"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "lod-ignores-group-scale"
@@ -1250,7 +1283,6 @@ op = "replace"
 find = "        groups[g + 2u] = vec4<f32>(app.tint.xyz, alpha);"
 with = "        groups[g + 2u] = vec4<f32>(app.tint.xyz * 0.5, alpha);"
 expect = "text.png diverges from baseline"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "group-adopt-takes-unchanged-appearance"
@@ -1310,7 +1342,7 @@ file = "native/src/library/runtime.rs"
 op = "replace"
 find = "(0..at.len()).filter(|&i| at[i] != target(i))"
 with = "(0..at.len()).filter(|&i| at[i] == target(i))"
-expect = "FAILED"
+expect = "a_page_turn_moves_one_volume_and_settles_on_the_slot_law"
 
 [[mutation]]
 name = "library-drag-offset-forgotten"
@@ -1441,7 +1473,6 @@ op = "replace"
 find = "            kk = it.tab_width - cells % it.tab_width;"
 with = "            kk = it.tab_width - col % it.tab_width;"
 expect = "visible kernel"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-device-tab-stop-ignored"
@@ -1452,7 +1483,6 @@ op = "replace"
 find = "        let (advance, line_advance_addend) = tabs.advance(bytes[pos], r.advance, line_adv);"
 with = "        let (advance, line_advance_addend) = { let _ = &tabs; (r.advance, r.advance as f64) };"
 expect = "hyper-oracle FAIL"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-pass1-seed-cells-ignore-tabs"
@@ -1463,7 +1493,6 @@ op = "replace"
 find = "                    let k = cells_of(advance, ascii_adv);\n                    cells += k;\n                    unit_cells += k;\n                    if fold_unit > 0 && line_col % fold_unit == 0 {"
 with = "                    let k = cells_of(r.advance, ascii_adv);\n                    cells += k;\n                    unit_cells += k;\n                    if fold_unit > 0 && line_col % fold_unit == 0 {"
 expect = "visible kernel"
-rebuild = "cargo build --release"
 
 [[mutation]]
 name = "hyper-tab-chunk-rewalk-skipped"

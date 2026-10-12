@@ -15,11 +15,11 @@ false).
 
 | Intent | Command | What it does |
 | :--- | :--- | :--- |
-| Iterate | `cargo glyph test <scope>` | Brings the renderer up to date, then runs the gates for a scope: `rust` (build, no-UI check, clippy, doc, tests: no pixels), `render` (anything that moves a pixel: pixel-ab, picks, layout oracles), `corpus` (fixtures, generators, vendored inputs). The verdict line says how many gates ran. |
+| Iterate | `cargo glyph test <scope>` | Brings the renderer up to date, then runs the gates for a scope: `rust` (build, no-UI check, clippy, doc, orphan modules, tests: no pixels), `render` (anything that moves a pixel: pixel-ab, picks, layout oracles), `corpus` (fixtures, generators, vendored inputs). The verdict line says how many gates ran. |
 | Land | `cargo glyph test` | All gates. Red on any warning, failed test, test count under `test_floor`, or golden mismatch. |
 | Validate a commit | `cargo glyph test --frozen` | Asserts the renderer is already current instead of building it; staleness IS the finding. |
 | One check | `cargo glyph gate <name>` | A single gate by name (`cargo glyph gates` lists them, with what each cannot see). |
-| Prove the checks | `cargo glyph prove [--changed \| --mutation <name>]` | Applies declared mutations; each must redden its gate for its stated reason. Reports coverage. `--changed` proves the mutations whose target file differs from HEAD. |
+| Prove the checks | `cargo glyph prove [--changed \| --since <ref> \| --mutation <name>] [--list]` | Applies declared mutations; each must redden its gate for its stated reason. Reports coverage. `--changed` proves the mutations whose target file differs from HEAD; `--since <ref>` those this branch touched since its merge-base with `<ref>`, committed or not, plus every mutation of a gate whose script changed and every mutation whose declaration (or its gate's) is new or edited. `--list` prints the selection without running it. |
 | Run | `cargo glyph run [args]` | Builds if stale, then runs the renderer in YOUR directory; no arguments opens the launcher. |
 
 Do not hand-run `cargo build`, `tools/*.sh` or the binary's check flags in
@@ -41,7 +41,7 @@ tool; re-baselining is a human act (root `AGENTS.md` § pixel-ab).
   slot formats, paint, and the visible kernel against Pass 2) over the
   fixture corpus, `g-pick-repo`, `g-cluster-repo` and the chunk-cut fixtures.
 - `pixel-ab`: the golden views byte-compared per rasterizer key, plain and
-  under each `golden_equivalents` entry (`--field-mode derived`,
+  under each `golden_equivalents` entry (`--field-mode instanced`,
   `--field-mode visible`; five syntax views are exempt from the visible one,
   by name, and their distance is still printed).
 

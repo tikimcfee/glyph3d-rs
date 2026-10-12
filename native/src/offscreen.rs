@@ -13,7 +13,6 @@ use crate::{
     build_scene_with_options, Op, SceneChoice, SceneCullOptions, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH,
 };
 
-#[allow(clippy::too_many_arguments)]
 pub fn run(
     ctx: &GpuContext,
     choice: &SceneChoice,

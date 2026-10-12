@@ -39,8 +39,7 @@ is that check.
 
   LOCAL drift (did someone edit a vendored copy?) — no web repo needed:
       python3 tools/vendor-manifest.py --check
-  This runs in the battery's generator-reproduction gate (`tools/check-all.sh`
-  step 1; build.toml gate `vendor-hashes`).
+  This is the battery's `vendor-hashes` gate (build.toml).
 
   UPSTREAM drift (did the web repo move on?) — needs the web repo present:
       python3 tools/vendor-manifest.py     and read the last column.

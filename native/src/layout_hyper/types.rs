@@ -64,5 +64,8 @@ pub struct ChunkPrepass {
 
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(pub *mut T);
+// SAFETY: only an address crosses threads; every write through it is an unsafe block of
+// its own, into the disjoint per-item or per-chunk slot ranges Pass 1 laid out.
 unsafe impl<T> Send for SendPtr<T> {}
+// SAFETY: shared, it is only copied; see Send.
 unsafe impl<T> Sync for SendPtr<T> {}

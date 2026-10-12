@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """gen_emoji_corpus.py — the cluster demo corpus, generated from the shipped table.
 
-Two fixtures for pointing the demo at the sequence pass (engine/delta/cluster-mode.md):
+Two fixtures for pointing the demo at the sequence pass (its design note,
+engine/delta/cluster-mode.md, went with the Mojo engine in b22fd92):
 
   native/fixtures/emoji-corpus-small.txt — the quick check: one line per
       sequence class plus the edge cases (RI triplet, over-long chain,
