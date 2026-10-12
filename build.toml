@@ -3,7 +3,8 @@
 # Consumed by `glyph` (glyph/src/, entry main.rs; `cargo glyph --help`). This file is
 # the single account of WHICH artifacts exist, WHAT they are built from, and
 # WHICH instruments run over them — the thing that used to live only as line
-# order in tools/check-all.sh. Root AGENTS.md ("Verification") explains what
+# order in tools/check-all.sh (a thin door onto `cargo glyph test` now). Root
+# AGENTS.md ("What the checks actually do") explains what
 # each gate compares, what makes it red, and what it cannot see; the per-gate
 # `blind_to` lines below are one-line reminders, not the full account.
 #
