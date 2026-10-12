@@ -343,10 +343,16 @@ pub(crate) fn cmd_prove(
         }
         // A gate that reads a product, under a mutation that declares no
         // rebuild of its own: bring products current first, so it never
-        // runs a previous mutation's binary left by a deferred restore.
+        // runs a previous mutation's binary left by a deferred restore. The
+        // clean tree built above, and every earlier mutation is restored, so a
+        // product that fails here fails on THIS mutant: report it as the
+        // declared-rebuild path does and fall through to the restore. (Until
+        // 2026-10-11 this returned at once, leaving the mutant in the tree.)
         if built && mu.rebuild.is_none() && needs_product(&mu.gate) && !ensure_products(m, false) {
-            println!("FATAL {} — products do not build before its gate; run: cargo glyph build", mu.name);
-            return false;
+            built = false;
+            println!("FAIL  {} — the mutated tree does not BUILD its gate's products, so this", mu.name);
+            println!("      proves nothing about the gate; a red here is the compiler, not the");
+            println!("      check. Make the mutation semantic, not syntactic.");
         }
         phase[1] = t.elapsed();
         let t = std::time::Instant::now();
