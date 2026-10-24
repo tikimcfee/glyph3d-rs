@@ -18,11 +18,12 @@
 //!
 //! The fix takes Apple TBDR's footprint from the quad's projective map
 //! (`glyph_field::Footprint::Analytic`, chosen by `GpuProfile::glyph_footprint`).
-//! Mutation `metal-footprint-selection-dropped` puts the M2 back on the
+//! Mutation `footprint-selection-dropped` puts the M2 back on the
 //! hardware derivative, and this test reddens.
 //!
-//! On a host whose selection is `Hardware` (the RTX 5090: 0 flicker, frame
-//! 0 == frame 1, measured) the test runs the shipping shader. There it
+//! On a host whose selection is `Hardware` (the RTX 5090: 0 flicker and
+//! frame 0 == frame 1 measured with the same per-frame readback, and this
+//! test green there, 2026-10-24) it runs the shipping shader. There it
 //! witnesses that host's determinism, not the analytic path.
 //!
 //! The release binary renders it offscreen with `GLYPH_REPEAT_CHECK=1`, as
