@@ -30,6 +30,20 @@ given commit + given input ⇒ byte-identical PNG. That property is what makes t
 pixel comparison meaningful, and it is a fact about this crate's
 offscreen path.
 
+The chain also needs every fragment's colour to be a function of that
+fragment's own inputs, and a hardware derivative is not one on every GPU.
+`fwidth`, and the implicit gradients of `textureSample`, are differences
+across a 2x2 quad. On Apple's TBDR GPUs, in the glyph pass (blended, writes
+depth, may discard), whether a quad-mate lane hidden behind a nearer glyph
+was depth-rejected before or after shading varies with GPU timing, so the
+winner's footprint did too. `repo-back-oblique` flickered at delta 1 on a
+still camera, and frame 0 sat in a different state from the frames after it
+(C35, 2026-10-24). On Apple TBDR the glyph shaders therefore take no
+hardware derivative (`glyph_field::Footprint`, next section). A new
+derivative in a blended, depth-writing pipeline needs the same thought:
+today the glyph shaders are the only one. Environment writes `frag_depth`,
+regions do not write depth, and meshes and backdrops take no derivative.
+
 Everything that could break it is fenced, and **the fence table lives in root
 `AGENTS.md`** — it used to be restated here with different reasons and a stale
 claim (`engine/` as READ-ONLY, which it has not been since engine work moved
@@ -232,6 +246,32 @@ says how the build tool uses both. `--present-mode fifo|mailbox|immediate` is
 windowed-only and rides on the FPS line, because under Fifo that figure is the
 display's refresh (75 on the first Linux box) and not a fact about the renderer.
 
+`GpuProfile::glyph_footprint` (C35, 2026-10-24) picks where the glyph
+shaders' AA footprint comes from, and so which shader text the field
+compiles.
+- **`Analytic` on Apple-on-Metal.** The same predicate as the unified-memory
+  clause: an Intel or AMD Mac's Metal part is immediate-mode and stays on
+  hardware. `crates/glyph-field/src/footprint.rs` derives this form from the
+  mode's WGSL at pipeline creation by anchored substitution:
+  - three flat varyings carry the quad's projective map in pixel units, its
+    scale from `FrameUniform.viewport` (binding 0, the `Camera` block
+    widened to read it);
+  - the fragment inverts its 2x2 Jacobian for `fw` and for the emoji
+    sheet's `textureSampleGrad`.
+- **`Hardware` everywhere else.** The source is compiled exactly as written.
+
+It is chosen at pipeline creation, not by a `Params` flag or an override
+constant. A flag would make the 5090 run the analytic varyings and a branch
+on every fragment, and an override constant would still change the module
+it compiles. The 5090 must run today's shader, and its frames must stay
+byte-equal to the vulkan-nvidia set. The measured cost there was 10-17% of
+frame time, against a 14-27% gain on the M2 (oblique and repo-wide, 2026-10-24).
+- **Instanced:** `quad_height = "inst.height"`.
+- **Derived and Visible:** `"1.0"`. Visible draws through the Derived
+  module.
+- **The mask pipeline** is built over the same module, so selection and
+  glyphs agree.
+
 ## Apple Silicon vs. Desktop x86_64 & Discrete GPU Specifics
 
 This section is the one copy of these facts (the testing skill points here;
@@ -417,6 +457,13 @@ its staging text predates C22). Key touchpoints:
   tail of the previous frame's segment list — was invisible offscreen until
   this: `GLYPH_FRAME_SCRIPT="0:pose <elsewhere>;1:pose <target>" --frames 4`
   against a static render of the target. Use `--frames` past the last step.
+- `GLYPH_REPEAT_CHECK=1` — offscreen (C35, 2026-10-24): every frame is
+  read back and compared with frame 0. It prints `repeat: frame K: N px
+  differ from frame 0 (max delta D)` per frame and a closing `repeat: F
+  frames, M differ from frame 0`. A still scene must repeat inside one
+  process. The per-frame GPU wait is part of the check: it is the stall under
+  which the M2 showed both footprint states. `native/tests/oblique_repeat.rs`
+  drives it at the `repo-back-oblique` pose.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
   reproduces it — the same line the Debug panel's "copy pose" button puts on

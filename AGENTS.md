@@ -191,7 +191,13 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
-  landing bar. Where its time goes: every mutation prints its build, gate
+  landing bar. A mutation of a path only one rasterizer takes declares
+  `gpu = "<key>"` (C35, 2026-10-24; the key must name a golden set, or
+  `validate` refuses it): on any other host the prover prints it `N/A` and
+  counts it neither proven nor failed, and a run in which EVERY selected
+  mutation is N/A fails as `NOTHING PROVEN` rather than passing over
+  nothing. Before the field existed, `prove` on the 5090 would have
+  reported a Metal-only mutation as surviving. Where its time goes: every mutation prints its build, gate
   and restore seconds and the run ends with a TIME line naming the slowest.
   A test that turns slow is paid once per mutation that reaches its binary
   (one quadratic test was 48 s of a 62 s cargo-test until 2026-10-11). A mutation whose gate is ALREADY red cannot prove anything and
@@ -696,6 +702,55 @@ What a set proves is the renderer ON THE HARDWARE THAT MADE IT — a green here 
 Linux says nothing about Metal, and `validate` refuses a golden output that is
 not keyed.
 
+**`repo-back-oblique` was not byte-stable on Apple TBDR, and the glyph
+footprint is per rasterizer since (C35, 2026-10-24).**
+- **The symptom.** On the M2 the frame flipped 1-2 px at delta 1 between
+  fresh processes. In one process a still camera flickered 63-81 px, and
+  frame 0 (what the golden's `--frames 2` captures) sat about 880 px from
+  the frames after it. The 5090 rendered it 36 of 36 identical.
+- **The cause** (measured; `cross-ref/apple-oblique-nondeterminism/`). It
+  was not depth precision and not draw order. A stencil count showed the
+  set of fragments passing the depth test identical every frame, one per
+  pixel, and the depth buffer identical too. What moved was the winning
+  fragment's own `fwidth(glyph_uv)`. That is a difference across a 2x2
+  quad, and a quad-mate lane hidden behind a nearer glyph was sometimes
+  depth-rejected before shading and sometimes after, with GPU timing, in a
+  pass that blends, writes depth and discards.
+- **The fix.** Apple-on-Metal takes the footprint from the quad's
+  projective map (`glyph_field::Footprint::Analytic`, selected by
+  `GpuProfile::glyph_footprint`, derived from each glyph shader in
+  `crates/glyph-field/src/footprint.rs`). Every other adapter compiles the
+  shader source byte for byte as before: the vulkan-nvidia frames do not
+  move, and the 5090 does not pay the 10-17% the analytic path cost it there
+  (on the M2 it is faster: 156 → 178 fps oblique, 250 → 316 repo-wide).
+- **What it moved, on Metal only** (against the pre-fix renders). 0 to
+  35,598 px per frame, all at delta 1, except 73 px of the oblique frame at
+  ≥ 16 (max 138). Those are two
+  hard thresholds the frame happens to cross, not a formula error: the
+  analytic and hardware `fw` agree to the probe's resolution (±0.6%) at
+  99.9995% of covered pixels.
+  - Greeking's default hard cut (`em_px <= greek_onset_px`, 10 px): its
+    isoline crosses the receding column at y ≈ 803, where `em_px` is
+    10.006 under the hardware's finite difference and 9.994 under the
+    analytic derivative at the pixel centre, so a pixel flips between the glyph and its full greek bar.
+  - The depth-written fringe: a near fragment whose coverage is exactly 0
+    is discarded and writes no depth, so whether the far ink behind it shows
+    turns on that zero.
+
+  Either threshold amplifies a 0.1% footprint change into a whole-ink step.
+- **The witness.** `native/tests/oblique_repeat.rs` renders the pose 12
+  frames in one process (`GLYPH_REPEAT_CHECK`), in every field mode, and
+  requires every frame equal to frame 0. It is red on the hardware
+  footprint on the M2 (mutation `footprint-selection-dropped`,
+  `gpu = "metal-apple"`), and runs the unchanged shader everywhere else.
+- **Adoption.** The metal-apple set has been pending since 2026-10-11 (C33,
+  step 2). Its candidates now carry this change too, and adopting them stays
+  a human act. Against the pre-fix renders, every moved pixel is this one
+  cause, by construction: the only change is the footprint source.
+- **For `drift`.** metal-apple and vulkan-nvidia now differ by a footprint
+  formula as well as a rasterizer. That is isolated delta-1 edge noise on
+  every frame, and the greek isoline's few whole-ink pixels on this one.
+
 **Golden equivalents: a second field, without a second set (2026-10-09).**
 `build.toml [settings] golden_equivalents` lists argument lists under which
 every golden view must render its baseline's exact bytes; the gate renders
@@ -837,6 +892,14 @@ engine to itself is a determinism check: say so in its `blind_to`.
 Worth holding in one place, because each check's blind spot is defensible alone
 and the union is not:
 
+- **Each glyph footprint is seen in pixels on one rasterizer only** (C35,
+  2026-10-24). The analytic footprint (Apple TBDR) reaches pixels only on
+  metal-apple, and the hardware one only on every other key. On the 5090
+  the analytic form is held by its naga tests alone: it compiles, reads the
+  viewport at FrameUniform's offset, and takes no hardware derivative.
+  Determinism with hardware derivatives on a TBDR part other than Apple's
+  (Mali, Adreno, PowerVR) has never been measured.
+
 - **The device path past the emitter.** Since 2026-10-09 hyper-oracle runs
   the device Pass 2 (`layout_hyper/pass2_device.rs`) into host memory and
   holds it to the oracle; what happens to those bytes afterwards (the
@@ -926,7 +989,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `engine/glyph_schema.mjs` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json`; the fixture generators read it, so editing the schema invalidates the corpus |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
-| `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. `glyph_field.wgsl` moved byte-identically (git mv) into `crates/glyph-field-instanced/shaders/` on 2026-10-05 when the glyph field split into render modes; a move is not an edit, and the goldens are the proof |
+| `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the glyph shaders' Apple TBDR form is DERIVED from them by anchored substitution (`crates/glyph-field/src/footprint.rs`, C35): an edit to an anchor line panics at pipeline build on Metal and fails the mode crates' wgsl tests everywhere. The naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. `glyph_field.wgsl` moved byte-identically (git mv) into `crates/glyph-field-instanced/shaders/` on 2026-10-05 when the glyph field split into render modes; a move is not an edit, and the goldens are the proof |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
