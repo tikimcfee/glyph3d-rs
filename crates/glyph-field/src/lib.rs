@@ -41,6 +41,7 @@
 mod copy;
 mod field;
 mod field_core;
+mod footprint;
 mod mode;
 mod records;
 mod resources;
@@ -50,6 +51,7 @@ mod upload;
 pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN};
 pub use field::{split_at_chunks, GlyphField};
 pub use field_core::{FieldCore, FieldShape};
+pub use footprint::{analytic_source, Footprint};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 pub use resources::{

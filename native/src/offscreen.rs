@@ -134,6 +134,19 @@ pub fn run_scene(
         .map(|spec| parse_frame_script(&spec).unwrap_or_else(|e| panic!("GLYPH_FRAME_SCRIPT: {e}")))
         .unwrap_or_default();
 
+    // GLYPH_REPEAT_CHECK (C35, 2026-10-24): read EVERY frame back and compare
+    // it with frame 0, printing one `repeat:` line per frame and a summary.
+    // A still scene must repeat byte for byte inside one process. On the M2
+    // the hardware glyph footprint broke that (quad derivatives depend on GPU
+    // timing in the glyph pass), and a fresh process's frame 1 (the golden)
+    // sat in a different state from the frames after it. A cross-process
+    // golden cannot see the in-process class; this can
+    // (native/tests/oblique_repeat.rs). The per-frame wait is part of the
+    // check: it is the stall under which the M2 showed both states.
+    let repeat_check = std::env::var_os("GLYPH_REPEAT_CHECK").is_some();
+    let mut repeat_first: Option<Vec<u8>> = None;
+    let mut repeat_differing = 0u32;
+
     // Readback buffer: copy_texture_to_buffer requires 256-byte-aligned rows.
     let unpadded_bpr = size.width * 4;
     let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -201,7 +214,7 @@ pub fn run_scene(
         if let Some(p) = &ctx.profiler {
             p.borrow_mut().resolve_queries(&mut encoder);
         }
-        if frame == frames - 1 {
+        if frame == frames - 1 || repeat_check {
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -221,6 +234,19 @@ pub fn run_scene(
             );
         }
         ctx.queue.submit([encoder.finish()]);
+        if repeat_check {
+            let px = read_frame(device, &readback, padded_bpr, unpadded_bpr, size.height);
+            match &repeat_first {
+                None => repeat_first = Some(px),
+                Some(first) => {
+                    let (n, max) = frame_diff(first, &px);
+                    if n > 0 {
+                        repeat_differing += 1;
+                    }
+                    println!("repeat: frame {frame}: {n} px differ from frame 0 (max delta {max})");
+                }
+            }
+        }
         if let Some(p) = &ctx.profiler {
             if let Err(e) = p.borrow_mut().end_frame() {
                 log::warn!("profiler end_frame: {e}");
@@ -234,6 +260,9 @@ pub fn run_scene(
         }
     }
     let encode_submit = t0.elapsed();
+    if repeat_check {
+        println!("repeat: {frames} frames, {repeat_differing} differ from frame 0");
+    }
 
     // Block until the copy lands in the readback buffer.
     let map_t0 = std::time::Instant::now();
@@ -436,6 +465,43 @@ pub fn parse_frame_script(spec: &str) -> Result<Vec<(u32, FrameStep)>, String> {
         steps.push((frame, step));
     }
     Ok(steps)
+}
+
+/// One frame's pixels from the readback buffer, row padding stripped (the
+/// GLYPH_REPEAT_CHECK path; it waits for the GPU).
+fn read_frame(device: &wgpu::Device, readback: &wgpu::Buffer, padded_bpr: u32, unpadded_bpr: u32, height: u32) -> Vec<u8> {
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device
+        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+        .expect("device poll failed during repeat readback");
+    rx.recv().expect("map_async callback dropped").expect("buffer map failed");
+    let data = slice.get_mapped_range().expect("readback range not mapped");
+    let mut px = Vec::with_capacity((unpadded_bpr * height) as usize);
+    for row in 0..height {
+        let start = (row * padded_bpr) as usize;
+        px.extend_from_slice(&data[start..start + unpadded_bpr as usize]);
+    }
+    drop(data);
+    readback.unmap();
+    px
+}
+
+/// Pixels (4-byte texels) that differ between two frames, and the largest
+/// channel delta among them.
+fn frame_diff(a: &[u8], b: &[u8]) -> (usize, u8) {
+    let mut n = 0;
+    let mut max = 0u8;
+    for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0) {
+        if pa != pb {
+            n += 1;
+            max = max.max(pa.iter().zip(pb).map(|(x, y)| x.abs_diff(*y)).max().unwrap_or(0));
+        }
+    }
+    (n, max)
 }
 
 #[cfg(test)]
