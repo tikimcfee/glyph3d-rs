@@ -73,6 +73,10 @@ pub struct FieldTargets {
     pub depth_format: wgpu::TextureFormat,
     /// Scene MSAA count (1 today — coverage is analytic).
     pub sample_count: u32,
+    /// Where the glyph shaders' AA footprint comes from: the hardware
+    /// derivative everywhere except Apple TBDR, whose quad derivatives depend
+    /// on GPU timing in this pass (C35, [`crate::Footprint`]).
+    pub footprint: crate::Footprint,
 }
 
 /// One device buffer range holding a run of a mode's slots: slot 0 starts at

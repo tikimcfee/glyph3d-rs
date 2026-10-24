@@ -26,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 386
+test_floor = 394
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1173,6 +1173,27 @@ op = "replace"
 find = "    let slot_base = base.y;"
 with = "    let slot_base = atomicAdd(&counters[15u], line.glyph_count);"
 expect = "a_shrinking_segment_list_lays_out_no_stale_entry"
+
+[[mutation]]
+name = "footprint-selection-dropped"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C35 (2026-10-24): on Apple TBDR the glyph shaders take their AA footprint from the quad's projective map, because there `fwidth` over a 2x2 quad depends on whether a quad-mate lane hidden behind a nearer glyph was depth-rejected before or after shading — GPU timing — and a still frame flickered at delta 1 (63-81 px in one process at the oblique pose, frame 0 a further ~880 px off: the state the golden captured). Building the field on the hardware footprint puts the M2 back on it. CONSUMED BY: FieldTargets.footprint, set from GpuProfile::glyph_footprint in setup.rs and read at glyph-pipeline creation (field_core.rs), judged by native/tests/oblique_repeat.rs (every frame of one process equal to frame 0, three field modes). Scoped to metal-apple: every other rasterizer builds the hardware footprint anyway, so there the mutation changes nothing and cannot redden"
+file = "native/src/glyph_scene/setup.rs"
+op = "replace"
+find = "            footprint: ctx.profile.glyph_footprint(),"
+with = "            footprint: glyph_field::Footprint::Hardware,"
+expect = "a_still_oblique_frame_repeats_in_one_process_in_every_mode"
+
+[[mutation]]
+name = "analytic-footprint-keeps-fwidth"
+gate = "cargo-test"
+why = "C35 (2026-10-24): the analytic footprint is derived from each glyph shader by anchored substitution, and its whole point is that the coverage footprint reads no quad-mate lane. Leaving `fwidth(in.glyph_uv)` in place (the coverage edit made a no-op) keeps the Metal pipeline on the scheduling-dependent derivative while every anchor still matches. CONSUMED BY: analytic_source's coverage edit (crates/glyph-field/src/footprint.rs), judged on every host first by glyph-field's own every_anchor_is_replaced_and_the_helpers_appended (no `= fwidth(` may survive the substitution), which runs first and so is the expected failure, then by both mode crates' tests/wgsl.rs, which count naga Derivative and implicit-gradient ImageSample expressions in the analytic form and require zero (and, on metal-apple, by oblique_repeat)"
+file = "crates/glyph-field/src/footprint.rs"
+op = "replace"
+find = "            to: \"    let fw = foot_fwidth(in);\".to_string(),"
+with = "            to: \"    let fw = fwidth(in.glyph_uv);\".to_string(),"
+expect = "every_anchor_is_replaced_and_the_helpers_appended"
 
 [[mutation]]
 name = "visible-stale-segment-tail"

@@ -193,6 +193,7 @@ impl GlyphScene {
             color_format: POOL_FORMAT,
             depth_format,
             sample_count: SCENE_SAMPLE_COUNT,
+            footprint: ctx.profile.glyph_footprint(),
         };
         // The arena's two forms map onto the field's two sources. A DEVICE
         // arena is already slots in the field's OWN format (the producer was
