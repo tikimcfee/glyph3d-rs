@@ -1084,7 +1084,7 @@ painted COMMENT any more. The five `[[golden_view.exempt]]` entries are
 gone; the visible equivalent holds every frame but `demo`. Candidates and
 `ATTRIBUTION.txt`: `out/tooling-ab/sweep/candidates/syntax-retired/vulkan-nvidia/`
 (untracked). **Adopted on vulkan-nvidia 2026-10-11** with § 9's frames, one
-adoption; metal-apple pending.
+adoption; metal-apple on 2026-10-24, together with C35's footprint change.
 
 **Left open.** Every repo backdrop now takes the extension tint, so the
 slot-colour backdrop tint fold that served the syntax loads (Pass 2's

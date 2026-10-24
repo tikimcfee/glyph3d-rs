@@ -39,7 +39,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   a one-item repo load (`repo::load_file`: HyperLayout, the shared
   colourisers and every field — Visible for real — with `--copies N` as N
   views over the one buffer, tiled); it moved the pixels of `text`, `emoji`
-  and `emoji-cluster`, which await adoption (pixel-ab, below). Step 3 deletes
+  and `emoji-cluster`, adopted on both sets (pixel-ab, below). Step 3 deletes
   `glyph-field-instanced`. Until then Instanced stays
   a mode, held byte-equal by the `--field-mode instanced` golden equivalent, and
   is still the fall-back for a load past the Derived lanes. The agent-session
@@ -639,8 +639,8 @@ commit that culled `long.md`'s far lines (`048d403`, repaired by `9c96ad1`)
 and per-chunk syntax colouring (`8b28f1f`, C17). A red gate stops seeing the
 NEXT change too).
 
-**Re-adopted on vulkan-nvidia 2026-10-11 (step 2 and C33); metal-apple
-pending.** Two changes moved frames, and one adoption took both. The syntax
+**Re-adopted on vulkan-nvidia 2026-10-11 (step 2 and C33), and on
+metal-apple 2026-10-24 (the same two, with C35).** Two changes moved frames, and one adoption took both. The syntax
 heuristic's retirement (C33) took the token colour out of eight frames, each
 new frame byte-equal to the old code's flat render, so nothing but colour
 moved (the table is § 10 of
@@ -657,9 +657,11 @@ fit an ulp wider from it acting together, neither moving a pixel alone;
 2,217 px (1,121 the shared colouriser's `#` comment painting `bare:` after a
 keycap, the rest the same summation). No tab-stop pixel remains. The camera fit stays measured by ink, not rounded to whole
 cells: the ink is the width (Ivan, at adoption). All nine pixel-ab mutations
-were re-proven against the new frames. **The metal-apple set has not been
-re-adopted**: on that host the gate is red on the same eight frames until
-it is, and every pixel-ab mutation's gate reads ALREADY RED there.
+were re-proven against the new frames. **metal-apple was re-adopted on
+2026-10-24**, once C35 (below) had made its oblique frame byte-stable: one
+adoption took step 2, C33 and C35 together, and its commit carries the
+attribution. Until then the gate was red there on those eight frames, and
+every pixel-ab mutation's gate read ALREADY RED.
 
 **One golden set per rasterizer, since 2026-09-07.** `<key>` is what the
 renderer prints from `--gpu-key`: `<backend>-<vendor>` off the adapter wgpu
@@ -743,10 +745,10 @@ footprint is per rasterizer since (C35, 2026-10-24).**
   requires every frame equal to frame 0. It is red on the hardware
   footprint on the M2 (mutation `footprint-selection-dropped`,
   `gpu = "metal-apple"`), and runs the unchanged shader everywhere else.
-- **Adoption.** The metal-apple set has been pending since 2026-10-11 (C33,
-  step 2). Its candidates now carry this change too, and adopting them stays
-  a human act. Against the pre-fix renders, every moved pixel is this one
-  cause, by construction: the only change is the footprint source.
+- **Adoption (2026-10-24).** The metal-apple set, pending since 2026-10-11
+  (C33, step 2), was re-adopted with this change after Ivan looked at the
+  frames. Against the pre-fix renders, every moved pixel is this one cause,
+  by construction: the only change is the footprint source.
 - **For `drift`.** metal-apple and vulkan-nvidia now differ by a footprint
   formula as well as a rasterizer. That is isolated delta-1 edge noise on
   every frame, and the greek isoline's few whole-ink pixels on this one.
