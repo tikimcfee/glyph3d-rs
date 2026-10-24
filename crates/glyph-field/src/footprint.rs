@@ -10,8 +10,10 @@
 //! shading and sometimes after, depending on GPU timing. The winning
 //! fragment's `fw` moves with it, so its coverage does too. Measured on an
 //! M2: the set of fragments that pass the depth test is identical every
-//! frame, and the colour flickers at delta 1. This is also the "early state"
-//! the golden captured at frame 0 (cross-ref/apple-oblique-nondeterminism).
+//! frame, and the colour flickers at delta 1. The "early state" the golden
+//! captured at frame 0 is gone under the analytic footprint too, which late-Z
+//! did not remove; what switches the M2 out of it over wall-clock time is
+//! untraced (`out/APPLE-TBDR-FOOTPRINT-2026-10-24.md`).
 //!
 //! [`Footprint::Analytic`] removes the quad from the arithmetic. The vertex
 //! stage already knows the glyph quad's projective map: corner `(u, v)` lands

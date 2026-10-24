@@ -211,7 +211,7 @@ impl GpuProfile {
     /// "early state" from the frames after it (repo-back-oblique). Every
     /// other adapter keeps the hardware derivative. The RTX 5090 rendered the
     /// same pose 36 of 36 identical with it, and the analytic path costs it
-    /// 10-17% of frame time (where it makes the M2 14-27% faster). Same
+    /// 10-17% of its fps (where it gives the M2 14-26% more). Same
     /// predicate as the unified-memory clause above: Metal on an Intel or AMD
     /// Mac is an immediate-mode part and stays on hardware.
     pub fn glyph_footprint(&self) -> glyph_field::Footprint {

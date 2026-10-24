@@ -265,7 +265,7 @@ constant. A flag would make the 5090 run the analytic varyings and a branch
 on every fragment, and an override constant would still change the module
 it compiles. The 5090 must run today's shader, and its frames must stay
 byte-equal to the vulkan-nvidia set. The measured cost there was 10-17% of
-frame time, against a 14-27% gain on the M2 (oblique and repo-wide, 2026-10-24).
+fps (+11-20% frame time), against a 14-26% fps gain on the M2 (oblique and repo-wide, 2026-10-24).
 - **Instanced:** `quad_height = "inst.height"`.
 - **Derived and Visible:** `"1.0"`. Visible draws through the Derived
   module.

@@ -710,7 +710,7 @@ footprint is per rasterizer since (C35, 2026-10-24).**
   fresh processes. In one process a still camera flickered 63-81 px, and
   frame 0 (what the golden's `--frames 2` captures) sat about 880 px from
   the frames after it. The 5090 rendered it 36 of 36 identical.
-- **The cause** (measured; `cross-ref/apple-oblique-nondeterminism/`). It
+- **The cause** (measured; `out/APPLE-TBDR-FOOTPRINT-2026-10-24.md`). It
   was not depth precision and not draw order. A stencil count showed the
   set of fragments passing the depth test identical every frame, one per
   pixel, and the depth buffer identical too. What moved was the winning
@@ -723,12 +723,13 @@ footprint is per rasterizer since (C35, 2026-10-24).**
   `GpuProfile::glyph_footprint`, derived from each glyph shader in
   `crates/glyph-field/src/footprint.rs`). Every other adapter compiles the
   shader source byte for byte as before: the vulkan-nvidia frames do not
-  move, and the 5090 does not pay the 10-17% the analytic path cost it there
+  move, and the 5090 does not pay the 10-17% of fps the analytic path cost it there
   (on the M2 it is faster: 156 → 178 fps oblique, 250 → 316 repo-wide).
 - **What it moved, on Metal only** (against the pre-fix renders). 0 to
   35,598 px per frame, all at delta 1, except 73 px of the oblique frame at
-  ≥ 16 (max 138). Those are two
-  hard thresholds the frame happens to cross, not a formula error: the
+  ≥ 16 (max 138). The 43-45 of those at ≥ 64 were traced to two
+  hard thresholds the frame happens to cross, and the rest are attributed to
+  the same two, untraced. Not a formula error: the
   analytic and hardware `fw` agree to the probe's resolution (±0.6%) at
   99.9995% of covered pixels.
   - Greeking's default hard cut (`em_px <= greek_onset_px`, 10 px): its
