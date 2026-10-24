@@ -149,6 +149,14 @@ pub(crate) struct Mutation {
     #[serde(rename = "with")]
     pub(crate) with_: Option<String>,
     pub(crate) rebuild: Option<String>,
+    /// The golden-set key (`<backend>-<vendor>`, e.g. `metal-apple`) of the
+    /// only rasterizer on which this mutation is observable: a defect in a
+    /// path that only that hardware takes (C35, 2026-10-24: the analytic
+    /// glyph footprint is Apple-TBDR-only). On any other host the prover
+    /// reports it NOT APPLICABLE: neither proven nor failed, and never
+    /// counted as reddening. Without the field, `prove` on the 5090 reported
+    /// a Metal-only mutation as surviving.
+    pub(crate) gpu: Option<String>,
 }
 
 pub(crate) fn load() -> Result<Manifest, String> {
@@ -158,6 +166,18 @@ pub(crate) fn load() -> Result<Manifest, String> {
 }
 
 // ── validation (see `glyph validate`) ────────────────────────────────────
+
+/// Whether `key` has a golden set: some golden output, with `{gpu}` read as
+/// `key`, exists. A key must also be path-safe, as `paths::gpu_key` demands.
+fn golden_set_exists(m: &Manifest, key: &str) -> bool {
+    let safe = !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    safe && m
+        .artifact
+        .values()
+        .filter(|a| a.class == Class::Golden)
+        .flat_map(|a| a.outputs.iter())
+        .any(|o| root().join(o.replace("{gpu}", key)).exists())
+}
 
 /// Which artifacts a gate makes usable by the gates after it. Derived from
 /// `kind` rather than declared: a `provides` field would be one more thing that
@@ -364,6 +384,18 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
         }
         if mu.rebuild.as_deref().map(str::trim) == Some("") {
             p.push(format!("mutation {} has an empty rebuild command", mu.name));
+        }
+        // A host scope must name a rasterizer that has a golden set here: a
+        // misspelt key would make the mutation NOT APPLICABLE everywhere,
+        // which is an unproven claim that reads as a scoped one.
+        if let Some(key) = &mu.gpu {
+            if !golden_set_exists(m, key) {
+                p.push(format!(
+                    "mutation {} is scoped to gpu '{key}', which names no golden set \
+                     (no baseline under that key); it would be NOT APPLICABLE on every host",
+                    mu.name
+                ));
+            }
         }
     }
     p
