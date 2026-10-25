@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 use crate::glyph_scene::{PickCommand, Verb};
+use crate::gpu::GpuContext;
+use crate::scene::SceneLike;
 use super::args::RawOps;
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
@@ -15,9 +17,32 @@ pub enum Op {
     Highlight(PathBuf),
 }
 
+/// Apply one op to a scene: the one applier the offscreen run, the windowed
+/// startup ops and the windowed command bus share (2026-10-24; the first
+/// two were copies of one loop), so a console line and the same flags on
+/// the command line reach the scene through the same calls. The reply is
+/// the scene's line; `None` is a scene that does not take the op, and
+/// `--cam-pose` replies `None` too, as it always has. Each caller keeps its
+/// own handling of `None`: offscreen prints its "does not support" line for
+/// both, which is its stdout as it was.
+pub fn apply_op(scene: &mut dyn SceneLike, ctx: &GpuContext, op: &Op) -> Option<String> {
+    match op {
+        Op::Pick(p) => scene.apply_pick(ctx, p),
+        Op::Verb(v) => scene.apply_verb(ctx, v),
+        Op::CamPose(eye, yaw, pitch) => {
+            scene.set_cam_pose(*eye, *yaw, *pitch);
+            None
+        }
+        // S3 spike: Zed-sidecar highlight — one op, applied like a verb.
+        Op::Highlight(p) => scene.apply_highlight_sidecar(ctx, p),
+    }
+}
+
 /// --pick-row/--pick-col upgrade the most recent --pick-file pick into a
 /// deterministic RowCol pick (defaults: row 0 / col 0 for the unset half).
-pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) {
+/// An `Err` when there is no pick to upgrade: the launch CLI panics on it
+/// (`build_ops`); a live console line must not.
+pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<u32>) -> Result<(), String> {
     match ops.last_mut() {
         Some(Op::Pick(PickCommand::File(f))) => {
             let f = f.clone();
@@ -36,9 +61,39 @@ pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<
                 *c = col;
             }
         }
-        _ => panic!("--pick-row/--pick-col must follow --pick-file"),
+        _ => return Err("--pick-row/--pick-col must follow --pick-file".to_string()),
     }
+    Ok(())
 }
+
+/// Every `--verb` head `parse_verb` knows, in its usage order. Its usage
+/// line is built from this list (byte-identical to the literal it replaced,
+/// which `verb_error_messages_survive` reads), and the windowed palette
+/// lists it, so a new verb reaches both by being added here.
+pub const VERB_HEADS: &[&str] = &[
+    "recolor-glyph",
+    "recolor-line",
+    "nudge-glyph",
+    "scale-glyph",
+    "move-group",
+    "scale-group",
+    "tint-group",
+    "tint-cycle",
+    "hide-group",
+    "show-group",
+    "toggle-hidden",
+    "set-glyph-background",
+    "set-glyph-transform",
+    "reset-glyph-group",
+    "page-next",
+    "page-prev",
+    "page-first",
+    "page-last",
+    "page-to",
+    "form",
+    "library-stack",
+    "library-sort",
+];
 
 /// Parse a `--verb` string into a Verb (clap `value_parser`). Forms:
 ///   recolor-glyph `[rrggbb]`      recolor-line `[rrggbb]`
@@ -52,13 +107,7 @@ pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<
 /// so nothing scripted could reach them — the M3 witness needs one.)
 pub fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
-    let usage = format!(
-        "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
-         nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
-         hide-group|show-group|toggle-hidden|set-glyph-background|\
-         set-glyph-transform|reset-glyph-group|page-next|page-prev|page-first|\
-         page-last|page-to|form|library-stack|library-sort"
-    );
+    let usage = format!("unknown/malformed --verb {s:?} — expected {}", VERB_HEADS.join("|"));
     let f = |i: usize| -> Result<f32, String> {
         t.get(i)
             .and_then(|v| v.parse().ok())
@@ -126,6 +175,14 @@ pub fn parse_verb(s: &str) -> Result<Verb, String> {
 /// so for multi-value flags (--pick-px, --cam-pose) both values and indices
 /// are chunked by the flag's arity and zipped occurrence-by-occurrence.
 pub(crate) fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
+    try_build_ops(matches, raw).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `build_ops` without the panic: an `Err` names the op flag that cannot
+/// apply (a `--pick-row` with no `--pick-file` before it). The windowed
+/// command bus parses its lines through this, since a typed line must not
+/// be able to abort the app.
+pub(crate) fn try_build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Result<Vec<Op>, String> {
     enum Keyed {
         PickFile(String),
         Row(u32),
@@ -170,13 +227,13 @@ pub(crate) fn build_ops(matches: &clap::ArgMatches, raw: &RawOps) -> Vec<Op> {
     for (_, k) in keyed {
         match k {
             Keyed::PickFile(f) => ops.push(Op::Pick(PickCommand::File(f))),
-            Keyed::Row(r) => set_pick_row_col(&mut ops, Some(r), None),
-            Keyed::Col(c) => set_pick_row_col(&mut ops, None, Some(c)),
+            Keyed::Row(r) => set_pick_row_col(&mut ops, Some(r), None)?,
+            Keyed::Col(c) => set_pick_row_col(&mut ops, None, Some(c))?,
             Keyed::Px(x, y) => ops.push(Op::Pick(PickCommand::Pixel { x, y })),
             Keyed::CamPose(p, yaw, pitch) => ops.push(Op::CamPose(p, yaw, pitch)),
             Keyed::Verb(v) => ops.push(Op::Verb(v)),
             Keyed::Highlight(p) => ops.push(Op::Highlight(p)),
         }
     }
-    ops
+    Ok(ops)
 }

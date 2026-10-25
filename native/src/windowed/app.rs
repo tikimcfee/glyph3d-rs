@@ -449,16 +449,7 @@ impl App<'_> {
         // windowed event handlers use).
         scene.set_viewport(config.width, config.height);
         for op in self.ops {
-            let line = match op {
-                Op::Pick(p) => scene.apply_pick(&self.ctx, p),
-                Op::Verb(v) => scene.apply_verb(&self.ctx, v),
-                Op::CamPose(eye, yaw, pitch) => {
-                    scene.set_cam_pose(*eye, *yaw, *pitch);
-                    None
-                }
-                Op::Highlight(p) => scene.apply_highlight_sidecar(&self.ctx, p),
-            };
-            if let Some(line) = line {
+            if let Some(line) = crate::cli::apply_op(scene.as_mut(), &self.ctx, op) {
                 println!("{line}");
             }
         }
