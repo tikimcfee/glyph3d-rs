@@ -584,6 +584,7 @@ impl App<'_> {
             println!("agent sessions: F7 toggles the Agent Sessions browser");
             println!("field HUD: F8 toggles the top-left field readout (mode, cull tiers, per-frame ms)");
             println!("console: F9 toggles the command console (every panel action logs its line there; `help` lists them)");
+            println!("palette: Cmd-K (macOS) / Ctrl-K toggles the command palette (each row shows the line it runs)");
         }
         println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png (GLYPH_POSE_PRINT=1 also prints its --cam-pose)");
 

@@ -377,6 +377,9 @@ impl WindowState {
                 let ctx = root_ui.ctx();
                 let snap = probe_snap.as_ref();
                 let cell = self.ui_probe.as_ref();
+                // First: the palette consumes Cmd/Ctrl-K before any text
+                // field is shown (egui's TextEdit binds Ctrl-K itself).
+                super::palette::show(ctx, snap, shell, panel_lines);
                 super::panels::hud::show(ctx, snap, fps, shell.hud_open);
                 super::panels::debug::show(ctx, snap, cell, fps, shell, panel_lines);
                 super::panels::carrel::show(ctx, snap, panel_lines);
