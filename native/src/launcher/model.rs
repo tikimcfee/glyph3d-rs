@@ -424,7 +424,9 @@ impl Launcher {
             }
             Control::ZWrapSpacing => {
                 let v = cfg.z_wrap_spacing.unwrap_or(d.z_wrap_spacing);
-                cfg.z_wrap_spacing = Some(dial(v, dir, 0.05, 0.0, 2.0));
+                // No ceiling: the layout takes any finite pitch >= 0
+                // (`--z-wrap-spacing` refuses only negatives).
+                cfg.z_wrap_spacing = Some(dial(v, dir, 0.05, 0.0, f64::INFINITY));
             }
             Control::TextDetail => {
                 let v = cfg.text_detail_px.map(f64::from).unwrap_or(self.lod_defaults.0);

@@ -103,8 +103,8 @@ fn choices_cycle_both_ways_and_dials_clamp() {
     for _ in 0..100 {
         l.step(1);
     }
-    assert_eq!(l.cfg.z_wrap_spacing, Some(2.0));
-    for _ in 0..100 {
+    assert_eq!(l.cfg.z_wrap_spacing, Some(5.2), "no ceiling (it was 2.0 until 2026-10-24)");
+    for _ in 0..200 {
         l.step(-1);
     }
     assert_eq!(l.cfg.z_wrap_spacing, Some(0.0));
