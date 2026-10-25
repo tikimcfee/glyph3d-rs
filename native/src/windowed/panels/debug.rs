@@ -19,7 +19,6 @@ pub(in crate::windowed) fn show(
     panel_lines: &mut Vec<String>,
 ) {
     let debug_open = &mut shell.debug_open;
-    let scratch = &mut shell.scratch;
     // K1 leftover REMOVED (stage-k fix): the empty
     // `CentralPanel::default()` paints an OPAQUE full-viewport
     // panel_fill rect that blanketed the 3D scene — "background
@@ -355,9 +354,6 @@ pub(in crate::windowed) fn show(
                     panel_lines.push(lines::PANEL_SESSIONS.to_string());
                 }
             });
-            ui.separator();
-            ui.label("K2 typing test — WASD/h/g/t/x here must not move the scene:");
-            ui.text_edit_singleline(scratch);
             super::files::show(ui, probe_snap, ui_probe, &mut shell.filter, &mut shell.selected_group, panel_lines);
         });
 }

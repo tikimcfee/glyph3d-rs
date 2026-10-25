@@ -486,6 +486,12 @@ its staging text predates C22). Key touchpoints:
   Since M3 it also shows the selection in the field's own key
   (`item:start..end` for Visible, the slot or slot range otherwise) and the
   pick's `file byte N`.
+- **F9** toggles the console (windowed, egui; 2026-10-24): the command
+  bus's REPL. Every line the bus runs — a panel button, a hotkey, a
+  self-test step, or one typed there — is logged with its replies, and the
+  input line takes the same grammar: `--` flag lines parsed by the CLI's
+  own definition, verb heads, `pick`, `pose`, `fly`, `set`, `panel`, `help`
+  (`windowed/bus.rs`; `out/INTERFACE-SHELL-2026-10-24.md`).
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback

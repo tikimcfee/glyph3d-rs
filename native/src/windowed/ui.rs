@@ -22,10 +22,15 @@ pub(super) struct EguiUi {
 /// thing a session file would one day save.
 #[cfg(feature = "egui-ui")]
 pub(super) struct UiState {
-    /// K3: scratch text field in the Debug window — doubles as the K2
-    /// typing-isolation trap test (typing WASD/h/g/t/x here must not fly the
-    /// camera or fire verbs; the gating matrix in window_event ensures it).
-    pub(super) scratch: String,
+    /// The console window's visibility (F9 toggles; its close button clears
+    /// it). The console replaced the K3 scratch field as the K2
+    /// typing-isolation trap (typing WASD/h/g/t/x there must not fly the
+    /// camera or fire verbs; `app::route_key` ensures it).
+    pub(super) console_open: bool,
+    /// The console's input line and history.
+    pub(super) console: super::panels::console::Console,
+    /// Every line the command bus ran, with its replies (the console shows it).
+    pub(super) log: super::panels::console::CommandLog,
     /// K4: Debug window visibility (F1 toggles; the window's own close
     /// button clears it).
     pub(super) debug_open: bool,
@@ -60,7 +65,9 @@ impl UiState {
     /// where it has the most to say (`--field-mode visible`).
     pub(super) fn new(hud_open: bool) -> Self {
         Self {
-            scratch: String::new(),
+            console_open: false,
+            console: Default::default(),
+            log: Default::default(),
             debug_open: true,
             filter: String::new(),
             selected_group: None,

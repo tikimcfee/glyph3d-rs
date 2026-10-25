@@ -5,6 +5,7 @@
 //! "snapshot in, lines out" leaves free to make.
 
 pub(super) mod carrel;
+pub(super) mod console;
 pub(super) mod debug;
 pub(super) mod files;
 pub(super) mod hud;

@@ -33,8 +33,8 @@
 //!   - the moment egui wants ANY input, the look-grab is released (checked
 //!     per frame in render()); it re-acquires once the pointer leaves egui.
 //!
-//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons, K2
-//! scratch text field). Since 2026-10-24 every action the window takes —
+//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons; its
+//! K2 scratch text field was replaced by the console, F9). Since 2026-10-24 every action the window takes —
 //! a panel button, a hotkey, a self-test step — is a command LINE on the
 //! command bus (`bus.rs`), parsed by the launch CLI's own clap definition
 //! and run between frames by one executor (`exec.rs`) through the CLI's own

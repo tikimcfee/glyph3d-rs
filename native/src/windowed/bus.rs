@@ -75,6 +75,8 @@ pub(super) enum AppCommand {
     Help,
     /// The launch CLI's own `--help`.
     CliHelp,
+    /// Empty the console's log.
+    ClearLog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub(super) enum PanelId {
     Debug,
     Hud,
     Sessions,
+    Console,
 }
 
 /// A line and what it lowered to. The line is kept for the log; the
@@ -128,6 +131,7 @@ pub(super) const APP_WORDS: &[(&str, &str)] = &[
     ("panel debug", "show or hide the Debug window (F1)"),
     ("panel hud", "show or hide the field HUD (F8)"),
     ("panel sessions", "show or hide the Agent Sessions browser (F7)"),
+    ("panel console", "show or hide this console (F9)"),
     ("sessions refresh", "scan the agent-session directories again"),
     ("live next", "step a live source forward (F3)"),
     ("live prev", "step a live source back (F4)"),
@@ -144,6 +148,7 @@ pub(super) const APP_WORDS: &[(&str, &str)] = &[
     ("VERB [ARGS]", "--verb \"VERB [ARGS]\" on the current pick"),
     ("--FLAG ...", "any op or relayout flag, parsed by the CLI itself (--help lists them)"),
     ("# ...", "a comment: logged, runs nothing"),
+    ("clear", "empty the console's log"),
     ("help", "this list"),
 ];
 
@@ -283,7 +288,8 @@ pub(super) fn parse_line(line: &str) -> Result<Parsed, String> {
                 "debug" => PanelId::Debug,
                 "hud" => PanelId::Hud,
                 "sessions" => PanelId::Sessions,
-                other => return Err(format!("`panel {other}`: the panels are debug, hud and sessions")),
+                "console" => PanelId::Console,
+                other => return Err(format!("`panel {other}`: the panels are debug, hud, sessions and console")),
             }))],
             _ => return Err("`panel` takes one panel name".to_string()),
         },
@@ -303,6 +309,7 @@ pub(super) fn parse_line(line: &str) -> Result<Parsed, String> {
         "shot" => none(vec![Command::App(AppCommand::Shot)])?,
         "copy-pose" => none(vec![Command::App(AppCommand::CopyPose)])?,
         "help" => none(vec![Command::App(AppCommand::Help)])?,
+        "clear" => none(vec![Command::App(AppCommand::ClearLog)])?,
         other => return Err(format!("unknown command `{other}` (`help` lists them)")),
     };
     Ok(Parsed { line: line.to_string(), commands })
@@ -410,6 +417,7 @@ pub(super) mod lines {
     pub(in crate::windowed) const PANEL_DEBUG: &str = "panel debug";
     pub(in crate::windowed) const PANEL_HUD: &str = "panel hud";
     pub(in crate::windowed) const PANEL_SESSIONS: &str = "panel sessions";
+    pub(in crate::windowed) const PANEL_CONSOLE: &str = "panel console";
     pub(in crate::windowed) const LIVE_NEXT: &str = "live next";
     pub(in crate::windowed) const LIVE_PREV: &str = "live prev";
     pub(in crate::windowed) const LIVE_RESET: &str = "live reset";
@@ -593,6 +601,7 @@ mod tests {
             "set verb",
             "key q",
             "panel nope",
+            "clear all",
             "live sideways",
             "shot now",
             "--agent-session \"unclosed",
@@ -667,7 +676,7 @@ mod tests {
         use crate::repo::{RepoLayoutMode, Strategy};
         use clap::ValueEnum;
         let mut written: Vec<String> = [
-            lines::SHOT, lines::PANEL_DEBUG, lines::PANEL_HUD, lines::PANEL_SESSIONS, lines::LIVE_NEXT,
+            lines::SHOT, lines::PANEL_DEBUG, lines::PANEL_HUD, lines::PANEL_SESSIONS, lines::PANEL_CONSOLE, lines::LIVE_NEXT,
             lines::LIVE_PREV, lines::LIVE_RESET, lines::COPY_POSE, lines::SESSIONS_REFRESH, lines::PICK_CLEAR,
             lines::KEY_GRAB_FILE, lines::KEY_GRAB_CARREL, lines::KEY_CARREL_OLDEST, lines::KEY_CARREL_PREV,
             lines::KEY_CARREL_NEXT, lines::KEY_CARREL_LATEST, lines::KEY_CARREL_MODE,
