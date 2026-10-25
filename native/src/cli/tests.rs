@@ -360,6 +360,19 @@ fn pick_row_after_verb_panics() {
 }
 
 #[test]
+fn every_verb_head_is_one_parse_verb_knows() {
+    // VERB_HEADS builds parse_verb's usage line and is what a host lists;
+    // a head parse_verb does not match would answer with that usage line.
+    for head in VERB_HEADS {
+        if let Err(e) = parse_verb(head) {
+            assert!(!e.contains("unknown/malformed"), "{head}: {e}");
+        }
+    }
+    let usage = parse_verb("frobnicate").expect_err("an unknown head is refused");
+    assert!(usage.ends_with(&VERB_HEADS.join("|")), "{usage}");
+}
+
+#[test]
 fn unknown_flag_errors() {
     let err = try_parse(&["--bogus"]).err().expect("--bogus must fail");
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
