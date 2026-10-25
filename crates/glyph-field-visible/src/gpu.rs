@@ -1241,6 +1241,7 @@ pub fn derived_shape<'a>(entries: &'a [wgpu::BindGroupEntry<'a>; 3]) -> FieldSha
         label_prefix: "visible ",
         shader_label: "glyph_field_derived.wgsl (visible)",
         shader_source: glyph_field_derived::GLYPH_FIELD_DERIVED_WGSL,
+        quad_height: glyph_field_derived::QUAD_HEIGHT,
         extra_layout: &glyph_field_derived::pipeline::EXTRA_LAYOUT,
         extra_entries: entries,
     }

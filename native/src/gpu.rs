@@ -200,6 +200,28 @@ impl GpuProfile {
         }
     }
 
+    /// Where the glyph shaders' AA footprint comes from (C35, 2026-10-24).
+    ///
+    /// Apple's TBDR GPUs take the analytic one. Measured on an M2: in the
+    /// glyph pass (blended, depth-writing, discarding), `fwidth` over a 2x2
+    /// quad depends on whether a quad-mate lane hidden behind a nearer glyph
+    /// was depth-rejected before or after shading, which varies with GPU
+    /// timing. The set of fragments that pass the test does not vary. So a
+    /// still frame flickered at delta 1, and frame 0 sat in a different
+    /// "early state" from the frames after it (repo-back-oblique). Every
+    /// other adapter keeps the hardware derivative. The RTX 5090 rendered the
+    /// same pose 36 of 36 identical with it, and the analytic path costs it
+    /// 10-17% of its fps (where it gives the M2 14-26% more). Same
+    /// predicate as the unified-memory clause above: Metal on an Intel or AMD
+    /// Mac is an immediate-mode part and stays on hardware.
+    pub fn glyph_footprint(&self) -> glyph_field::Footprint {
+        if self.backend == wgpu::Backend::Metal && self.vendor_slug() == "apple" {
+            glyph_field::Footprint::Analytic
+        } else {
+            glyph_field::Footprint::Hardware
+        }
+    }
+
     pub fn from_adapter(adapter: &wgpu::Adapter) -> Self {
         let info = adapter.get_info();
         let feats = adapter.features();
@@ -360,6 +382,15 @@ impl GpuProfile {
         }
     }
 }
+
+/// How many closed frames the profiler may hold before their timestamps are
+/// read back. Each one keeps a query set alive, and on Metal a query set is
+/// an `MTLCounterSampleBuffer`, of which the M2 allocates 32 at most: the
+/// 33rd failed ("Cannot allocate sample buffer", measured 2026-10-24) and
+/// took the device with it, so the offscreen readback panicked (C36). The
+/// cap was 64 until then. Past it the profiler drops frames unmeasured,
+/// which is why offscreen waits for the oldest frame before reaching it.
+pub const PROFILER_PENDING_FRAMES: usize = 8;
 
 /// Logged adapter identity, kept around for diagnostics.
 pub struct GpuContext {
@@ -614,12 +645,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
             wgpu_profiler::GpuProfilerSettings {
                 enable_timer_queries: true,
                 enable_debug_groups: false,
-                // Higher than the suggested 2-4: offscreen runs submit many
-                // frames before their query maps complete (CPU outpaces the
-                // GPU in short verification runs), and frames beyond the cap
-                // are dropped unmeasured. Windowed drains every frame, so it
-                // never approaches this. Cost is a few tiny query buffers.
-                max_num_pending_frames: 64,
+                max_num_pending_frames: PROFILER_PENDING_FRAMES,
             },
         ) {
             Ok(p) => {
@@ -659,6 +685,19 @@ mod profile_tests {
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Metal, 0x106b).key(), "metal-apple");
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x10de).key(), "vulkan-nvidia");
         assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x1002).key(), "vulkan-amd");
+    }
+
+    /// C35: only Apple TBDR takes the analytic glyph footprint; the 5090 and
+    /// every other rasterizer keep the hardware derivative (and its pixels).
+    #[test]
+    fn only_apple_metal_takes_the_analytic_footprint() {
+        use glyph_field::Footprint;
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Metal, 0x106b).glyph_footprint(), Footprint::Analytic);
+        // What an M2 really reports: no vendor id, an "Apple" device name.
+        assert_eq!(GpuProfile::synthetic_named(wgpu::Backend::Metal, 0, "Apple M2").glyph_footprint(), Footprint::Analytic);
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x10de).glyph_footprint(), Footprint::Hardware);
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Metal, 0x1002).glyph_footprint(), Footprint::Hardware);
+        assert_eq!(GpuProfile::synthetic(wgpu::Backend::Vulkan, 0x106b).glyph_footprint(), Footprint::Hardware);
     }
 
     /// THE SHAPE REAL APPLE HARDWARE REPORTS, which the synthetic 0x106b case

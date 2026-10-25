@@ -984,10 +984,14 @@ impl WindowState {
                                     "layout (repo) — applies on release; the scene rebuilds, \
                                      pick/selection state resets:",
                                 );
+                                // The bar spans 0-1; the number beside it
+                                // (drag or type) takes any pitch >= 0.
                                 let resp = ui.add(
                                     egui::Slider::new(spacing, 0.0..=1.0)
+                                        .clamping(egui::SliderClamping::Never)
                                         .text("z_wrap_spacing × em (0 = flat, default 0.15)"),
                                 );
+                                *spacing = spacing.max(0.0);
                                 if let Some([lo, hi]) = snap.z_extent {
                                     ui.label(format!(
                                         "field depth: z ∈ [{lo:.1}, {hi:.1}] world units"

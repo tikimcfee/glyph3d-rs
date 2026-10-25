@@ -549,7 +549,7 @@ impl Dummy {
     }
 }
 
-const TARGETS: FieldTargets = FieldTargets { color_format: wgpu::TextureFormat::Rgba8UnormSrgb, depth_format: wgpu::TextureFormat::Depth32Float, sample_count: 1 };
+const TARGETS: FieldTargets = FieldTargets { color_format: wgpu::TextureFormat::Rgba8UnormSrgb, depth_format: wgpu::TextureFormat::Depth32Float, sample_count: 1, footprint: glyph_field::Footprint::Hardware };
 
 /// An orthographic camera over x, y in +-1000 and z in [-100, 100] (wgpu
 /// clip z in [0, 1]), the eye above the plane; `shift_x` moves the world

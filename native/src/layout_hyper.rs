@@ -2101,6 +2101,7 @@ mod tests {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
             depth_format: wgpu::TextureFormat::Depth32Float,
             sample_count: 1,
+            footprint: glyph_field::Footprint::Hardware,
         };
 
         let field = DerivedField::new(&ctx.device, &ctx.queue, source, &resources, targets);

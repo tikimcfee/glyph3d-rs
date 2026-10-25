@@ -24,6 +24,10 @@ pub struct FieldShape<'a> {
     /// `fs_main`.
     pub shader_label: &'static str,
     pub shader_source: &'static str,
+    /// The WGSL expression for the quad's local height in `vs_main` (the
+    /// factor on `(c.y - 0.5)`), which the analytic footprint needs for the
+    /// quad's v edge: `"1.0"` in Derived, `"inst.height"` in Instanced.
+    pub quad_height: &'static str,
     /// Layout entries after the shared map (bindings above 7).
     pub extra_layout: &'a [wgpu::BindGroupLayoutEntry],
     /// The matching resources, bound identically in every chunk's group.
@@ -265,9 +269,16 @@ fn build_glyph_pipeline(
     shape: &FieldShape<'_>,
 ) -> (wgpu::ShaderModule, wgpu::PipelineLayout, wgpu::RenderPipeline) {
     let p = shape.label_prefix;
+    // The hardware footprint compiles the source exactly as written; the
+    // analytic one is derived from it (footprint.rs). The mask pipeline is
+    // built over this same module, so selection and glyphs agree.
+    let source: std::borrow::Cow<'static, str> = match targets.footprint {
+        crate::Footprint::Hardware => shape.shader_source.into(),
+        crate::Footprint::Analytic => crate::analytic_source(shape.shader_source, shape.quad_height).into(),
+    };
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(shape.shader_label),
-        source: wgpu::ShaderSource::Wgsl(shape.shader_source.into()),
+        source: wgpu::ShaderSource::Wgsl(source),
     });
 
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

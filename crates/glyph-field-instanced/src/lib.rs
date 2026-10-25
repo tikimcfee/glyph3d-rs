@@ -29,3 +29,7 @@ pub use slot::RenderSlot;
 
 /// The shader source, for validation tests and tooling.
 pub const GLYPH_FIELD_WGSL: &str = include_str!("../shaders/glyph_field.wgsl");
+
+/// The quad's local height in `vs_main`: an Instanced slot carries its own
+/// (`(c.y - 0.5) * inst.height`). Read by the analytic footprint ([`glyph_field::analytic_source`]).
+pub const QUAD_HEIGHT: &str = "inst.height";
