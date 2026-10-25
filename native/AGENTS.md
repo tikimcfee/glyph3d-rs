@@ -492,6 +492,12 @@ its staging text predates C22). Key touchpoints:
   input line takes the same grammar: `--` flag lines parsed by the CLI's
   own definition, verb heads, `pick`, `pose`, `fly`, `set`, `panel`, `help`
   (`windowed/bus.rs`; `out/INTERFACE-SHELL-2026-10-24.md`).
+- **Cmd-K** (macOS) / **Ctrl-K** toggles the command palette (windowed,
+  egui; 2026-10-24, `windowed/palette.rs`): every verb head, the live
+  settings as their flag lines, `fly <path>` per file, `--agent-session`
+  per scanned session and the app words, fuzzy-ranked; each row's subtitle
+  is the exact line Enter fires (a row that still needs arguments fills
+  the console instead, as Tab always does).
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback

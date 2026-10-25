@@ -31,6 +31,10 @@ pub(super) struct UiState {
     pub(super) console: super::panels::console::Console,
     /// Every line the command bus ran, with its replies (the console shows it).
     pub(super) log: super::panels::console::CommandLog,
+    /// The command palette (Cmd/Ctrl-K): open, its query, the highlighted row.
+    pub(super) palette_open: bool,
+    pub(super) palette_query: String,
+    pub(super) palette_selected: usize,
     /// K4: Debug window visibility (F1 toggles; the window's own close
     /// button clears it).
     pub(super) debug_open: bool,
@@ -68,6 +72,9 @@ impl UiState {
             console_open: false,
             console: Default::default(),
             log: Default::default(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
             debug_open: true,
             filter: String::new(),
             selected_group: None,

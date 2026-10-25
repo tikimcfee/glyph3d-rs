@@ -70,7 +70,7 @@ pub(super) fn drain(host: &mut Host<'_>, state: &mut WindowState) -> bool {
     }
     for parsed in std::mem::take(&mut state.commands) {
         ran = true;
-        log::info!("bus: {}", parsed.line);
+        log::debug!("bus: {}", parsed.line);
         #[cfg(feature = "egui-ui")]
         state.log(LogEntry::Line(parsed.line));
         for command in parsed.commands {
