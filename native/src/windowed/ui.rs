@@ -1,7 +1,9 @@
 //! Stage K — the egui overlay state and the Debug panel's verb table.
 //! Extracted from `windowed.rs` in the 2026-09 code-shape refactor — a pure
 //! move; `pub(super)` stands in for the same-module privacy these items had
-//! (the window's render drives every field).
+//! (the window's render drives every field). Since 2026-10-24 the egui
+//! plumbing (`EguiUi`) and what the panels remember (`UiState`) are two
+//! structs: the panels take `UiState` alone.
 
 /// Stage K: the egui overlay — context, winit event translation, and the
 /// wgpu painter. `None` in WindowState under `--no-ui`; the type (and all
@@ -11,6 +13,15 @@ pub(super) struct EguiUi {
     pub(super) ctx: egui::Context,
     pub(super) state: egui_winit::State,
     pub(super) renderer: egui_wgpu::Renderer,
+    /// Everything the panels remember between frames.
+    pub(super) shell: UiState,
+}
+
+/// What the panels remember between frames: which windows are open, what
+/// the filters hold, the scanned sessions. All UI memory in one struct, the
+/// thing a session file would one day save.
+#[cfg(feature = "egui-ui")]
+pub(super) struct UiState {
     /// K3: scratch text field in the Debug window — doubles as the K2
     /// typing-isolation trap test (typing WASD/h/g/t/x here must not fly the
     /// camera or fire verbs; the gating matrix in window_event ensures it).
@@ -43,9 +54,31 @@ pub(super) struct EguiUi {
     pub(super) pending_clipboard: Option<String>,
 }
 
+#[cfg(feature = "egui-ui")]
+impl UiState {
+    /// The state a window opens with: the Debug window shown, the field HUD
+    /// where it has the most to say (`--field-mode visible`).
+    pub(super) fn new(hud_open: bool) -> Self {
+        Self {
+            scratch: String::new(),
+            debug_open: true,
+            filter: String::new(),
+            selected_group: None,
+            session_browser_open: false,
+            session_filter_text: String::new(),
+            session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
+            discovered_sessions: None,
+            hud_open,
+            session_dirs_report: String::new(),
+            pending_clipboard: None,
+        }
+    }
+}
+
 /// Stage K (K3): Debug-panel verb buttons — each fires its own text as a
 /// command-bus line, which the bus parses as `--verb <text>` through the
-/// CLI's own definition, so panel ⇔ CLI equivalence is by construction. Zero-arg/default forms only; the
+/// CLI's own definition, so panel ⇔ CLI equivalence is by construction.
+/// Zero-arg/default forms only; the
 /// parameterized verbs (nudge/scale/move, tint-group rrggbb) stay CLI-only
 /// until a phase needs arg entry.
 #[cfg(feature = "egui-ui")]

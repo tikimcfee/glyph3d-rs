@@ -76,6 +76,8 @@ use app::App;
 mod bus;
 mod exec;
 
+#[cfg(feature = "egui-ui")]
+mod panels;
 mod state;
 #[cfg(feature = "egui-ui")]
 mod selftest;

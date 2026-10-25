@@ -8,7 +8,8 @@
 use crate::gpu::GpuContext;
 
 use super::bus::lines;
-use super::state::{hud_line, WindowState};
+use super::panels::hud::hud_line;
+use super::state::WindowState;
 
 impl WindowState {
     pub(super) fn run_selftests(&mut self, ctx: &GpuContext) {

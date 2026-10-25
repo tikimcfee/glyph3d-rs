@@ -540,18 +540,8 @@ impl App<'_> {
                 ctx: egui_ctx,
                 state,
                 renderer,
-                scratch: String::new(),
-                debug_open: true,
-                filter: String::new(),
-                selected_group: None,
-                session_browser_open: false,
-                session_filter_text: String::new(),
-                session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
-                discovered_sessions: None,
-                session_dirs_report: String::new(),
-                pending_clipboard: None,
                 // The field HUD starts open where it has the most to say.
-                hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
+                shell: super::ui::UiState::new(self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible),
             })
         } else {
             None
