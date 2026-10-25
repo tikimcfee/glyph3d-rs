@@ -168,10 +168,13 @@ pub fn run_scene(
         scene.instance_count(),
     );
 
-    // Stage H: per-frame drain keeps the profiler's pending-frame queue (cap
-    // 3) from silently dropping newer frames; the post-loop drain below
-    // collects whatever is still in flight.
+    // Stage H: a per-frame drain, and a wait for the oldest profiled frame
+    // whenever `PROFILER_PENDING_FRAMES` are in flight, keep the profiler's
+    // queue from dropping frames unmeasured (C36: and from outgrowing the
+    // query sets Metal can allocate); the post-loop drain below collects
+    // whatever is still in flight. The CPU otherwise outpaces the GPU here.
     let mut profile_acc = crate::gpu::ProfileAccumulator::default();
+    let mut profiled_in_flight = std::collections::VecDeque::new();
     let t0 = std::time::Instant::now();
     for frame in 0..frames {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -233,7 +236,7 @@ pub fn run_scene(
                 size,
             );
         }
-        ctx.queue.submit([encoder.finish()]);
+        let submitted = ctx.queue.submit([encoder.finish()]);
         if repeat_check {
             let px = read_frame(device, &readback, padded_bpr, unpadded_bpr, size.height);
             match &repeat_first {
@@ -248,14 +251,38 @@ pub fn run_scene(
             }
         }
         if let Some(p) = &ctx.profiler {
-            if let Err(e) = p.borrow_mut().end_frame() {
-                log::warn!("profiler end_frame: {e}");
+            match p.borrow_mut().end_frame() {
+                Ok(()) => profiled_in_flight.push_back(submitted),
+                Err(e) => log::warn!("profiler end_frame: {e}"),
             }
-            // Non-blocking pump: fold any GPU-completed frame into the means.
+            // Non-blocking pump: fold every GPU-completed frame into the
+            // means; at the cap, block on the oldest frame's submission.
             let _ = device.poll(wgpu::PollType::Poll);
             let period = ctx.queue.get_timestamp_period();
-            if let Some(results) = p.borrow_mut().process_finished_frame(period) {
-                profile_acc.add_frame(&results);
+            let mut waited = false;
+            loop {
+                let mut drained = false;
+                while let Some(results) = p.borrow_mut().process_finished_frame(period) {
+                    profile_acc.add_frame(&results);
+                    profiled_in_flight.pop_front();
+                    drained = true;
+                }
+                if profiled_in_flight.len() < crate::gpu::PROFILER_PENDING_FRAMES {
+                    break;
+                }
+                if waited && !drained {
+                    // A completed submission whose query maps never finish
+                    // (a failed map): stop waiting and let the cap drop it.
+                    log::warn!("profiler: a profiled frame's timings never mapped");
+                    break;
+                }
+                waited = true;
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: profiled_in_flight.front().cloned(),
+                        timeout: None,
+                    })
+                    .expect("device poll failed waiting on a profiled frame");
             }
         }
     }
