@@ -38,11 +38,14 @@ pub(super) struct EguiUi {
     pub(super) hud_open: bool,
     /// What the last scan looked at, and why: one line from `glyph-session-dirs`.
     pub(super) session_dirs_report: String,
+    /// Text `copy-pose` put on the clipboard, handed to egui inside the next
+    /// pass (the executor runs between passes).
+    pub(super) pending_clipboard: Option<String>,
 }
 
-/// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed
-/// through the same crate::parse_verb the CLI uses, so panel ⇔ CLI
-/// equivalence is by construction. Zero-arg/default forms only; the
+/// Stage K (K3): Debug-panel verb buttons — each fires its own text as a
+/// command-bus line, which the bus parses as `--verb <text>` through the
+/// CLI's own definition, so panel ⇔ CLI equivalence is by construction. Zero-arg/default forms only; the
 /// parameterized verbs (nudge/scale/move, tint-group rrggbb) stay CLI-only
 /// until a phase needs arg entry.
 #[cfg(feature = "egui-ui")]

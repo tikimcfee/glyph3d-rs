@@ -33,8 +33,12 @@
 //!   - the moment egui wants ANY input, the look-grab is released (checked
 //!     per frame in render()); it re-acquires once the pointer leaves egui.
 //!
-//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons calling
-//! the exact CLI op API, K2 scratch text field). K4 makes the LOD threshold live
+//! K3 adds the Debug window (FPS/camera/pick readouts, verb buttons, K2
+//! scratch text field). Since 2026-10-24 every action the window takes —
+//! a panel button, a hotkey, a self-test step — is a command LINE on the
+//! command bus (`bus.rs`), parsed by the launch CLI's own clap definition
+//! and run between frames by one executor (`exec.rs`) through the CLI's own
+//! op applier; the panels read the probe snapshot and touch no scene. K4 makes the LOD threshold live
 //! via a slider (probe-cell → CullState Cell seam; offscreen keeps the
 //! const) and adds live cull counters; F1 toggles the window.
 //!
@@ -53,7 +57,7 @@
 //! Layout dial (repo scenes): the Debug panel's z_wrap_spacing slider
 //! applies on drag RELEASE by rebuilding the scene — re-running
 //! repo::load_repo with the new pitch and swapping the GlyphScene in place
-//! (the pending_relayout arm in window_event). Layout is not a per-frame
+//! (a `--z-wrap-spacing` line on the command bus, run between frames). Layout is not a per-frame
 //! input like K4's LOD threshold, and the JS system's `grid.layout` was
 //! likewise a discrete refold command, not a live drag. The camera pose
 //! survives the swap (restored from the old probe); pick/selection/grab
@@ -68,6 +72,9 @@ use crate::{Op, SceneChoice};
 
 mod app;
 use app::App;
+
+mod bus;
+mod exec;
 
 mod state;
 #[cfg(feature = "egui-ui")]
@@ -124,7 +131,7 @@ pub fn run(
     ctx: GpuContext,
     // Owned: the relayout arm mutates the choice's params (Repo's
     // z_wrap_spacing, Repo/Text cluster_mode) before rebuilding the scene
-    // (windowed.rs's pending_relayout arm). Offscreen keeps borrowing its own.
+    // (app::apply_relayout, run by the command bus). Offscreen keeps borrowing its own.
     choice: SceneChoice,
     cull_opts: crate::SceneCullOptions,
     ops: &[Op],

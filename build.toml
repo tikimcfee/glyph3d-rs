@@ -26,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 402
+test_floor = 411
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1023,6 +1023,36 @@ op = "replace"
 find = "    if egui_consumed {\n        return KeyRoute::Drop;\n    }"
 with = "    if false {\n        return KeyRoute::Drop;\n    }"
 expect = "typing_in_a_field_never_reaches_the_scene"
+
+[[mutation]]
+name = "console-pick-sugar-row-col-swapped"
+gate = "cargo-test"
+why = "the command bus's `pick FILE:ROW:COL` sugar hands the row to --pick-col and the column to --pick-row, so a console pick (and every line built the same way) selects a different glyph than the same flags on the command line — the panel/console/CLI equivalence the bus exists for, broken in the one place it is not clap's own parse (2026-10-24). CONSUMED BY: bus::parse_line's `pick` arm, the console's and palette's pick lines; reddens console_lines_lower_to_the_cli_op_stream, whose picks never have row == col"
+file = "native/src/windowed/bus.rs"
+op = "replace"
+find = '''                if let Some(row) = parts.next() {
+                    argv.extend(["--pick-row".to_string(), row.to_string()]);
+                }
+                if let Some(col) = parts.next() {
+                    argv.extend(["--pick-col".to_string(), col.to_string()]);
+                }'''
+with = '''                if let Some(row) = parts.next() {
+                    argv.extend(["--pick-col".to_string(), row.to_string()]);
+                }
+                if let Some(col) = parts.next() {
+                    argv.extend(["--pick-row".to_string(), col.to_string()]);
+                }'''
+expect = "console_lines_lower_to_the_cli_op_stream"
+
+[[mutation]]
+name = "split-args-drops-quotes"
+gate = "cargo-test"
+why = "the command bus's word splitter splits on whitespace inside quotes, so a quoted path with a space reaches clap as two words: the Agent Sessions browser's Load line for any session under a spaced directory, and every quoted --verb or fly, are refused or mean something else (2026-10-24). CONSUMED BY: bus::split_args, which every line goes through (bus::parse_line), and the lines bus::lines::agent_session writes; reddens session_paths_with_spaces_survive_the_line"
+file = "native/src/windowed/bus.rs"
+op = "replace"
+find = "            Some(_) => word.push(c),"
+with = "            Some(_) if c.is_whitespace() => words.push(std::mem::take(&mut word)),\n            Some(_) => word.push(c),"
+expect = "session_paths_with_spaces_survive_the_line"
 
 [[mutation]]
 name = "copy-split-body-unaligned"

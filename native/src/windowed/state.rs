@@ -13,7 +13,7 @@ use crate::gpu::GpuContext;
 use crate::scene::{self, SceneLike};
 
 #[cfg(feature = "egui-ui")]
-use super::app::RelayoutRequest;
+use super::bus::lines;
 #[cfg(feature = "egui-ui")]
 use super::ui::{EguiUi, PANEL_VERBS};
 
@@ -86,25 +86,28 @@ pub(super) struct WindowState {
     /// after-counters next frame). See AGENTS.md debug env vars.
     #[cfg(feature = "egui-ui")]
     pub(super) k4_selftest: u8,
-    /// The relayout signal (repo and text scenes): the panel sets Some(...) on
-    /// the z_wrap_spacing slider's drag release or the cluster toggle's click;
-    /// the RedrawRequested arm consumes it and rebuilds the scene between
-    /// frames. None where no layout params exist (demo/agent-session scenes).
+    /// The command bus's queue (2026-10-24, `bus.rs`): lines the hotkeys,
+    /// panels and self-tests pushed (`push_line`), run FIFO between frames by
+    /// `exec::drain` in the RedrawRequested arm. It replaced the one-slot
+    /// relayout signal, which a second request in the same frame overwrote.
+    pub(super) commands: Vec<super::bus::Parsed>,
+    /// A fly waiting for its row's live pose: (row, `frames_total` when
+    /// queued). `exec::finish_fly` frames it once a frame has rendered.
     #[cfg(feature = "egui-ui")]
-    pub(super) pending_relayout: Option<RelayoutRequest>,
+    pub(super) pending_fly: Option<(usize, u64)>,
     /// Dev-only verification hook state (GLYPH_ZSPACE_SELFTEST=1): same
     /// 0/1/2/3 arming as cluster_selftest below, driving the layout dial
-    /// through the same pending_relayout arm the slider's release uses.
+    /// through the same command-bus line the slider's release pushes.
     #[cfg(feature = "egui-ui")]
     pub(super) zspace_selftest: u8,
     /// Dev-only verification hook state (GLYPH_CLUSTER_SELFTEST=1): same
     /// 0/1/2/3 arming as zspace_selftest, toggling the cluster mode through
-    /// the same pending_relayout arm the panel's button uses.
+    /// the same command-bus line the panel's button pushes.
     #[cfg(feature = "egui-ui")]
     pub(super) cluster_selftest: u8,
     /// Dev-only verification hook state (GLYPH_FIELDMODE_SELFTEST=1): at
     /// t≈3 s cycles the field mode Instanced → Derived → Visible through the
-    /// same pending_relayout arm the panel's selector fires, printing the
+    /// same command-bus line the panel's selector pushes, printing the
     /// HUD line after each rebuild. 0 = off/done; odd states fire, even
     /// states are the quiet frame after a rebuild (see `render`).
     #[cfg(feature = "egui-ui")]
@@ -412,6 +415,8 @@ impl WindowState {
         #[cfg(feature = "egui-ui")]
         let mut egui_wants_input = false;
         #[cfg(feature = "egui-ui")]
+        let mut panel_lines: Vec<String> = Vec::new();
+        #[cfg(feature = "egui-ui")]
         if let Some(egui) = self.egui.as_mut() {
             let raw_input = egui.state.take_egui_input(&self.window);
             // Clone the Context (an Arc bump) so the closure below can borrow
@@ -431,13 +436,21 @@ impl WindowState {
             let session_browser_open = &mut egui.session_browser_open;
             let session_filter_text = &mut egui.session_filter_text;
             let session_filter_harness = &mut egui.session_filter_harness;
-            let discovered_sessions = &mut egui.discovered_sessions;
-            let session_dirs_report = &mut egui.session_dirs_report;
+            let discovered_sessions = &egui.discovered_sessions;
+            let session_dirs_report = &egui.session_dirs_report;
             let hud_open = egui.hud_open;
-            // The layout dial's apply signal: the panel's slider sets it on
-            // release; the RedrawRequested arm consumes it and rebuilds.
-            let pending_relayout = &mut self.pending_relayout;
+            let mut clipboard = egui.pending_clipboard.take();
+            // Every action a panel takes is a line pushed here, queued on
+            // the command bus after the pass and run between frames
+            // (exec::drain). The panels read the probe snapshot and never
+            // touch the scene; the only cell writes left are the K4 LOD
+            // tuning, the z dial's own value and the browser's row
+            // feedback, which are view state, not intents.
+            let panel_lines = &mut panel_lines;
             let full_output = egui_ctx.run_ui(raw_input, |root_ui| {
+                if let Some(text) = clipboard.take() {
+                    root_ui.ctx().copy_text(text);
+                }
                 // The field HUD (F8): an always-on readout, separate from the
                 // Debug window, anchored top-left — what the field is and
                 // what it did this frame, in the same words the self-test
@@ -509,11 +522,10 @@ impl WindowState {
                 // layer" only affects input order, not fill. With real
                 // windows present it is vestigial; no CentralPanel is needed
                 // (egui::Window shows fine without one).
-                // K3: the Debug window. Every scene-facing call below is the
-                // exact API the CLI ops use — verb buttons parse CLI-literal
-                // strings through crate::parse_verb and call
-                // SceneLike::apply_verb; the determinism chain never learns
-                // egui exists.
+                // K3: the Debug window. Every button pushes a command line
+                // (verb buttons push the --verb literal itself), parsed by
+                // the CLI's own definition and run through the CLI's own
+                // applier; the determinism chain never learns egui exists.
                 egui::Window::new("Debug")
                     .id(egui::Id::new("stage_k_debug_panel"))
                     .open(debug_open)
@@ -547,9 +559,7 @@ impl WindowState {
                                 // it: a view seen once becomes a golden
                                 // view's command line.
                                 if ui.button("copy pose (--cam-pose, degrees)").clicked() {
-                                    let arg = cam_pose_arg(snap.eye, snap.yaw, snap.pitch);
-                                    println!("{arg}");
-                                    ui.ctx().copy_text(arg);
+                                    panel_lines.push(lines::COPY_POSE.to_string());
                                 }
                                 if snap.strategy.is_some() || snap.field_mode.is_some() {
                                     let engine_str = snap
@@ -588,22 +598,22 @@ impl WindowState {
                                 ui.horizontal(|ui| {
                                     if let Some(z) = &snap.grabbed_zone {
                                         if ui.button(format!("Release Carrel '{z}' (C)")).clicked() {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                            panel_lines.push(lines::KEY_GRAB_CARREL.to_string());
                                         }
                                     } else if snap.active_zone.is_some()
                                         && ui.button("Grab Entire Carrel (C)").clicked()
                                     {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                        panel_lines.push(lines::KEY_GRAB_CARREL.to_string());
                                     }
 
                                     if let Some(g) = snap.grabbed_group {
                                         if ui.button(format!("Release File #{g} (G)")).clicked() {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                            panel_lines.push(lines::KEY_GRAB_FILE.to_string());
                                         }
                                     } else if snap.last_pick.is_some()
                                         && ui.button("Grab File (G)").clicked()
                                     {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                        panel_lines.push(lines::KEY_GRAB_FILE.to_string());
                                     }
                                 });
                             }
@@ -612,15 +622,11 @@ impl WindowState {
                             }
                         }
                         ui.separator();
-                        ui.label("verbs (same strings --verb parses):");
+                        ui.label("verbs (each button fires its own text as a line):");
                         ui.horizontal_wrapped(|ui| {
                             for spec in PANEL_VERBS {
                                 if ui.button(*spec).clicked() {
-                                    let verb = crate::parse_verb(spec)
-                                        .expect("panel verb literal must parse like the CLI");
-                                    if let Some(line) = self.scene.apply_verb(ctx, &verb) {
-                                        println!("{line}");
-                                    }
+                                    panel_lines.push(spec.to_string());
                                 }
                             }
                         });
@@ -741,10 +747,7 @@ impl WindowState {
                                     ));
                                 }
                                 if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        z_wrap_spacing: Some(*spacing),
-                                        ..Default::default()
-                                    });
+                                    panel_lines.push(lines::z_wrap_spacing(*spacing));
                                 }
                             }
                         }
@@ -756,44 +759,16 @@ impl WindowState {
                                     "layout engine (repo) — click switches backend & rebuilds:",
                                 );
                                 ui.horizontal_wrapped(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            current_strategy == crate::repo::Strategy::Hyper,
-                                            "Hyper (CPU)",
-                                        )
-                                        .clicked()
-                                        && current_strategy != crate::repo::Strategy::Hyper
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_strategy: Some(crate::repo::Strategy::Hyper),
-                                            ..Default::default()
-                                        });
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            current_strategy == crate::repo::Strategy::Direct,
-                                            "Direct",
-                                        )
-                                        .clicked()
-                                        && current_strategy != crate::repo::Strategy::Direct
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_strategy: Some(crate::repo::Strategy::Direct),
-                                            ..Default::default()
-                                        });
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            current_strategy == crate::repo::Strategy::Batched,
-                                            "Batch",
-                                        )
-                                        .clicked()
-                                        && current_strategy != crate::repo::Strategy::Batched
-                                    {
-                                        *pending_relayout = Some(RelayoutRequest {
-                                            set_strategy: Some(crate::repo::Strategy::Batched),
-                                            ..Default::default()
-                                        });
+                                    for (strategy, label) in [
+                                        (crate::repo::Strategy::Hyper, "Hyper (CPU)"),
+                                        (crate::repo::Strategy::Direct, "Direct"),
+                                        (crate::repo::Strategy::Batched, "Batch"),
+                                    ] {
+                                        if ui.selectable_label(current_strategy == strategy, label).clicked()
+                                            && current_strategy != strategy
+                                        {
+                                            panel_lines.push(lines::flag("repo-engine", strategy));
+                                        }
                                     }
                                 });
                             }
@@ -819,10 +794,7 @@ impl WindowState {
                                         if ui.selectable_label(current_mode == mode, label).clicked()
                                             && current_mode != mode
                                         {
-                                            *pending_relayout = Some(RelayoutRequest {
-                                                set_field_mode: Some(mode),
-                                                ..Default::default()
-                                            });
+                                            panel_lines.push(lines::flag("field-mode", mode));
                                         }
                                     }
                                 });
@@ -850,10 +822,7 @@ impl WindowState {
                                     } else {
                                         crate::fold::ClusterMode::Leader
                                     };
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        cluster_mode: Some(super::app::other_cluster_mode(current)),
-                                        ..Default::default()
-                                    });
+                                    panel_lines.push(lines::flag("cluster-mode", super::app::other_cluster_mode(current)));
                                 }
                             }
                         }
@@ -871,10 +840,7 @@ impl WindowState {
                                     crate::repo::RepoLayoutMode::Library => "layout mode: LIBRARY (click for shelf)",
                                 };
                                 if ui.button(label).clicked() {
-                                    *pending_relayout = Some(RelayoutRequest {
-                                        layout_mode: Some(super::app::next_layout_mode(mode)),
-                                        ..Default::default()
-                                    });
+                                    panel_lines.push(lines::flag("layout-mode", super::app::next_layout_mode(mode)));
                                 }
                             }
                         }
@@ -882,7 +848,7 @@ impl WindowState {
                         ui.horizontal(|ui| {
                             ui.label("agent sessions (F7):");
                             if ui.button("Browse Sessions 📂").clicked() {
-                                *session_browser_open = !*session_browser_open;
+                                panel_lines.push(lines::PANEL_SESSIONS.to_string());
                             }
                         });
                         ui.separator();
@@ -893,9 +859,10 @@ impl WindowState {
                         // rows; a CollapsingHeader-per-directory tree is NOT
                         // virtualized and would be the classic egui
                         // large-list trap at ~1.3k files). Vanilla egui — no
-                        // new deps (fence 2). Row click = select + fly-to
-                        // via the exact --cam-pose API (set_cam_pose);
-                        // framing mirrors camera_eye_target's Front formula.
+                        // new deps (fence 2). Row click = `pick group N`
+                        // then `fly group N` (the Front framing of the
+                        // file's live box, bus::fly_pose); a click on the
+                        // selected row is `pick clear`.
                         if let Some(snap) = &probe_snap {
                             if !snap.files.is_empty() {
                                 ui.separator();
@@ -919,8 +886,6 @@ impl WindowState {
                                     .map(|(i, _)| i)
                                     .collect();
                                 let row_h = ui.text_style_height(&egui::TextStyle::Body);
-                                let viewport_aspect =
-                                    self.config.width as f32 / self.config.height.max(1) as f32;
                                 let mut shown: Vec<usize> = Vec::new();
                                 egui::ScrollArea::vertical()
                                     .max_height(280.0)
@@ -961,38 +926,20 @@ impl WindowState {
                                                 if resp.clicked() {
                                                     if *selected_group == Some(row.group_id) {
                                                         *selected_group = None;
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Clear,
-                                                        );
+                                                        panel_lines.push(lines::PICK_CLEAR.to_string());
                                                     } else {
                                                         *selected_group = Some(row.group_id);
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Group(
-                                                                row.group_id,
-                                                            ),
-                                                        );
-                                                    // Front-camera framing
-                                                    // (camera_eye_target):
-                                                    // fit the AABB, text
-                                                    // plane faces +Z.
-                                                    let half_h_needed = dynst
-                                                        .half[1]
-                                                        .max(dynst.half[0] / viewport_aspect);
-                                                    let dist = crate::glyph_scene::fit_distance(half_h_needed);
-                                                    self.scene.set_cam_pose(
-                                                        [dynst.center[0], dynst.center[1], dist],
-                                                        0.0,
-                                                        0.0,
-                                                    );
+                                                        panel_lines.push(lines::pick_group(row.group_id));
+                                                        panel_lines.push(lines::fly_group(row.group_id));
                                                     }
                                                 }
                                             });
                                         }
                                     });
                                 // The scene refreshes these rows' poses
-                                // next frame (UiProbeState::browser_rows).
+                                // next frame (UiProbeState::browser_rows): a
+                                // sanctioned cell write, view feedback the
+                                // scene reads, not an intent.
                                 if let Some(cell) = &self.ui_probe {
                                     cell.borrow_mut().browser_rows = shown;
                                 }
@@ -1013,13 +960,13 @@ impl WindowState {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("⏮ Oldest (End)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::End, true);
+                                    panel_lines.push(lines::KEY_CARREL_OLDEST.to_string());
                                 }
 
                                 let total_beats = carrel.beat_count.max(carrel.turn_count);
 
                                 if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketLeft, true);
+                                    panel_lines.push(lines::KEY_CARREL_PREV.to_string());
                                 }
 
                                 if carrel.beat_count > 0 {
@@ -1034,20 +981,20 @@ impl WindowState {
                                 }
 
                                 if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketRight, true);
+                                    panel_lines.push(lines::KEY_CARREL_NEXT.to_string());
                                 }
 
                                 if ui.button("Latest ⏭ (Home)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::Home, true);
+                                    panel_lines.push(lines::KEY_CARREL_LATEST.to_string());
                                 }
 
                                 ui.separator();
                                 if ui.button("Mode (V)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyV, true);
+                                    panel_lines.push(lines::KEY_CARREL_MODE.to_string());
                                 }
                                 ui.separator();
                                 if ui.button("Sessions (F7) 📂").clicked() {
-                                    *session_browser_open = !*session_browser_open;
+                                    panel_lines.push(lines::PANEL_SESSIONS.to_string());
                                 }
                             });
 
@@ -1109,10 +1056,7 @@ impl WindowState {
                             });
 
                             if opts_changed && current_opts != carrel.layout_options {
-                                *pending_relayout = Some(RelayoutRequest {
-                                    carrel_options: Some(current_opts),
-                                    ..Default::default()
-                                });
+                                panel_lines.push(lines::carrel(&current_opts));
                             }
                             if !carrel.beat_summary.is_empty() {
                                 ui.separator();
@@ -1140,10 +1084,10 @@ impl WindowState {
                 }
 
                 if *session_browser_open {
+                    // The first open scans, through the bus like the button;
+                    // this frame shows "not scanned yet", the next the list.
                     if discovered_sessions.is_none() {
-                        let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
-                        *session_dirs_report = glyph_session_dirs::describe(&dirs);
-                        *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
+                        panel_lines.push(lines::SESSIONS_REFRESH.to_string());
                     }
 
                     egui::Window::new("Agent Sessions (F7)")
@@ -1164,9 +1108,7 @@ impl WindowState {
                                     session_filter_text.clear();
                                 }
                                 if ui.button("⟳ Refresh").clicked() {
-                                    let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
-                                    *session_dirs_report = glyph_session_dirs::describe(&dirs);
-                                    *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
+                                    panel_lines.push(lines::SESSIONS_REFRESH.to_string());
                                 }
                             });
 
@@ -1269,10 +1211,7 @@ impl WindowState {
                                                 }
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     if ui.button("▶ Load").clicked() {
-                                                        *pending_relayout = Some(RelayoutRequest {
-                                                            switch_agent_session: Some(s.path.clone()),
-                                                            ..Default::default()
-                                                        });
+                                                        panel_lines.push(lines::agent_session(&s.path));
                                                     }
                                                     if let Some(m) = s.modified {
                                                         if let Ok(dur) = std::time::SystemTime::now().duration_since(m) {
@@ -1359,6 +1298,10 @@ impl WindowState {
             egui_textures_delta = Some(textures_delta);
             egui_wants_input =
                 egui.ctx.egui_wants_pointer_input() || egui.ctx.egui_wants_keyboard_input();
+        }
+        #[cfg(feature = "egui-ui")]
+        for line in panel_lines {
+            self.push_line(&line);
         }
 
         // Stage K (K2): UI focus and the mouse-look grab cannot coexist —
