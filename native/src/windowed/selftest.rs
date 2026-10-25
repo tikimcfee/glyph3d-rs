@@ -110,8 +110,13 @@ impl WindowState {
                             "CLUSTER-SELFTEST before: cluster_mode={on} instances={}",
                             self.scene.instance_count()
                         );
+                        let current = if on {
+                            crate::fold::ClusterMode::Cluster
+                        } else {
+                            crate::fold::ClusterMode::Leader
+                        };
                         self.pending_relayout = Some(RelayoutRequest {
-                            toggle_cluster: true,
+                            cluster_mode: Some(super::app::other_cluster_mode(current)),
                             ..Default::default()
                         });
                         self.cluster_selftest = 2;

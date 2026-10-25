@@ -842,8 +842,13 @@ impl WindowState {
                                     .button(if on { "cluster mode: ON" } else { "cluster mode: off" })
                                     .clicked()
                                 {
+                                    let current = if on {
+                                        crate::fold::ClusterMode::Cluster
+                                    } else {
+                                        crate::fold::ClusterMode::Leader
+                                    };
                                     *pending_relayout = Some(RelayoutRequest {
-                                        toggle_cluster: true,
+                                        cluster_mode: Some(super::app::other_cluster_mode(current)),
                                         ..Default::default()
                                     });
                                 }
@@ -864,7 +869,7 @@ impl WindowState {
                                 };
                                 if ui.button(label).clicked() {
                                     *pending_relayout = Some(RelayoutRequest {
-                                        toggle_layout: true,
+                                        layout_mode: Some(super::app::next_layout_mode(mode)),
                                         ..Default::default()
                                     });
                                 }
