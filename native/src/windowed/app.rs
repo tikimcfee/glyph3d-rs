@@ -20,7 +20,6 @@ use crate::{Op, SceneChoice};
 use super::state::WindowState;
 #[cfg(feature = "egui-ui")]
 use super::ui::EguiUi;
-use super::utc_stamp;
 
 /// The relayout arm: mutate the scene choice's layout params, then swap the
 /// scene in place — rebuilt through the same builder startup used, so it is
@@ -34,8 +33,8 @@ use super::utc_stamp;
 /// no layout params and a stale signal is a no-op.
 /// A free function, not an App method: the caller already holds
 /// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
-/// would double-borrow.
-#[cfg(feature = "egui-ui")]
+/// would double-borrow. The command bus's executor calls it (`exec.rs`);
+/// it returns the `relayout:` line, which the bus prints.
 pub(super) fn apply_relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
@@ -43,7 +42,7 @@ pub(super) fn apply_relayout(
     ui: bool,
     state: &mut WindowState,
     req: RelayoutRequest,
-) {
+) -> Option<String> {
     let mut changed = false;
     let mut note = String::new();
     let reset_pose = req.switch_agent_session.is_some();
@@ -64,12 +63,13 @@ pub(super) fn apply_relayout(
         note += &format!("switch_agent_session -> {} ", session_path.display());
     }
     if let SceneChoice::AgentSession { layout_options, .. } = choice {
-        if let Some(new_opts) = req.carrel_options {
-            if *layout_options != new_opts {
-                *layout_options = new_opts;
-                changed = true;
-                note += &format!("carrel_options -> limit: {}, scroll: {} ", new_opts.deck_window_limit, new_opts.deck_scroll_offset);
-            }
+        // The scene's own move (all options), then the typed flags over it.
+        let mut new_opts = req.carrel_options.unwrap_or(*layout_options);
+        req.carrel.apply(&mut new_opts);
+        if *layout_options != new_opts {
+            *layout_options = new_opts;
+            changed = true;
+            note += &format!("carrel_options -> limit: {}, scroll: {} ", new_opts.deck_window_limit, new_opts.deck_scroll_offset);
         }
     }
     // The z dial exists on repo scenes, and on text scenes since they became
@@ -123,12 +123,16 @@ pub(super) fn apply_relayout(
         }
     }
     if !changed {
-        return; // a release without a move (a click, a typed repeat) rebuilds nothing
+        // A release without a move (a click, a typed repeat) rebuilds nothing.
+        return Some("relayout: nothing to change (the scene already has those values)".to_string());
     }
     // Snapshot the camera and live cull settings BEFORE the swap: the probe holds
     // last frame's actual eye/yaw/pitch and live background/cull settings, and a rebuild
     // that teleports the viewer or resets the background would make the dial unusable.
-    let (pose, live_cull_opts) = if let Some(p) = state.ui_probe.as_ref() {
+    // Without a probe (no overlay) the scene's own pose is kept and the cull
+    // settings are the run's: there is no panel to have moved them.
+    #[cfg(feature = "egui-ui")]
+    let probed = state.ui_probe.as_ref().map(|p| {
         let p = p.borrow();
         (
             Some((p.eye, p.yaw, p.pitch)),
@@ -146,9 +150,10 @@ pub(super) fn apply_relayout(
                 ground_y: cull_opts.ground_y,
             },
         )
-    } else {
-        (None, *cull_opts)
-    };
+    });
+    #[cfg(not(feature = "egui-ui"))]
+    let probed = None;
+    let (pose, live_cull_opts) = probed.unwrap_or_else(|| (state.scene.cam_pose(), *cull_opts));
     let t = Instant::now();
     let (mut scene, probe) = if ui {
         crate::build_scene_probed(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts)
@@ -172,11 +177,16 @@ pub(super) fn apply_relayout(
         }
     }
     state.scene = scene;
-    state.ui_probe = probe;
-    println!(
+    #[cfg(feature = "egui-ui")]
+    {
+        state.ui_probe = probe;
+    }
+    #[cfg(not(feature = "egui-ui"))]
+    let _ = probe;
+    Some(format!(
         "relayout: {note}(scene rebuilt in {:?}; pick/selection/grab state reset)",
         t.elapsed()
-    );
+    ))
 }
 
 /// What the panel asked the rebuild arm to change. Any field alone may be
@@ -185,22 +195,51 @@ pub(super) fn apply_relayout(
 /// cluster and layout modes were `toggle_*` flags, which no CLI flag
 /// spells): the asker computes the next value from the current one
 /// (`next_layout_mode`, `other_cluster_mode`), so every request is a value a
-/// `--cluster-mode` or `--layout-mode` flag could carry.
-#[cfg(feature = "egui-ui")]
-#[derive(Clone, Default)]
+/// `--cluster-mode` or `--layout-mode` flag could carry. Since the command
+/// bus (2026-10-24) every request but the scene's own carrel move comes
+/// from a flag line (`bus::parse_line`), one field per typed flag.
+#[derive(Clone, Debug, Default)]
 pub(super) struct RelayoutRequest {
     pub(super) z_wrap_spacing: Option<f64>,
     pub(super) cluster_mode: Option<crate::fold::ClusterMode>,
     pub(super) layout_mode: Option<crate::repo::RepoLayoutMode>,
     pub(super) switch_agent_session: Option<std::path::PathBuf>,
+    /// The scene's own carrel move, every option at once
+    /// (`SceneLike::take_pending_carrel_options`: the active beat and the
+    /// desk scroll have no flag).
     pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
+    /// The carrel flags a line typed, applied over the options.
+    pub(super) carrel: CarrelPatch,
     pub(super) set_strategy: Option<crate::repo::Strategy>,
     pub(super) set_field_mode: Option<glyph_field::GlyphFieldMode>,
 }
 
+/// The Agent Carrel's flags, each only where a line typed it: a
+/// `--deck-scroll-offset 4` moves the scroll and keeps the scene's limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CarrelPatch {
+    pub(super) deck_window_limit: Option<usize>,
+    pub(super) deck_scroll_offset: Option<usize>,
+    pub(super) desk_revision_limit: Option<usize>,
+    pub(super) max_file_stacks: Option<usize>,
+}
+
+impl CarrelPatch {
+    fn apply(&self, options: &mut crate::spatial_scene::CarrelLayoutOptions) {
+        let set = |slot: &mut usize, value: Option<usize>| {
+            if let Some(v) = value {
+                *slot = v;
+            }
+        };
+        set(&mut options.deck_window_limit, self.deck_window_limit);
+        set(&mut options.deck_scroll_offset, self.deck_scroll_offset);
+        set(&mut options.desk_revision_limit, self.desk_revision_limit);
+        set(&mut options.max_file_stacks, self.max_file_stacks);
+    }
+}
+
 /// The canvas layout after `mode` in the F6 cycle: shelf → carrel → library
 /// → shelf.
-#[cfg(feature = "egui-ui")]
 pub(super) fn next_layout_mode(mode: crate::repo::RepoLayoutMode) -> crate::repo::RepoLayoutMode {
     use crate::repo::RepoLayoutMode as M;
     match mode {
@@ -246,28 +285,6 @@ pub(super) struct App<'a> {
     pub(super) present_mode: wgpu::PresentMode,
     /// Stop after N presented frames.
     pub(super) frames: Option<u32>,
-}
-
-impl App<'_> {
-    fn live_step_title(&mut self, cmd: super::LiveStep) -> Option<String> {
-        let live = self.live.as_ref()?;
-        if let Some(step) = &live.step {
-            let _ = step.send(cmd);
-        }
-        let count = live.step_count;
-        self.live_step_ix = match cmd {
-            super::LiveStep::Next => {
-                if count > 0 { (self.live_step_ix + 1).min(count - 1) } else { 0 }
-            }
-            super::LiveStep::Prev => self.live_step_ix.saturating_sub(1),
-            super::LiveStep::Reset => 0,
-        };
-        Some(if count > 0 {
-            format!("fieldzed live — step {}/{}", self.live_step_ix + 1, count)
-        } else {
-            "fieldzed live".to_string()
-        })
-    }
 }
 
 /// Where one keyboard event goes: the KeyboardInput arm's decision, pure so
@@ -532,6 +549,7 @@ impl App<'_> {
                 session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
                 discovered_sessions: None,
                 session_dirs_report: String::new(),
+                pending_clipboard: None,
                 // The field HUD starts open where it has the most to say.
                 hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
             })
@@ -613,10 +631,11 @@ impl App<'_> {
             ui_probe,
             #[cfg(feature = "egui-ui")]
             ui_fps: 0.0,
+            commands: Vec::new(),
+            #[cfg(feature = "egui-ui")]
+            pending_fly: None,
             #[cfg(feature = "egui-ui")]
             k4_selftest: u8::from(std::env::var_os("GLYPH_K4_SELFTEST").is_some()),
-            #[cfg(feature = "egui-ui")]
-            pending_relayout: None,
             #[cfg(feature = "egui-ui")]
             zspace_selftest: u8::from(std::env::var_os("GLYPH_ZSPACE_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
@@ -657,21 +676,26 @@ impl App<'_> {
                 state.scene.set_viewport(size.width, size.height);
             }
             WindowEvent::RedrawRequested => {
-                // The layout controls apply BETWEEN frames: the panel set
-                // pending_relayout on slider release / toggle click during
-                // previous render or keypress; rebuild before render if pending.
                 #[cfg(feature = "egui-ui")]
-                {
-                    if let Some(opts) = state.scene.take_pending_carrel_options() {
-                        state.pending_relayout = Some(RelayoutRequest {
-                            carrel_options: Some(opts),
-                            ..Default::default()
-                        });
-                    }
-                    if let Some(req) = state.pending_relayout.take() {
-                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
-                    }
+                let ui = self.ui;
+                #[cfg(not(feature = "egui-ui"))]
+                let ui = false;
+                // The command bus drains BETWEEN frames: before this render
+                // (lines a key or a scene step queued since the last frame)
+                // and after it (lines the panels emitted during it). The
+                // scene's own carrel moves join the queue first.
+                let mut host = super::exec::Host {
+                    ctx: &self.ctx,
+                    choice: &mut self.choice,
+                    cull_opts: &mut self.cull_opts,
+                    live: &mut self.live,
+                    live_step_ix: &mut self.live_step_ix,
+                    ui,
+                };
+                if let Some(opts) = state.scene.take_pending_carrel_options() {
+                    state.commands.push(super::bus::scene_carrel_note(opts));
                 }
+                super::exec::drain(&mut host, state);
                 state.render(&self.ctx);
                 if let Some(max_frames) = self.frames {
                     if state.frames_total >= max_frames as u64 {
@@ -679,33 +703,25 @@ impl App<'_> {
                         return;
                     }
                 }
-                #[cfg(feature = "egui-ui")]
-                {
-                    if let Some(opts) = state.scene.take_pending_carrel_options() {
-                        state.pending_relayout = Some(RelayoutRequest {
-                            carrel_options: Some(opts),
-                            ..Default::default()
-                        });
-                    }
-                    if let Some(req) = state.pending_relayout.take() {
-                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
-                        state.window.request_redraw();
-                    }
+                if let Some(opts) = state.scene.take_pending_carrel_options() {
+                    state.commands.push(super::bus::scene_carrel_note(opts));
+                }
+                if super::exec::drain(&mut host, state) {
+                    state.window.request_redraw();
                 }
                 if self.live.is_some() {
-                    #[cfg(feature = "egui-ui")]
-                    let ui = self.ui;
-                    #[cfg(not(feature = "egui-ui"))]
-                    let ui = false;
                     poll_live(&self.ctx, self.cull_opts, ui, &mut self.live, state);
                 }
             }
             // Stage K (K6): F2 = capture the next presented frame to PNG.
-            // App-level hotkey that must work REGARDLESS of egui focus (e.g.
-            // while typing in the scratch field), so it matches ABOVE the
+            // App-level hotkeys that must work REGARDLESS of egui focus (e.g.
+            // while typing in a text field), so they match ABOVE the
             // egui-consumed arm — unlike F1, which deliberately yields to a
             // focused field. egui still saw the event first (the feed at the
-            // top); it ignores F2.
+            // top); it ignores them. Each pushes its line onto the command
+            // bus (2026-10-24), which runs it between frames. F6 rebuilds the
+            // scene, so it does so mid-typing too: a function key types
+            // nothing, and that is the price of not yielding.
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && matches!(
@@ -718,58 +734,18 @@ impl App<'_> {
                             | PhysicalKey::Code(KeyCode::F8)
                     ) =>
             {
+                use super::bus::lines;
                 match event.physical_key {
-                    PhysicalKey::Code(KeyCode::F2) => {
-                        state.capture_pending = Some(std::path::PathBuf::from(concat!(
-                            env!("CARGO_MANIFEST_DIR"),
-                            "/../out"
-                        )).join(format!(
-                            "windowed-shot-{}.png",
-                            utc_stamp(std::time::SystemTime::now())
-                        )));
-                        // GLYPH_POSE_PRINT=1: the shot's camera as the
-                        // `--cam-pose` argument that reproduces it (degrees),
-                        // so a view seen once can be a golden view's command.
-                        if std::env::var_os("GLYPH_POSE_PRINT").is_some() {
-                            match state.scene.cam_pose() {
-                                Some((eye, yaw, pitch)) => println!("{}", super::state::cam_pose_arg(eye, yaw, pitch)),
-                                None => println!("pose: this scene has no fly camera"),
-                            }
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::F8) => {
-                        #[cfg(feature = "egui-ui")]
-                        if let Some(egui) = state.egui.as_mut() {
-                            egui.hud_open = !egui.hud_open;
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::F3) => {
-                        let window = state.window.clone();
-                        if let Some(t) = self.live_step_title(super::LiveStep::Next) {
-                            window.set_title(&t);
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::F4) => {
-                        let window = state.window.clone();
-                        if let Some(t) = self.live_step_title(super::LiveStep::Prev) {
-                            window.set_title(&t);
-                        }
-                    }
-                    PhysicalKey::Code(KeyCode::F5) => {
-                        let window = state.window.clone();
-                        if let Some(t) = self.live_step_title(super::LiveStep::Reset) {
-                            window.set_title(&t);
-                        }
-                    }
+                    PhysicalKey::Code(KeyCode::F2) => state.push_line(lines::SHOT),
+                    PhysicalKey::Code(KeyCode::F8) => state.push_line(lines::PANEL_HUD),
+                    PhysicalKey::Code(KeyCode::F3) => state.push_line(lines::LIVE_NEXT),
+                    PhysicalKey::Code(KeyCode::F4) => state.push_line(lines::LIVE_PREV),
+                    PhysicalKey::Code(KeyCode::F5) => state.push_line(lines::LIVE_RESET),
                     PhysicalKey::Code(KeyCode::F6) => {
                         // The next mode from the scene choice itself, so F6
                         // needs no probe (and works under --no-ui).
-                        #[cfg(feature = "egui-ui")]
                         if let SceneChoice::Repo { layout_mode, .. } = &self.choice {
-                            state.pending_relayout = Some(RelayoutRequest {
-                                layout_mode: Some(next_layout_mode(*layout_mode)),
-                                ..Default::default()
-                            });
+                            state.push_line(&lines::flag("layout-mode", next_layout_mode(*layout_mode)));
                             state.window.request_redraw();
                         }
                     }
@@ -802,18 +778,8 @@ impl App<'_> {
                         // Stage K (K4): F1 toggles the Debug window — never
                         // scene input. (With a text field focused, egui
                         // consumes F1 first; release focus with Esc, then F1.)
-                        KeyRoute::DebugPanel => {
-                            #[cfg(feature = "egui-ui")]
-                            if let Some(egui) = state.egui.as_mut() {
-                                egui.debug_open = !egui.debug_open;
-                            }
-                        }
-                        KeyRoute::SessionsPanel => {
-                            #[cfg(feature = "egui-ui")]
-                            if let Some(egui) = state.egui.as_mut() {
-                                egui.session_browser_open = !egui.session_browser_open;
-                            }
-                        }
+                        KeyRoute::DebugPanel => state.push_line(super::bus::lines::PANEL_DEBUG),
+                        KeyRoute::SessionsPanel => state.push_line(super::bus::lines::PANEL_SESSIONS),
                         // Esc releases the pointer grab (and is not camera input).
                         KeyRoute::Ungrab => state.ungrab(),
                         // Backquote toggles mouse-look grab — an always-available

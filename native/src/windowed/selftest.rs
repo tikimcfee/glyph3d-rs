@@ -7,7 +7,7 @@
 
 use crate::gpu::GpuContext;
 
-use super::app::RelayoutRequest;
+use super::bus::lines;
 use super::state::{hud_line, WindowState};
 
 impl WindowState {
@@ -44,9 +44,9 @@ impl WindowState {
         }
         // Dev-only verification hook (GLYPH_ZSPACE_SELFTEST=1): drive the
         // layout dial programmatically — set the probe's z_wrap_spacing to
-        // 2× its seed and fire the SAME pending_relayout arm the slider's
-        // drag-release sets (consumed after this render, in window_event's
-        // RedrawRequested arm). Logs the instance count (must NOT change —
+        // 2× its seed and push the SAME line the slider's drag-release
+        // pushes (`--z-wrap-spacing X`, run after this render by the command
+        // bus's drain in window_event's RedrawRequested arm). Logs the instance count (must NOT change —
         // z_step moves no slot counts) and the field's z extent (must
         // ~double) before/after the rebuild. States: 1 = fire at t>3 s;
         // 2 = one quiet frame (the rebuild happened after last frame's
@@ -67,10 +67,7 @@ impl WindowState {
                         if let Some(probe) = &self.ui_probe {
                             probe.borrow_mut().z_wrap_spacing = Some(new);
                         }
-                        self.pending_relayout = Some(RelayoutRequest {
-                            z_wrap_spacing: Some(new),
-                            ..Default::default()
-                        });
+                        self.push_line(&lines::z_wrap_spacing(new));
                         self.zspace_selftest = 2;
                     }
                     None => {
@@ -95,8 +92,8 @@ impl WindowState {
             _ => {}
         }
         // Dev-only verification hook (GLYPH_CLUSTER_SELFTEST=1): toggle the
-        // cluster mode through the SAME pending_relayout arm the panel's
-        // button fires. Meaningful only on cluster-bearing content (the
+        // cluster mode through the SAME command-bus line the panel's button
+        // pushes (`--cluster-mode X`, the other mode). Meaningful only on cluster-bearing content (the
         // g-cluster-repo fixture, or a text scene like emoji-corpus-small.txt):
         // instance count must DROP as trailers leave the arena. States:
         // 1 = fire at t>3 s; 2 = one quiet frame; 3 = print the
@@ -115,10 +112,7 @@ impl WindowState {
                         } else {
                             crate::fold::ClusterMode::Leader
                         };
-                        self.pending_relayout = Some(RelayoutRequest {
-                            cluster_mode: Some(super::app::other_cluster_mode(current)),
-                            ..Default::default()
-                        });
+                        self.push_line(&lines::flag("cluster-mode", super::app::other_cluster_mode(current)));
                         self.cluster_selftest = 2;
                     }
                     None => {
@@ -143,9 +137,9 @@ impl WindowState {
         }
         // Dev-only verification hook (GLYPH_FIELDMODE_SELFTEST=1): cycle the
         // field mode Instanced → Derived → Visible through the SAME
-        // pending_relayout arm the panel's selector fires, printing the HUD
-        // line after each rebuild. Odd states fire a request (consumed after
-        // this render), even states are the quiet frame whose render fills
+        // command-bus line the panel's selector pushes (`--field-mode X`),
+        // printing the HUD line after each rebuild. Odd states push the line
+        // (run after this render), even states are the quiet frame whose render fills
         // the new probe; the print reads that. Until the Visible field's
         // bodies land, the third step panics at `VisibleField::new` — which
         // is the point of running it: the mode reaches the call.
@@ -164,10 +158,7 @@ impl WindowState {
                             if let Some(probe) = &self.ui_probe {
                                 println!("FIELDMODE-SELFTEST before step {}: {}", s.div_ceil(2), hud_line(&probe.borrow(), self.ui_fps));
                             }
-                            self.pending_relayout = Some(RelayoutRequest {
-                                set_field_mode: Some(mode),
-                                ..Default::default()
-                            });
+                            self.push_line(&lines::flag("field-mode", mode));
                             self.fieldmode_selftest = s + 1;
                         }
                         _ => {

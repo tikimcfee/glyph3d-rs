@@ -399,13 +399,14 @@ its staging text predates C22). Key touchpoints:
   CLI: `--text-detail-px`, `--show-glyphs-px`; the old `--greek-onset-px` /
   `--lod-min-px` and launch_config keys still parse.)
 - `GLYPH_ZSPACE_SELFTEST=1` — windowed, dev-only: at t≈3 s drives the Debug
-  panel's z_wrap_spacing dial to 2× and fires the SAME scene-rebuild arm the
-  slider's drag-release uses, logging instance count (must not change —
-  z_step moves no slot counts) and the field's z extent (must ~double)
-  before/after. Exercises the panel → probe → pending_relayout → rebuild
-  path without a human.
-- `GLYPH_CLUSTER_SELFTEST=1` — windowed, dev-only: toggles the Debug panel's
-  cluster-mode button through the SAME rebuild arm, logging the instance
+  panel's z_wrap_spacing dial to 2× and pushes the SAME command-bus line the
+  slider's drag-release pushes (`--z-wrap-spacing X`), logging instance
+  count (must not change — z_step moves no slot counts) and the field's z
+  extent (must ~double) before/after. Exercises the panel → command bus →
+  rebuild path without a human.
+- `GLYPH_CLUSTER_SELFTEST=1` — windowed, dev-only: pushes the Debug panel's
+  cluster-mode button's line (`--cluster-mode`, the other mode) onto the
+  command bus, the SAME rebuild the button runs, logging the instance
   count before/after (on cluster-bearing content the count moves — trailers
   enter/leave the arena; the DIRECTION follows the starting mode: with
   cluster the default since 2026-09-22, the hook's toggle goes OFF and the
@@ -415,7 +416,8 @@ its staging text predates C22). Key touchpoints:
   no mode and hide it.
 - `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
   cycles the field mode Instanced → Derived → Visible through the SAME
-  rebuild arm the Debug panel's selector fires, printing the F8 HUD line
+  command-bus line the Debug panel's selector pushes (`--field-mode X`),
+  printing the F8 HUD line
   (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild.
 - `GLYPH_VISIBLE_VERB_SELFTEST=1` — windowed, dev-only (M3, 2026-10-10): from
   t≈3 s, one step every fourth frame, through the SAME entry points the CLI op

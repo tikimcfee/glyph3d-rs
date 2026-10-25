@@ -154,8 +154,8 @@ pub struct UiProbeState {
     pub visible_stats: Option<glyph_field_visible::VisibleStats>,
     // ── Layout dial (repo scenes): the wrap staircase's pitch. Unlike the
     // K4 controls this is LAYOUT, not a per-frame cull input — applying it
-    // re-runs load_repo and rebuilds the scene (windowed.rs's
-    // pending_relayout arm), so the panel fires on drag RELEASE, never per
+    // re-runs load_repo and rebuilds the scene (a `--z-wrap-spacing` line
+    // on the windowed command bus), so the panel fires on drag RELEASE, never per
     // tick (the JS system's `grid.layout` semantics: a discrete refold
     // command). Seeded at install from the files' actual z_step; written by
     // the panel's slider; read by nothing per frame. None for non-repo
