@@ -1007,11 +1007,11 @@ expect = "windowed_emission_matches_unwindowed"
 [[mutation]]
 name = "egui-use-ungated"
 gate = "cargo-check-no-ui"
-why = "C24 put back: an egui item used outside the egui-ui feature gate compiles in the default build and breaks the no-UI one, which nothing built until 2026-10-09. CONSUMED BY: the no-default-features check"
-file = "native/src/windowed/state.rs"
+why = "C24 put back: an egui item used outside the egui-ui feature gate compiles in the default build and breaks the no-UI one, which nothing built until 2026-10-09. The target moved with the panels (2026-10-24): ui_rgb and every other egui use now live in windowed/panels/, gated as one module, so the ungated use is that module's declaration. CONSUMED BY: the no-default-features check"
+file = "native/src/windowed.rs"
 op = "replace"
-find = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\n#[cfg(feature = \"egui-ui\")]\nfn ui_rgb("
-with = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\nfn ui_rgb("
+find = "#[cfg(feature = \"egui-ui\")]\nmod panels;"
+with = "mod panels;"
 expect = "cargo-check-no-ui errored"
 
 [[mutation]]

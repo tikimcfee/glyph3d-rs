@@ -174,7 +174,7 @@ fn app_command(host: &mut Host<'_>, state: &mut WindowState, command: AppCommand
             let arg = cam_pose_arg(eye, yaw, pitch);
             #[cfg(feature = "egui-ui")]
             if let Some(egui) = state.egui.as_mut() {
-                egui.pending_clipboard = Some(arg.clone());
+                egui.shell.pending_clipboard = Some(arg.clone());
             }
             Some(arg)
         }
@@ -195,11 +195,11 @@ fn app_command(host: &mut Host<'_>, state: &mut WindowState, command: AppCommand
 
 #[cfg(feature = "egui-ui")]
 fn toggle_panel(state: &mut WindowState, panel: PanelId) -> Option<String> {
-    let egui = state.egui.as_mut()?;
+    let shell = &mut state.egui.as_mut()?.shell;
     let open = match panel {
-        PanelId::Debug => &mut egui.debug_open,
-        PanelId::Hud => &mut egui.hud_open,
-        PanelId::Sessions => &mut egui.session_browser_open,
+        PanelId::Debug => &mut shell.debug_open,
+        PanelId::Hud => &mut shell.hud_open,
+        PanelId::Sessions => &mut shell.session_browser_open,
     };
     *open = !*open;
     None
@@ -217,12 +217,12 @@ fn toggle_panel(_state: &mut WindowState, panel: PanelId) -> Option<String> {
 
 #[cfg(feature = "egui-ui")]
 fn sessions_refresh(state: &mut WindowState) -> Option<String> {
-    let egui = state.egui.as_mut()?;
+    let shell = &mut state.egui.as_mut()?.shell;
     let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
-    egui.session_dirs_report = glyph_session_dirs::describe(&dirs);
+    shell.session_dirs_report = glyph_session_dirs::describe(&dirs);
     let sessions = crate::agent_transcript::discovery::scan_session_dirs(&dirs);
-    let reply = format!("sessions: {} found ({})", sessions.len(), egui.session_dirs_report);
-    egui.discovered_sessions = Some(sessions);
+    let reply = format!("sessions: {} found ({})", sessions.len(), shell.session_dirs_report);
+    shell.discovered_sessions = Some(sessions);
     Some(reply)
 }
 
