@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use clap::CommandFactory;
+use clap::{CommandFactory, FromArgMatches};
 use super::*;
 use crate::fold;
 use crate::glyph_scene::{PickCommand, Verb};
@@ -363,6 +363,37 @@ fn pick_row_without_pick_file_panics() {
 #[should_panic(expected = "--pick-row/--pick-col must follow --pick-file")]
 fn pick_row_after_verb_panics() {
     parse(&["--pick-file", "a", "--verb", "tint-cycle", "--pick-row", "1"]);
+}
+
+#[test]
+fn the_fallible_op_builder_refuses_instead_of_panicking() {
+    // The same stray --pick-row the launch CLI panics on, as an Err the
+    // windowed console can show (2026-10-24).
+    let matches = Cli::command()
+        .try_get_matches_from(["glyph3d-native", "--pick-row", "1"])
+        .expect("clap accepts the flag; the op builder is what refuses");
+    let cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
+    let err = try_build_ops(&matches, &cli.raw_ops).expect_err("a row with no file pick must refuse");
+    assert!(err.contains("--pick-row/--pick-col must follow --pick-file"), "{err}");
+    let matches = Cli::command()
+        .try_get_matches_from(["glyph3d-native", "--pick-file", "a", "--pick-row", "2"])
+        .expect("a well-formed pick parses");
+    let cli = Cli::from_arg_matches(&matches).expect("clap derive round-trip");
+    let ops = try_build_ops(&matches, &cli.raw_ops).expect("a row after a file pick builds");
+    assert!(matches!(&ops[..], [Op::Pick(PickCommand::RowCol { row: 2, col: 0, .. })]));
+}
+
+#[test]
+fn every_verb_head_is_one_parse_verb_knows() {
+    // VERB_HEADS builds parse_verb's usage line and the palette's verb rows;
+    // a head parse_verb does not match would answer with that usage line.
+    for head in VERB_HEADS {
+        if let Err(e) = parse_verb(head) {
+            assert!(!e.contains("unknown/malformed"), "{head}: {e}");
+        }
+    }
+    let usage = parse_verb("frobnicate").expect_err("an unknown head is refused");
+    assert!(usage.ends_with(&VERB_HEADS.join("|")), "{usage}");
 }
 
 #[test]

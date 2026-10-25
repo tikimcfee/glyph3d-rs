@@ -92,17 +92,7 @@ pub fn run_scene(
     // --cam-pose switches to a scripted Fly pose (oblique-pick repro).
     scene.set_viewport(size.width, size.height);
     for op in ops {
-        let line = match op {
-            Op::Pick(p) => scene.apply_pick(ctx, p),
-            Op::Verb(v) => scene.apply_verb(ctx, v),
-            Op::CamPose(eye, yaw, pitch) => {
-                scene.set_cam_pose(*eye, *yaw, *pitch);
-                None
-            }
-            // S3 spike: Zed-sidecar highlight — one op, applied like a verb.
-            Op::Highlight(p) => scene.apply_highlight_sidecar(ctx, p),
-        };
-        match line {
+        match crate::cli::apply_op(scene.as_mut(), ctx, op) {
             Some(line) => println!("{line}"),
             None => println!("op: scene does not support picking/manipulation"),
         }
