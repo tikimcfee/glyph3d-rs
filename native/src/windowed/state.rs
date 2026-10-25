@@ -41,6 +41,9 @@ pub(super) struct WindowState {
     /// Last cursor position, physical px (click picks use it).
     pub(super) cursor: (f32, f32),
     pub(super) last_frame: Instant,
+    /// The keyboard modifiers held now (`WindowEvent::ModifiersChanged`):
+    /// a press with Cmd or Ctrl held never reaches the scene (`route_key`).
+    pub(super) modifiers: winit::keyboard::ModifiersState,
     /// Stage K (K6): frames presented since startup (the `--screenshot-frame`
     /// counter — distinct from `frames`, which the FPS line resets every
     /// second).

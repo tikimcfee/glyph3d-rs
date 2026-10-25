@@ -270,6 +270,99 @@ impl App<'_> {
     }
 }
 
+/// Where one keyboard event goes: the KeyboardInput arm's decision, pure so
+/// it is tested (2026-10-24). F2-F6 and F8 are matched before this, on press
+/// only, regardless of focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeyRoute {
+    /// Nowhere: a focused egui widget had the press, or a Cmd/Ctrl chord.
+    Drop,
+    /// `SceneLike::on_key`, pressed or released.
+    Scene,
+    /// F1: toggle the Debug window.
+    DebugPanel,
+    /// F7: toggle the Agent Sessions browser.
+    SessionsPanel,
+    /// Esc: release the pointer grab.
+    Ungrab,
+    /// Backquote: toggle the mouse-look grab.
+    ToggleGrab,
+}
+
+/// Route a key. `egui_consumed` is what egui-winit said of the event (it
+/// judges by LAST frame's focus); `chord` is Cmd or Ctrl held.
+///
+/// - Every RELEASE reaches the scene, consumed or not. Until 2026-10-24 a
+///   consumed release was dropped, so W held while a text field took focus
+///   latched the fly camera moving until W was pressed again. Safe because
+///   the scene's verb keys fire on press only (`GlyphScene::on_key`); a
+///   release only clears a fly key's bit.
+/// - A consumed PRESS never reaches anything: typing WASD/h/g/t/x in a
+///   field must not fly the camera or fire a verb.
+/// - A press with Cmd or Ctrl held never reaches the scene (the camera
+///   ignores modifiers, so Cmd-S flew backwards); the app keys still apply.
+pub(super) fn route_key(egui_consumed: bool, pressed: bool, chord: bool, code: KeyCode) -> KeyRoute {
+    if !pressed {
+        return KeyRoute::Scene;
+    }
+    if egui_consumed {
+        return KeyRoute::Drop;
+    }
+    match code {
+        KeyCode::F1 => KeyRoute::DebugPanel,
+        KeyCode::F7 => KeyRoute::SessionsPanel,
+        KeyCode::Escape => KeyRoute::Ungrab,
+        KeyCode::Backquote => KeyRoute::ToggleGrab,
+        _ if chord => KeyRoute::Drop,
+        _ => KeyRoute::Scene,
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::{route_key, KeyRoute};
+    use winit::keyboard::KeyCode as K;
+
+    /// Every key the scene acts on: the fly keys and the verb keys.
+    const SCENE_KEYS: &[K] = &[
+        K::KeyW, K::KeyA, K::KeyS, K::KeyD, K::KeyE, K::KeyR, K::KeyQ, K::KeyF,
+        K::KeyH, K::KeyG, K::KeyT, K::KeyX, K::KeyB, K::KeyC, K::KeyV, K::KeyN, K::KeyP,
+        K::BracketLeft, K::BracketRight, K::Home, K::End,
+    ];
+
+    #[test]
+    fn typing_in_a_field_never_reaches_the_scene() {
+        for &code in SCENE_KEYS {
+            assert_eq!(route_key(true, true, false, code), KeyRoute::Drop, "{code:?} typed into a field");
+            assert_eq!(route_key(false, true, false, code), KeyRoute::Scene, "{code:?} over the scene");
+        }
+        // The app keys yield to a focused field too.
+        for code in [K::F1, K::F7, K::Escape, K::Backquote] {
+            assert_eq!(route_key(true, true, false, code), KeyRoute::Drop, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn every_release_reaches_the_scene() {
+        for &code in SCENE_KEYS {
+            for (consumed, chord) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_eq!(route_key(consumed, false, chord, code), KeyRoute::Scene, "{code:?} {consumed} {chord}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_chord_never_moves_the_scene() {
+        for &code in SCENE_KEYS {
+            assert_eq!(route_key(false, true, true, code), KeyRoute::Drop, "{code:?} with Cmd/Ctrl");
+        }
+        assert_eq!(route_key(false, true, true, K::F1), KeyRoute::DebugPanel);
+        assert_eq!(route_key(false, true, false, K::F7), KeyRoute::SessionsPanel);
+        assert_eq!(route_key(false, true, false, K::Escape), KeyRoute::Ungrab);
+        assert_eq!(route_key(false, true, false, K::Backquote), KeyRoute::ToggleGrab);
+    }
+}
+
 #[cfg(all(test, feature = "egui-ui"))]
 mod tests {
     use super::{next_layout_mode, other_cluster_mode};
@@ -505,6 +598,7 @@ impl App<'_> {
             saw_device_delta: false,
             cursor: (0.0, 0.0),
             last_frame: Instant::now(),
+            modifiers: winit::keyboard::ModifiersState::empty(),
             frames_total: 0,
             shot_at_frame: self.shot.clone(),
             capture_pending: None,
@@ -690,47 +784,58 @@ impl App<'_> {
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. } => {
                 state.ungrab();
             }
-            // Consumed by egui (e.g. click on a panel, typing in a focused
-            // widget): never routed to the scene.
-            _ if egui_consumed => {}
+            // The modifier state, for route_key's chord test. Tracked above
+            // the consumed arm so a chord pressed over a panel still counts.
+            WindowEvent::ModifiersChanged(modifiers) => {
+                state.modifiers = modifiers.state();
+            }
+            // Keys route through one decision (route_key), above the
+            // consumed arm: a RELEASE reaches the scene even when egui
+            // consumed it (2026-10-24), so a fly key held while a text
+            // field takes focus cannot latch the camera moving.
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
-                    // Stage K (K4): F1 toggles the Debug window — never scene
-                    // input. (With the scratch field focused, egui consumes
-                    // F1 first; release focus with Esc, then F1.)
-                    #[cfg(feature = "egui-ui")]
-                    if code == KeyCode::F1 && pressed {
-                        if let Some(egui) = state.egui.as_mut() {
-                            egui.debug_open = !egui.debug_open;
+                    let chord = state.modifiers.super_key() || state.modifiers.control_key();
+                    match route_key(egui_consumed, pressed, chord, code) {
+                        KeyRoute::Drop => {}
+                        // Stage K (K4): F1 toggles the Debug window — never
+                        // scene input. (With a text field focused, egui
+                        // consumes F1 first; release focus with Esc, then F1.)
+                        KeyRoute::DebugPanel => {
+                            #[cfg(feature = "egui-ui")]
+                            if let Some(egui) = state.egui.as_mut() {
+                                egui.debug_open = !egui.debug_open;
+                            }
                         }
-                        return;
-                    }
-                    #[cfg(feature = "egui-ui")]
-                    if code == KeyCode::F7 && pressed {
-                        if let Some(egui) = state.egui.as_mut() {
-                            egui.session_browser_open = !egui.session_browser_open;
+                        KeyRoute::SessionsPanel => {
+                            #[cfg(feature = "egui-ui")]
+                            if let Some(egui) = state.egui.as_mut() {
+                                egui.session_browser_open = !egui.session_browser_open;
+                            }
                         }
-                        return;
-                    }
-                    // Esc releases the pointer grab (and is not camera input).
-                    if code == KeyCode::Escape && pressed {
-                        state.ungrab();
-                    } else if code == KeyCode::Backquote && pressed {
+                        // Esc releases the pointer grab (and is not camera input).
+                        KeyRoute::Ungrab => state.ungrab(),
                         // Backquote toggles mouse-look grab — an always-available
                         // alternative to holding the right button (trackpads,
                         // mice without a usable right button, accessibility).
-                        if state.grabbed {
-                            state.ungrab();
-                        } else {
-                            state.grab();
+                        KeyRoute::ToggleGrab => {
+                            if state.grabbed {
+                                state.ungrab();
+                            } else {
+                                state.grab();
+                            }
                         }
-                    } else {
-                        state.scene.on_key(&self.ctx, code, pressed);
-                        state.window.request_redraw();
+                        KeyRoute::Scene => {
+                            state.scene.on_key(&self.ctx, code, pressed);
+                            state.window.request_redraw();
+                        }
                     }
                 }
             }
+            // Consumed by egui (e.g. click on a panel, a focused widget):
+            // never routed to the scene.
+            _ if egui_consumed => {}
             // Stage G: LEFT click picks (only while the pointer is NOT
             // grabbed); RIGHT press grabs for mouse-look. (The release arm
             // lives above the egui-consumed arm — see the K2 note there.)
