@@ -14,6 +14,7 @@ const SHAPE: FieldShape<'static> = FieldShape {
     label_prefix: "",
     shader_label: "glyph_field.wgsl",
     shader_source: crate::GLYPH_FIELD_WGSL,
+    quad_height: crate::QUAD_HEIGHT,
     extra_layout: &[],
     extra_entries: &[],
 };
