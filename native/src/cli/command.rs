@@ -168,7 +168,7 @@ impl Cli {
                     deck_scroll_offset: self.deck_scroll_offset,
                     desk_revision_limit: self.desk_revision_limit,
                     desk_scroll_offset: 0,
-                    max_file_stacks: 20,
+                    max_file_stacks: self.max_file_stacks,
                     active_beat: None,
                 },
                 cached_session: std::sync::Arc::new(std::sync::RwLock::new(None)),

@@ -136,6 +136,9 @@ pub struct Cli {
     /// Sliding window limit for Agent Carrel workdesk file revisions (default 20)
     #[arg(long, value_name = "N", default_value_t = 20)]
     pub desk_revision_limit: usize,
+    /// Maximum number of file stacks placed on the Agent Carrel workdesk (default 20)
+    #[arg(long, value_name = "N", default_value_t = 20)]
+    pub max_file_stacks: usize,
     /// Tile the file N times (stress)
     #[arg(long, value_name = "N", default_value_t = 1)]
     pub copies: u32,

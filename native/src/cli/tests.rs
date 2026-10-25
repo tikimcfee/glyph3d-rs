@@ -366,6 +366,28 @@ fn pick_row_after_verb_panics() {
 }
 
 #[test]
+fn carrel_window_flags_reach_the_session_choice() {
+    // Every slider of the Carrel window has a flag (2026-10-24: the workdesk's
+    // file-stack cap was the one without, hardcoded 20 at launch), so each
+    // slider's line on the command bus is a real command line.
+    let options = |args: &[&str]| {
+        let CliCommand::Render(plan) = parse(args).action() else { panic!("an --agent-session run renders") };
+        let SceneChoice::AgentSession { layout_options, .. } = plan.choice else { panic!("an agent-session scene") };
+        layout_options
+    };
+    let defaults = options(&["--agent-session", "/s.jsonl"]);
+    assert_eq!(defaults, crate::spatial_scene::CarrelLayoutOptions::default());
+    let set = options(&[
+        "--agent-session", "/s.jsonl", "--deck-window-limit", "7", "--deck-scroll-offset", "2",
+        "--desk-revision-limit", "9", "--max-file-stacks", "11",
+    ]);
+    assert_eq!(
+        (set.deck_window_limit, set.deck_scroll_offset, set.desk_revision_limit, set.max_file_stacks),
+        (7, 2, 9, 11)
+    );
+}
+
+#[test]
 fn the_fallible_op_builder_refuses_instead_of_panicking() {
     // The same stray --pick-row the launch CLI panics on, as an Err the
     // windowed console can show (2026-10-24).
