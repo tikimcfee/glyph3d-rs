@@ -297,9 +297,16 @@ its staging text predates C22). Key touchpoints:
 
 ## Debug env vars
 
-- `GLYPH_PROFILE=1` — requests TIMESTAMP_QUERY and builds a wgpu-profiler;
+- `GLYPH_PROFILE=1` — builds a wgpu-profiler (and requests
+  TIMESTAMP_QUERY_INSIDE_PASSES; TIMESTAMP_QUERY itself is requested
+  wherever the adapter has it, with or without the variable);
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
-  Without it the device is created exactly as before (zero-cost Option).
+  Without it every profiling call site is a no-op `Option`. The profiler
+  holds at most `gpu::PROFILER_PENDING_FRAMES` frames unread, because each
+  is a Metal counter sample buffer and the M2 has 32 (C36); offscreen waits
+  for the oldest frame at that cap, so it measures every frame. The wait
+  costs no throughput there: `g-pick-repo`, 600 frames on the M2, 324-325
+  fps unprofiled and 326-327 profiled (2026-10-24; the run is GPU-bound).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument: `repo.{walk,backend,verify,views,layout,staged,segments}` and
   `hyper.{pass1,pass2,emoji_tints,pass2.windowed,staging.stream}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`

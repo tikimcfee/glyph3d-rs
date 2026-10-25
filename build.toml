@@ -26,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 394
+test_floor = 395
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1194,6 +1194,28 @@ op = "replace"
 find = "            to: \"    let fw = foot_fwidth(in);\".to_string(),"
 with = "            to: \"    let fw = fwidth(in.glyph_uv);\".to_string(),"
 expect = "every_anchor_is_replaced_and_the_helpers_appended"
+
+[[mutation]]
+name = "profiler-pending-cap-restored"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C36 (2026-10-24): every frame the profiler holds before its timestamps are read back keeps a query set alive, and on Metal a query set is an MTLCounterSampleBuffer, of which the M2 allocates 32 at most. At the old cap of 64, an offscreen run that outpaced the GPU asked for a 33rd, the allocation failed and took the device with it, and the screenshot readback panicked with BufferAsyncError (measured: 32 frames clean, 33 panicked). Restoring 64 takes the offscreen wait's threshold up with it, so the loop never waits before the M2 runs out. CONSUMED BY: GpuProfilerSettings::max_num_pending_frames and the offscreen loop's wait (offscreen.rs), judged by native/tests/profile_offscreen.rs (a 60-frame GLYPH_PROFILE run exits 0 and measures every frame). Scoped to metal-apple: a host with more query sets to give runs 64 pending frames clean"
+file = "native/src/gpu.rs"
+op = "replace"
+find = "pub const PROFILER_PENDING_FRAMES: usize = 8;"
+with = "pub const PROFILER_PENDING_FRAMES: usize = 64;"
+expect = "a_profiled_offscreen_run_measures_every_frame"
+
+[[mutation]]
+name = "profiler-offscreen-wait-dropped"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C36 (2026-10-24): at the pending-frame cap the profiler drops frames unmeasured, and offscreen encodes far faster than the GPU draws, so the loop waits for the oldest profiled frame whenever the cap is reached. Without the wait the run survives (the cap still bounds the query sets) but the profile measures a fraction of its frames, and its means describe whichever frames happened to finish. CONSUMED BY: the offscreen frame loop's profiler drain (offscreen.rs), judged by native/tests/profile_offscreen.rs (measured == 60). Scoped to metal-apple, where the loop is measured outrunning the GPU; whether another host's GPU keeps up unaided was not measured"
+file = "native/src/offscreen.rs"
+op = "replace"
+find = "                if profiled_in_flight.len() < crate::gpu::PROFILER_PENDING_FRAMES {"
+with = "                if profiled_in_flight.len() < usize::MAX {"
+expect = "a_profiled_offscreen_run_measures_every_frame"
 
 [[mutation]]
 name = "visible-stale-segment-tail"

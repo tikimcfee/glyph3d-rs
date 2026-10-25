@@ -383,6 +383,15 @@ impl GpuProfile {
     }
 }
 
+/// How many closed frames the profiler may hold before their timestamps are
+/// read back. Each one keeps a query set alive, and on Metal a query set is
+/// an `MTLCounterSampleBuffer`, of which the M2 allocates 32 at most: the
+/// 33rd failed ("Cannot allocate sample buffer", measured 2026-10-24) and
+/// took the device with it, so the offscreen readback panicked (C36). The
+/// cap was 64 until then. Past it the profiler drops frames unmeasured,
+/// which is why offscreen waits for the oldest frame before reaching it.
+pub const PROFILER_PENDING_FRAMES: usize = 8;
+
 /// Logged adapter identity, kept around for diagnostics.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
@@ -636,12 +645,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
             wgpu_profiler::GpuProfilerSettings {
                 enable_timer_queries: true,
                 enable_debug_groups: false,
-                // Higher than the suggested 2-4: offscreen runs submit many
-                // frames before their query maps complete (CPU outpaces the
-                // GPU in short verification runs), and frames beyond the cap
-                // are dropped unmeasured. Windowed drains every frame, so it
-                // never approaches this. Cost is a few tiny query buffers.
-                max_num_pending_frames: 64,
+                max_num_pending_frames: PROFILER_PENDING_FRAMES,
             },
         ) {
             Ok(p) => {
