@@ -1,0 +1,18 @@
+[2026-09-02T03:19:30Z INFO  glyph3d_native::gpu] instance flags: InstanceFlags(0x0)
+[2026-09-02T03:19:30Z INFO  glyph3d_native::gpu] adapter: name="Apple M2" backend=Metal vendor=0x0000 device=0x0000 driver=""
+[2026-09-02T03:19:30Z INFO  glyph3d_native::gpu] adapter features: INDIRECT_FIRST_INSTANCE=true MULTI_DRAW_INDIRECT_COUNT=false
+[2026-09-02T03:19:30Z INFO  glyph3d_native::gpu] device limits: max_storage_buffer_binding_size=9534832640 (9093 MiB) max_buffer_size=9534832640 (9093 MiB)
+[2026-09-02T03:19:30Z INFO  glyph3d_native] cull path: GpuPacked (--cull gpu-packed)
+[2026-09-02T03:19:34Z INFO  glyph3d_native::repo] layout: target_w 15105, field 15086x22682
+repo: 1305 files, 97.0 MB source (75 dirs walked, 4 skipped >10 MiB, 0 skipped non-UTF-8)
+repo: 96877426 engine records -> 95197527 glyph instances (1679899 blank/missing dropped) | engine path: naive per-file
+phases: walk 0.207s | engine 1.996s (48.6 MB/s) | stage 1.495s | layout 0.000s | total 3.698s
+[2026-09-02T03:19:34Z INFO  glyph3d_native::atlas] atlas: 4431 slots, 82239 curves (1024x161), 5349 mapped codepoints, fonts upem=2048 cell=1229fu em=2320fu
+[2026-09-02T03:19:34Z INFO  glyph3d_native::repo] field bounds: x [0, 15086], y [-22682, 1.2] — 15086x22683 world units
+[2026-09-02T03:19:37Z INFO  glyph3d_native::glyph_scene] glyph field: 95197527 instances (4357 MiB) in 2 chunk(s) of ≤89478485 (4095 MiB binding limit), 1305 groups
+[2026-09-02T03:19:37Z INFO  glyph3d_native::glyph_scene] cull: 1305 segments (GpuPacked frustum+LOD) | backdrop buffer 41760 B (KB-scale, no instance-sized buffers added)
+[2026-09-02T03:19:37Z INFO  glyph3d_native::glyph_scene] cull (GpuPacked): 1305 segments → 1306 draw slots over 2 chunk(s) | segment table 62640 B, draw args 20896 B (one packed draw_indirect per chunk, draw_indirect for backdrops)
+[2026-09-02T03:19:37Z INFO  glyph3d_native::offscreen] offscreen: 1600x1000 Rgba8UnormSrgb, rendering 900 frame(s) of 95197527 instances
+offscreen: 900 frame(s) x 95197527 instances | submit+render 2.34s (2.60ms/frame) | readback wait 192.03ms | total 2.54s
+offscreen: steady-state ≈ 355.0 fps (900 frames GPU-completed in 2.53s)
+wrote /Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/multi-draw-indirect/out/tooling-ab/mdi-bench/exp-wide-gpu-packed-novalidation.png

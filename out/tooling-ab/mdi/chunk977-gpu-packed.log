@@ -1,0 +1,21 @@
+[2026-09-02T04:07:16Z INFO  glyph3d_native::gpu] instance flags: InstanceFlags(VALIDATION_INDIRECT_CALL)
+[2026-09-02T04:07:16Z INFO  glyph3d_native::gpu] adapter: name="Apple M2" backend=Metal vendor=0x0000 device=0x0000 driver=""
+[2026-09-02T04:07:16Z INFO  glyph3d_native::gpu] adapter features: INDIRECT_FIRST_INSTANCE=true MULTI_DRAW_INDIRECT_COUNT=false
+[2026-09-02T04:07:16Z INFO  glyph3d_native::gpu] device limits: max_storage_buffer_binding_size=4294967292 (4095 MiB) max_buffer_size=4294967295 (4095 MiB)
+[2026-09-02T04:07:16Z INFO  glyph3d_native] cull path: GpuPacked (--cull gpu-packed)
+[2026-09-02T04:07:16Z INFO  glyph3d_native::repo] layout: target_w 139, field 90x171
+repo: 4 files, 0.0 MB source (2 dirs walked, 0 skipped >10 MiB, 0 skipped non-UTF-8)
+repo: 11168 engine records -> 10857 glyph instances (311 blank/missing dropped) | engine path: naive per-file
+phases: walk 0.000s | engine 0.001s (12.4 MB/s) | stage 0.000s | layout 0.000s | total 0.001s
+[2026-09-02T04:07:16Z INFO  glyph3d_native::atlas] atlas: 4431 slots, 82239 curves (1024x161), 5349 mapped codepoints, fonts upem=2048 cell=1229fu em=2320fu
+[2026-09-02T04:07:16Z INFO  glyph3d_native::repo] field bounds: x [0, 90], y [-171, 1.2] — 90x172 world units
+[2026-09-02T04:07:16Z INFO  glyph3d_native::glyph_scene] GLYPH_CHUNK_CAP: arena chunk cap forced to 977 instances
+[2026-09-02T04:07:16Z INFO  glyph3d_native::glyph_scene] glyph field: 10857 instances (0 MiB) in 12 chunk(s) of ≤977 (4095 MiB binding limit), 4 groups
+[2026-09-02T04:07:16Z INFO  glyph3d_native::glyph_scene] cull: 4 segments (GpuPacked frustum+LOD) | backdrop buffer 128 B (KB-scale, no instance-sized buffers added)
+[2026-09-02T04:07:16Z INFO  glyph3d_native::glyph_scene] cull (GpuPacked): 4 segments → 15 draw slots over 12 chunk(s) | segment table 192 B, draw args 240 B (one packed draw_indirect per chunk, draw_indirect for backdrops)
+[2026-09-02T04:07:16Z INFO  glyph3d_native::offscreen] offscreen: 1600x1000 Rgba8UnormSrgb, rendering 2 frame(s) of 10857 instances
+CULLDBG (gpu path; cpu twin says) glyph draws=15 instances=10857 | backdrops=0
+offscreen: 2 frame(s) x 10857 instances | submit+render 1.52ms (760.25µs/frame) | readback wait 8.70ms | total 15.37ms
+offscreen: steady-state ≈ 195.6 fps (2 frames GPU-completed in 10.22ms)
+wrote /Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/multi-draw-indirect/out/tooling-ab/mdi/chunk977-gpu-packed.png
+cull-verify: EXACT — [GpuPacked] glyph draws gpu 15 vs cpu 15 over 12 chunk(s) (15 slots), backdrops gpu 0 vs cpu 0 (bytes equal)

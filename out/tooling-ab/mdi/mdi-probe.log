@@ -1,0 +1,19 @@
+mdi-probe — indirect draws with first_instance != 0: device-configuration matrix
+adapter: Apple M2 (Metal) | adapter features: INDIRECT_FIRST_INSTANCE=true MULTI_DRAW_INDIRECT_COUNT=false
+  A: features=EMPTY                   validation=on  (the Stage F-J device)
+  B: features=INDIRECT_FIRST_INSTANCE validation=on  (the fix)
+  C: features=EMPTY                   validation=OFF (informational; wgpu: UB)
+
+case                                                        | A observed                     | B observed                     | C observed [info]             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+direct draw(0..6, 5..10) [control]                          | {5..10} ok                     | {5..10} ok                     | {5..10}                       
+draw_indirect first_instance=0                              | {0..5} ok                      | {0..5} ok                      | {0..5}                        
+draw_indirect first_instance=7                              | ∅ ok                           | {7..12} ok                     | {7..12}                       
+draw_indexed_indirect first_instance=9                      | ∅ ok                           | {9..12} ok                     | {9..12}                       
+multi_draw_indirect x2 [fi=0 | fi=50]                       | {0..2} ok                      | {0..2, 50..52} ok              | {0..2, 50..52}                
+multi_draw_indirect x4 (one zero-instance pad slot)         | ∅ ok                           | {20..23, 30..32, 40..44} ok    | {20..23, 30..32, 40..44}      
+compute cull -> multi_draw_indirect(8), view [2,5)          | ∅ ok                           | {16..20, 24..28, 32..36} ok    | {16..20, 24..28, 32..36}      
+compute cull -> multi_draw_indirect(8), view [0,1.5)        | {0..4} ok                      | {0..4, 8..12} ok               | {0..4, 8..12}                 
+draw_indirect first_instance=1_500_000 (chunk-scale offset) | ∅ ok                           | {1500000..1500003} ok          | {1500000..1500003}            
+
+RESULT: PASS (18/18 graded expectations met; A = spec no-op without the feature, B = draws land with it)

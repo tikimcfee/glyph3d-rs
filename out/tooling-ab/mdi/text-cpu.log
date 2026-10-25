@@ -1,0 +1,14 @@
+[2026-09-02T04:07:15Z INFO  glyph3d_native::gpu] instance flags: InstanceFlags(VALIDATION_INDIRECT_CALL)
+[2026-09-02T04:07:15Z INFO  glyph3d_native::gpu] adapter: name="Apple M2" backend=Metal vendor=0x0000 device=0x0000 driver=""
+[2026-09-02T04:07:15Z INFO  glyph3d_native::gpu] adapter features: INDIRECT_FIRST_INSTANCE=true MULTI_DRAW_INDIRECT_COUNT=false
+[2026-09-02T04:07:15Z INFO  glyph3d_native::gpu] device limits: max_storage_buffer_binding_size=4294967292 (4095 MiB) max_buffer_size=4294967295 (4095 MiB)
+[2026-09-02T04:07:15Z INFO  glyph3d_native] cull path: Cpu (--cull cpu)
+[2026-09-02T04:07:15Z INFO  glyph3d_native::atlas] atlas: 4431 slots, 82239 curves (1024x161), 5349 mapped codepoints, fonts upem=2048 cell=1229fu em=2320fu
+[2026-09-02T04:07:15Z INFO  glyph3d_native] staged fixtures/baseline-view.txt: 691 codepoints → 691 glyph instances (1 copies, 0 missing/bitmap)
+[2026-09-02T04:07:15Z INFO  glyph3d_native::glyph_scene] glyph field: 691 instances (0 MiB) in 1 chunk(s) of ≤89478485 (4095 MiB binding limit), 1 groups
+[2026-09-02T04:07:15Z INFO  glyph3d_native::glyph_scene] cull: 1 segments (Cpu frustum+LOD) | backdrop buffer 32 B (KB-scale, no instance-sized buffers added)
+[2026-09-02T04:07:15Z INFO  glyph3d_native::offscreen] offscreen: 1600x1000 Rgba8UnormSrgb, rendering 2 frame(s) of 691 instances
+CULLDBG glyph draws=1 instances=691 | backdrops=0
+offscreen: 2 frame(s) x 691 instances | submit+render 1.06ms (529.02µs/frame) | readback wait 3.66ms | total 9.14ms
+offscreen: steady-state ≈ 423.5 fps (2 frames GPU-completed in 4.72ms)
+wrote /Users/lugo/localdev/viz-native/glyph3d-native/.claude/worktrees/multi-draw-indirect/out/tooling-ab/mdi/text-cpu.png
