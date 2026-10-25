@@ -97,7 +97,8 @@ WINDOWED MODE:
   Esc releases | interact: LEFT click = pick glyph, h highlight line,
   g grab file (mouse drags, scroll scales), t tint, x hide |
   F1 toggle Debug panel, F2 save screenshot (out/windowed-shot-*.png;
-  GLYPH_POSE_PRINT=1 also prints the frame's --cam-pose), F8 toggle the field HUD |
+  GLYPH_POSE_PRINT=1 also prints the frame's --cam-pose), F8 toggle the field HUD,
+  F9 toggle the console (the command bus's REPL: `help` lists its lines) |
   --screenshot-frame N --screenshot-out PATH: scripted capture, keeps running";
 
 /// Stage H: clap-derive CLI. Semantics (flags, defaults, op-stream order) are

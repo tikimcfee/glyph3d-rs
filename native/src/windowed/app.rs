@@ -583,6 +583,7 @@ impl App<'_> {
             println!("debug panel: F1 toggles the egui Debug window (sliders tune the LOD threshold live)");
             println!("agent sessions: F7 toggles the Agent Sessions browser");
             println!("field HUD: F8 toggles the top-left field readout (mode, cull tiers, per-frame ms)");
+            println!("console: F9 toggles the command console (every panel action logs its line there; `help` lists them)");
         }
         println!("screenshot: F2 saves the next presented frame to out/windowed-shot-<timestamp>.png (GLYPH_POSE_PRINT=1 also prints its --cam-pose)");
 
@@ -722,12 +723,16 @@ impl App<'_> {
                             | PhysicalKey::Code(KeyCode::F5)
                             | PhysicalKey::Code(KeyCode::F6)
                             | PhysicalKey::Code(KeyCode::F8)
+                            | PhysicalKey::Code(KeyCode::F9)
                     ) =>
             {
                 use super::bus::lines;
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::F2) => state.push_line(lines::SHOT),
                     PhysicalKey::Code(KeyCode::F8) => state.push_line(lines::PANEL_HUD),
+                    // F9 works while typing so it can close the console it
+                    // is typing in.
+                    PhysicalKey::Code(KeyCode::F9) => state.push_line(lines::PANEL_CONSOLE),
                     PhysicalKey::Code(KeyCode::F3) => state.push_line(lines::LIVE_NEXT),
                     PhysicalKey::Code(KeyCode::F4) => state.push_line(lines::LIVE_PREV),
                     PhysicalKey::Code(KeyCode::F5) => state.push_line(lines::LIVE_RESET),

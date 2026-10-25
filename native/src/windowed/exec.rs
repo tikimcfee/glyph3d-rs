@@ -18,6 +18,8 @@ use super::app::apply_relayout;
 use super::bus::{self, AppCommand, Command, FlyTarget, PanelId};
 use super::state::{cam_pose_arg, WindowState};
 use super::{utc_stamp, LiveSource, LiveStep};
+#[cfg(feature = "egui-ui")]
+use super::panels::console::LogEntry;
 
 /// The `App` fields a command may touch, borrowed disjointly from the
 /// window state (the free-function pattern `apply_relayout` already uses:
@@ -39,7 +41,19 @@ impl WindowState {
     pub(super) fn push_line(&mut self, line: &str) {
         match bus::parse_line(line) {
             Ok(parsed) => self.commands.push(parsed),
-            Err(e) => println!("bus: {line:?} refused: {e}"),
+            Err(e) => {
+                println!("bus: {line:?} refused: {e}");
+                #[cfg(feature = "egui-ui")]
+                self.log(LogEntry::Refused(format!("{line}: {e}")));
+            }
+        }
+    }
+
+    /// Append to the console's log (none without the overlay).
+    #[cfg(feature = "egui-ui")]
+    fn log(&mut self, entry: LogEntry) {
+        if let Some(egui) = self.egui.as_mut() {
+            egui.shell.log.push(entry);
         }
     }
 }
@@ -51,14 +65,19 @@ pub(super) fn drain(host: &mut Host<'_>, state: &mut WindowState) -> bool {
     #[cfg(feature = "egui-ui")]
     if let Some(reply) = finish_fly(host, state) {
         println!("{reply}");
+        state.log(LogEntry::Reply(reply));
         ran = true;
     }
     for parsed in std::mem::take(&mut state.commands) {
         ran = true;
         log::info!("bus: {}", parsed.line);
+        #[cfg(feature = "egui-ui")]
+        state.log(LogEntry::Line(parsed.line));
         for command in parsed.commands {
             if let Some(reply) = execute(host, state, command) {
                 println!("{reply}");
+                #[cfg(feature = "egui-ui")]
+                state.log(LogEntry::Reply(reply));
             }
         }
     }
@@ -190,7 +209,21 @@ fn app_command(host: &mut Host<'_>, state: &mut WindowState, command: AppCommand
             use clap::CommandFactory;
             Some(crate::cli::Cli::command().render_long_help().to_string())
         }
+        AppCommand::ClearLog => clear_log(state),
     }
+}
+
+#[cfg(feature = "egui-ui")]
+fn clear_log(state: &mut WindowState) -> Option<String> {
+    if let Some(egui) = state.egui.as_mut() {
+        egui.shell.log.clear();
+    }
+    None
+}
+
+#[cfg(not(feature = "egui-ui"))]
+fn clear_log(_state: &mut WindowState) -> Option<String> {
+    Some("clear: there is no log without the egui overlay".to_string())
 }
 
 #[cfg(feature = "egui-ui")]
@@ -200,8 +233,13 @@ fn toggle_panel(state: &mut WindowState, panel: PanelId) -> Option<String> {
         PanelId::Debug => &mut shell.debug_open,
         PanelId::Hud => &mut shell.hud_open,
         PanelId::Sessions => &mut shell.session_browser_open,
+        PanelId::Console => &mut shell.console_open,
     };
     *open = !*open;
+    // An opened console takes the keyboard, so F9 then typing just works.
+    if panel == PanelId::Console && shell.console_open {
+        shell.console.focus = true;
+    }
     None
 }
 
@@ -211,6 +249,7 @@ fn toggle_panel(_state: &mut WindowState, panel: PanelId) -> Option<String> {
         PanelId::Debug => "debug",
         PanelId::Hud => "hud",
         PanelId::Sessions => "sessions",
+        PanelId::Console => "console",
     };
     Some(format!("panel {name}: built without the egui overlay"))
 }

@@ -381,6 +381,7 @@ impl WindowState {
                 super::panels::debug::show(ctx, snap, cell, fps, shell, panel_lines);
                 super::panels::carrel::show(ctx, snap, panel_lines);
                 super::panels::sessions::show(ctx, shell, panel_lines);
+                super::panels::console::show(ctx, shell, panel_lines);
             });
             let egui::FullOutput {
                 platform_output,
