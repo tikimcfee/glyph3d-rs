@@ -101,35 +101,25 @@ pub(super) fn apply_relayout(
             note += &format!("field_mode -> {:?} ", new_mode);
         }
     }
-    // The cluster toggle rides any scene whose choice carries the mode —
-    // repo and text alike (SceneChoice::Text has carried it since the pass
-    // landed; the panel seed for text scenes is GlyphScene's
-    // probe_cluster_mode).
-    if req.toggle_cluster {
-        let mode = match choice {
-            SceneChoice::Repo { cluster_mode, .. } | SceneChoice::Text { cluster_mode, .. } => {
-                Some(cluster_mode)
+    // The cluster mode rides any scene whose choice carries it — repo and
+    // text alike (SceneChoice::Text has carried it since the pass landed;
+    // the panel seed for text scenes is GlyphScene's probe_cluster_mode).
+    if let Some(new_mode) = req.cluster_mode {
+        if let SceneChoice::Repo { cluster_mode, .. } | SceneChoice::Text { cluster_mode, .. } = choice {
+            if *cluster_mode != new_mode {
+                *cluster_mode = new_mode;
+                changed = true;
+                note += &format!("cluster_mode -> {new_mode:?} ");
             }
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            *mode = match *mode {
-                crate::fold::ClusterMode::Leader => crate::fold::ClusterMode::Cluster,
-                crate::fold::ClusterMode::Cluster => crate::fold::ClusterMode::Leader,
-            };
-            changed = true;
-            note += &format!("cluster_mode -> {mode:?} ");
         }
     }
-    if req.toggle_layout {
+    if let Some(new_mode) = req.layout_mode {
         if let SceneChoice::Repo { layout_mode, .. } = choice {
-            *layout_mode = match *layout_mode {
-                crate::repo::RepoLayoutMode::Shelf => crate::repo::RepoLayoutMode::Carrel,
-                crate::repo::RepoLayoutMode::Carrel => crate::repo::RepoLayoutMode::Library,
-                crate::repo::RepoLayoutMode::Library => crate::repo::RepoLayoutMode::Shelf,
-            };
-            changed = true;
-            note += &format!("layout_mode -> {:?} ", *layout_mode);
+            if *layout_mode != new_mode {
+                *layout_mode = new_mode;
+                changed = true;
+                note += &format!("layout_mode -> {new_mode:?} ");
+            }
         }
     }
     if !changed {
@@ -189,18 +179,45 @@ pub(super) fn apply_relayout(
     );
 }
 
-/// What the panel asked the rebuild arm to change. Either field alone may be
-/// set; the arm applies both and rebuilds only if one actually moved.
+/// What the panel asked the rebuild arm to change. Any field alone may be
+/// set; the arm applies every one that is and rebuilds only if one actually
+/// moved. Every field is an absolute value, never a toggle (2026-10-24: the
+/// cluster and layout modes were `toggle_*` flags, which no CLI flag
+/// spells): the asker computes the next value from the current one
+/// (`next_layout_mode`, `other_cluster_mode`), so every request is a value a
+/// `--cluster-mode` or `--layout-mode` flag could carry.
 #[cfg(feature = "egui-ui")]
 #[derive(Clone, Default)]
 pub(super) struct RelayoutRequest {
     pub(super) z_wrap_spacing: Option<f64>,
-    pub(super) toggle_cluster: bool,
-    pub(super) toggle_layout: bool,
+    pub(super) cluster_mode: Option<crate::fold::ClusterMode>,
+    pub(super) layout_mode: Option<crate::repo::RepoLayoutMode>,
     pub(super) switch_agent_session: Option<std::path::PathBuf>,
     pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
     pub(super) set_strategy: Option<crate::repo::Strategy>,
     pub(super) set_field_mode: Option<glyph_field::GlyphFieldMode>,
+}
+
+/// The canvas layout after `mode` in the F6 cycle: shelf → carrel → library
+/// → shelf.
+#[cfg(feature = "egui-ui")]
+pub(super) fn next_layout_mode(mode: crate::repo::RepoLayoutMode) -> crate::repo::RepoLayoutMode {
+    use crate::repo::RepoLayoutMode as M;
+    match mode {
+        M::Shelf => M::Carrel,
+        M::Carrel => M::Library,
+        M::Library => M::Shelf,
+    }
+}
+
+/// The sequence-pass mode the toggle switches to from `mode`.
+#[cfg(feature = "egui-ui")]
+pub(super) fn other_cluster_mode(mode: crate::fold::ClusterMode) -> crate::fold::ClusterMode {
+    use crate::fold::ClusterMode as M;
+    match mode {
+        M::Leader => M::Cluster,
+        M::Cluster => M::Leader,
+    }
 }
 
 pub(super) struct App<'a> {
@@ -250,6 +267,29 @@ impl App<'_> {
         } else {
             "fieldzed live".to_string()
         })
+    }
+}
+
+#[cfg(all(test, feature = "egui-ui"))]
+mod tests {
+    use super::{next_layout_mode, other_cluster_mode};
+    use crate::fold::ClusterMode;
+    use crate::repo::RepoLayoutMode;
+
+    #[test]
+    fn relayout_requests_cycle_from_the_current_value() {
+        // F6 and the panel's layout button: every mode, then back to the start.
+        let mut seen = vec![RepoLayoutMode::Shelf];
+        for _ in 0..3 {
+            seen.push(next_layout_mode(*seen.last().unwrap()));
+        }
+        assert_eq!(
+            seen,
+            [RepoLayoutMode::Shelf, RepoLayoutMode::Carrel, RepoLayoutMode::Library, RepoLayoutMode::Shelf]
+        );
+        // The cluster button: always the other mode, never the same one.
+        assert_eq!(other_cluster_mode(ClusterMode::Leader), ClusterMode::Cluster);
+        assert_eq!(other_cluster_mode(ClusterMode::Cluster), ClusterMode::Leader);
     }
 }
 
@@ -628,10 +668,12 @@ impl App<'_> {
                         }
                     }
                     PhysicalKey::Code(KeyCode::F6) => {
+                        // The next mode from the scene choice itself, so F6
+                        // needs no probe (and works under --no-ui).
                         #[cfg(feature = "egui-ui")]
-                        {
+                        if let SceneChoice::Repo { layout_mode, .. } = &self.choice {
                             state.pending_relayout = Some(RelayoutRequest {
-                                toggle_layout: true,
+                                layout_mode: Some(next_layout_mode(*layout_mode)),
                                 ..Default::default()
                             });
                             state.window.request_redraw();
