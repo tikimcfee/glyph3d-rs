@@ -36,7 +36,7 @@ pub mod views;
 pub mod windowed;
 
 pub use atlas::default_trie;
-pub use cli::{Op, parse_verb};
+pub use cli::{Op, apply_op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
 #[cfg(feature = "wgpu")]
 pub use gpu::GpuContext;

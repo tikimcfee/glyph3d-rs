@@ -57,7 +57,9 @@
 # Derived wgsl validation, the profile's footprint choice, the host-scoped
 # mutation rule, the oblique repeat witness and the profiled offscreen run
 # (there 386 -> 395, counted with the Instanced and Visible crates' share).
-test_floor = 353
+# 353 -> 354 (2026-11-01): VERB_HEADS against parse_verb, ported from the
+# second clone's interface-shell branch.
+test_floor = 354
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

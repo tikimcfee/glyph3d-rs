@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use crate::glyph_scene::{PickCommand, Verb};
+use crate::scene::SceneLike;
 use super::args::RawOps;
 
 /// Stage G: one scripted operation (picks and verbs interleave in CLI order).
@@ -13,6 +14,26 @@ pub enum Op {
     /// S3 spike: apply a Zed-sidecar highlight to instance colors (offscreen,
     /// before the first frame — same op-stream slot as picks/verbs).
     Highlight(PathBuf),
+}
+
+/// Apply one op to a scene: the one applier for every host that runs the op
+/// stream (2026-10-24, ported 2026-11-01): the offscreen run, the window's
+/// startup ops and the makepad host's were three copies of one match. The
+/// reply is the scene's line; `None` is a scene that does not take the op,
+/// and `--cam-pose` replies `None` too, as it always has. Each caller keeps
+/// its own handling of `None`: offscreen prints its "does not support" line
+/// for both, which is its stdout as it was.
+pub fn apply_op(scene: &mut dyn SceneLike, op: &Op) -> Option<String> {
+    match op {
+        Op::Pick(p) => scene.apply_pick(p),
+        Op::Verb(v) => scene.apply_verb(v),
+        Op::CamPose(eye, yaw, pitch) => {
+            scene.set_cam_pose(*eye, *yaw, *pitch);
+            None
+        }
+        // S3 spike: Zed-sidecar highlight — one op, applied like a verb.
+        Op::Highlight(p) => scene.apply_highlight_sidecar(p),
+    }
 }
 
 /// --pick-row/--pick-col upgrade the most recent --pick-file pick into a
@@ -40,6 +61,35 @@ pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<
     }
 }
 
+/// Every `--verb` head `parse_verb` knows, in its usage order. Its usage
+/// line is built from this list (byte-identical to the literal it replaced,
+/// which `verb_error_messages_survive` reads), so a host listing the verbs
+/// (a panel, a palette) lists what the CLI parses.
+pub const VERB_HEADS: &[&str] = &[
+    "recolor-glyph",
+    "recolor-line",
+    "nudge-glyph",
+    "scale-glyph",
+    "move-group",
+    "scale-group",
+    "tint-group",
+    "tint-cycle",
+    "hide-group",
+    "show-group",
+    "toggle-hidden",
+    "set-glyph-background",
+    "set-glyph-transform",
+    "reset-glyph-group",
+    "page-next",
+    "page-prev",
+    "page-first",
+    "page-last",
+    "page-to",
+    "form",
+    "library-stack",
+    "library-sort",
+];
+
 /// Parse a `--verb` string into a Verb (clap `value_parser`). Forms:
 ///   recolor-glyph `[rrggbb]`      recolor-line `[rrggbb]`
 ///   nudge-glyph dx dy `[dz]`      scale-glyph f
@@ -52,13 +102,7 @@ pub(crate) fn set_pick_row_col(ops: &mut Vec<Op>, row: Option<u32>, col: Option<
 /// so nothing scripted could reach them — the M3 witness needs one.)
 pub fn parse_verb(s: &str) -> Result<Verb, String> {
     let t: Vec<&str> = s.split_whitespace().collect();
-    let usage = format!(
-        "unknown/malformed --verb {s:?} — expected recolor-glyph|recolor-line|\
-         nudge-glyph|scale-glyph|move-group|scale-group|tint-group|tint-cycle|\
-         hide-group|show-group|toggle-hidden|set-glyph-background|\
-         set-glyph-transform|reset-glyph-group|page-next|page-prev|page-first|\
-         page-last|page-to|form|library-stack|library-sort"
-    );
+    let usage = format!("unknown/malformed --verb {s:?} — expected {}", VERB_HEADS.join("|"));
     let f = |i: usize| -> Result<f32, String> {
         t.get(i)
             .and_then(|v| v.parse().ok())
