@@ -68,6 +68,8 @@ use app::App;
 
 mod state;
 #[cfg(feature = "egui-ui")]
+mod selftest;
+#[cfg(feature = "egui-ui")]
 mod ui;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
