@@ -178,7 +178,6 @@ pub struct G3CarrelUiState {
     pub prompt_summary: String,
     /// `path (active: R2, total: 5)`, one per workdesk file.
     pub touched_files: Vec<String>,
-    pub bullet_color: [u8; 3],
 }
 
 /// The carrel's deck and desk dials. Ranges: deck window 5..=100 cards,

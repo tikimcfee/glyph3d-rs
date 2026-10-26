@@ -90,7 +90,36 @@ fn hud_lines(snap: &UiProbeState, fps: f32) -> Vec<String> {
     lines
 }
 
-fn debug_state(snap: &UiProbeState, selected_group: Option<u32>) -> G3DebugState {
+/// The browser's rows, converted once per scene: the probe's `files` are
+/// static for a scene's life (an `Rc` the probe keeps), so the rows are
+/// rebuilt only when that `Rc` is a new one.
+#[derive(Default)]
+pub struct FileRows {
+    /// The probe's `files` the rows were made from, held so its address
+    /// cannot be reused by another.
+    source: Option<Rc<dyn std::any::Any>>,
+    rows: Rc<Vec<G3FileRow>>,
+}
+
+impl FileRows {
+    fn of(&mut self, snap: &UiProbeState) -> Rc<Vec<G3FileRow>> {
+        let files = &snap.files;
+        let same = self.source.as_ref().is_some_and(|s| std::ptr::addr_eq(Rc::as_ptr(s), Rc::as_ptr(files)));
+        if !same {
+            self.rows = Rc::new(
+                files
+                    .iter()
+                    .map(|f| G3FileRow { rel_path: f.rel_path.clone(), depth: f.rel_path.matches('/').count(), group_id: f.group_id })
+                    .collect(),
+            );
+            let source: Rc<dyn std::any::Any> = files.clone();
+            self.source = Some(source);
+        }
+        self.rows.clone()
+    }
+}
+
+fn debug_state(snap: &UiProbeState, selected_group: Option<u32>, files: Rc<Vec<G3FileRow>>) -> G3DebugState {
     let camera = match snap.camera_mode {
         Some(CameraMode::Front { zoom }) => format!("Front(zoom {zoom:.2})"),
         Some(CameraMode::Orbit) => "Orbit".to_string(),
@@ -127,11 +156,6 @@ fn debug_state(snap: &UiProbeState, selected_group: Option<u32>) -> G3DebugState
             snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
         ),
     };
-    let files: Vec<G3FileRow> = snap
-        .files
-        .iter()
-        .map(|f| G3FileRow { rel_path: f.rel_path.clone(), depth: f.rel_path.matches('/').count(), group_id: f.group_id })
-        .collect();
     G3DebugState {
         camera_line: format!(
             "camera: {camera} eye=({:.2},{:.2},{:.2}) yaw={:.3} pitch={:.3} rad ({:.1}°, {:.1}°)",
@@ -177,7 +201,7 @@ fn debug_state(snap: &UiProbeState, selected_group: Option<u32>) -> G3DebugState
             }
             .to_string()
         }),
-        files: Rc::new(files),
+        files,
         file_dyn: snap.file_dyn.iter().map(|d| G3FileDyn { hidden: d.hidden, tint: d.tint }).collect(),
         selected_group,
     }
@@ -215,12 +239,11 @@ fn carrel_state(c: &UiCarrelState) -> G3CarrelUiState {
             .iter()
             .map(|(path, act, total)| format!("{path} (active: R{act}, total: {total})"))
             .collect(),
-        bullet_color: ui_colors.workdesk_bullet,
     }
 }
 
 /// The panels' state this frame.
-pub fn ui_state(host: &EngineHost) -> G3UiState {
+pub fn ui_state(host: &EngineHost, file_rows: &mut FileRows) -> G3UiState {
     let snap = host.probe.as_ref().map(|p| p.borrow().clone());
     G3UiState {
         fps: host.fps,
@@ -228,7 +251,7 @@ pub fn ui_state(host: &EngineHost) -> G3UiState {
         debug_open: host.debug_open,
         sessions_open: host.sessions_open,
         hud_lines: snap.as_ref().map(|s| hud_lines(s, host.fps)).unwrap_or_default(),
-        debug: snap.as_ref().map(|s| debug_state(s, host.scene.selected_group_id())),
+        debug: snap.as_ref().map(|s| debug_state(s, host.scene.selected_group_id(), file_rows.of(s))),
         carrel: snap.as_ref().and_then(|s| s.carrel.as_ref()).map(carrel_state),
         sessions: host.sessions.state(),
     }
