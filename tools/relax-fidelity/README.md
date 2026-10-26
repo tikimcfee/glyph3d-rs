@@ -26,7 +26,7 @@ cold compile under relax takes about three minutes; later runs reuse
 
 - `src/main.rs` runs float kernels over adversarial inputs (±0, subnormals, quiet
   and signalling NaNs with payloads, ties, cast edges, 2^k boundaries) and over
-  random ones. Each result is printed as its bits, about 589k lines. Each
+  random ones. Each result is printed as its bits, about 772k lines. Each
   operation is reached three ways: at run time through a function pointer on
   `black_box`ed inputs, on literals the optimiser may fold, and in `const`
   items. A 2^17-input sweep covers the transcendentals glyph3d calls, and
@@ -70,6 +70,11 @@ in every configuration: warm, cold cache with 16 repetitions, and
 | `a*b + c` written out (all four operand orders) | identical | **no contraction**: relax makes `FMulAdd` only from the `fma` intrinsic (lower.rs) and `simd_fma` (lower/simd.rs). 6,000 triples chosen so that fused and unfused results must differ came out unfused |
 | `mul_add` (f32, f64; negated operands) | identical values | relax core: `fma_native()` ? `vfmadd` : C `fma`/`fmaf`; rustc links compiler-builtins' `fmaf`/`fma`. All are correctly rounded |
 | `sqrt` | identical | `sqrtss`/`sqrtsd` |
+| identity folds `x*1`, `1*x`, `x/1`, `x-0.0`, `x+(-0.0)` (and `x+0.0`, which must not fold) | identical values | relax has the fold (`backend/src/passes.rs:1588-1607`, off under `MAKEPAD_RUN_NAN_EXACT`), but in the harness's closures it never fired on any tier: a signalling NaN came back quieted, which only the instruction does. rustc folds (LLVM instsimplify) and keeps the sNaN. So the difference is sNaN bits, in the opposite direction to the audit's reading. `x * -1.0`: rustc folds to a sign flip (`0xff800001`), relax multiplies (`0x7fc00001`). `x + 0.0` on `-0.0` gives `+0.0` on both, so neither folds it |
+| `x / c` with `1/c` an exact power of two (2, 0.5, 2^±126, 2^127, 2^-149; f64 2^1022, 2^1023, 2^-1074) | identical | each beside the same division by a `black_box`ed constant, over the subnormal and NaN inputs too |
+| `mul_add` at its edges: exact ties (13-bit operands, addend 0, ±tiny, ±half an ulp), products past `MAX` brought back by the addend, subnormal products | identical | 21,000 f32 and 21,000 f64 triples, under AVX (`vfmadd`) and under `MAKEPAD_RUN_NO_AVX=1` (C `fma`) |
+| wasm-export FMA (the f32-via-f64 double rounding and the f64 Dekker emulation, `backend/src/wasm.rs`) | **not covered** | only the native JIT was run; a native prove never reaches the wasm backend |
+| `std::simd` `mul_add` (`simd_fma`, emitted without a `cpu.fma` check) | **not covered** | `std::simd` is unstable on rustc 1.98, so there's no rustc side to compare; this host has FMA |
 | `floor ceil trunc round round_ties_even fract` | identical values | relax inlines `roundss` (and its own `round`); rustc calls compiler-builtins. Only a signalling NaN differs: relax quiets it |
 | `min`/`max`, both operands at run time | identical | including NaN handling |
 | `CONST.min(x)` / `CONST.max(x)` with `x == CONST`, opposite sign of zero | **differs (zero sign)** | rustc returns the constant, whichever side it is written on (consistent with LLVM putting a commutative `minnum`'s constant on the right, where `minss` returns it on equality). Relax returns `x` (other) in every case. Rust leaves this unspecified. Repro below |
@@ -80,7 +85,7 @@ in every configuration: warm, cold cache with 16 repetitions, and
 | `as` casts f→int (every width, saturation, NaN→0) and int→f (u64→f32 double-rounding traps, i128/u128) | identical | |
 | f32↔f64 conversion | identical except sNaN | LLVM deletes `(x as f64) as f32`, so rustc keeps a signalling NaN's bits; relax converts, which quiets it |
 | `to_bits`/`from_bits`, moves through memory | identical | NaN payloads survive |
-| NaN payload and sign through arithmetic | **differs** | which input NaN propagates when two are NaN (operand order), and quieting. Rust leaves NaN bits unspecified. Relax's own tiers differ here too: in a cold run a lane-accumulator loop's NaN payloads changed when its O3 build installed, and the O3 payloads match rustc's |
+| NaN payload and sign through arithmetic | **differs** | which input NaN propagates when two are NaN (operand order), and quieting. Rust leaves NaN bits unspecified. Relax's own configurations differ here too: in a cold run a lane-accumulator loop's NaN payloads changed when its O3 build installed (the O3 payloads match rustc's), and the SSE build's payloads in that loop differ from the AVX build's |
 | subnormals | identical | relax sets no FTZ/DAZ (MXCSR/FPCR is written only by an explicit `FpEnv`) |
 | constant evaluation (`const` items) | identical | |
 | sums, dot products, lane accumulators, element maps, scans (loops relax vectorises) | identical on finite data | the vectorisers keep per-lane order (`loops.rs`: "bit-identical"). Float reductions are never reassociated; only integer sums are |
@@ -123,3 +128,29 @@ rustc-made record. If relax wanted rustc's bits, the fixes would be
 `min_max_non_nan` / the `FBin(Min|Max)` lowering returning the constant
 operand on equality, and routing `cbrt` (and the rest of compiler-builtins'
 list) to a correctly-rounded implementation rather than the host libm.
+
+## Reconciled with the makepad-side audit (2026-10-26)
+
+agy's relax helper wrote its own reading of relax's float codegen
+(`RELAX_PROVE.md` § 3 and its exceptions E1-E4; the copy in agent-mail predates
+its § 3b, which carries this harness's findings). Each claim, against the
+harness:
+
+- No contraction; `mul_add` correctly rounded on both paths; compares, casts,
+  `powi` order, no FTZ/DAZ, constant folding in the operation's own type:
+  **confirmed** (rows above).
+- Identity folds exact: **confirmed for values**. On the sNaN detail the
+  harness shows the reverse of the static reading: rustc folds, relax (in this
+  shape) does not (row above).
+- `x/c -> x*(1/c)` only for an exact power of two: **confirmed** bit-exact
+  against the unfolded division.
+- E4, NaN payload/sign and the `min(-0.0, 0.0)` operand choice: **confirmed**.
+  The zero-sign case is a literal receiver only.
+- E1/E2 (wasm FMA) and E3 (`simd_fma` without a CPU check): **not tested**;
+  outside a native prove.
+- Missing from the audit's § 3, present in its § 3b: f64 `cbrt` 1 ulp,
+  because rustc binaries carry compiler-builtins' libm subset and relax uses
+  the host's. Its "transcendentals use the system libm, as rustc does" holds
+  for every function except that subset.
+- The audit's coverage gap (`mul_add` halfway and overflow cases) is now in
+  the harness: identical.
