@@ -86,9 +86,12 @@ pub fn reverse_string_replace(
 }
 
 /// Invert unified diff hunks: `+` becomes `-`, `-` becomes `+`, positions swap.
+/// The hunks keep their file order, which `apply_hunks` walks: reversed
+/// last-first (as this was until 2026-10-26), a patch of two or more hunks
+/// failed to reverse at all (a MultiEdit's base, `an_edit_with_file_text_*`).
 pub fn reverse_hunks(hunks: &[DiffHunkRecord]) -> Vec<DiffHunkRecord> {
     let mut reversed = Vec::with_capacity(hunks.len());
-    for h in hunks.iter().rev() {
+    for h in hunks {
         let mut new_lines = Vec::with_capacity(h.lines.len());
         for line in &h.lines {
             if let Some(stripped) = line.strip_prefix('+') {
