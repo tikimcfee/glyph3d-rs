@@ -86,7 +86,7 @@ mod lod_order_tests {
 // on the CONCRETE GlyphScene before boxing (see build_scene_probed in
 // main.rs), written once per frame by render(), read by the panel.
 // Offscreen never installs one, so the determinism chain never touches it.
-// Single-threaded: winit's event-loop thread owns both writer and reader.
+// Single-threaded: the host's event-loop thread owns both writer and reader.
 
 /// Read-only snapshot displayed by the windowed debug panel.
 #[derive(Clone, Default)]

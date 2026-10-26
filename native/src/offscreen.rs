@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
-use crate::scene;
+use crate::scene::{self, SceneKey};
 use crate::{
     build_scene_with_options, Op, SceneChoice, SceneCullOptions, OFFSCREEN_HEIGHT, OFFSCREEN_WIDTH,
 };
@@ -389,11 +389,11 @@ pub fn parse_dump_spec(spec: &str) -> Result<DumpSpec, String> {
 }
 
 /// `GLYPH_DRAG_SCRIPT`'s `g|c:DX:DY[:EVENTS[:FRAMES]]`.
-fn parse_drag_script(spec: &str) -> (winit::keyboard::KeyCode, f32, f32, u32, u32) {
+fn parse_drag_script(spec: &str) -> (SceneKey, f32, f32, u32, u32) {
     let parts: Vec<&str> = spec.split(':').collect();
     let key = match parts.first().copied() {
-        Some("g") => winit::keyboard::KeyCode::KeyG,
-        Some("c") => winit::keyboard::KeyCode::KeyC,
+        Some("g") => SceneKey::G,
+        Some("c") => SceneKey::C,
         other => panic!("GLYPH_DRAG_SCRIPT: {other:?} is not g|c (g|c:DX:DY[:EVENTS[:FRAMES]])"),
     };
     let num = |i: usize, d: f32| parts.get(i).map_or(d, |v| v.parse().expect("GLYPH_DRAG_SCRIPT: DX, DY, EVENTS and FRAMES are numbers"));
