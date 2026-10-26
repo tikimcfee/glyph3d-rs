@@ -30,6 +30,7 @@ pub mod seam;
 pub mod spatial_scene;
 pub mod text;
 pub mod views;
+#[cfg(feature = "windowed")]
 pub mod windowed;
 
 pub use atlas::default_trie;
