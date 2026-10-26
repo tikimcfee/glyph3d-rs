@@ -22,7 +22,8 @@ glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
 glyph-field-visible = { path = "../crates/glyph-field-visible" }
 # The transform tree (2026-10-10): every group row a node, resolved on
-# the GPU into the group table (glyph_scene/nodes.rs).
+# the CPU into the group table, whose changed rows are uploaded
+# (glyph_scene/nodes.rs; a GPU compute pass until 2026-10-26).
 glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
 # host that brings its own window links the library without it.

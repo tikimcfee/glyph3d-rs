@@ -11,10 +11,9 @@
 //! directories follow the same way (`faces.rs`, `regions.rs`). Nothing in
 //! the move itself is per moved FILE: it is noted on the tree cull
 //! (`tree_cull.rs`, which refits its bounds along the moved nodes'
-//! ancestors and computes moved files' boxes as it walks) and deferred for
-//! the CPU mirror of the group rows, which a reader (pick, a verb, the
-//! windowed HUD) brings up to date when it asks
-//! (`GroupNodes::defer_mirror` / `sync_group_mirror`).
+//! ancestors and computes moved files' boxes as it walks) and its group rows
+//! deferred until the flush rebuilds them, or a reader (pick, a verb, the
+//! windowed HUD) asks first (`GroupNodes::defer_rows` / `sync_group_rows`).
 //!
 //! `GLYPH_LIBRARY_TIMING=1` prints one `LIBTIME` line per animated frame:
 //! what moved, what each stage cost, and what the last flush and face
@@ -31,7 +30,7 @@ use crate::library::LibraryVerb;
 pub(super) struct MoveCost {
     /// Moved nodes noted (their subtrees are what moved).
     pub(super) nodes: usize,
-    /// Deferring the mirror and marking the tree cull.
+    /// Deferring the group rows and marking the tree cull.
     pub(super) note_ms: f64,
 }
 
@@ -65,12 +64,12 @@ impl GlyphScene {
         self.controller.as_ref()?.library.as_ref()
     }
 
-    /// Note a tree move: the moved nodes' subtrees are deferred for the CPU
-    /// mirror and marked on the tree cull (when the scene culls from the
-    /// tree). O(moved nodes), never O(the files they carry).
+    /// Note a tree move: the moved nodes' subtrees' group rows are deferred
+    /// (`defer_rows`) and the nodes marked on the tree cull (when the scene
+    /// culls from the tree). O(moved nodes), never O(the files they carry).
     pub(super) fn note_tree_move(&mut self, moved: &[glyph_scene_graph::NodeHandle]) -> MoveCost {
         let t0 = Instant::now();
-        self.nodes.defer_mirror(moved);
+        self.nodes.defer_rows(moved);
         if let Some(tree) = self.cull.as_ref().and_then(|c| c.tree.as_ref()) {
             let mut tree = tree.borrow_mut();
             for h in moved {
@@ -80,11 +79,11 @@ impl GlyphScene {
         MoveCost { nodes: moved.len(), note_ms: t0.elapsed().as_secs_f64() * 1e3 }
     }
 
-    /// Bring the CPU mirror of the group rows (`groups_cpu`: pick, the
-    /// verbs, the HUD) up to date with every deferred move. Returns the rows
-    /// written (0 when nothing waited).
-    pub(super) fn sync_group_mirror(&mut self) -> usize {
-        self.nodes.sync_mirror(&mut self.groups_cpu)
+    /// Bring the group table (pick, the verbs, the HUD read it) up to date
+    /// with every move deferred since the last flush. Returns the rows
+    /// rebuilt (0 when nothing waited).
+    pub(super) fn sync_group_rows(&mut self) -> usize {
+        self.nodes.sync_rows()
     }
 
     /// A library zone's (`dir:<path>`) world translation, from the tree.
