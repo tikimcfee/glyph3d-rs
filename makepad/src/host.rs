@@ -7,9 +7,11 @@
 //! and swaps in what comes back. The panels and the viewport reach it
 //! through `Scope` data (`ui_adapter`, `viewport`).
 //!
-//! The engine still builds its scene against a wgpu device, so the host
-//! holds a `GpuContext` of its own (no surface) until the makepad passes
-//! draw the frame; `stand_in` renders with it meanwhile.
+//! The engine still builds its scene against a wgpu device (its own field
+//! buffers and pipelines, unused here: the makepad passes draw from the
+//! frame's data and the field's host blocks), so the host holds a
+//! `GpuContext` of its own, with no surface, until the scene builds
+//! without one.
 
 use std::time::Instant;
 
@@ -22,10 +24,9 @@ use glyph3d_native::{SceneChoice, SceneCullOptions};
 
 use crate::sessions::SessionBrowser;
 
-/// The format the engine's scene composites into. BGRA sRGB, the windowed
-/// driver's surface format: the composite runs its shader path, and the
-/// bytes a readback sees are makepad's `VecBGRAu8_32` word order.
-pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+/// The format the engine's wgpu pipelines are built for (the scene builds
+/// them, the host never draws through them): the windowed driver's.
+const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 /// The flags makepad's platform reads from the command line itself
 /// (`--remote`, the virtual clock, `--window WxH@s` ...): dropped before the
@@ -104,6 +105,10 @@ pub struct EngineHost {
     pub debug_open: bool,
     pub sessions_open: bool,
     pub sessions: SessionBrowser,
+    /// Which scene this is, bumped by every rebuild: the frame feed keys
+    /// its per-scene tables on it.
+    scene_generation: u64,
+    start: Instant,
     last_tick: Instant,
     fps_window: (Instant, u32),
     pub fps: f32,
@@ -152,6 +157,8 @@ impl EngineHost {
             debug_open: true,
             sessions_open: false,
             sessions: SessionBrowser::default(),
+            scene_generation: 1,
+            start: Instant::now(),
             last_tick: Instant::now(),
             fps_window: (Instant::now(), 0),
             fps: 0.0,
@@ -169,6 +176,15 @@ impl EngineHost {
 
     pub fn viewport(&self) -> (u32, u32) {
         self.viewport
+    }
+
+    pub fn scene_generation(&self) -> u64 {
+        self.scene_generation
+    }
+
+    /// Wall-clock seconds since the host started: the frame's time.
+    pub fn time(&self) -> f32 {
+        self.start.elapsed().as_secs_f32()
     }
 
     /// One frame's motion, before it is drawn: the fly camera's integration
@@ -214,6 +230,7 @@ impl EngineHost {
         if let Some((scene, probe)) = rebuilt {
             self.scene = scene;
             self.probe = probe;
+            self.scene_generation += 1;
         }
     }
 

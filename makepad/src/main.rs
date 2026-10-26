@@ -15,12 +15,12 @@ use std::rc::Rc;
 
 use makepad_widgets::*;
 
+mod frame_feed;
 mod g3_passes;
 mod g3_ui;
 mod host;
 mod input;
 mod sessions;
-mod stand_in;
 mod ui_adapter;
 mod ui_model;
 mod viewport;

@@ -1,0 +1,199 @@
+//! The engine's frame as the makepad passes take it: each `FrameData` the
+//! scene prepares (`SceneLike::prepare_frame`, the CPU half of a frame)
+//! becomes one `G3FrameInputs` for `G3Renderer::draw_frame`. Most of it is
+//! a borrow; what this keeps across frames is what the renderer uploads
+//! only on change:
+//!
+//! - the float tables (`glyph3d_native::float_tables`): the atlas's
+//!   glyph map, curves and advances and the emoji sheet once per process;
+//!   the item table per scene; the group overrides when they change;
+//! - the group table as float texels, written run by run as the frame
+//!   reports changed rows, and the dirty rects since the renderer last
+//!   consumed a generation (a frame's runs are handed over once, so they
+//!   accumulate here until the renderer has seen them);
+//! - the field's host blocks, viewed as the `f32`-carried words makepad
+//!   publishes: the same allocation (`Arc` identity is the block's
+//!   generation), never a copy.
+
+use std::sync::Arc;
+
+use glyph3d_native::atlas::EmojiLevels;
+use glyph3d_native::float_tables::{self, AtlasTables, FloatTexture, TexelRect};
+use glyph3d_native::glyph_scene::{FrameData, RegionParams};
+
+use crate::g3_passes::{G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
+
+/// The process's atlas tables and emoji texels, loaded on the first frame.
+struct AtlasStatics {
+    atlas: AtlasTables,
+    emoji: EmojiLevels,
+    emoji_rgba: Vec<u8>,
+}
+
+/// The tables of the scene being drawn.
+struct SceneTables {
+    /// `EngineHost::scene_generation` they were built for.
+    scene: u64,
+    items: FloatTexture,
+    overrides: FloatTexture,
+    /// The override words `overrides` was packed from.
+    override_words: Vec<u32>,
+    groups: FloatTexture,
+    /// Group rows the texture holds.
+    group_count: u32,
+    /// Rects written since the renderer last consumed the group generation.
+    dirty: Vec<TexelRect>,
+    /// Bumped with every change of the tables or the groups above; folded
+    /// with the scene's into the renderer's generations.
+    tables_version: u64,
+    groups_version: u64,
+}
+
+#[derive(Default)]
+pub struct FrameFeed {
+    statics: Option<AtlasStatics>,
+    scene: Option<SceneTables>,
+    /// The blocks as makepad takes them, refreshed per frame (a refcount
+    /// each), kept so the inputs can borrow them.
+    blocks: Vec<Arc<[f32]>>,
+}
+
+/// A block's `u32` words as the `f32`-carried words makepad's instance
+/// publications take, without a copy: the same allocation, so its `Arc`
+/// identity (the renderer's generation for it) is the block's own.
+fn words_as_f32(block: &Arc<[u32]>) -> Arc<[f32]> {
+    let raw = Arc::into_raw(block.clone()) as *const [f32];
+    // SAFETY: `u32` and `f32` have the same size and alignment and every bit
+    // pattern is a valid `f32`, so `[u32]` and `[f32]` of one length share a
+    // layout and `Arc`'s header; the pointer came from `Arc::into_raw` of an
+    // `Arc<[u32]>` and is turned back exactly once. The f32 lanes are a byte
+    // carrier: the glyph shader reads them as `instance(u32)`, never as float.
+    unsafe { Arc::from_raw(raw) }
+}
+
+/// A frame's generation for one group: the scene's in the high half, the
+/// group's own version in the low.
+fn generation(scene: u64, version: u64) -> u64 {
+    (scene << 32) ^ version
+}
+
+impl FrameFeed {
+    /// Draw `frame` (scene `scene_generation`) into `rect` through `renderer`.
+    pub fn draw(
+        &mut self,
+        cx: &mut makepad_widgets::Cx2d,
+        renderer: &mut G3Renderer,
+        draws: &mut crate::g3_passes::G3Draws,
+        rect: makepad_widgets::Rect,
+        scene_generation: u64,
+        frame: &FrameData<'_>,
+    ) {
+        let statics = self.statics.get_or_insert_with(|| {
+            let atlas = float_tables::atlas_tables(&glyph3d_native::atlas_dir());
+            let emoji = EmojiLevels::load(&glyph3d_native::default_emoji_sheet());
+            let mut emoji_rgba = vec![0u8; emoji.byte_len()];
+            emoji.copy_into(&mut emoji_rgba);
+            AtlasStatics { atlas, emoji, emoji_rgba }
+        });
+
+        let overrides = frame.group_overrides.as_deref().unwrap_or(&[0]);
+        let rows = &frame.group_rows[..];
+        let tables = match &mut self.scene {
+            Some(t) if t.scene == scene_generation => {
+                if t.override_words != overrides {
+                    t.override_words = overrides.to_vec();
+                    t.overrides = float_tables::override_texels(overrides);
+                    t.tables_version += 1;
+                }
+                if rows.len() as u32 != t.group_count {
+                    // Rows appended (a verb's new group): a fresh, whole table.
+                    t.groups = float_tables::group_texels(rows);
+                    t.group_count = rows.len() as u32;
+                    t.dirty.clear();
+                    t.groups_version += 1;
+                } else if !frame.group_runs.is_empty() {
+                    for run in &frame.group_runs {
+                        let written = &rows[run.start as usize..run.end as usize];
+                        t.dirty.extend(float_tables::write_group_rows(&mut t.groups, run.start, written));
+                    }
+                    t.groups_version += 1;
+                }
+                t
+            }
+            _ => self.scene.insert(SceneTables {
+                scene: scene_generation,
+                items: float_tables::item_texels(frame.item_table),
+                overrides: float_tables::override_texels(overrides),
+                override_words: overrides.to_vec(),
+                groups: float_tables::group_texels(rows),
+                group_count: rows.len() as u32,
+                dirty: Vec::new(),
+                tables_version: 0,
+                groups_version: 0,
+            }),
+        };
+
+        self.blocks.clear();
+        if let Some(slots) = &frame.slots {
+            self.blocks.extend(slots.blocks().iter().map(words_as_f32));
+        }
+        let statics_view = G3StaticTables {
+            glyphmap: &statics.atlas.glyphmap,
+            curves: &statics.atlas.curves,
+            advances: &statics.atlas.glyph_advances,
+            items: &tables.items,
+            overrides: &tables.overrides,
+            emoji: G3EmojiSheet {
+                width: statics.emoji.sheet.layer_w as usize,
+                height: statics.emoji.sheet.layer_h as usize,
+                layers: statics.emoji.sheet.layers as usize,
+                max_level: statics.emoji.mip_levels as usize - 1,
+                rgba: &statics.emoji_rgba,
+            },
+        };
+        let chunk_ranges = frame.glyph_ranges.per_chunk();
+        let selection_ranges = frame.selection.as_ref().map(|s| s.ranges.per_chunk());
+        let selection = frame
+            .selection
+            .as_ref()
+            .zip(selection_ranges.as_deref())
+            .map(|(s, ranges)| G3Selection { chunk_ranges: ranges, tint: s.tint });
+        let faces = frame.faces.as_deref().map_or(&[][..], Vec::as_slice);
+        let regions = frame.regions.as_deref().map_or(&[][..], Vec::as_slice);
+        let [r, g, b, a] = frame.clear_color;
+        let groups_generation = generation(scene_generation, tables.groups_version);
+        let inputs = G3FrameInputs {
+            tables_generation: generation(scene_generation, tables.tables_version),
+            tables: &statics_view,
+            blocks: &self.blocks,
+            meshes_generation: generation(scene_generation, frame.faces_generation ^ frame.meshes_generation.rotate_left(16)),
+            faces,
+            quads: frame.quads,
+            cubes: frame.cubes,
+            group_faces: &[],
+            groups_generation,
+            groups: G3GroupTable { table: &tables.groups, group_count: tables.group_count, dirty: &tables.dirty },
+            view_proj: frame.view_proj,
+            reverse_z: true,
+            clear_color: [r as f32, g as f32, b as f32, a as f32],
+            env: frame.env,
+            glyph_params: frame.params,
+            regions,
+            region_params: frame.region_params.unwrap_or(RegionParams {
+                edge_opacity: 0.0,
+                edge_px: 0.0,
+                picked_opacity: 0.0,
+                picked_edge_opacity: 0.0,
+            }),
+            picked_region: frame.picked_region,
+            backdrops: &frame.backdrops,
+            chunk_ranges: &chunk_ranges,
+            selection,
+        };
+        renderer.draw_frame(cx, draws, rect, &inputs);
+        // The renderer consumed this generation: its rects are uploaded.
+        if renderer.seen().groups == Some(groups_generation) {
+            tables.dirty.clear();
+        }
+    }
+}

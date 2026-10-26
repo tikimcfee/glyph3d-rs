@@ -46,6 +46,8 @@
 use makepad_widgets::makepad_draw::makepad_platform::retained_instances::RetainedInstances;
 use makepad_widgets::*;
 use glyph3d_native::float_tables::{FloatTexture, TexelRect, GROUP_TABLE_WIDTH, TABLE_WIDTH};
+use glyph3d_native::glyph_scene::mesh::MeshInstance;
+use glyph3d_native::glyph_scene::{BackdropInst, EnvUniform, Params, RegionInstance, RegionParams};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -195,7 +197,7 @@ script_mod! {
 
     // ── Pass 2: cull.wgsl backdrops ──────────────────────────────────────
     // One flat tinted quad per far-LOD segment; the CPU cull compacts the
-    // survivors and streams them per frame (`G3BackdropInst`, 9 lanes).
+    // survivors and streams them per frame (`BackdropInst`, 9 lanes).
 
     mod.draw.DrawG3Backdrop = mod.std.set_type_default() do #(DrawG3Backdrop::script_shader(vm)){
         color_format: @Rgba16F
@@ -948,32 +950,11 @@ fn g3_inv_size(texture: &Texture, cx: &Cx) -> [f32; 2] {
 // Pass 1: environment
 // ---------------------------------------------------------------------------
 
-/// environment.rs's `EnvUniform` (struct Env), field for field. Built on the
-/// CPU exactly as glyph3d builds it (camera-relative, grid phase reduced in
-/// f64); matrices are column-major.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct G3Env {
-    pub inv_vp_rel: [f32; 16],
-    pub vp_rel: [f32; 16],
-    /// xyz = eye (world), w = ground_y.
-    pub eye: [f32; 4],
-    pub grid_origin: [f32; 4],
-    pub spacing: [f32; 4],
-    pub fade: [f32; 4],
-    pub ground: [f32; 4],
-    pub minor_line: [f32; 4],
-    pub major_line: [f32; 4],
-    pub axis_x: [f32; 4],
-    pub axis_z: [f32; 4],
-    pub sky_horizon: [f32; 4],
-    pub sky_zenith: [f32; 4],
-}
-
-impl G3Env {
-    /// Whether the ground draws: glyph3d's plane exists only seen from above.
-    pub fn ground_visible(&self) -> bool {
-        self.eye[1] > self.eye[3]
-    }
+/// Whether the ground draws: glyph3d's plane exists only seen from above
+/// (`EnvUniform::eye` is the eye in xyz and the ground height in w; the
+/// engine builds it camera-relative, its grid phase reduced in f64).
+fn g3_ground_visible(env: &EnvUniform) -> bool {
+    env.eye[1] > env.eye[3]
 }
 
 #[derive(Script, ScriptHook, Debug)]
@@ -988,7 +969,7 @@ pub struct DrawG3Sky {
 }
 
 impl DrawG3Sky {
-    pub fn set_env(&mut self, cx: &Cx, env: &G3Env) {
+    pub fn set_env(&mut self, cx: &Cx, env: &EnvUniform) {
         self.draw_vars.set_uniform(cx, live_id!(u_inv_vp_rel), &env.inv_vp_rel);
         self.draw_vars.set_uniform(cx, live_id!(u_sky_horizon), &env.sky_horizon);
         self.draw_vars.set_uniform(cx, live_id!(u_sky_zenith), &env.sky_zenith);
@@ -1012,7 +993,7 @@ pub struct DrawG3Ground {
 }
 
 impl DrawG3Ground {
-    pub fn set_env(&mut self, cx: &Cx, env: &G3Env) {
+    pub fn set_env(&mut self, cx: &Cx, env: &EnvUniform) {
         let dv = &mut self.draw_vars;
         dv.set_uniform(cx, live_id!(u_vp_rel), &env.vp_rel);
         dv.set_uniform(cx, live_id!(u_eye), &env.eye);
@@ -1028,8 +1009,8 @@ impl DrawG3Ground {
     }
 
     /// Draw right after the sky; skipped when the eye is at or below the plane.
-    pub fn draw(&mut self, cx: &mut CxDraw, env: &G3Env) {
-        if env.ground_visible() {
+    pub fn draw(&mut self, cx: &mut CxDraw, env: &EnvUniform) {
+        if g3_ground_visible(env) {
             g3_draw_single(cx, &mut self.draw_vars);
         }
     }
@@ -1038,17 +1019,6 @@ impl DrawG3Ground {
 // ---------------------------------------------------------------------------
 // Pass 2: backdrops
 // ---------------------------------------------------------------------------
-
-/// cull.rs's `BackdropInst` (48 B), as glyph3d's CPU cull emits it.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct G3BackdropInst {
-    pub min: [f32; 2],
-    pub max: [f32; 2],
-    pub rgba: [f32; 4],
-    /// .x = the far-Z reading depth; .yzw unused.
-    pub depth: [f32; 4],
-}
 
 #[derive(Script, ScriptHook, Debug)]
 #[repr(C)]
@@ -1071,7 +1041,7 @@ pub const G3_BACKDROP_LANES: usize = 9;
 impl DrawG3Backdrop {
     /// The frame's compacted backdrop survivors as ONE instanced draw call.
     /// `scratch` is reused across frames.
-    pub fn draw_all(&mut self, cx: &mut CxDraw, backdrops: &[G3BackdropInst], scratch: &mut Vec<f32>) {
+    pub fn draw_all(&mut self, cx: &mut CxDraw, backdrops: &[BackdropInst], scratch: &mut Vec<f32>) {
         scratch.clear();
         scratch.reserve(backdrops.len() * G3_BACKDROP_LANES);
         for b in backdrops {
@@ -1088,34 +1058,23 @@ impl DrawG3Backdrop {
 // Pass 3: meshes
 // ---------------------------------------------------------------------------
 
-/// mesh.rs's `MeshInstance` (80 B = 20 lanes), the exact `DrawG3Mesh` record.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct G3MeshInstance {
-    pub world_col0: [f32; 4],
-    pub world_col1: [f32; 4],
-    pub world_col2: [f32; 4],
-    pub color: [f32; 4],
-    /// .w == 0.0: unlit; otherwise Lambert 0.8 + 0.2 ambient.
-    pub material_params: [f32; 4],
-}
-
 /// Lanes per mesh record: `col0..col2`, `color`, `params`.
 pub const G3_MESH_LANES: usize = 20;
 
-impl G3MeshInstance {
-    /// Publish instances once; draw them every frame with `DrawG3Mesh::draw_retained`.
-    pub fn publish(instances: &[G3MeshInstance]) -> RetainedInstances {
-        let mut lanes = Vec::with_capacity(instances.len() * G3_MESH_LANES);
-        for m in instances {
-            lanes.extend_from_slice(&m.world_col0);
-            lanes.extend_from_slice(&m.world_col1);
-            lanes.extend_from_slice(&m.world_col2);
-            lanes.extend_from_slice(&m.color);
-            lanes.extend_from_slice(&m.material_params);
-        }
-        RetainedInstances::new(G3_MESH_LANES, lanes.into()).expect("whole mesh records")
+/// Publish the engine's mesh instances (mesh.rs's `MeshInstance`, 80 B =
+/// 20 lanes, the exact `DrawG3Mesh` record; `material_params.w == 0.0` is
+/// unlit, otherwise Lambert 0.8 + 0.2 ambient) once; draw them every frame
+/// with `DrawG3Mesh::draw_retained`.
+pub fn g3_publish_meshes(instances: &[MeshInstance]) -> RetainedInstances {
+    let mut lanes = Vec::with_capacity(instances.len() * G3_MESH_LANES);
+    for m in instances {
+        lanes.extend_from_slice(&m.world_col0);
+        lanes.extend_from_slice(&m.world_col1);
+        lanes.extend_from_slice(&m.world_col2);
+        lanes.extend_from_slice(&m.color);
+        lanes.extend_from_slice(&m.material_params);
     }
+    RetainedInstances::new(G3_MESH_LANES, lanes.into()).expect("whole mesh records")
 }
 
 #[derive(Script, ScriptHook, Debug)]
@@ -1286,26 +1245,6 @@ impl DrawG3GroupFace {
 // Pass 4: regions
 // ---------------------------------------------------------------------------
 
-/// regions.rs's `RegionInstance` (64 B), as the CPU `region_instance` twin
-/// writes it.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct G3RegionInstance {
-    pub col0: [f32; 4],
-    pub col1: [f32; 4],
-    pub col2: [f32; 4],
-    pub color: [f32; 4],
-}
-
-/// The region params uniform (RegionParams minus `picked`/`count`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct G3RegionParams {
-    pub edge_opacity: f32,
-    pub edge_px: f32,
-    pub picked_opacity: f32,
-    pub picked_edge_opacity: f32,
-}
-
 #[derive(Script, ScriptHook, Debug)]
 #[repr(C)]
 pub struct DrawG3Region {
@@ -1333,8 +1272,8 @@ impl DrawG3Region {
     pub fn draw_all(
         &mut self,
         cx: &mut CxDraw,
-        params: &G3RegionParams,
-        regions: &[G3RegionInstance],
+        params: &RegionParams,
+        regions: &[RegionInstance],
         picked: Option<usize>,
         scratch: &mut Vec<f32>,
     ) {
@@ -1519,22 +1458,7 @@ impl G3Tables {
     }
 }
 
-/// glyph_field_derived.wgsl's `Params` (the parts a shader reads).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct G3GlyphParams {
-    pub greek_mode: u32,
-    pub dilate_px: f32,
-    pub soften: f32,
-    pub min_lo: f32,
-    pub min_hi: f32,
-    pub emoji_cell: [u32; 2],
-    pub emoji_cols: u32,
-    pub emoji_rows: u32,
-    pub emoji_layer: [f32; 2],
-    pub greek_onset_px: f32,
-}
-
-fn g3_set_glyph_params(cx: &Cx, dv: &mut DrawVars, p: &G3GlyphParams) {
+fn g3_set_glyph_params(cx: &Cx, dv: &mut DrawVars, p: &Params) {
     dv.set_uniform(cx, live_id!(u_greek_mode), &[p.greek_mode as f32]);
     dv.set_uniform(cx, live_id!(u_dilate_px), &[p.dilate_px]);
     dv.set_uniform(cx, live_id!(u_soften), &[p.soften]);
@@ -1558,7 +1482,7 @@ pub struct DrawG3Glyph {
 
 impl DrawG3Glyph {
     /// Tables + params, once per frame before the chunks draw.
-    pub fn prepare(&mut self, cx: &Cx, tables: &G3Tables, params: &G3GlyphParams) {
+    pub fn prepare(&mut self, cx: &Cx, tables: &G3Tables, params: &Params) {
         tables.bind(cx, &mut self.draw_vars);
         g3_set_glyph_params(cx, &mut self.draw_vars, params);
     }
@@ -1702,9 +1626,9 @@ pub struct G3FrameInputs<'a> {
     /// group-composed face specs (empty until sheets have group rows of
     /// their own; see `DrawG3GroupFace`).
     pub meshes_generation: u64,
-    pub faces: &'a [G3MeshInstance],
-    pub quads: &'a [G3MeshInstance],
-    pub cubes: &'a [G3MeshInstance],
+    pub faces: &'a [MeshInstance],
+    pub quads: &'a [MeshInstance],
+    pub cubes: &'a [MeshInstance],
     pub group_faces: &'a [G3GroupFaceSpec],
     // ── on change ──
     pub groups_generation: u64,
@@ -1716,13 +1640,13 @@ pub struct G3FrameInputs<'a> {
     pub reverse_z: bool,
     pub clear_color: [f32; 4],
     /// The environment; None = off (draws nothing, as in glyph3d).
-    pub env: Option<G3Env>,
-    pub glyph_params: G3GlyphParams,
-    pub regions: &'a [G3RegionInstance],
-    pub region_params: G3RegionParams,
+    pub env: Option<EnvUniform>,
+    pub glyph_params: Params,
+    pub regions: &'a [RegionInstance],
+    pub region_params: RegionParams,
     pub picked_region: Option<usize>,
     /// The CPU cull's compacted backdrop survivors.
-    pub backdrops: &'a [G3BackdropInst],
+    pub backdrops: &'a [BackdropInst],
     /// The CPU cull's visible slot ranges per block (chunk); a block past
     /// the end of this list draws nothing.
     pub chunk_ranges: &'a [&'a [Range<u32>]],
@@ -1878,9 +1802,9 @@ impl G3Renderer {
         }
         if self.seen.meshes != Some(inputs.meshes_generation) || self.meshes.is_none() {
             self.meshes = Some(G3MeshPublications {
-                faces: G3MeshInstance::publish(inputs.faces),
-                quads: G3MeshInstance::publish(inputs.quads),
-                cubes: G3MeshInstance::publish(inputs.cubes),
+                faces: g3_publish_meshes(inputs.faces),
+                quads: g3_publish_meshes(inputs.quads),
+                cubes: g3_publish_meshes(inputs.cubes),
                 group_faces: G3GroupFaceSpec::publish(inputs.group_faces),
             });
             self.seen.meshes = Some(inputs.meshes_generation);
