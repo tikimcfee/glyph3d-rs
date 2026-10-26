@@ -157,6 +157,19 @@ fn unary32() -> Vec<U32> {
         ("cbrt", |x| x.cbrt()), ("pow2.2", |x| x.powf(2.2)), ("sin_cos.0", |x| x.sin_cos().0),
         ("sin_cos.1", |x| x.sin_cos().1), ("bits_rt", |x| f32::from_bits(bb(x.to_bits()))),
         ("rem_euclid3", |x| x.rem_euclid(3.0)), ("div_euclid3", |x| x.div_euclid(3.0)),
+        // the identity folds relax's passes make (x*1, x/1, x-0, x+(-0) -> x; never x+0),
+        // each beside the same operation on an opaque constant, which nothing can fold
+        ("id_mul1", |x| x * 1.0), ("id_mul1_bb", |x| x * bb(1.0)), ("id_div1", |x| x / 1.0),
+        ("id_div1_bb", |x| x / bb(1.0)), ("id_sub0", |x| x - 0.0), ("id_sub0_bb", |x| x - bb(0.0)),
+        ("id_addm0", |x| x + -0.0), ("id_addm0_bb", |x| x + bb(-0.0)), ("id_add0", |x| x + 0.0),
+        ("id_add0_bb", |x| x + bb(0.0)), ("id_neg_neg", |x| -(-x)), ("id_mulm1", |x| x * -1.0),
+        // x / c -> x * (1 / c) where 1 / c is an exact power of two (normal or subnormal)
+        ("div2", |x| x / 2.0), ("div2_bb", |x| x / bb(2.0)), ("div0.5", |x| x / 0.5),
+        ("div2^126", |x| x / f32::from_bits(0x7e80_0000)), ("div2^126_bb", |x| x / bb(f32::from_bits(0x7e80_0000))),
+        ("div2^127", |x| x / f32::from_bits(0x7f00_0000)), ("div2^127_bb", |x| x / bb(f32::from_bits(0x7f00_0000))),
+        ("div2^-126", |x| x / f32::MIN_POSITIVE), ("div2^-126_bb", |x| x / bb(f32::MIN_POSITIVE)),
+        ("div2^-149", |x| x / f32::from_bits(1)), ("div2^-149_bb", |x| x / bb(f32::from_bits(1))),
+        ("div10", |x| x / 10.0), ("div10_bb", |x| x / bb(10.0)),
     ]
 }
 
@@ -204,6 +217,12 @@ fn unary64() -> Vec<U64> {
         ("log10", |x| x.log10()), ("ln_1p", |x| x.ln_1p()), ("cbrt", |x| x.cbrt()),
         ("pow2.2", |x| x.powf(2.2)), ("bits_rt", |x| f64::from_bits(bb(x.to_bits()))),
         ("rem_euclid3", |x| x.rem_euclid(3.0)),
+        ("id_mul1", |x| x * 1.0), ("id_mul1_bb", |x| x * bb(1.0)), ("id_div1", |x| x / 1.0),
+        ("id_sub0", |x| x - 0.0), ("id_sub0_bb", |x| x - bb(0.0)), ("id_addm0", |x| x + -0.0),
+        ("id_add0", |x| x + 0.0), ("id_add0_bb", |x| x + bb(0.0)),
+        ("div2", |x| x / 2.0), ("div2_bb", |x| x / bb(2.0)), ("div2^1022", |x| x / f64::from_bits(0x7fd0_0000_0000_0000)),
+        ("div2^1023", |x| x / f64::from_bits(0x7fe0_0000_0000_0000)), ("div2^1023_bb", |x| x / bb(f64::from_bits(0x7fe0_0000_0000_0000))),
+        ("div2^-1074", |x| x / f64::from_bits(1)), ("div10", |x| x / 10.0),
     ]
 }
 
@@ -314,6 +333,24 @@ fn battery(o: &mut String) {
         t32.push((a, b, r.mid32()));
         t32.push((a, b, -(a * b)));
     }
+    // mul_add at its edges: a, b with 13 significant bits make an exact 26-bit product, so
+    // the f32 rounding of a*b alone is often an exact tie; the addend is 0, +-tiny (breaks
+    // the tie one way: one rounding must see it), +-half an ulp; then products past f32::MAX
+    // that the addend brings back, and products in the subnormal range
+    for _ in 0..1500 {
+        let m = |r: &mut Rng| f32::from_bits(((r.next() as u32 & 1) << 31) | (127 + (r.next() % 8) as u32) << 23 | ((r.next() as u32) & 0x7ff_c00));
+        let (a, b) = (m(&mut r), m(&mut r));
+        let p = a * b;
+        let ulp = f32::from_bits(p.abs().to_bits() + 1) - p.abs();
+        for c in [0.0, 1.0e-30, -1.0e-30, ulp * 0.5, -ulp * 0.5, ulp * 0.25, -p] {
+            t32.push((a, b, c));
+        }
+    }
+    for (a, b, c) in [(1.8446744e19f32, 1.8446744e19, -f32::MAX), (f32::MAX, 2.0, -f32::MAX), (f32::MAX, 1.5, -f32::MAX),
+        (-f32::MAX, 2.0, f32::MAX), (1.0e-30, 1.0e-15, 0.0), (1.0e-30, 1.0e-15, f32::from_bits(1)), (f32::MIN_POSITIVE, 0.5, 0.0),
+        (f32::MIN_POSITIVE, 0.75, -f32::from_bits(1)), (1.0e-20, -1.0e-20, f32::MIN_POSITIVE), (3.0, 1.0 / 3.0, -1.0)] {
+        t32.push((a, b, c));
+    }
     let sub64: Vec<f64> = s64.iter().copied().step_by(3).collect();
     let mut t64: Vec<(f64, f64, f64)> = Vec::new();
     for &a in &sub64 {
@@ -327,6 +364,21 @@ fn battery(o: &mut String) {
         let (a, b) = (r.mid64(), r.mid64());
         t64.push((a, b, r.mid64()));
         t64.push((a, b, -(a * b)));
+    }
+    for _ in 0..1500 {
+        let m = |r: &mut Rng| f64::from_bits(((r.next() & 1) << 63) | (1023 + r.next() % 8) << 52 | (r.next() & 0xf_ffff_e000_0000));
+        let (a, b) = (m(&mut r), m(&mut r));
+        let p = a * b;
+        let ulp = f64::from_bits(p.abs().to_bits() + 1) - p.abs();
+        for c in [0.0, 1.0e-200, -1.0e-200, ulp * 0.5, -ulp * 0.5, ulp * 0.25, -p] {
+            t64.push((a, b, c));
+        }
+    }
+    let big = f64::from_bits(0x5ff0_0000_0000_0000); // 2^512
+    for (a, b, c) in [(big, big, -f64::MAX), (f64::MAX, 2.0, -f64::MAX), (f64::MAX, 1.5, -f64::MAX), (2.0f64.powi(997), 2.0f64.powi(26) + 1.0, 1.0),
+        (1.0e300, 1.0e10, -1.0e308), (1.0e-200, 1.0e-150, 0.0), (1.0e-200, 1.0e-150, f64::from_bits(1)), (f64::MIN_POSITIVE, 0.5, 0.0),
+        (3.0, 1.0 / 3.0, -1.0), (0.1, 10.0, -1.0)] {
+        t64.push((a, b, c));
     }
 
     for (name, f) in unary32() {
