@@ -8,6 +8,8 @@
 //!
 //! curves/glyphmap are uploaded verbatim as `Rgba32Uint` textures and sampled
 //! in WGSL with `textureLoad` (integer textures: no filtering, no sRGB).
+//! [`SlugTexels`] reads them for both that upload and `float_tables`, the
+//! same tables as exact-integer float texels for a float-texture host.
 //! The trie stays on the CPU — text staging (text.rs) does byte→slot decode.
 //!
 //! Plus the colour-emoji sheet (2026-09-10, `out/EMOJI.md`):
@@ -1148,6 +1150,71 @@ impl EmojiTexture {
     }
 }
 
+/// Per-slot advance in world units: the `glyph_advances` table every glyph
+/// shader reads by atlas slot. A bitmap slot with a cell, and every slot
+/// past the web's 4,431 (the appended emoji and sequence slots), takes the
+/// trie's bitmap advance; every other slot the primary font's cell.
+pub fn slot_advances(trie: &TrieTable) -> Vec<f32> {
+    let em = trie.metrics.em_height_fu;
+    let primary_adv = crate::text::fu_to_world(trie.metrics.advance_fu as i32, em);
+    let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
+    (0..trie.slot_count as usize)
+        .map(|s| {
+            if trie.emoji_cell[s].is_some() || s >= 4431 {
+                bitmap_adv
+            } else {
+                primary_adv
+            }
+        })
+        .collect()
+}
+
+/// One Slug texture file as read (FORMAT.md `curves.bin`, `glyphmap.bin`):
+/// the whole word array, header included, so the payload is a borrow of it
+/// rather than a copy. The wgpu atlas uploads [`Self::payload`] verbatim;
+/// `float_tables` converts it for hosts with float textures only.
+pub struct SlugTexels {
+    words: Vec<u32>,
+}
+
+impl SlugTexels {
+    /// Read and check one file: its magic, the 1024-texel width both
+    /// textures share, and a payload of exactly `width x height` texels.
+    pub fn read(path: &Path, magic: &str) -> Self {
+        let words = read_words(path);
+        check_magic(&words, magic, path);
+        assert!(words.len() >= 8, "{}: shorter than its 8-word header", path.display());
+        let texels = Self { words };
+        assert_eq!(texels.width(), ATLAS_TEX_WIDTH, "{}: texture width", path.display());
+        assert_eq!(
+            texels.payload().len(),
+            (texels.width() * texels.height() * 4) as usize,
+            "{}: payload is not width x height RGBA texels",
+            path.display()
+        );
+        texels
+    }
+
+    pub fn width(&self) -> u32 {
+        self.words[3]
+    }
+
+    pub fn height(&self) -> u32 {
+        self.words[4]
+    }
+
+    /// Header word 5: the curve count (curves.bin) or the slot count
+    /// (glyphmap.bin). Texels past what it covers are zero padding.
+    pub fn count(&self) -> u32 {
+        self.words[5]
+    }
+
+    /// The texels, row-major, four u32 lanes each.
+    pub fn payload(&self) -> &[u32] {
+        &self.words[8..]
+    }
+}
+
 fn read_words(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
@@ -1254,13 +1321,8 @@ impl Atlas {
         let ((cv, gm), trie) = std::thread::scope(|s| {
             let h_bins = s.spawn(|| {
                 std::thread::scope(|s2| {
-                    let h_cv = s2.spawn(|| {
-                        let cv = read_words(&dir.join("curves.bin"));
-                        check_magic(&cv, "G3CV", &dir.join("curves.bin"));
-                        cv
-                    });
-                    let gm = read_words(&dir.join("glyphmap.bin"));
-                    check_magic(&gm, "G3GM", &dir.join("glyphmap.bin"));
+                    let h_cv = s2.spawn(|| SlugTexels::read(&dir.join("curves.bin"), "G3CV"));
+                    let gm = SlugTexels::read(&dir.join("glyphmap.bin"), "G3GM");
                     (h_cv.join().expect("curves read"), gm)
                 })
             });
@@ -1268,13 +1330,11 @@ impl Atlas {
             (h_bins.join().expect("bins read"), trie)
         });
 
-        let (cv_w, cv_h, curve_count) = (cv[3], cv[4], cv[5]);
-        assert_eq!(cv_w, ATLAS_TEX_WIDTH);
-        let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, &cv[8..]);
+        let (cv_w, cv_h, curve_count) = (cv.width(), cv.height(), cv.count());
+        let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, cv.payload());
 
-        let (gm_w, gm_h, entry_count) = (gm[3], gm[4], gm[5]);
-        assert_eq!(gm_w, ATLAS_TEX_WIDTH);
-        let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, &gm[8..]);
+        let (gm_w, gm_h, entry_count) = (gm.width(), gm.height(), gm.count());
+        let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, gm.payload());
 
         let metrics = trie.metrics;
 
@@ -1306,22 +1366,10 @@ impl Atlas {
             slot_ink.len()
         );
 
-        let em = metrics.em_height_fu;
-        let primary_adv = crate::text::fu_to_world(metrics.advance_fu as i32, em);
-        let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
-        let slot_advances: Vec<f32> = (0..slot_count as usize)
-            .map(|s| {
-                if trie.emoji_cell[s].is_some() || s >= 4431 {
-                    bitmap_adv
-                } else {
-                    primary_adv
-                }
-            })
-            .collect();
         use wgpu::util::DeviceExt;
         let glyph_advances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph advances"),
-            contents: bytemuck::cast_slice(&slot_advances),
+            contents: bytemuck::cast_slice(&slot_advances(&trie)),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
