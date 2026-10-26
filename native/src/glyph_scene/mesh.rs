@@ -295,7 +295,7 @@ impl MeshPipeline {
     }
 
     /// Renders instances of a unit mesh from an instance buffer someone
-    /// else keeps (the library's page faces, written on the GPU).
+    /// else keeps (the library's page faces, `faces.rs`).
     pub fn render_from<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,

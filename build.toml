@@ -1359,14 +1359,14 @@ with = "        let _ = dl;"
 expect = "a_dragged_directory_keeps_its_place_through_every_replan"
 
 [[mutation]]
-name = "group-mirror-deferred-forever"
+name = "group-rows-deferred-past-their-reader"
 gate = "cargo-test"
-why = "the deferred CPU mirror of a tree move never written back (2026-10-10: a library move notes its subtree instead of rewriting a group row per file every frame): pick, the verbs and the HUD read every moved file where it was at load, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_mirror, which apply_pick, apply_verb and the windowed HUD call before reading groups_cpu; reddens glyph_scene::nodes::tests::a_deferred_mirror_syncs_to_the_eager_rows"
+why = "a tree move's group rows never rebuilt for a reader before the flush (2026-10-10: a library move notes its subtree instead of rewriting a row per file; since 2026-10-26 the one group table is rebuilt by the flush, and sync_rows serves a reader in between): a pick or a verb in the frame of a move reads every moved file where the previous frame left it, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_rows, which apply_pick and apply_verb call before reading the table. Renamed from group-mirror-deferred-forever when the scene's second copy (groups_cpu) became the one table; reddens glyph_scene::nodes::tests::deferred_rows_sync_to_the_eager_rows"
 file = "native/src/glyph_scene/nodes.rs"
 op = "replace"
-find = "        self.mirror_subtrees(&pending, groups).len()"
+find = "        self.rebuild_subtrees(&pending).len()"
 with = "        0"
-expect = "a_deferred_mirror_syncs_to_the_eager_rows"
+expect = "deferred_rows_sync_to_the_eager_rows"
 
 [[mutation]]
 name = "region-refit-unlogged"
