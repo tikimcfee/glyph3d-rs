@@ -156,6 +156,7 @@ or mutation survival.
 ```sh
 cargo glyph build          bring the renderer up to date
 cargo glyph test           run everything; nonzero if anything is wrong
+cargo glyph test --inner   after each change: every gate but the merge tier
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
 cargo glyph run --demo     build if stale, then launch the renderer; arguments
@@ -190,6 +191,23 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
   NOTHING RAN`, never green: a scope once outlived its last gate and printed
   ALL GATES GREEN over nothing until it was removed (2026-10-09).
+- **The gates run at once** (2026-10-26, `glyph/src/schedule.rs`), each a
+  child `glyph gate`, their output printed in `build.toml` order as each
+  finishes. A gate waits only for an earlier gate that provides an artifact
+  it `needs`; the gates that open the GPU (`gpu = true`) run one at a time;
+  cargo's lock orders the cargo gates sharing `target/`. The run ends with a
+  TIME line: wall, products, gate seconds summed, the slowest. Measured on
+  the 32-core Linux host under sibling load: a full run after a one-line
+  edit in `native/src` 63 s (111 s serially), with nothing changed 38 s
+  (95 s).
+- **Two tiers, declared per gate.** `tier = "inner"` gates are what
+  `--inner` runs after each change (56 s after a one-line edit, measured
+  as above); `tier = "merge"` gates — the compiler's diagnostics: warnings,
+  clippy, rustdoc, the no-default-features builds — run only in a full
+  `glyph test`, and `--inner` names each one it skipped. They judge the
+  code's form, not what it computes, and each recompiles the renderer in its
+  own configuration. An `--inner` verdict says "not a landing run"; land on
+  a full one.
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
