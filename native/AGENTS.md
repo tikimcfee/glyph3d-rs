@@ -58,7 +58,7 @@ caller; the short version:
   What DID delete the copy is the direct path: `HyperLayout::layout_items`
   writes instances straight into the caller's arena and materializes no 32 B
   wire record at all. The record path (`VerifyLayout`) remains as the
-  verification form, and only `--repo-verify` takes it. Run
+  verification form, and only `--hyper-oracle-check` takes it. Run
   `--repo-scan-only --repo-engine hyper|direct|batch|naive` for the per-stage
   split rather than trusting a figure here.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
@@ -74,16 +74,12 @@ caller; the short version:
   compaction. Indexing it by instance is the tempting mistake and
   `layout::tests::paint_is_indexed_by_record_so_blanks_consume_an_entry`
   is what catches it.
-- `--repo-verify` diffs two backends at the seam — placements and instances
-  always, and records when BOTH paths have them (`layout::diff_backends`). It
-  used to compare records only, which cannot see compaction, paint or extents at
-  all. Today it diffs the chosen `--repo-engine` against a recording
-  `HyperLayout` reference run; `direct` has no records and reports `0 records`.
-  Gated again since 2026-10-09 as `repo-verify` (`hyper`) and
-  `repo-verify-direct`. Every strategy is the same HyperLayout, so these are
-  HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
-  `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
-  oracle-backed fold. `--line-table-stats <PATH>...` (same inputs) builds and
+- `layout::diff_backends` diffs two backends at the seam: placements and
+  instances always, and records when BOTH have them. `--hyper-oracle-check`
+  (gate `hyper-oracle`, `hyper_oracle.rs`) uses it to hold HyperLayout to the
+  oracle-backed fold. (`--repo-verify`, which held HyperLayout to itself, was
+  deleted on 2026-10-26: every `--repo-engine` is the same HyperLayout, and no
+  mutation could make it fail.) `--line-table-stats <PATH>...` (same inputs) builds and
   prints the visible-set field's line table (`layout_hyper/line_table.rs`,
   M1 of `out/VISIBLE-MODE.md`): lines, long-line segment seeds, sizes.
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
@@ -109,9 +105,8 @@ caller; the short version:
   CubeCL compute engine, `cubecl`, was retired 2026-10-09):
   - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
   - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
-    background prefetch. Under `--repo-verify`, `direct` records nothing (the
-    diff covers placements and instances only) while `batch` and `naive` take
-    the recording path; the stats line prints their readback/compaction phases.
+    background prefetch; the stats line prints `batch`/`naive`'s
+    readback/compaction phases.
 - `--field-mode derived|visible|instanced` selects the glyph field mode:
   - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
     retirement step 1 — no golden pixel moved): compact word layout, x stored,

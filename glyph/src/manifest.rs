@@ -98,7 +98,6 @@ pub(crate) enum Kind {
     Cargo,
     CargoTest,
     GoldenVerify,
-    RepoVerify,
 }
 
 /// What you changed, and therefore what is worth running.
@@ -128,9 +127,6 @@ pub(crate) struct Gate {
     pub(crate) needs: Vec<String>,
     pub(crate) cmd: Option<String>,
     pub(crate) pass_line: Option<String>,
-    /// repo-verify: the wrap modes `cmd`'s {mode} is substituted with.
-    #[serde(default)]
-    pub(crate) modes: Vec<String>,
     pub(crate) compare: Option<String>,
     pub(crate) blind_to: Option<String>,
 }
@@ -257,13 +253,6 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
                     g.name
                 ));
             }
-        }
-        if g.kind == Kind::RepoVerify && (g.cmd.is_none() || g.modes.is_empty()) {
-            p.push(format!(
-                "gate {} is kind=repo-verify but declares no cmd/modes; it would run \
-                 nothing and report success",
-                g.name
-            ));
         }
         if g.kind == Kind::Cmd && g.cmd.is_none() {
             p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));

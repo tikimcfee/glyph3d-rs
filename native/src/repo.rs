@@ -3,10 +3,8 @@
 //! Walks a repository (source-extension whitelist; VCS/build/dependency dirs
 //! skipped), lays every file out through the layout seam (`HyperLayout`,
 //! whatever `--repo-engine` says), and fills ONE
-//! glyph arena. The backend writes instances straight into the arena; only a
-//! `--repo-verify` run asks it for the 32 B wire records as well.
-//! `--repo-engine` selects; `--repo-verify` diffs against a recording
-//! `HyperLayout` reference. Each file is one VIEW (`crate::views`: its
+//! glyph arena. The backend writes instances straight into the arena.
+//! Each file is one VIEW (`crate::views`: its
 //! item row is the file's index) drawn with its own GROUP row, placed on a
 //! 2D grid of code pages; files are views {slot range, engine params} into
 //! the shared arena — the web's MegaGlyphField architecture (one arena,
@@ -25,10 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::glyph_scene::{GlyphInstance, GroupRow};
-use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, ItemParams, LayoutGlyphs,
-    LayoutItem, Paint, VerifyLayout,
-};
+use crate::layout::{GlyphArena, ItemParams, LayoutGlyphs, LayoutItem, Paint};
 use crate::text::{self, StagedText};
 
 pub use crate::layout_stack::{LayoutController, LayoutStack, LayoutZone, SpatialLayoutStrategy};
@@ -72,10 +67,6 @@ impl std::str::FromStr for Strategy {
 }
 
 impl Strategy {
-    pub fn can_record(&self) -> bool {
-        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem)
-    }
-
     pub fn materializes_records(&self) -> bool {
         matches!(self, Strategy::Batched | Strategy::PerItem)
     }
@@ -339,7 +330,6 @@ pub struct LoadStats {
     pub skipped_non_utf8: usize,
     pub dirs_visited: usize,
     pub strategy: Strategy,
-    pub verified: bool,
 }
 
 pub struct RepoLoad {
@@ -368,22 +358,17 @@ pub(crate) use shelf::{dir_tint, layout_shelf};
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
 /// `strategy` selects how `HyperLayout` runs (`Hyper` alone gets the
-/// background prefetch) and whether a verify
-/// run records. `verify` lays the same items out again with a recording
-/// `HyperLayout` reference and diffs the two AT THE SEAM: placements,
-/// instances and, when both can produce them, records, all bit-exact.
+/// background prefetch).
 pub fn load_repo(
     root: &Path,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
 ) -> RepoLoad {
     load_repo_from_walk(
         root,
         walk_repo(root),
         params,
         strategy,
-        verify,
         None,
         GlyphArena::new(),
         None,
@@ -401,7 +386,6 @@ pub fn load_items(
     root: &Path,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
     load_repo_from_walk(
@@ -409,7 +393,6 @@ pub fn load_items(
         walk,
         params,
         strategy,
-        verify,
         None,
         GlyphArena::new(),
         folds,
@@ -457,13 +440,11 @@ pub fn prefetch_repo(
 /// `gpu` is the renderer's device when one exists — HyperLayout emits
 /// straight into its buffers; `None` is the no-GPU door
 /// (`--repo-scan-only`), where layout fills a host arena.
-#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -485,20 +466,17 @@ pub fn load_repo_from_walk(
         prefetched,
         params,
         strategy,
-        verify,
         gpu,
         arena,
         folds,
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_prefetched(
     root: &Path,
     prefetched: PrefetchedRepo,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -507,7 +485,7 @@ pub fn load_repo_from_prefetched(
         buffer_of_view: (0..prefetched.walk.files.len() as u32).collect(),
         placement: Placement::Controller,
     };
-    load_views(root, prefetched, plan, params, strategy, verify, gpu, arena, folds)
+    load_views(root, prefetched, plan, params, strategy, gpu, arena, folds)
 }
 
 /// `--render-file FILE [--copies N]` as a repo load of that one file
@@ -547,7 +525,6 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&cra
         plan,
         params,
         Strategy::default(),
-        false,
         gpu,
         GlyphArena::new(),
         None,
@@ -580,7 +557,6 @@ fn load_views(
     plan: ViewPlan,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -597,7 +573,6 @@ fn load_views(
         files = walk.files.len(),
         bytes = walk.total_bytes,
         ?strategy,
-        verify,
     )
     .entered();
     let walk_dur = walk.walk_dur;
@@ -649,62 +624,11 @@ fn load_views(
     }
     let t = Instant::now();
     let sp_backend = tracing::info_span!("repo.backend").entered();
-    let (mut placements, records) = if verify && strategy.can_record() {
-        backend
-            .layout_items_recording(&items, &mut arena)
-            .expect("layout failed")
-    } else {
-        (
-            backend
-                .layout_items(&items, &mut arena)
-                .expect("layout failed"),
-            Vec::new(),
-        )
-    };
+    let mut placements = backend
+        .layout_items(&items, &mut arena)
+        .expect("layout failed");
     drop(sp_backend);
-    let mut backend_dur = t.elapsed();
-
-    let mut verified = false;
-    if verify {
-        let _sp_verify = tracing::info_span!("repo.verify").entered();
-        let t = Instant::now();
-        let mut alt = crate::layout_hyper::HyperLayout::new();
-        let mut alt_arena = GlyphArena::new();
-        let (alt_placements, alt_records) = alt
-            .layout_validated_items_recording(&items, &mut alt_arena)
-            .expect("layout failed");
-        let arena_flat = arena.instances_cow();
-        let alt_flat = alt_arena.instances_cow();
-        let report = diff_backends(
-            &BackendOutput {
-                name: backend.name(),
-                placements: &placements,
-                instances: &arena_flat,
-                records: &records,
-            },
-            &BackendOutput {
-                name: "hyper-ref",
-                placements: &alt_placements,
-                instances: &alt_flat,
-                records: &alt_records,
-            },
-        )
-        .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
-        if report.items == 0 || report.instances == 0 {
-            panic!(
-                "repo-verify FAIL: nothing to compare — {} items, {} instances.",
-                report.items, report.instances,
-            );
-        }
-        backend_dur += t.elapsed();
-        verified = true;
-        println!(
-            "repo-verify PASS: {} items, {} instances, {} records verified",
-            report.items,
-            report.instances,
-            report.records,
-        );
-    }
+    let backend_dur = t.elapsed();
 
     let t_fold_phase = Instant::now();
     // ── P2a: fold compaction ────────────────────────────────────────────
@@ -908,7 +832,6 @@ fn load_views(
         skipped_non_utf8: walk_skipped_non_utf8,
         dirs_visited: walk_dirs_visited,
         strategy,
-        verified,
     };
     RepoLoad {
         arena,
@@ -1207,7 +1130,7 @@ impl RepoLoad {
         );
         println!(
             "repo: {} engine records -> {} glyph instances ({} blank/missing dropped) \
-             | backend: {}{}",
+             | backend: {}",
             s.records,
             s.instances,
             s.blanks,
@@ -1217,7 +1140,6 @@ impl RepoLoad {
                 Strategy::Direct => "hyper/direct",
                 Strategy::Hyper => "hyper-rust (parallel direct)",
             },
-            if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
         println!(
             "phases: walk {:.3}s | backend {:.3}s ({:.1} MB/s, {}) \

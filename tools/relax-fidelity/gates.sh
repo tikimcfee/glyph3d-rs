@@ -30,11 +30,6 @@ add ho-leader . "" "--hyper-oracle-check ${HO[*]} --cluster-mode leader"
 add ho-strict . "GLYPH_HYPER_ORACLE_STRICT=1" "--hyper-oracle-check ${FIX[*]} ${HO[*]}"
 add ho-tab4   . "GLYPH_HYPER_ORACLE_STRICT=1" "--hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4"
 add ho-tab8   . "" "--hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
-for e in hyper direct; do
-  for m in down back; do
-    add "verify-$e-$m" native "" "--load-repo fixtures/g-pick-repo --wrap-mode $m --repo-engine $e --repo-verify --repo-scan-only"
-  done
-done
 
 pick=("$@")
 [ ${#pick[@]} -eq 0 ] && pick=("${names[@]}")

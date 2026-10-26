@@ -4,8 +4,7 @@
 //! `--load-repo` runs it, whatever `--repo-engine` says. Before this
 //! instrument nothing compared it to the JS oracle. The
 //! `--fixture-*` instruments hold `fold.rs`, the trie and `text.rs` to
-//! the oracle's recorded answers; `--repo-verify` holds
-//! HyperLayout to HyperLayout. A defect HyperLayout carries alone was
+//! the oracle's recorded answers. A defect HyperLayout carries alone was
 //! therefore visible only through pixels — and the goldens were re-adopted
 //! after HyperLayout landed, so they pin whatever it does.
 //!
@@ -51,8 +50,9 @@
 //!
 //! WHAT IT CANNOT SEE: the device path past the emitter (the staging copy into
 //! VRAM, the buffer chunking), the Derived field's vertex-stage Y/Z (the slot
-//! carries none), the background prefetch of Pass 1 (repo-verify holds it to
-//! the inline Pass 1 used here), and anything both sides share, above.
+//! carries none), the background prefetch of Pass 1 (it runs the same Pass 1
+//! driver as the inline Pass 1 used here), and anything both sides share,
+//! above.
 //!
 //! INPUTS. A `.pipe.bin` fixture contributes its bytes and item params (each
 //! item laid out as its own buffer, as a repo file is); a directory is walked

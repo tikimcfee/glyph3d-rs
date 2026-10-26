@@ -11,7 +11,7 @@ workspace, outside every gate.
 
 ```sh
 tools/relax-fidelity/run.sh       # float harness: rustc vs relax (warm, cold, SSE)
-tools/relax-fidelity/gates.sh     # the CPU instruments of reference-port, hyper-oracle, repo-verify
+tools/relax-fidelity/gates.sh     # the CPU instruments of reference-port and hyper-oracle
 tools/relax-fidelity/goldens.sh   # every golden view, plain and under each equivalent
 ```
 

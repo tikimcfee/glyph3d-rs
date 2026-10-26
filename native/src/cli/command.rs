@@ -23,7 +23,6 @@ pub enum CliCommand {
         dir: PathBuf,
         params: RepoParams,
         strategy: Strategy,
-        verify: bool,
     },
     /// Render execution plan (windowed or offscreen).
     Render(RenderPlan),
@@ -144,7 +143,6 @@ impl Cli {
                 dir,
                 params,
                 strategy: self.repo_engine,
-                verify: self.repo_verify,
             };
         }
 
@@ -170,7 +168,6 @@ impl Cli {
             SceneChoice::Repo {
                 dir: dir.clone(),
                 strategy: self.repo_engine,
-                verify: self.repo_verify,
                 focus: self.focus_file.clone(),
                 wrap_mode: self.wrap_mode,
                 z_wrap_spacing: self.z_wrap_spacing,

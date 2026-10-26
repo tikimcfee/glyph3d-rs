@@ -181,17 +181,9 @@ pub struct Cli {
     /// Which layout engine a repo load uses. `hyper` (the DEFAULT) is the
     /// parallel CPU HyperLayout, writing render instances straight into the
     /// arena with its inputs prefetched in the background. `direct`,
-    /// `batch` and `naive` run the same HyperLayout without the prefetch;
-    /// under `--repo-verify`, `direct` records no 32 B wire records
-    /// (placements and instances are diffed, records are not) while `batch`
-    /// and `naive` do.
+    /// `batch` and `naive` run the same HyperLayout without the prefetch.
     #[arg(long, value_name = "MODE", default_value = "hyper")]
     pub repo_engine: crate::repo::Strategy,
-    /// Diff the chosen strategy against a counterpart, bit-exact over the
-    /// whole repo: placements and instances always, wire records when both
-    /// paths have them (`direct` has none, and the PASS line says so).
-    #[arg(long)]
-    pub repo_verify: bool,
     /// How a wrap is spent on a repo load: `back` (the default, and what the
     /// `repo-wide`/`repo-zoom` byte-equal screenshot baselines are taken
     /// under; `repo-down` covers the other) keeps the row and steps the
@@ -376,17 +368,15 @@ pub struct RawOps {
 
 /// Whether this run looks for a personal `launch_config.toml` on its own.
 /// Only an interactive run does. Screenshot runs never do, and neither does
-/// any run that checks or measures (`--repo-verify`, `--repo-scan-only`, the
+/// any run that checks or measures (`--repo-scan-only`, the
 /// `--fixture-*` and `--hyper-oracle-check` instruments, `--line-table-stats`,
 /// `--gpu-key` / `--gpu-profile`, `--generate`): every gate launches the
 /// binary as one of these, and a personal override (a color, a wrap mode, a
 /// field mode) must not reach what a gate compares. Until 2026-10-10 only
-/// `--screenshot` was excluded, and a launcher-saved `field_mode = "visible"`
-/// in the checkout's `launch_config.toml` turned repo-verify-direct red
-/// (`direct` lays out no instances in visible mode).
+/// `--screenshot` was excluded, and a launcher-saved field mode in the
+/// checkout's `launch_config.toml` turned a gate red.
 pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
-    let checks = cli.repo_verify
-        || cli.repo_scan_only
+    let checks = cli.repo_scan_only
         || cli.gpu_key
         || cli.gpu_profile
         || cli.generate.is_some()

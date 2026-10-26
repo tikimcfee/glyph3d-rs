@@ -763,7 +763,6 @@ fn poll_live(
         std::path::Path::new("."),
         &src.params,
         crate::repo::Strategy::Hyper,
-        false,
         if folds.is_empty() { None } else { Some(&folds) },
     );
     let t_fold = t_all.elapsed();
