@@ -56,6 +56,15 @@ pub struct FrameFeed {
     /// The blocks as makepad takes them, refreshed per frame (a refcount
     /// each), kept so the inputs can borrow them.
     blocks: Vec<Arc<[f32]>>,
+    /// Which blocks the last frame's selection drew into, logged when it
+    /// changes (a selection across a block edge draws into two).
+    selection_blocks: Vec<usize>,
+    /// The last frame's mesh and region counts and picked region, logged
+    /// when they change.
+    shape: (usize, usize, usize, usize, Option<usize>),
+    /// `GLYPH_FRAME_TRACE=1`: log every frame's changed group, face and
+    /// region runs (a drag or a page turn moves them each frame).
+    trace: Option<bool>,
 }
 
 /// A block's `u32` words as the `f32`-carried words makepad's instance
@@ -153,6 +162,15 @@ impl FrameFeed {
         };
         let chunk_ranges = frame.glyph_ranges.per_chunk();
         let selection_ranges = frame.selection.as_ref().map(|s| s.ranges.per_chunk());
+        let selection_blocks: Vec<usize> = selection_ranges
+            .iter()
+            .flat_map(|per| per.iter().enumerate().filter(|(_, r)| !r.is_empty()).map(|(k, _)| k))
+            .collect();
+        if selection_blocks != self.selection_blocks {
+            let slots = frame.selection.as_ref().map_or(0, |s| s.ranges.slot_count());
+            makepad_widgets::log!("g3: selection draws {slots} slots into blocks {selection_blocks:?}");
+            self.selection_blocks = selection_blocks;
+        }
         let selection = frame
             .selection
             .as_ref()
@@ -160,6 +178,22 @@ impl FrameFeed {
             .map(|(s, ranges)| G3Selection { chunk_ranges: ranges, tint: s.tint });
         let faces = frame.faces.as_deref().map_or(&[][..], Vec::as_slice);
         let regions = frame.regions.as_deref().map_or(&[][..], Vec::as_slice);
+        let shape = (faces.len(), frame.quads.len(), frame.cubes.len(), regions.len(), frame.picked_region);
+        if shape != self.shape {
+            let (f, q, c, r, picked) = shape;
+            makepad_widgets::log!("g3: meshes {f} faces, {q} quads, {c} cubes; {r} regions, picked {picked:?}");
+            self.shape = shape;
+        }
+        if *self.trace.get_or_insert_with(|| std::env::var_os("GLYPH_FRAME_TRACE").is_some())
+            && !(frame.group_runs.is_empty() && frame.face_runs.is_empty() && frame.region_runs.is_empty())
+        {
+            makepad_widgets::log!(
+                "g3: frame runs: groups {:?}, faces {:?}, regions {:?}",
+                frame.group_runs,
+                frame.face_runs,
+                frame.region_runs
+            );
+        }
         let [r, g, b, a] = frame.clear_color;
         let groups_generation = generation(scene_generation, tables.groups_version);
         let inputs = G3FrameInputs {

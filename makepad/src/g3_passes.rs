@@ -1788,17 +1788,31 @@ impl G3Renderer {
             self.seen.groups = Some(inputs.groups_generation);
         }
         // Blocks by identity: only a new Arc at an index is re-published.
+        // One log line per sync that republished any (a load, an edit), so
+        // an edit's upload is visible: it should name one block, not all.
         self.blocks.truncate(inputs.blocks.len());
+        let mut republished = Vec::new();
         for (k, words) in inputs.blocks.iter().enumerate() {
             if self.blocks.get(k).is_some_and(|b| b.is(words)) {
                 continue;
             }
+            republished.push(k);
             let block = G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot");
             if k < self.blocks.len() {
                 self.blocks[k] = block;
             } else {
                 self.blocks.push(block);
             }
+        }
+        if !republished.is_empty() {
+            let shown: Vec<usize> = republished.iter().copied().take(8).collect();
+            log!(
+                "g3: republished {} of {} glyph blocks {:?}{}",
+                republished.len(),
+                self.blocks.len(),
+                shown,
+                if republished.len() > shown.len() { " ..." } else { "" }
+            );
         }
         if self.seen.meshes != Some(inputs.meshes_generation) || self.meshes.is_none() {
             self.meshes = Some(G3MeshPublications {

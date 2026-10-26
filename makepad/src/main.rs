@@ -29,7 +29,7 @@ use g3_ui::G3UiLayer;
 use host::EngineHost;
 use ui_model::{G3Panel, G3UiAction};
 
-app_main!(App);
+app_main!(App, configure: |_cx: &mut Cx| host::parse_plan_or_exit());
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -57,8 +57,8 @@ script_mod! {
 pub struct App {
     #[live]
     ui: WidgetRef,
-    /// Built on the first event: the scene load happens once the window
-    /// exists, and a command line the engine refuses ends the run there.
+    /// Built on the first event from the plan parsed at startup (a command
+    /// line the engine refuses never gets this far).
     #[rust]
     host: Option<EngineHost>,
     #[rust]
@@ -116,14 +116,8 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.host.is_none() {
-            match host::plan_from_args() {
-                Ok((choice, cull_opts, ops)) => self.host = Some(EngineHost::new(choice, cull_opts, &ops)),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    cx.quit();
-                    return;
-                }
-            }
+            let (choice, cull_opts, ops) = host::take_plan();
+            self.host = Some(EngineHost::new(choice, cull_opts, &ops));
         }
         self.match_event(cx, event);
         let host = self.host.as_mut().expect("built above");
