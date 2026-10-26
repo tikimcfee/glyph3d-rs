@@ -300,7 +300,10 @@ is a *product*: nothing to compare against, it only has to be CURRENT.
 Currency is a content hash of the declared inputs — `native/src`, `crates/`,
 `native/Cargo.toml`, `glyph/Cargo.toml`, and the root `Cargo.toml`,
 `Cargo.lock` and `.cargo/config.toml` — stamped at build time, rebuilt only
-when that hash moved. It is built at WORKSPACE scope, the scope cargo-build
+when that hash moved. Its build makes the test binaries too
+(`cargo build --release --lib --bins --tests`, 2026-10-26): one cargo
+compiles the renderer crate and its `cfg(test)` twin side by side, and
+cargo-test finds them built. It is built at WORKSPACE scope, the scope cargo-build
 and cargo-test rebuild it at: a package-scope build resolves features for the
 renderer alone and links different bytes, so until 2026-10-09 the stamp
 vouched for one binary and every gate after cargo-build ran another (which
