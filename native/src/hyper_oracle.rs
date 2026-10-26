@@ -1406,74 +1406,88 @@ mod tests {
         // the one it claims to be.
         let (defs, _) = slice_byte_buffers_into_chunk_defs(&[cut.as_bytes()]);
         assert!(defs.len() >= 3, "the cut text is {} chunk(s)", defs.len());
-        let mut compared = 0usize;
-        let mut moved = 0usize;
-        for width in [4u32, 8] {
-            let tab_width = fold::TabWidth::new(width).expect("a width");
-            let mut off_stop_cuts = 0usize;
-            for cluster in [ClusterMode::Cluster, ClusterMode::Leader] {
-                for (wrap, mode, rows, cols, wide) in shapes {
-                    let params = ItemParams {
-                        origin_x: 0.5,
-                        origin_y: -1.0,
-                        origin_z: 2.0,
-                        line_height: 1.1,
-                        z_step: 0.4,
-                        wrap_width: wrap,
-                        wrap_mode: mode,
-                        cluster_mode: cluster,
-                        tab_width,
-                        has_page: rows != 0 || cols != 0,
-                        page_rows: rows,
-                        page_cols: cols,
-                        pages_wide: wide,
-                        page_gap_x: 0.8,
-                        band_stride_y: 9.5,
-                        depth_per_band: -2.5,
-                        depth_per_col: 0.75,
-                        ..ItemParams::default()
-                    };
-                    let corpus = Corpus {
-                        name: "tabs".into(),
-                        items: texts
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
-                            .collect(),
-                    };
-                    let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
-                    let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
-                    assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
-                    assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
-                    assert_eq!(
-                        (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
-                        (0, 0, 0),
-                        "{at}: {:?}",
-                        d.firsts
-                    );
-                    assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
-                    assert_eq!((d.visible_bad, d.visible_span_bad), (0, 0), "{at}: visible kernel: {:?}", d.firsts);
-                    assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
-                    compared += d.instances;
-                    // The cut text's chunks, read off the reference: a chunk
-                    // holding a tab whose line is off a stop where it starts.
-                    if wrap == 0 && cols == 0 {
-                        let r = reference_item(cut.as_bytes(), &params, &trie);
-                        let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
-                        moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
-                        for def in &defs[1..] {
-                            let first = r.record_bytes.iter().position(|&b| b >= def.byte_offset).expect("a record in the chunk");
-                            let cells = ((r.records[first].x() as f64 - params.origin_x) / cell).round() as u64;
-                            let chunk = &cut.as_bytes()[def.byte_offset..def.byte_offset + def.byte_len];
-                            if !cells.is_multiple_of(width as u64) && chunk.contains(&b'\t') {
-                                off_stop_cuts += 1;
-                            }
+        // The 24 cases run at once: one after another they were 11 s of
+        // the renderer's 13 s unit-test run, the long pole of cargo-test
+        // (2026-10-26). Each case is independent; the tallies are summed.
+        use rayon::prelude::*;
+        let cases: Vec<_> = [4u32, 8]
+            .into_iter()
+            .flat_map(|width| {
+                [ClusterMode::Cluster, ClusterMode::Leader]
+                    .into_iter()
+                    .flat_map(move |cluster| shapes.into_iter().map(move |shape| (width, cluster, shape)))
+            })
+            .collect();
+        let tallies: Vec<(u32, usize, usize, usize)> = cases
+            .par_iter()
+            .map(|&(width, cluster, (wrap, mode, rows, cols, wide))| {
+                let tab_width = fold::TabWidth::new(width).expect("a width");
+                let (mut moved, mut off_stop_cuts) = (0usize, 0usize);
+                let params = ItemParams {
+                    origin_x: 0.5,
+                    origin_y: -1.0,
+                    origin_z: 2.0,
+                    line_height: 1.1,
+                    z_step: 0.4,
+                    wrap_width: wrap,
+                    wrap_mode: mode,
+                    cluster_mode: cluster,
+                    tab_width,
+                    has_page: rows != 0 || cols != 0,
+                    page_rows: rows,
+                    page_cols: cols,
+                    pages_wide: wide,
+                    page_gap_x: 0.8,
+                    band_stride_y: 9.5,
+                    depth_per_band: -2.5,
+                    depth_per_col: 0.75,
+                    ..ItemParams::default()
+                };
+                let corpus = Corpus {
+                    name: "tabs".into(),
+                    items: texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
+                        .collect(),
+                };
+                let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
+                let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
+                assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
+                assert_eq!(
+                    (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
+                    (0, 0, 0),
+                    "{at}: {:?}",
+                    d.firsts
+                );
+                assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
+                assert_eq!((d.visible_bad, d.visible_span_bad), (0, 0), "{at}: visible kernel: {:?}", d.firsts);
+                assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
+                // The cut text's chunks, read off the reference: a chunk
+                // holding a tab whose line is off a stop where it starts.
+                if wrap == 0 && cols == 0 {
+                    let r = reference_item(cut.as_bytes(), &params, &trie);
+                    let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
+                    moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
+                    for def in &defs[1..] {
+                        let first = r.record_bytes.iter().position(|&b| b >= def.byte_offset).expect("a record in the chunk");
+                        let cells = ((r.records[first].x() as f64 - params.origin_x) / cell).round() as u64;
+                        let chunk = &cut.as_bytes()[def.byte_offset..def.byte_offset + def.byte_len];
+                        if !cells.is_multiple_of(width as u64) && chunk.contains(&b'\t') {
+                            off_stop_cuts += 1;
                         }
                     }
                 }
-            }
+                (width, d.instances, moved, off_stop_cuts)
+            })
+            .collect();
+        for width in [4u32, 8] {
+            let off_stop_cuts: usize = tallies.iter().filter(|t| t.0 == width).map(|t| t.3).sum();
             assert!(off_stop_cuts > 0, "width {width}: no chunk of the cut text starts off a stop with a tab in it");
         }
+        let compared: usize = tallies.iter().map(|t| t.1).sum();
+        let moved: usize = tallies.iter().map(|t| t.2).sum();
         assert!(compared > 100_000, "the grid compared only {compared} instances");
         assert!(moved > 10_000, "the stops moved only {moved} glyphs of the cut text");
     }
