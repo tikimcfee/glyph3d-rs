@@ -23,13 +23,21 @@ fn gate_cargo(g: &Gate) -> bool {
         // cargo gate, so it never shares target/debug, and its lock, with an
         // editor's rust-analyzer, which checks there.
         Some("doc") => "cargo doc --workspace --release --no-deps",
-        // The renderer without its default features (no egui overlay): a
-        // supported build that nothing compiled until 2026-10-09, when it
-        // was found broken (C24). Its own target dir, so the changed feature
-        // set never invalidates the main build.
-        Some("check-no-ui") => {
-            "cargo check -p glyph3d-native --no-default-features --all-targets --target-dir target/no-ui"
-        }
+        // The renderer without its default features, in two builds: the
+        // window without the egui overlay, a supported build that nothing
+        // compiled until 2026-10-09, when it was found broken (C24); and
+        // since 2026-10-26 the bare library, no window at all, the build a
+        // host that owns its window links. The bare build's tree must hold
+        // no winit or egui (and must hold the renderer: an empty tree
+        // proves nothing). Its own target dir, so the changed feature sets
+        // never invalidate the main build.
+        Some("check-no-ui") => concat!(
+            "cargo check -p glyph3d-native --no-default-features --features windowed --all-targets --target-dir target/no-ui",
+            " && cargo check -p glyph3d-native --no-default-features --all-targets --target-dir target/no-ui",
+            " && cargo tree -p glyph3d-native --no-default-features -e no-dev --prefix none > target/no-ui/tree.txt",
+            " && grep -q '^glyph3d-native ' target/no-ui/tree.txt",
+            " && ! grep -E '^(winit|egui)' target/no-ui/tree.txt",
+        ),
         other => {
             println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
             return false;

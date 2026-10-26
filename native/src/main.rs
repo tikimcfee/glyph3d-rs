@@ -179,6 +179,7 @@ fn main() {
                         &plan.ops,
                     );
                 }
+                #[cfg(feature = "windowed")]
                 RenderTarget::Windowed {
                     no_ui,
                     shot,
@@ -196,6 +197,11 @@ fn main() {
                         None,
                         frames,
                     );
+                }
+                #[cfg(not(feature = "windowed"))]
+                RenderTarget::Windowed { .. } => {
+                    eprintln!("error: this build has no window (the `windowed` feature is off); render offscreen with --screenshot PATH");
+                    std::process::exit(1);
                 }
             }
         }
