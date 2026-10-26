@@ -12,8 +12,7 @@ use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::fold::rows_for_line;
 use crate::layout::{
-    DerivedDeviceSlots, DeviceSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs,
-    LayoutItem,
+    EmittedSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, SlotResidence,
 };
 use crate::text::fu_to_world;
 use glyph_field::GlyphFieldMode;
@@ -31,7 +30,7 @@ use line_table::{cells_of, ChunkLine, ChunkLines, ChunkSeed, CutPlan};
 use char_resolve::{resolve_byte_char_cluster, ResolveCtx};
 
 mod device_alloc;
-use device_alloc::{layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
+use device_alloc::{emit_host_blocks, layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
 
 mod pass2_device;
 use pass2_device::{DerivedEmit, RenderEmit};
@@ -305,16 +304,15 @@ impl HyperLayout {
                 em_height_fu,
             };
 
-            let (emission, derived_extras) = if derived {
-                let label = "derived glyph slots (direct)";
-                // The table depends only on Pass 1; build it alongside Pass 2.
-                let emission = if unified {
-                    layout_device_unified::<DerivedEmit>(dev, total_survivors, &inputs, label)
-                } else {
-                    layout_device_discrete::<DerivedEmit>(dev, total_survivors, &inputs, label)
-                };
-                let extras = DerivedDeviceSlots { mapped_base: emission.mapped_base };
-                (emission, Some(extras))
+            // Derived slots land in host blocks that are the field's chunks
+            // (2026-10-26): the one copy the wgpu field uploads from and a
+            // makepad renderer publishes. Instanced slots are emitted to the
+            // device directly, and stay so only because Instanced is being
+            // retired: not a second Derived path.
+            let (residence, chunk_slots, pass2_out, emoji_tint_pairs) = if derived {
+                let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
+                let (slots, pass2, pairs) = emit_host_blocks::<DerivedEmit>(&inputs, total_survivors, block_slots);
+                (SlotResidence::Host(slots), block_slots, pass2, pairs)
             } else {
                 let label = "glyph render slots (direct)";
                 let emission = if unified {
@@ -322,24 +320,20 @@ impl HyperLayout {
                 } else {
                     layout_device_discrete::<RenderEmit>(dev, total_survivors, &inputs, label)
                 };
-                (emission, None)
+                let DeviceEmission { chunks, chunk_slots, mapped_base, pass2, emoji_tint_pairs } = emission;
+                (SlotResidence::Device { chunks, mapped_slots: mapped_base }, chunk_slots, pass2, emoji_tint_pairs)
             };
-            let DeviceEmission { chunks, chunk_slots, mapped_base, pass2: pass2_out, emoji_tint_pairs } = emission;
 
-            let device_slots = DeviceSlots {
-                chunks,
+            let emitted = EmittedSlots {
+                residence,
                 chunk_slots,
                 len: total_survivors,
-                // RenderSlot-typed readers key off this; never hand them a
-                // DerivedSlot mapping.
-                mapped_slots: if derived { None } else { mapped_base },
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
                 format: field_mode,
-                derived: derived_extras,
                 emoji_tint_pairs,
             };
-            *arena = GlyphArena::from_device(device_slots);
+            *arena = GlyphArena::from_emitted(emitted);
             Ok(pass2_out.placements)
         } else {
             let (tail_ptr, capacity) = arena.uninit_tail(total_survivors);
@@ -1578,6 +1572,69 @@ mod tests {
     /// GPU).
     #[test]
     fn windowed_emission_matches_unwindowed() {
+        with_window_corpus(|items| {
+            let sizes = [1, 700, usize::MAX];
+            windowed_matches_unwindowed::<pass2_device::DerivedEmit>(items, &sizes);
+            windowed_matches_unwindowed::<pass2_device::RenderEmit>(items, &sizes);
+        });
+    }
+
+    /// The Derived field's slots land in host blocks (2026-10-26): every
+    /// block size, from one slot to more than the stream, holds exactly the
+    /// words, placements, tints and pairs of the one-buffer emission, the
+    /// blocks covering the stream in order with only the last short. Block
+    /// edges fall inside windows, inside layout chunks and inside emoji
+    /// items (whose chunks detour through scratch), so the scatter is held
+    /// at every kind of seam.
+    #[test]
+    fn host_blocks_match_the_contiguous_emission() {
+        with_window_corpus(|items| {
+            let trie = crate::default_trie();
+            let em_height_fu = trie.metrics.em_height_fu;
+            let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+            let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+            let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, items, &trie, bitmap_adv, em_height_fu);
+            let slot_bases: Vec<u32> = item_chunk_ranges.iter().map(|r| agg.chunk_slot_bases[r.start]).collect();
+            let inputs = EmitInputs {
+                items,
+                chunks: &chunks,
+                item_chunk_ranges: &item_chunk_ranges,
+                prepasses: &agg.prepasses,
+                slot_bases: &slot_bases,
+                chunk_slot_bases: &agg.chunk_slot_bases,
+                chunk_base_rows: &agg.chunk_base_rows,
+                chunk_record_bases: &agg.chunk_record_bases,
+                chunk_initial_cols: &agg.chunk_initial_cols,
+                chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
+                chunk_initial_line_advs: &agg.chunk_initial_line_advs,
+                trie: &trie,
+                bitmap_adv,
+                em_height_fu,
+            };
+            let total = agg.total_survivors;
+            let mut reference = vec![<DerivedSlot as bytemuck::Zeroable>::zeroed(); total.max(1)];
+            let (ref_out, ref_pairs) = inputs.run::<pass2_device::DerivedEmit>(reference.as_mut_ptr() as usize);
+            let ref_words: &[u32] = bytemuck::cast_slice(&reference[..total]);
+            assert!(total > 1400, "the corpus must span many blocks of 700");
+            for block_slots in [1, 7, 700, total + 3] {
+                let (slots, out, pairs) = device_alloc::emit_host_blocks::<pass2_device::DerivedEmit>(&inputs, total, block_slots);
+                assert_eq!((slots.len(), slots.block_slots(), slots.slot_words()), (total, block_slots, 5));
+                assert_eq!(slots.blocks().len(), total.div_ceil(block_slots), "block_slots {block_slots}: block count");
+                let lens: Vec<usize> = (0..slots.blocks().len()).map(|k| slots.block_len(k)).collect();
+                assert!(lens[..lens.len() - 1].iter().all(|&n| n == block_slots), "block_slots {block_slots}: only the last block is short");
+                let words: Vec<u32> = slots.blocks().iter().flat_map(|b| b.iter().copied()).collect();
+                assert!(words == ref_words, "block_slots {block_slots}: the blocks' words differ from the contiguous emission");
+                assert_eq!(out.placements, ref_out.placements, "block_slots {block_slots}: placements");
+                assert_eq!(out.file_tints, ref_out.file_tints, "block_slots {block_slots}: tints");
+                assert_eq!(pairs, ref_pairs, "block_slots {block_slots}: emoji tint pairs");
+            }
+        });
+    }
+
+    /// The windowed emission's corpus: an emoji item (its chunks detour
+    /// through scratch), items cut into several layout chunks, an empty
+    /// item, per-glyph colour.
+    fn with_window_corpus(f: impl FnOnce(&[LayoutItem<'_>])) {
         use crate::fold::WrapMode;
         let read = |p: &str| std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)).expect(p);
         let emoji = read("fixtures/emoji-view.txt");
@@ -1600,9 +1657,7 @@ mod tests {
             .enumerate()
             .map(|(i, (bytes, paint))| LayoutItem { bytes, params, group_id: i as u32, paint: *paint })
             .collect();
-        let sizes = [1, 700, usize::MAX];
-        windowed_matches_unwindowed::<pass2_device::DerivedEmit>(&items, &sizes);
-        windowed_matches_unwindowed::<pass2_device::RenderEmit>(&items, &sizes);
+        f(&items);
     }
 
     /// One distinct opaque colour per record (a record per UTF-8 leader), so
@@ -1952,10 +2007,13 @@ mod tests {
         }
     }
 
+    /// The device emission (the Instanced field's, since Derived slots land
+    /// in host blocks, 2026-10-26) chunks at the binding limit and the field
+    /// binds every chunk.
     #[test]
     fn hyper_device_chunking_splits_and_binds_across_limits() {
         use glyph_field::{FieldResources, FieldTargets, GlyphField, SlotSource};
-        use glyph_field_derived::DerivedField;
+        use glyph_field_instanced::InstancedField;
 
         let ctx = pollster::block_on(crate::gpu::init(None));
         let dev = crate::gpu::SharedDevice::from_ctx(&ctx);
@@ -1998,11 +2056,11 @@ mod tests {
 
         // Force chunk_cap = 16 slots to test multi-chunk emission on real GPU buffers
         let chunk_cap = 16;
-        let emission = device_alloc::layout_device_discrete_chunked::<pass2_device::DerivedEmit>(
+        let emission = device_alloc::layout_device_discrete_chunked::<pass2_device::RenderEmit>(
             &dev,
             total_survivors,
             &inputs,
-            "test derived chunked",
+            "test instanced chunked",
             chunk_cap,
         );
 
@@ -2013,7 +2071,7 @@ mod tests {
         let total_chunk_slots: u32 = emission.chunks.iter().map(|c| c.slots).sum();
         assert_eq!(total_chunk_slots as usize, total_survivors);
 
-        // Verify DerivedField builds bind groups for all chunks without validation error
+        // Verify InstancedField builds bind groups for all chunks without validation error
         let dummy_advances = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dummy advances"),
             size: 256,
@@ -2088,6 +2146,7 @@ mod tests {
             glyph_advances: &dummy_advances,
             item_params: &[],
             item_of_group: &[],
+            block_slots: chunk_cap,
         };
 
         let source = SlotSource::Device {
@@ -2103,7 +2162,7 @@ mod tests {
             sample_count: 1,
         };
 
-        let field = DerivedField::new(&ctx.device, &ctx.queue, source, &resources, targets);
+        let field = InstancedField::new(&ctx.device, &ctx.queue, source, &resources, targets);
         assert_eq!(field.chunk_count(), expected_chunks as u32);
         assert_eq!(field.chunk_capacity(), chunk_cap as u32);
         assert_eq!(field.glyph_count(), total_survivors as u32);

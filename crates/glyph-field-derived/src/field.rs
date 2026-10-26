@@ -27,6 +27,9 @@ pub struct DerivedField {
     /// The group overrides (binding 10, `derive.rs`): `OVERRIDE_MAX + 1`
     /// words, index 0 unused. Filled as group verbs allocate rows.
     group_overrides: wgpu::Buffer,
+    /// The same table on the host, written with the buffer, for a renderer
+    /// that draws from the host copy (`GlyphField::group_overrides`).
+    group_overrides_host: std::cell::RefCell<Vec<u32>>,
     /// The next free override index; never reused (a verb's group row is
     /// never freed either).
     next_override: std::cell::Cell<u32>,
@@ -47,11 +50,23 @@ impl DerivedField {
             resources.item_params
         };
 
-        // A device source for this field is the producer's direct Derived
-        // emission (HyperLayout Pass 2), bound as-is. A host source
-        // transcodes against the same item table.
+        // The field keeps its slots on the host, in blocks that are its
+        // chunks (2026-10-26): the producer's Derived emission arrives as
+        // those blocks (HyperLayout's Pass 2 writes them), host records are
+        // transcoded into them against the same item table, and the storage
+        // uploads one buffer per block from them. Instanced is the field
+        // whose slots are emitted straight to the device.
         let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group, no_items: resources.item_params.is_empty() };
-        let storage = SlotStorage::from_source(device, queue, source, &transcode, &LABELS);
+        let slots = match source {
+            SlotSource::Blocks(slots) => slots,
+            SlotSource::Host { slices, glyph_count, .. } => {
+                glyph_field::transcode_host_slots(&slices, glyph_count, resources.block_slots, &transcode)
+            }
+            SlotSource::Device { .. } => panic!(
+                "the Derived field keeps its slots on the host (2026-10-26): a device slot source is the Instanced field's"
+            ),
+        };
+        let storage = SlotStorage::from_source(device, queue, SlotSource::Blocks(slots), &transcode, &LABELS);
 
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived item table"),
@@ -93,6 +108,7 @@ impl DerivedField {
             _item_table_buffer: item_table_buffer,
             item_groups,
             group_overrides,
+            group_overrides_host: std::cell::RefCell::new(vec![0; crate::derive::OVERRIDE_MAX as usize + 1]),
             next_override: std::cell::Cell::new(1),
         }
     }
@@ -163,6 +179,7 @@ impl GlyphField for DerivedField {
             }
             self.next_override.set(idx + 1);
             queue.write_buffer(&self.group_overrides, idx as u64 * 4, bytemuck::bytes_of(&group_id));
+            self.group_overrides_host.borrow_mut()[idx as usize] = group_id;
             crate::derive::override_lane(item, idx)
         };
         self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&lane));
@@ -193,5 +210,13 @@ impl GlyphField for DerivedField {
 
     fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
         self.core.read_slot_words(device, queue, slot, out);
+    }
+
+    fn host_slots(&self) -> Option<std::cell::Ref<'_, glyph_field::HostSlots>> {
+        self.core.storage().host_slots()
+    }
+
+    fn group_overrides(&self) -> Option<std::cell::Ref<'_, [u32]>> {
+        Some(std::cell::Ref::map(self.group_overrides_host.borrow(), Vec::as_slice))
     }
 }

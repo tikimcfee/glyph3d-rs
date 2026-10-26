@@ -24,6 +24,14 @@ file_bg_color = [0.10, 0.10, 0.13, 0.85]
 # Selection tint over the picked glyphs / file in windowed runs: RGB, and A
 # as its strength (a coverage-weighted tint that keeps the glyph readable).
 selection_tint = [1.0, 0.85, 0.25, 0.45]
+# Slots per host block of the Derived field (2026-10-26): its slots live on
+# the host in blocks that are its chunks, one GPU buffer and one makepad
+# instance publication each. An edit re-uploads its whole block (makepad's
+# native frame builder re-uploads a draw item's buffer when its publication
+# changes), and every block is one draw item per frame: 262144 slots (5.2 MB)
+# keeps an edit's upload small and the 95M-glyph repo at ~364 items.
+# 1..=16777216. Moves no pixel: the slots are the same, only their chunking.
+derived_block_slots = 262144
 
 [lod]
 # Every threshold here is "px per text row": how many on-screen pixels tall a

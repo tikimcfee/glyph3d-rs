@@ -89,9 +89,13 @@ caller; the short version:
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, and aligned 8-burst /
-  4-burst register slot emission. Emits 32-byte
-  `RenderSlot` instances in `Instanced` mode or compact 20-byte `DerivedSlot` instances
-  in `Derived` mode directly into mapped GPU unified memory without intermediate copies.
+  4-burst register slot emission. Emits compact 20-byte `DerivedSlot`s in
+  `Derived` mode into HOST blocks that are the field's chunks (2026-10-26;
+  `[glyph_scene] derived_block_slots`, `glyph_field::HostSlots`): the one host
+  copy a makepad renderer publishes and the wgpu field uploads from, kept current
+  by every slot write. 32-byte `RenderSlot`s in `Instanced` mode go straight
+  into mapped GPU unified memory or staged windows, device-direct only because
+  Instanced is being retired.
 - **Paint is flat at load, colour arrives as spans** (2026-10-11). Every load
   paints `Paint::Flat`; per-glyph colour comes afterwards as byte spans (the
   `--highlight` sidecar and the seam's style runs: `style_file` in a stored

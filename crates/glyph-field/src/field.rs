@@ -100,6 +100,21 @@ pub trait GlyphField {
     /// Read back `out.len()` raw 32-bit words of slot storage starting at
     /// `slot`'s first byte, in the mode's own format (GLYPH_G_DUMP).
     fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]);
+
+    // ── the host copy (2026-10-26, for a renderer that draws from it) ───
+
+    /// The slots on the host, in blocks that are this field's chunks, kept
+    /// current by every write above (Derived). None for a field whose slots
+    /// live on the device alone (Instanced, Visible).
+    fn host_slots(&self) -> Option<std::cell::Ref<'_, crate::HostSlots>> {
+        None
+    }
+
+    /// The group overrides table as the shader reads it, on the host
+    /// (Derived; index 0 unused). None for a field without one.
+    fn group_overrides(&self) -> Option<std::cell::Ref<'_, [u32]>> {
+        None
+    }
 }
 
 /// Split the global slot run `first_slot .. first_slot + count` into
