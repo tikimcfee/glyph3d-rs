@@ -1,8 +1,11 @@
 //! The scene's group rows as nodes of the transform tree (2026-10-10;
 //! step 1 of `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md`).
 //! `crates/glyph-scene-graph` holds the tables and the resolve; this module
-//! maps the renderer's group rows onto it and keeps the GPU's group table
-//! current. Everything here is keyed by GROUP ROW (`gid`), never by view:
+//! maps the renderer's group rows onto it and holds THE group table: the
+//! one host copy (`rows`) that pick, cull and the HUD read, that the resolve
+//! writes, and whose changed rows are uploaded to the GPU's (2026-10-26;
+//! until then the scene kept a second copy, `groups_cpu`, synced to this
+//! one). Everything here is keyed by GROUP ROW (`gid`), never by view:
 //! which group row a view draws with is the view registry's answer
 //! (`crate::views`).
 //!
@@ -18,10 +21,13 @@
 //!
 //! **The frame** (`flush`, first thing in the frame): the tables resolve
 //! the moved subtrees on the CPU (`NodeTables::resolve_frame`), each
-//! resolved node with a group row has its row rebuilt in the host's image
-//! of the GPU table (`image`), and only the rows whose bytes changed go up,
-//! coalesced into runs (`upload_rows`). A settled frame resolves nothing
-//! and uploads nothing. The resolved ranges are handed on: the library's
+//! resolved node with a group row has its row rebuilt in the table, and the
+//! rows whose bytes changed since the last upload (`unsent`: the flush's,
+//! and any written between frames) go up, coalesced into runs
+//! (`upload_rows`). Between a write and the next flush the table is
+//! therefore what the readers see and the GPU table is a frame behind by
+//! exactly `unsent`. A settled frame resolves nothing and uploads nothing.
+//! The resolved ranges are handed on: the library's
 //! page faces and regions rebuild from the same nodes (`faces.rs`,
 //! `regions.rs`). Until 2026-10-26 the dirty input rows went up instead and
 //! a compute pass resolved them into the table; the renderer's default path
@@ -32,18 +38,20 @@
 //! the identity today), `scale-group` and the grab wheel the local scale
 //! (uniform when the result is, else the per-axis post scale), `tint-group`
 //! / `tint-cycle` the appearance tint, `hide-group` / `show-group` its alpha.
-//! The CPU mirror (`groups_cpu`, which pick, cull and the HUD read) is then
-//! rewritten from the tables (`mirror`) — the arithmetic the flush runs.
+//! The row is then rebuilt from the tables at once (`rebuild_row`), the
+//! arithmetic the flush runs. A tree move (the library's) is noted instead
+//! (`defer_rows`) and its subtrees' rows rebuilt when a reader asks before
+//! the flush (`sync_rows`), or by the flush itself.
 //!
 //! **External writers** — the bevy-backed layout controller (carrel zones,
-//! decks, the library's animation) still flatten their own hierarchy into
-//! `groups_cpu` and call `write_group_rows`, which now ADOPTS those rows
-//! (`adopt`): their transform columns become the node's local row every
-//! time, but their appearance columns only when the external writer changed
-//! them since it last wrote (a `Visible` toggle, a new binding tint). So an
-//! animation that moves a tinted or hidden file no longer erases the verb's
-//! edit — the library probe's E4 — while a carrel that hides a card still
-//! hides it. The library's own hierarchy moves onto these nodes next.
+//! decks) still flatten their own hierarchy into the table's rows
+//! (`external_rows`) and call `write_group_rows`, which ADOPTS each row
+//! (`adopt`): its transform columns become the node's local row every time,
+//! its appearance columns only when the external writer changed them since
+//! it last wrote (a `Visible` toggle, a new binding tint), and the row is
+//! rebuilt from the tables. So an animation that moves a tinted or hidden
+//! file does not erase the verb's edit — the library probe's E4 — while a
+//! carrel that hides a card still hides it.
 
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
@@ -115,9 +123,10 @@ pub(crate) struct GroupNodes {
     tables: RefCell<NodeTables>,
     /// The GPU group table; None only in the device-less unit tests.
     buffer: Option<wgpu::Buffer>,
-    /// Row by row, what the GPU group table holds (rows `0..len()`).
-    image: RefCell<Vec<GroupRow>>,
-    /// Rows allocated since the last flush: not on the GPU yet.
+    /// The group table, row per group id (`0..len()`).
+    rows: RefCell<Vec<GroupRow>>,
+    /// Rows written since the last upload: the GPU's differ from `rows`
+    /// exactly here.
     unsent: RefCell<Vec<u32>>,
     root: NodeHandle,
     /// Group id → node.
@@ -127,10 +136,11 @@ pub(crate) struct GroupNodes {
     /// The last flush's group-row upload and nodes resolved, for the
     /// instruments.
     last_flush: Cell<(UploadCost, u32)>,
-    /// Moved subtree roots whose group rows the CPU mirror has not taken
-    /// yet (`defer_mirror`; each slot once, `pending_mark`).
-    pending: Vec<NodeHandle>,
-    pending_mark: Vec<bool>,
+    /// Moved subtree roots whose rows are not rebuilt yet (`defer_rows`;
+    /// each slot once, `pending_mark`). The flush clears them: its resolve
+    /// covers every moved node.
+    pending: RefCell<Vec<NodeHandle>>,
+    pending_mark: RefCell<Vec<bool>>,
 }
 
 impl GroupNodes {
@@ -149,14 +159,14 @@ impl GroupNodes {
         let mut this = Self {
             tables: RefCell::new(tables),
             buffer: None,
-            image: RefCell::new(Vec::with_capacity(groups.len())),
+            rows: RefCell::new(Vec::with_capacity(groups.len())),
             unsent: RefCell::new(Vec::new()),
             root,
             nodes: Vec::with_capacity(groups.len()),
             ext: Vec::with_capacity(groups.len()),
             last_flush: Cell::new((UploadCost::default(), 0)),
-            pending: Vec::new(),
-            pending_mark: Vec::new(),
+            pending: RefCell::new(Vec::new()),
+            pending_mark: RefCell::new(Vec::new()),
         };
         for row in groups {
             this.push_row(row);
@@ -169,7 +179,7 @@ impl GroupNodes {
     /// background are the row's own, never the tree's.
     pub(crate) fn push_row(&mut self, row: &GroupRow) {
         let gid = self.nodes.len() as u32;
-        self.image.get_mut().push(*row);
+        self.rows.get_mut().push(*row);
         self.unsent.get_mut().push(gid);
         let (local, post, app) = decompose(row);
         let t = &mut self.tables.get_mut();
@@ -184,6 +194,23 @@ impl GroupNodes {
 
     pub(crate) fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Group `gid`'s row as the table holds it.
+    pub(crate) fn row(&self, gid: u32) -> Option<GroupRow> {
+        self.rows.borrow().get(gid as usize).copied()
+    }
+
+    /// The whole table (pick and allocation scan it).
+    pub(crate) fn rows(&self) -> std::cell::Ref<'_, Vec<GroupRow>> {
+        self.rows.borrow()
+    }
+
+    /// The rows for an external writer to flatten into. Every row it writes
+    /// must be handed to `adopt` before anything reads it: until then it
+    /// holds the writer's columns, not the tree's.
+    pub(crate) fn external_rows(&mut self) -> &mut [GroupRow] {
+        self.rows.get_mut()
     }
 
     /// Move group `gid` by a WORLD-space delta: converted into its parent's
@@ -234,13 +261,15 @@ impl GroupNodes {
     }
 
     /// Take a row an external writer (the layout controller's sync) left in
-    /// the CPU mirror: its transform always, its appearance only if that
-    /// writer changed it since its last write; then rewrite the row from the
-    /// tables, so the mirror shows what the GPU will.
-    pub(crate) fn adopt(&mut self, gid: u32, row: &mut GroupRow) {
+    /// the table (`external_rows`): its transform always, its appearance
+    /// only if that writer changed it since its last write; then rebuild the
+    /// row from the tables. The writer overwrote what the GPU holds, so the
+    /// row goes up whatever it rebuilds to.
+    pub(crate) fn adopt(&mut self, gid: u32) {
         let Some(&h) = self.nodes.get(gid as usize) else { return };
-        let (local, post, app) = decompose(row);
-        let ext = ext_appearance(row);
+        let Some(row) = self.rows.get_mut().get(gid as usize).copied() else { return };
+        let (local, post, app) = decompose(&row);
+        let ext = ext_appearance(&row);
         let t = &mut self.tables.get_mut();
         t.set_local(h, local).expect("live");
         if t.post_scale(h).expect("live").xyz != post {
@@ -250,18 +279,29 @@ impl GroupNodes {
             t.set_appearance(h, app).expect("live");
             self.ext[gid as usize] = ext;
         }
-        self.mirror(gid, row);
+        self.rebuild_row(gid);
+        self.unsent.get_mut().push(gid);
     }
 
-    /// Rewrite `row`'s columns 0-3 from the tables, as the flush builds them
-    /// (column 0's w, and columns 4-5, are left as they are).
-    pub(crate) fn mirror(&self, gid: u32, row: &mut GroupRow) {
-        let Some(&h) = self.nodes.get(gid as usize) else { return };
+    /// Group `gid`'s row with columns 0-3 composed from the tables, as the
+    /// flush builds them (column 0's w, and columns 4-5, are the row's own).
+    pub(crate) fn composed_row(&self, gid: u32) -> Option<GroupRow> {
+        let &h = self.nodes.get(gid as usize)?;
+        let mut row = self.row(gid)?;
         let t = self.tables.borrow();
         let (w, alpha) = t.world(h).expect("live");
-        let p = t.post_scale(h).expect("live").xyz;
-        let a = t.appearance(h).expect("live");
-        write_row(row, &w, alpha, p, &a);
+        write_row(&mut row, &w, alpha, t.post_scale(h).expect("live").xyz, &t.appearance(h).expect("live"));
+        Some(row)
+    }
+
+    /// Rebuild group `gid`'s row from the tables (`composed_row`), at once.
+    pub(crate) fn rebuild_row(&mut self, gid: u32) {
+        let Some(new) = self.composed_row(gid) else { return };
+        let row = &mut self.rows.get_mut()[gid as usize];
+        if bytemuck::bytes_of(row) != bytemuck::bytes_of(&new) {
+            *row = new;
+            self.unsent.get_mut().push(gid);
+        }
     }
 
     /// Resolve the frame's node edits and upload the group rows they
@@ -275,23 +315,25 @@ impl GroupNodes {
         let t0 = Instant::now();
         let mut t = self.tables.borrow_mut();
         let plan = t.resolve_frame();
-        let mut image = self.image.borrow_mut();
+        let mut rows = self.rows.borrow_mut();
         let mut changed = std::mem::take(&mut *self.unsent.borrow_mut());
         let (post, app) = (t.post_rows(), t.appearance_rows());
         for slot in plan.slots(&t) {
             let Some(gid) = t.slot_group_row(slot) else { continue };
-            let Some(old) = image.get_mut(gid as usize) else { continue };
+            let Some(row) = rows.get_mut(gid as usize) else { continue };
             let (w, alpha) = t.resolved_world(slot);
-            let mut row = *old;
-            write_row(&mut row, w, *alpha, post[slot as usize].xyz, &app[slot as usize]);
-            if bytemuck::bytes_of(&row) != bytemuck::bytes_of(old) {
-                *old = row;
+            if write_row(row, w, *alpha, post[slot as usize].xyz, &app[slot as usize]) {
                 changed.push(gid);
             }
         }
+        // The resolve covered every deferred move.
+        let mut mark = self.pending_mark.borrow_mut();
+        for h in self.pending.borrow_mut().drain(..) {
+            mark[h.index() as usize] = false;
+        }
         changed.sort_unstable();
         changed.dedup();
-        let bytes = upload_rows(&ctx.queue, buffer, bytemuck::cast_slice(&image), std::mem::size_of::<GroupRow>(), &changed);
+        let bytes = upload_rows(&ctx.queue, buffer, bytemuck::cast_slice(&rows), std::mem::size_of::<GroupRow>(), &changed);
         let rows = UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 };
         if (!plan.is_empty() || bytes > 0) && ctx.profiler.is_some() {
             crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", rows.ms);
@@ -324,38 +366,40 @@ impl GroupNodes {
         self.nodes.get(gid as usize).copied()
     }
 
-    /// Note moved nodes whose subtrees' group rows the CPU mirror will take
-    /// when a reader asks (`sync_mirror`) — O(1) a node, nothing per row: a
-    /// directory drag no longer rewrites a row per file it carries every
-    /// frame (2026-10-10). The frame's flush draws the move regardless.
-    pub(crate) fn defer_mirror(&mut self, moved: &[NodeHandle]) {
+    /// Note moved nodes whose subtrees' rows a reader before the next flush
+    /// will need rebuilt (`sync_rows`) — O(1) a node, nothing per row: a
+    /// directory drag does not rewrite a row per file it carries every
+    /// frame (2026-10-10). The frame's flush rebuilds them regardless.
+    pub(crate) fn defer_rows(&mut self, moved: &[NodeHandle]) {
+        let (pending, mark) = (self.pending.get_mut(), self.pending_mark.get_mut());
         for &h in moved {
             let i = h.index() as usize;
-            if i >= self.pending_mark.len() {
-                self.pending_mark.resize(i + 1, false);
+            if i >= mark.len() {
+                mark.resize(i + 1, false);
             }
-            if !self.pending_mark[i] {
-                self.pending_mark[i] = true;
-                self.pending.push(h);
+            if !mark[i] {
+                mark[i] = true;
+                pending.push(h);
             }
         }
     }
 
-    /// Bring `groups` up to date with every deferred move (each moved
-    /// subtree resolved once, `mirror_subtrees`). Returns the rows written.
-    pub(crate) fn sync_mirror(&mut self, groups: &mut [GroupRow]) -> usize {
-        if self.pending.is_empty() {
+    /// Rebuild the rows of every deferred move (each moved subtree resolved
+    /// once, `rebuild_subtrees`), for a reader before the flush. Returns the
+    /// rows rebuilt.
+    pub(crate) fn sync_rows(&mut self) -> usize {
+        if self.pending.get_mut().is_empty() {
             return 0;
         }
-        let pending = std::mem::take(&mut self.pending);
+        let pending = std::mem::take(self.pending.get_mut());
         for h in &pending {
-            self.pending_mark[h.index() as usize] = false;
+            self.pending_mark.get_mut()[h.index() as usize] = false;
         }
-        self.mirror_subtrees(&pending, groups).len()
+        self.rebuild_subtrees(&pending).len()
     }
 
     /// Group `gid`'s live world offset and per-axis scale, composed from the
-    /// tree on demand (O(depth); the bits the mirror would hold).
+    /// tree on demand (O(depth); the bits the row will hold).
     pub(crate) fn world_offset_scale(&self, gid: u32) -> Option<([f32; 3], [f32; 3])> {
         let &h = self.nodes.get(gid as usize)?;
         let t = self.tables.borrow();
@@ -364,13 +408,14 @@ impl GroupNodes {
         Some((w.translation, [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale]))
     }
 
-    /// The CPU mirror of a move: every node in the subtrees of `moved`
-    /// resolved once on the CPU (O(1) a node; `NodeTables::resolve_subtrees`)
-    /// and each one that routes to a group row rewritten into `groups` —
-    /// columns 0-3, exactly as `mirror` writes them. Returns the group ids
-    /// rewritten, ascending in depth-first order.
-    pub(crate) fn mirror_subtrees(&mut self, moved: &[NodeHandle], groups: &mut [GroupRow]) -> Vec<u32> {
+    /// The rows of a move, between frames: every node in the subtrees of
+    /// `moved` resolved once (O(1) a node; `NodeTables::resolve_subtrees`)
+    /// and each one that routes to a group row rebuilt — columns 0-3,
+    /// exactly as `rebuild_row` writes them. Returns the group ids rebuilt,
+    /// in depth-first order.
+    pub(crate) fn rebuild_subtrees(&mut self, moved: &[NodeHandle]) -> Vec<u32> {
         let t = self.tables.get_mut();
+        let (rows, unsent) = (self.rows.get_mut(), self.unsent.get_mut());
         let mut hits: Vec<(u32, Similarity, f32, u32)> = Vec::new();
         t.resolve_subtrees(moved, |slot, row, w, a| {
             if let Some(r) = row {
@@ -380,10 +425,12 @@ impl GroupNodes {
         let mut out = Vec::with_capacity(hits.len());
         for (gid, w, alpha, _) in hits {
             let Some(&h) = self.nodes.get(gid as usize) else { continue };
-            let Some(row) = groups.get_mut(gid as usize) else { continue };
+            let Some(row) = rows.get_mut(gid as usize) else { continue };
             let p = t.post_scale(h).expect("live").xyz;
             let a = t.appearance(h).expect("live");
-            write_row(row, &w, alpha, p, &a);
+            if write_row(row, &w, alpha, p, &a) {
+                unsent.push(gid);
+            }
             out.push(gid);
         }
         out
@@ -391,13 +438,15 @@ impl GroupNodes {
 }
 
 /// Columns 0-3 of a group row from a node's world, inherited alpha, post
-/// scale and appearance — what the flush uploads and the mirror holds
-/// (column 0's w, and columns 4-5, are left as they are).
-fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Appearance) {
+/// scale and appearance (column 0's w, and columns 4-5, are left as they
+/// are). Returns whether the row's bytes changed.
+fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Appearance) -> bool {
+    let old = *row;
     row.cols[0] = [w.translation[0], w.translation[1], w.translation[2], row.cols[0][3]];
     row.cols[1] = w.rotation;
     row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];
     row.cols[3] = [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale, a.blend];
+    bytemuck::bytes_of(row) != bytemuck::bytes_of(&old)
 }
 
 /// Block on a readback of `bytes` of `src` (tests only, never the frame
@@ -438,18 +487,17 @@ mod tests {
         ]
     }
 
-    /// The identity-root claim: every row mirrored back from its node is the
+    /// The identity-root claim: every row composed back from its node is the
     /// same bits, uniform or per-axis scale alike — and each verb through
     /// the node path lands exactly where the old in-place edit of the row
-    /// did. (`flush_uploads_exactly_the_rows_that_changed` holds the GPU
-    /// table to these rows.)
+    /// did, in the table itself. (`flush_uploads_exactly_the_rows_that_changed`
+    /// holds the GPU table to these rows.)
     #[test]
     fn rows_through_their_nodes_come_back_bit_for_bit_and_verbs_match_the_old_edits() {
         let rows = rows();
         let mut n = GroupNodes::cpu_only(&rows);
         for (gid, r) in rows.iter().enumerate() {
-            let mut back = *r;
-            n.mirror(gid as u32, &mut back);
+            let back = n.composed_row(gid as u32).unwrap();
             assert_eq!(bytemuck::bytes_of(&back), bytemuck::bytes_of(r), "row {gid}");
         }
         let mut old = rows.clone();
@@ -468,8 +516,8 @@ mod tests {
         old[2].cols[2][3] = 0.0;
         assert!(n.set_alpha(2, 0.0));
         for (gid, want) in old.iter().enumerate() {
-            let mut got = rows[gid];
-            n.mirror(gid as u32, &mut got);
+            n.rebuild_row(gid as u32);
+            let got = n.row(gid as u32).unwrap();
             assert_eq!(bytemuck::bytes_of(&got), bytemuck::bytes_of(want), "row {gid} after the verbs");
         }
         assert!(!n.translate(9, [1.0; 3]), "an unknown group is refused");
@@ -479,7 +527,7 @@ mod tests {
     /// the path): a load's rows resolve to their own bits and upload
     /// nothing; a verb uploads exactly the rows it changed (as one run when
     /// they sit close); an allocated row goes up whole, clip and background
-    /// included; and the table read back is the mirror, bit for bit. (Forty
+    /// included; and the GPU table read back is the host's, bit for bit. (Forty
     /// rows, so a few changed ones stay under the whole-table share.)
     #[test]
     fn flush_uploads_exactly_the_rows_that_changed() {
@@ -509,6 +557,13 @@ mod tests {
         n.set_tint(12, [0.25, 0.5, 0.75]);
         let (_, up) = flush(&n);
         assert_eq!((up.rows, up.bytes), (2, 3 * 96), "rows 10 and 12, one run across row 11");
+        // A verb rebuilds its row at once (the readers see it before the
+        // flush); the flush still sends it, once.
+        n.translate(20, [0.0, 3.0, 0.0]);
+        n.rebuild_row(20);
+        assert_eq!(n.row(20).unwrap().cols[0][1], rows[20].cols[0][1] + 3.0, "the table holds the move before the flush");
+        let (_, up) = flush(&n);
+        assert_eq!((up.rows, up.bytes), (1, 96), "a row rebuilt between frames goes up at the flush");
         let mut extra = GroupRow::identity([4.0, 5.0, 6.0]);
         extra.cols[5] = [0.9, 0.1, 0.2, 1.0];
         n.push_row(&extra);
@@ -516,10 +571,10 @@ mod tests {
         assert_eq!((up.rows, up.bytes), (1, 96), "an allocated row goes up whole");
         assert_eq!(flush(&n).1.bytes, 0, "a settled frame uploads nothing");
         let back: Vec<GroupRow> = bytemuck::cast_slice(&read_buffer(&ctx, &buf, 41 * 96)).to_vec();
-        for (gid, row) in rows.iter().chain([&extra]).enumerate() {
-            let mut want = *row;
-            n.mirror(gid as u32, &mut want);
-            assert_eq!(bytemuck::bytes_of(&back[gid]), bytemuck::bytes_of(&want), "row {gid} on the GPU");
+        for (gid, got) in back.iter().enumerate() {
+            let want = n.row(gid as u32).unwrap();
+            assert_eq!(bytemuck::bytes_of(got), bytemuck::bytes_of(&want), "row {gid} on the GPU");
+            assert_eq!(bytemuck::bytes_of(&want), bytemuck::bytes_of(&n.composed_row(gid as u32).unwrap()), "row {gid} is the tree's");
         }
         assert_eq!(back[40].cols[5], extra.cols[5], "the background is the row's own");
     }
@@ -534,29 +589,31 @@ mod tests {
         let mut n = GroupNodes::cpu_only(&rows);
         n.set_tint(0, [1.0, 0.0, 0.0]);
         n.set_alpha(0, 0.0);
-        // The layout controller's sync: a new offset, its own binding tint.
+        // The layout controller's sync, into the table: a new offset, its
+        // own binding tint.
         let mut synced = rows[0];
         synced.cols[0] = [40.0, 2.0, -3.0, 0.0];
-        let mut mirror = synced;
-        n.adopt(0, &mut mirror);
-        assert_eq!(mirror.cols[0], [40.0, 2.0, -3.0, 0.0], "the move is taken");
-        assert_eq!(mirror.cols[2], [1.0, 0.0, 0.0, 0.0], "the verb's tint and hide survive");
+        n.external_rows()[0] = synced;
+        n.adopt(0);
+        assert_eq!(n.row(0).unwrap().cols[0], [40.0, 2.0, -3.0, 0.0], "the move is taken");
+        assert_eq!(n.row(0).unwrap().cols[2], [1.0, 0.0, 0.0, 0.0], "the verb's tint and hide survive");
         // The writer hides the group itself (its sync writes alpha 0, scale 0).
         let mut hidden = synced;
         hidden.cols[2] = [0.0; 4];
         hidden.cols[3] = [0.0; 4];
-        let mut mirror = hidden;
-        n.adopt(0, &mut mirror);
-        assert_eq!(mirror.cols[2], [0.0; 4], "a change the writer made lands");
+        n.external_rows()[0] = hidden;
+        n.adopt(0);
+        assert_eq!(n.row(0).unwrap().cols[2], [0.0; 4], "a change the writer made lands");
         assert_eq!(n.len(), 3);
     }
 
-    /// The deferred CPU mirror (2026-10-10, the library on the tree): a
-    /// moved parent's subtree is noted, not mirrored — the rows stay as
-    /// they were until a reader syncs — and the sync writes exactly the
-    /// rows an eager mirror (`mirror`, per group) writes, each once.
+    /// The deferred rows of a tree move (2026-10-10, the library on the
+    /// tree): a moved parent's subtree is noted, not rebuilt — the rows stay
+    /// as they were until a reader syncs (or the flush) — and the sync writes
+    /// exactly the rows an eager rebuild (`composed_row`, per group) gives,
+    /// each once.
     #[test]
-    fn a_deferred_mirror_syncs_to_the_eager_rows() {
+    fn deferred_rows_sync_to_the_eager_rows() {
         let rows = rows();
         let mut n = GroupNodes::cpu_only(&rows);
         // Nest groups 0 and 2 under a scaled, offset parent, as the library
@@ -567,18 +624,17 @@ mod tests {
         let parent = t.insert(Some(root), Similarity { scale: 0.25, ..Similarity::from_translation([3.0, -4.0, 5.0]) }, Appearance::IDENTITY).unwrap();
         t.reparent(g0, Some(parent)).unwrap();
         t.reparent(g2, Some(parent)).unwrap();
-        let mut groups = rows.clone();
-        n.defer_mirror(&[parent]);
-        n.defer_mirror(&[parent, g0]);
-        assert_eq!(bytemuck::cast_slice::<_, u8>(&groups), bytemuck::cast_slice::<_, u8>(&rows), "deferred: nothing written yet");
-        assert_eq!(n.sync_mirror(&mut groups), 2, "each moved group's row once");
+        n.defer_rows(&[parent]);
+        n.defer_rows(&[parent, g0]);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&n.rows()), bytemuck::cast_slice::<_, u8>(&rows), "deferred: nothing written yet");
+        assert_eq!(n.sync_rows(), 2, "each moved group's row once");
+        let groups = n.rows().clone();
         for gid in 0..3u32 {
-            let mut want = rows[gid as usize];
-            n.mirror(gid, &mut want);
+            let want = n.composed_row(gid).unwrap();
             assert_eq!(bytemuck::bytes_of(&groups[gid as usize]), bytemuck::bytes_of(&want), "row {gid}");
         }
         assert_ne!(groups[0].cols[0], rows[0].cols[0], "the nested row moved");
-        assert_eq!(n.sync_mirror(&mut groups), 0, "nothing waits after a sync");
+        assert_eq!(n.sync_rows(), 0, "nothing waits after a sync");
         let off = n.world_offset_scale(2).unwrap();
         assert_eq!(off.0, [groups[2].cols[0][0], groups[2].cols[0][1], groups[2].cols[0][2]]);
         assert_eq!(off.1, [groups[2].cols[3][0], groups[2].cols[3][1], groups[2].cols[3][2]]);
