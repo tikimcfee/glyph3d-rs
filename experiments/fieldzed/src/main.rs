@@ -141,7 +141,6 @@ fn main() -> anyhow::Result<()> {
             Path::new("."),
             &params,
             glyph3d_native::repo::Strategy::Hyper,
-            false,
             None, // folds: the offscreen frames don't carry structure (yet)
         );
         let mut staged = load.into_staged(None, &atlas.slot_ink);

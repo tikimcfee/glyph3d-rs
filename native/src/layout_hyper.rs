@@ -1408,8 +1408,9 @@ pub fn prefetch_hyper(
 /// survivors, built from the same Pass 1 calls `layout_items_internal` makes.
 /// This hands it a host `Vec`. What it does not reach is what happens to the
 /// bytes afterwards (the staging copy into VRAM, chunking across buffers)
-/// and the background prefetch of Pass 1 (`prefetch_hyper`, which
-/// `repo-verify` holds to the inline Pass 1 used here).
+/// and the background prefetch of Pass 1 (`prefetch_hyper`, which runs the
+/// same Pass 1 driver, `pass1_over_chunks_with_lines`, as the inline Pass 1
+/// used here).
 fn device_pass2_on_host<E: pass2_device::SlotEmit>(
     items: &[LayoutItem<'_>],
     trie: &TrieTable,

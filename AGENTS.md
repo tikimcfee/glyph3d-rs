@@ -287,7 +287,7 @@ Reading and editing, in order of preference (measured 2026-10-11,
 
 ## What the checks actually do
 
-Seventeen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
+Fifteen gates (2026-10-26; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -622,25 +622,6 @@ retired CPU stager had; `text.png` has tabs), `--tab-width` overriding it.
 The agent-session cards stage through their own CPU code, which keeps fixed
 4-cell stops and reads no setting.
 
-**repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
-2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
-modes, diffed against a fresh recording HyperLayout at the seam: placements,
-instances, and records where both sides have them (`direct` has none and its
-PASS line says `0 records`). Each refuses a verify over zero items — before
-2026-09-07 a missing corpus printed `PASS: 0 items` and exited 0. Read the
-pair honestly: **every `--repo-engine` constructs the same
-HyperLayout**, so this is HyperLayout against HyperLayout. Under
-`--repo-scan-only` (no GPU) the sides differ only by `hyper`'s background
-prefetch of Pass 1, and for `direct` not at all, so these catch
-nondeterminism in the parallel passes and prefetch drift — truth is
-hyper-oracle's job. `batch`/`naive` are not gated: they run the reference's
-own code path verbatim. Both gates are UNCOVERED in prove, and that is the
-finding, not an omission: since C15 the prefetch and the inline Pass 1 are
-one driver (`pass1_over_chunks`) and differ only in how the chunk list is
-built (before it, only in a segment-advance table g-pick-repo never read:
-doubling it stayed green, measured 2026-10-09), and nothing separates
-`direct` from its reference without a device.
-
 **pixel-ab.** The golden views re-rendered and byte-compared against
 `out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
 is deliberately not repeated here because it has changed. This is the **only**
@@ -845,15 +826,16 @@ engine-check, and its Mojo halves). Four checked pure-Rust paths whose
 instruments kept shipping and kept passing, run by nothing for nine days;
 they came back as reference-port, repo-verify(-direct) and
 cubecl-chain/-fork (the last two retired again on 2026-10-09 with the CubeCL
-engine itself; their corpus, `native/fixtures/cubecl-fork/`, stays, read by
+engine itself, repo-verify(-direct) on 2026-10-26: HyperLayout against
+itself, which no mutation could make fail; their corpus, `native/fixtures/cubecl-fork/`, stays, read by
 hyper-oracle), and the check that never existed — HyperLayout against
 the oracle — arrived with them, red. In those nine days HyperLayout became the
 only engine, and nothing compared it to anything but itself.
 
 The lessons these gates taught stay true and are the pattern for any new one:
 **a check must refuse to pass having compared nothing** (the reference fails
-if nothing was in domain, repo-verify refuses zero items, STRICT refuses an unexercised bucket, the parity script refuses a
-corpus of the wrong size), and a count that quietly drops is how a check goes
+if nothing was in domain, STRICT refuses an unexercised bucket, the parity
+script refuses a corpus of the wrong size), and a count that quietly drops is how a check goes
 vacuous without going red — quote the volumes. And a gate that compares an
 engine to itself is a determinism check: say so in its `blind_to`.
 

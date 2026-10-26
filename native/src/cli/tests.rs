@@ -51,7 +51,6 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("shelf"), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
-    assert!(!cli.repo_verify);
     assert!(cli.focus_file.is_none());
     assert!(!cli.repo_scan_only);
     assert!(!cli.no_cull);
@@ -87,7 +86,7 @@ fn scalar_flags_parse() {
         "--file-backgrounds", "--file-bg-color", "0.15,0.15,0.20,0.80",
         "--show-glyphs-px", "2.0", "--text-detail-px", "12",
         "--load-repo", "fixtures/g-pick-repo",
-        "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
+        "--repo-engine", "batch", "--focus-file", "alpha",
         "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
         "--layout-mode", "carrel",
         "--render-file", "src/main.rs",
@@ -118,7 +117,6 @@ fn scalar_flags_parse() {
     assert_eq!(cli.z_wrap_spacing, 0.6);
     assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Carrel);
-    assert!(cli.repo_verify);
     assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
     assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
 }
@@ -745,12 +743,11 @@ fn screenshot_runs_never_discover_launch_config() {
 
 /// Every way a gate launches the binary without `--screenshot` is a check or
 /// a measurement, and none reads a personal launch config (2026-10-10: a
-/// saved `field_mode = "visible"` reddened repo-verify-direct).
+/// saved field mode reddened a gate).
 #[test]
 fn check_runs_never_discover_launch_config() {
     for args in [
-        &["--load-repo", "r", "--repo-engine", "direct", "--repo-verify", "--repo-scan-only"][..],
-        &["--load-repo", "r", "--repo-verify"],
+        &["--load-repo", "r", "--repo-engine", "direct", "--repo-scan-only"][..],
         &["--load-repo", "r", "--repo-scan-only"],
         &["--fixture-trie", "f"],
         &["--fixture-fold", "f"],

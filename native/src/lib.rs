@@ -78,7 +78,6 @@ pub enum SceneChoice {
     Repo {
         dir: PathBuf,
         strategy: repo::Strategy,
-        verify: bool,
         focus: Option<String>,
         wrap_mode: fold::WrapMode,
         z_wrap_spacing: f64,
@@ -322,7 +321,6 @@ fn build_scene_impl(
         SceneChoice::Repo {
             dir,
             strategy,
-            verify,
             focus,
             wrap_mode,
             z_wrap_spacing,
@@ -370,7 +368,6 @@ fn build_scene_impl(
                     prefetched,
                     &params,
                     *strategy,
-                    *verify,
                     Some(ctx),
                     arena,
                     None,

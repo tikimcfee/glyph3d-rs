@@ -3,7 +3,7 @@
 use crate::artifacts::verify_committed;
 use crate::golden::verify_golden;
 use crate::manifest::{Class, Gate, Kind, Manifest};
-use crate::paths::{expand, native, resolve_gpu, root, sh};
+use crate::paths::{expand, resolve_gpu, root, sh};
 
 fn warn_count(out: &str) -> usize {
     out.lines().filter(|l| l.starts_with("warning") && !l.contains("generated")).count()
@@ -107,33 +107,6 @@ fn gate_cargo_test(m: &Manifest) -> bool {
     true
 }
 
-fn gate_repo_verify(g: &Gate) -> bool {
-    let mut ok = true;
-    let template = g.cmd.as_deref().unwrap_or_default();
-    for mode in &g.modes {
-        let (good, out) = sh(
-            &format!(
-                "../target/release/glyph3d-native {}",
-                template.replace("{mode}", mode)
-            ),
-            &native(),
-        );
-        // The result line is not necessarily the last one: the renderer logs
-        // after it. Search, do not assume position.
-        match out.lines().find(|l| l.contains("repo-verify PASS")) {
-            Some(hit) if good => println!("PASS  --wrap-mode {mode} — {}", hit.trim()),
-            _ => {
-                for l in out.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-                    println!("      {l}");
-                }
-                println!("FAIL  --wrap-mode {mode}");
-                ok = false;
-            }
-        }
-    }
-    ok
-}
-
 fn gate_cmd(g: &Gate) -> bool {
     let cmd = g.cmd.as_deref().unwrap_or_default();
     let (good, out) = sh(cmd, &root());
@@ -229,6 +202,5 @@ pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
         Kind::Cargo => gate_cargo(g),
         Kind::CargoTest => gate_cargo_test(m),
         Kind::GoldenVerify => verify_golden(m),
-        Kind::RepoVerify => gate_repo_verify(g),
     }
 }

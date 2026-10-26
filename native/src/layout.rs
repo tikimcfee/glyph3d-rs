@@ -860,9 +860,6 @@ impl VerifyLayout for LayoutEngine {
 /// checks) and is held to it for the rest. A second hand-written copy of this
 /// loop would be a second place for the paint index to slip.
 ///
-/// A backend that compacts on its own is held to the same output by
-/// `--repo-verify`, which diffs arenas and placements, not just records.
-///
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
 /// their advance is already baked into the surviving records' X by the fold,
 /// so dropping them moves nothing.
@@ -985,9 +982,9 @@ pub struct VerifyReport {
 /// Diff two backends at the seam, bit-exact, and say where they first differ.
 ///
 /// THIS IS WHAT A NEW BACKEND IS SCORED BY, which is why it compares three
-/// things rather than one. The old `--repo-verify` compared RECORDS
-/// only; records alone cannot see a difference in compaction, in paint
-/// indexing, or in either extent — every one of which now lives behind the
+/// things rather than one. Records alone (all the first `--repo-verify`
+/// compared) cannot see a difference in compaction, in paint indexing, or in
+/// either extent — every one of which now lives behind the
 /// seam and every one of which a new backend has to get right. Instances and
 /// placements close that, and records stay because they are the finest
 /// granularity available and they see blanks, which instances by construction
