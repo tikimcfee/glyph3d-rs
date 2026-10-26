@@ -335,8 +335,8 @@ scope = "rust"
 kind = "cargo"
 cmd = "check-no-ui"
 needs = []
-compare = "rustc warning count vs zero, renderer built with --no-default-features (no egui overlay), all targets"
-blind_to = "whether the no-UI build RUNS correctly — it is checked, not executed; and every other feature combination"
+compare = "rustc warning count vs zero, renderer checked with --no-default-features twice, all targets: with --features windowed (the window, no egui overlay) and bare (no window: the library a host that owns its window links, 2026-10-26); and the bare build's dependency tree holds the renderer and no winit or egui crate"
+blind_to = "whether either build RUNS correctly — they are checked, not executed; every other feature combination; and a windowing crate in the bare tree under a name not starting winit or egui"
 
 [[gate]]
 name = "cargo-clippy"
@@ -1007,12 +1007,31 @@ expect = "windowed_emission_matches_unwindowed"
 [[mutation]]
 name = "egui-use-ungated"
 gate = "cargo-check-no-ui"
-why = "C24 put back: an egui item used outside the egui-ui feature gate compiles in the default build and breaks the no-UI one, which nothing built until 2026-10-09. CONSUMED BY: the no-default-features check"
+why = "C24 put back: an egui item used outside the egui-ui feature gate compiles in the default build and breaks the no-UI one, which nothing built until 2026-10-09. CONSUMED BY: the --no-default-features --features windowed check (the bare check never compiles windowed/)"
 file = "native/src/windowed/state.rs"
 op = "replace"
 find = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\n#[cfg(feature = \"egui-ui\")]\nfn ui_rgb("
 with = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\nfn ui_rgb("
 expect = "cargo-check-no-ui errored"
+
+[[mutation]]
+name = "windowed-module-ungated"
+gate = "cargo-check-no-ui"
+why = "the window module compiled without its feature (2026-10-26): the default build is unchanged, and the bare library, the build a host with its own window links, no longer compiles, since winit is absent from it. CONSUMED BY: the bare --no-default-features check"
+file = "native/src/lib.rs"
+op = "replace"
+find = "#[cfg(feature = \"windowed\")]\npub mod windowed;"
+with = "pub mod windowed;"
+expect = "cargo-check-no-ui errored"
+
+[[mutation]]
+name = "winit-unconditional"
+gate = "cargo-check-no-ui"
+why = "winit back as a dependency every build takes (2026-10-26), declared again in a target table every target matches, so the manifest still resolves: both checks compile, winit unused, and the bare library drags the windowing stack into a host that owns its window. (Under another name in [dependencies] cargo refuses the manifest outright, which proves nothing.) CONSUMED BY: the bare tree's grep for winit"
+file = "native/Cargo.toml"
+op = "append"
+arg = "\n[target.'cfg(all())'.dependencies]\nwinit = \"0.30\"\n"
+expect = "winit v0.30"
 
 [[mutation]]
 name = "copy-split-body-unaligned"
