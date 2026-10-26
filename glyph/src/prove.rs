@@ -191,7 +191,7 @@ fn declarations_changed(base: Option<&str>, current: &str) -> (BTreeSet<String>,
 /// Whether a change set touches a mutation: its target file changed, the
 /// script its gate runs did, or its own declaration or its gate's did. The
 /// script clause is what makes a gate's own edit re-prove the gate: a change
-/// to `tools/check-orphans.sh` cannot weaken a mutation's target, but it can
+/// to `tools/check-pick-oracle.sh` cannot weaken a mutation's target, but it can
 /// stop the gate noticing it. The declaration clauses are what make a NEW
 /// mutation, or an edited one, prove itself on the branch that adds it,
 /// whether or not its target file changed. Gates built into the runner
