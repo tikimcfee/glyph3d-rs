@@ -29,8 +29,9 @@
 # Lowered 376 -> 374 on purpose (2026-10-26): the scene graph's GPU resolve
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
-# walk; the group table read back).
-test_floor = 374
+# walk; the group table read back). float_tables' eight tests (mp-tables,
+# merged the same day) raise it to 382.
+test_floor = 382
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1156,6 +1157,26 @@ op = "replace"
 find = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / em_height_fu as f64) as f32"
 with = "    (fu as f64 * CELL_HEIGHT_WORLD as f64 / (em_height_fu + 1) as f64) as f32"
 expect = "fu_to_world_is_the_nearest_f32"
+
+[[mutation]]
+name = "float-tables-limit-off-by-one"
+gate = "cargo-test"
+why = "2026-10-26: the float tables (float_tables.rs, for the makepad host's f32-only data textures) carry every integer as its exact f32 and refuse one at or past 2^24 rather than round it. A bound that lets 2^24 itself through is the first step to rounding silently (2^24 + 1 is the first integer with no f32). CONSUMED BY: float_tables::exact_u32, every u32 lane of the glyph map, curves, item table and overrides, via the_first_inexact_integer_is_refused"
+file = "native/src/float_tables.rs"
+op = "replace"
+find = "        v < EXACT_INT_LIMIT,"
+with = "        v <= EXACT_INT_LIMIT,"
+expect = "the_first_inexact_integer_is_refused"
+
+[[mutation]]
+name = "float-tables-no-cell-bitcast"
+gate = "cargo-test"
+why = "2026-10-26: the glyph map's NO_CELL (0xFFFFFFFF) must reach a float texture as -1.0, never as its bits, which are a NaN a GPU may canonicalise. Bit-casting it puts a NaN in the 384 NO_CELL slots of the shipped atlas. CONSUMED BY: float_tables::glyphmap_texels over the committed glyphmap.bin, via the_shipped_atlas_round_trips_exactly (and no_integer_lane_is_bit_sourced)"
+file = "native/src/float_tables.rs"
+op = "replace"
+find = "            3 if v == NO_CELL => NO_CELL_TEXEL,"
+with = "            3 if v == NO_CELL => f32::from_bits(v),"
+expect = "the_shipped_atlas_round_trips_exactly"
 
 [[mutation]]
 name = "visible-verb-keyed-off-by-one-byte"
