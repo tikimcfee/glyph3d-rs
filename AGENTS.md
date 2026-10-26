@@ -56,12 +56,17 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
   Derived and Visible mode.
   `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
-  behind generation handles, CPU depth-first topology, per-table dirty sets,
-  and one compute pass resolving world transforms over the dirty ranges;
-  every group row is a node of it (`native/src/glyph_scene/nodes.rs`), and
-  the pass writes the group table's transform and appearance columns.
-  `resolve-bench` (in the crate, run by hand) times it;
-  `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built".
+  behind generation handles, CPU depth-first topology, dirty marks, and a
+  CPU resolve of world transforms over the dirty depth-first ranges; every
+  group row is a node of it (`native/src/glyph_scene/nodes.rs`), whose
+  flush rebuilds the resolved nodes' group rows and uploads the ones that
+  changed (the library's page faces and regions follow the same way). The
+  default (Derived) frame dispatches no compute since 2026-10-26: the
+  resolve, the face pass and the region compose were GPU passes until then
+  (the makepad port draws with no compute dispatch; Visible mode keeps its
+  own). `resolve-bench` (in the crate, run by hand) times the resolve;
+  `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built" has
+  the GPU form's figures.
   Agent sessions come from gomuxai's `agent` CLI, the one reader of agent
   transcripts: `agent sessions --json` lists them (the F7 browser and the
   launcher), `agent transcript <session>` prints one session's events, and
@@ -863,7 +868,7 @@ and the union is not:
 - **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
-- **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its world rows to the CPU reference after each case.
+- **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its resolved world rows to the chain walk after each case.
 - **`tools/preview_glyphs.py` and `repro_pick_oblique.py`** are manual tools,
   run by **zero** checks, so the oblique-pick repro is exercised by nothing in
   the battery. (`tools/verify_atlas.py` was on this list until 2026-10-11; it
@@ -876,7 +881,8 @@ and the union is not:
   the group rows are seen by nothing. Candidate frames and the commands
   that made them are in `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`. Its
   bounding regions (E20, `glyph_scene/regions.rs`) are held to the tree
-  cull's boxes, a brute-force pick and their CPU twin by `regions::tests`,
+  cull's boxes, a brute-force pick and (read back from the device) their
+  boxes carried through their directories' worlds by `regions::tests`,
   and seen in pixels only by `tests/library_regions.rs`'s one-region
   on/off comparison on `g-pick-repo`; their depth order against the glyph
   pass is seen by nothing.

@@ -37,7 +37,7 @@ impl LayoutController {
     /// row off its world transform — translation AND the fit scale —
     /// resolved on the CPU from the library's hierarchy in a scratch node
     /// table (the same nodes, composed the same way, that the scene's tables
-    /// will hold and the GPU resolve will draw: `GlyphScene::new` attaches
+    /// will hold and their resolve will draw: `GlyphScene::new` attaches
     /// the library to them). No bevy scene: the library has none since
     /// 2026-10-10. `views[i].offset` takes the translation; the scale is
     /// read from the group row by everything downstream
