@@ -62,25 +62,45 @@ fn engine_args(mut args: impl Iterator<Item = String>) -> Vec<String> {
     out
 }
 
-/// The scene a run was asked for: the engine's CLI, the windowed render
-/// plan's choice, options and startup ops. Any other run mode (a fixture
-/// check, `--gpu-key`, an offscreen screenshot) belongs to
-/// `glyph3d-native` and is refused here.
-pub fn plan_from_args() -> Result<(SceneChoice, SceneCullOptions, Vec<Op>), String> {
+/// What the command line asked for: the scene, its options and the
+/// startup ops (`--pick-*`, `--verb`, `--cam-pose`, `--highlight`).
+pub type Plan = (SceneChoice, SceneCullOptions, Vec<Op>);
+
+thread_local! {
+    /// The plan, parsed at startup and taken once by the app.
+    static PLAN: std::cell::RefCell<Option<Plan>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Parse the command line at startup (`app_main!`'s `configure:`, which
+/// runs before the app's script and so before any window exists): the
+/// engine's CLI, the windowed render plan's choice, options and ops. Help
+/// and version print and exit 0; a bad line, and any run mode with no
+/// window (a fixture check, `--gpu-key`, an offscreen screenshot, which
+/// belong to `glyph3d-native`), print why and exit 1. A window never opens
+/// for a run that will not draw (2026-10-26: `--help` used to open one).
+pub fn parse_plan_or_exit() {
     use clap::CommandFactory;
-    let matches = Cli::command()
-        .try_get_matches_from(engine_args(std::env::args()))
-        .map_err(|e| e.to_string())?;
-    let cli = parse_cli_from(matches)?;
-    match cli.action() {
+    let matches = Cli::command().try_get_matches_from(engine_args(std::env::args())).unwrap_or_else(|e| e.exit());
+    let refuse = |why: String| -> ! {
+        eprintln!("error: {why}");
+        std::process::exit(1);
+    };
+    let cli = parse_cli_from(matches).unwrap_or_else(|e| refuse(e));
+    let plan = match cli.action() {
         CliCommand::Render(plan) => match plan.target {
-            glyph3d_native::cli::RenderTarget::Windowed { .. } => Ok((plan.choice, plan.cull_opts, plan.ops)),
+            glyph3d_native::cli::RenderTarget::Windowed { .. } => (plan.choice, plan.cull_opts, plan.ops),
             glyph3d_native::cli::RenderTarget::Offscreen { .. } => {
-                Err("--screenshot renders offscreen: run glyph3d-native for that".to_string())
+                refuse("--screenshot renders offscreen: run glyph3d-native for that".to_string())
             }
         },
-        _ => Err("this run mode has no window: run glyph3d-native for it".to_string()),
-    }
+        _ => refuse("this run mode has no window: run glyph3d-native for it".to_string()),
+    };
+    PLAN.with(|p| *p.borrow_mut() = Some(plan));
+}
+
+/// The plan [`parse_plan_or_exit`] stored, once.
+pub fn take_plan() -> Plan {
+    PLAN.with(|p| p.borrow_mut().take()).expect("the plan is parsed at startup, before the app's first event")
 }
 
 /// The engine as the host holds it.
