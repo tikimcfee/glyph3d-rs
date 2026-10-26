@@ -26,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 374
+test_floor = 376
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1607,3 +1607,23 @@ op = "replace"
 find = "            let full = if path.is_absolute() { path.to_path_buf() } else { cwd.as_ref()?.join(path) };"
 with = "            let full = if path.is_absolute() { path.to_path_buf() } else { cwd.as_ref().map_or(path.to_path_buf(), |_| path.to_path_buf()) };"
 expect = "an_edit_without_file_text_rebuilds_from_the_disk"
+
+[[mutation]]
+name = "read-file-text-ignored-by-the-engine"
+gate = "cargo-test"
+why = "a read's event `file` text ignored by the revision engine, which then reads the file on disk as it is NOW (the fallback for a read with no text): an agy or Kimi read (they carry their lines since gomuxai 7238f18) becomes the current file, not what the agent saw, or nothing when the file is gone. CONSUMED BY: revision::RevisionEngine::ingest_file_action_with_event's read arm; reddens agent_transcript::tests::agy_and_kimi_reads_use_their_file_text_not_the_disk (the disk is asked)"
+file = "native/src/revision/engine.rs"
+op = "replace"
+find = "                let text = match &action.file {"
+with = "                let text = match &None::<crate::agent_transcript::events::FileText> {"
+expect = "agy_and_kimi_reads_use_their_file_text_not_the_disk"
+
+[[mutation]]
+name = "read-beat-file-text-ignored"
+gate = "cargo-test"
+why = "a read's beat showing the revision engine's text in place of the lines the event says the call read: with no engine (or a partial read, which is no revision) the card says nothing was recorded, and with one it shows the whole file, not what the agent saw. CONSUMED BY: types::AgentSession::linearize_events's FileRead arm; reddens agent_transcript::tests::agy_and_kimi_reads_use_their_file_text_not_the_disk (the beat's content)"
+file = "native/src/agent_transcript/types.rs"
+op = "replace"
+find = "                                    Some(f) => Some(f.text.clone()),\n                                    None => revision_text(&record.file_path),\n                                },\n                                first_line"
+with = "                                    Some(_) => revision_text(&record.file_path),\n                                    None => revision_text(&record.file_path),\n                                },\n                                first_line"
+expect = "agy_and_kimi_reads_use_their_file_text_not_the_disk"

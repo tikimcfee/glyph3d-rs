@@ -36,8 +36,9 @@ pub(super) struct EguiUi {
     /// the glyph field is and what it did this frame. Independent of the
     /// Debug window; open by default in `--field-mode visible`.
     pub(super) hud_open: bool,
-    /// The command the last listing ran.
-    pub(super) session_list_source: String,
+    /// Where gomuxai looked (`agent sessions --dirs --json`, one line), or
+    /// why it couldn't say.
+    pub(super) session_dirs_report: Result<String, String>,
     /// Why the last session the browser tried to load didn't load.
     pub(super) session_load_error: Option<String>,
 }

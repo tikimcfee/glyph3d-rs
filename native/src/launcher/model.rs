@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 
-use crate::agent_transcript::{agent_cli::nest_subagents, AgentCli, SessionInfo};
+use crate::agent_transcript::agent_cli::{describe_dirs, nest_subagents};
+use crate::agent_transcript::{AgentCli, SessionInfo};
 use crate::cli::Cli;
 use crate::launch_config::{value_name, LaunchConfig};
 
@@ -206,8 +207,9 @@ pub struct Launcher {
     /// Newest first, as gomuxai lists them; listed on first use, and again
     /// on reload.
     sessions: Option<Vec<SessionInfo>>,
-    /// What the last listing ran, or why it failed.
-    session_list_report: String,
+    /// Where gomuxai looked (`agent sessions --dirs`, one line), or why the
+    /// listing failed.
+    session_dirs_report: String,
     /// The file the last launch wrote, kept so a launch can be repeated.
     pub last_launch: Option<PathBuf>,
 }
@@ -230,7 +232,7 @@ impl Launcher {
             config_source: None,
             config_error: None,
             sessions: Some(Vec::new()),
-            session_list_report: "not listed (tests)".to_string(),
+            session_dirs_report: "not listed (tests)".to_string(),
             last_launch: None,
         };
         l.resolve_lod_defaults();
@@ -473,13 +475,13 @@ impl Launcher {
     pub fn sessions(&mut self) -> &[SessionInfo] {
         if self.sessions.is_none() {
             let listed = AgentCli::from_launch_config(&self.cfg).and_then(|agent| {
-                self.session_list_report = format!("`{}`", agent.describe(&["sessions", "--json"]));
+                self.session_dirs_report = describe_dirs(&agent.dirs()?);
                 agent.sessions()
             });
             let found = match listed {
                 Ok(all) => nest_subagents(&all).into_iter().map(|(top, _)| top.clone()).take(SESSION_PICKS).collect(),
                 Err(e) => {
-                    self.session_list_report = e;
+                    self.session_dirs_report = e;
                     Vec::new()
                 }
             };
@@ -502,7 +504,7 @@ impl Launcher {
         let current = crate::launch_config::expand_home(Path::new(&self.session_path)).display().to_string();
         let paths: Vec<String> = self.sessions().iter().map(|s| s.path.clone()).collect();
         if paths.is_empty() {
-            self.status = format!("No sessions listed: {}", self.session_list_report);
+            self.status = format!("No sessions in: {}", self.session_dirs_report);
             return;
         }
         let n = paths.len() as i32;
@@ -514,11 +516,11 @@ impl Launcher {
         self.session_path = paths[i as usize].clone();
     }
 
-    /// Where the session list comes from (the command), or why it failed.
-    pub fn session_list_report(&self) -> &str {
+    /// Where gomuxai looks for sessions, or why it couldn't list them.
+    pub fn session_dirs_report(&self) -> &str {
         match self.sessions {
             None => "not listed yet (◄/► on the session field lists them)",
-            Some(_) => &self.session_list_report,
+            Some(_) => &self.session_dirs_report,
         }
     }
 

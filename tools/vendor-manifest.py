@@ -201,7 +201,7 @@ THIRD_PARTY = {
 # corpus's own account of the cases and the decisions they encode. Read by
 # native/src/agent_transcript/tests.rs (include_str!), which pins the count.
 GOMUXAI_REPO = "tikimcfee/gomuxai"
-GOMUXAI_COMMIT = "a33c68b9772b9a465fc329b283607fa9a1edb175"
+GOMUXAI_COMMIT = "7238f185475f8ba33d94a0abb6dcb3b5fa327044"
 GOMUXAI_UPSTREAM_DIR = "internal/transcript/testdata/corpus"
 GOMUXAI_LOCAL_DIR = "tools/vendor/gomuxai/" + GOMUXAI_UPSTREAM_DIR
 GOMUXAI = [f"{GOMUXAI_LOCAL_DIR}/{rel}" for rel in [

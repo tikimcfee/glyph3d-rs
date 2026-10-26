@@ -401,7 +401,7 @@ impl App<'_> {
                 session_filter_text: String::new(),
                 session_filter_harness: None,
                 discovered_sessions: None,
-                session_list_source: String::new(),
+                session_dirs_report: Ok(String::new()),
                 session_load_error: None,
                 // The field HUD starts open where it has the most to say.
                 hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
