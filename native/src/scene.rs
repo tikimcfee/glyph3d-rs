@@ -73,6 +73,12 @@ pub trait SceneLike {
         target: &FrameTarget<'_>,
         t: f32,
     );
+    /// The CPU half of a frame at `viewport` (physical px) and `t`, with no
+    /// wgpu type (`glyph_scene::FrameData`): what a host drawing the passes
+    /// itself consumes. None for a scene without one (the quad demo).
+    fn prepare_frame(&self, _viewport: (u32, u32), _t: f32) -> Option<crate::glyph_scene::FrameData<'_>> {
+        None
+    }
 
     // ── Stage F: interactive hooks (windowed only) ─────────────────────────
     // Default no-ops: the Stage A demo scene and all offscreen runs ignore

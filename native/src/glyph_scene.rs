@@ -92,7 +92,7 @@ pub use tint::{SegTintAccum, seg_tint, srgb_to_linear_table};
 
 mod instance;
 pub use instance::{GlyphInstance, GroupRow, RenderSlot};
-use instance::Params;
+pub use instance::Params;
 
 pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};
 
@@ -113,6 +113,11 @@ mod style;
 mod setup;
 mod pipelines;
 mod render;
+mod frame;
+pub use frame::{ChunkRanges, FrameCosts, FrameData, FrameSelection};
+pub use environment::EnvUniform;
+pub use regions::{RegionCost, RegionInstance, RegionParams};
+pub use nodes::UploadCost;
 pub mod mesh;
 
 /// The scene's handle on its glyph field. Every mode is reached through the
@@ -247,6 +252,10 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) composite: CompositeState,
     pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
     pub(in crate::glyph_scene) params: Cell<Params>,
+    /// Bumped by every Params setter (`FrameData::params_generation`), and
+    /// the generation `params_buf` holds.
+    pub(in crate::glyph_scene) params_generation: Cell<u64>,
+    pub(in crate::glyph_scene) params_uploaded: Cell<u64>,
     pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
     pub(crate) mesh_frame_bg: wgpu::BindGroup,
     /// A library load's page faces, built on the host from the sheets'
@@ -544,6 +553,10 @@ impl SceneLike for GlyphScene {
         t: f32,
     ) {
         render::render_scene(self, ctx, encoder, target, t);
+    }
+
+    fn prepare_frame(&self, viewport: (u32, u32), t: f32) -> Option<FrameData<'_>> {
+        Some(GlyphScene::prepare_frame(self, viewport, t))
     }
 
     fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
