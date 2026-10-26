@@ -17,7 +17,7 @@
 //!   frame; `region_instance` composes it with the directory's resolved
 //!   world into the drawn instance, for exactly the regions whose box a
 //!   refit changed or whose directory the frame's resolve reached, and only
-//!   the instances whose bytes changed go up (`nodes::upload_rows`). So the
+//!   the instances whose bytes changed go up (`nodes::upload_runs`). So the
 //!   host's work per frame is O(moved directories + refits), never
 //!   O(directories), and a settled library does none. (From 2026-10-10 to
 //!   2026-10-26 a compute pass composed every region on the GPU after any
@@ -47,13 +47,14 @@
 //! at depth 1 to `region_color_b` at the deepest directory in the tree),
 //! the JS recipe; depth counts boxes (a compressed chain is one level).
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
+use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DQuat, DVec3};
 use glyph_scene_graph::{FramePlan, NodeHandle, NodeTables, Similarity, NONE};
 
-use super::nodes::upload_rows;
+use super::nodes::{run_rows, upload_runs, write_runs};
 use super::tree_cull::{is_empty, Aabb, TreeCull};
 use crate::library::plan::Plan;
 use crate::library::LibNodes;
@@ -133,11 +134,21 @@ pub(super) fn region_color(depth: u32, max_depth: u32, spec: &RegionSpec) -> [f3
 /// The instance library_regions.wgsl draws (its vertex attributes), 64 B.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
-pub(super) struct RegionInstance {
+pub struct RegionInstance {
     pub col0: [f32; 4],
     pub col1: [f32; 4],
     pub col2: [f32; 4],
     pub color: [f32; 4],
+}
+
+/// The region draw's dials: `RegionParams` in library_regions.wgsl less its
+/// picked index and count.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RegionParams {
+    pub edge_opacity: f32,
+    pub edge_px: f32,
+    pub picked_opacity: f32,
+    pub picked_edge_opacity: f32,
 }
 
 /// `RegionParams` in library_regions.wgsl, 32 B (`count` is read by no
@@ -363,7 +374,7 @@ impl RegionTable {
 
 /// What one frame's region work did and cost on the CPU (`REGIONTIME`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct RegionCost {
+pub struct RegionCost {
     /// Refit slots taken from the tree cull (any library node).
     pub refits: usize,
     /// Instances recomposed (a refit box or a resolved directory).
@@ -508,16 +519,16 @@ impl LibraryRegions {
         self.picked.set(r.unwrap_or(NONE));
     }
 
-    /// The frame's region work, after the cull (whose refit logged what
-    /// changed) and before the glyph pass: take the refits, recompose the
-    /// regions whose box changed or whose directory the frame's resolve
-    /// (`plan`) reached, upload the instances that changed, and the picked
-    /// index if it moved. A settled frame does nothing.
-    pub(super) fn prepare(&self, queue: &wgpu::Queue, tree: &mut TreeCull, t: &NodeTables, plan: Option<&FramePlan>) -> RegionCost {
+    /// The CPU half of the frame's region work, after the cull (whose
+    /// refit logged what changed) and before the glyph pass: take the
+    /// refits, recompose the regions whose box changed or whose directory
+    /// the frame's resolve (`plan`) reached, and plan the runs the changed
+    /// instances go up in. A settled frame does nothing.
+    pub(super) fn prepare(&self, tree: &mut TreeCull, t: &NodeTables, plan: Option<&FramePlan>) -> (RegionCost, Vec<Range<u32>>) {
         let t0 = std::time::Instant::now();
         let mut cost = RegionCost::default();
         if self.count == 0 {
-            return cost;
+            return (cost, Vec::new());
         }
         let mut table = self.table.borrow_mut();
         cost.refits = table.sync(tree);
@@ -541,14 +552,37 @@ impl LibraryRegions {
             !same
         });
         cost.uploaded = dirty.len();
-        cost.bytes = upload_rows(queue, &self.instances, bytemuck::cast_slice(&image), std::mem::size_of::<RegionInstance>(), &dirty);
+        let runs = upload_runs(&dirty, image.len() as u32);
+        cost.bytes = run_rows(&runs) * std::mem::size_of::<RegionInstance>();
+        cost.ms = t0.elapsed().as_secs_f64() * 1e3;
+        (cost, runs)
+    }
+
+    /// The wgpu half: write `runs` (`prepare`'s) into the instance buffer,
+    /// and the picked index into the uniform if it moved.
+    pub(super) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
+        write_runs(queue, &self.instances, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<RegionInstance>(), runs);
         if self.picked.get() != self.picked_written.get() {
             let p = RegionParamsGpu { picked: self.picked.get(), ..self.params_cpu };
             queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
             self.picked_written.set(self.picked.get());
         }
-        cost.ms = t0.elapsed().as_secs_f64() * 1e3;
-        cost
+    }
+
+    /// Every region instance as the host last composed it.
+    pub(super) fn image(&self) -> Ref<'_, Vec<RegionInstance>> {
+        self.image.borrow()
+    }
+
+    /// The picked region, if any.
+    pub(super) fn picked(&self) -> Option<u32> {
+        Some(self.picked.get()).filter(|&r| r != NONE)
+    }
+
+    /// The draw's dials (the uniform less the picked index and count).
+    pub(super) fn params(&self) -> RegionParams {
+        let p = &self.params_cpu;
+        RegionParams { edge_opacity: p.edge_opacity, edge_px: p.edge_px, picked_opacity: p.picked_opacity, picked_edge_opacity: p.picked_edge_opacity }
     }
 
     /// Draw every region (inside the glyph field pass, after the page faces).

@@ -5,7 +5,7 @@
 //! keeps current by sheet: after the frame's resolve, each face whose sheet
 //! the resolve reached is rebuilt from the sheet's world (`face_instance`)
 //! in the host's image of the buffer, and only the faces whose bytes
-//! changed go up, coalesced into runs (`nodes::upload_rows`). A page turn
+//! changed go up, coalesced into runs (`nodes::upload_runs`). A page turn
 //! costs the faces of the turned volume, a directory drag the faces under
 //! it, and a settled frame nothing; before the library moved onto the tree,
 //! every face was a bevy scene mesh and any moved sheet re-extracted and
@@ -14,13 +14,14 @@
 //! wrote every face on the GPU after any resolve; `face_instance` was its
 //! twin and is now the path, held to bevy's extraction in `library::tests`.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
+use std::ops::Range;
 
 use bytemuck::Zeroable;
 use glyph_scene_graph::{FramePlan, NodeTables, NONE};
 
 use super::mesh::MeshInstance;
-use super::nodes::{upload_rows, UploadCost};
+use super::nodes::{run_rows, upload_runs, write_runs, UploadCost};
 use crate::library::FaceSpec;
 
 /// The face of a sheet whose world is `sheet`: bevy's extraction of the
@@ -73,6 +74,8 @@ pub(crate) struct LibraryFaces {
     pub(crate) instances: wgpu::Buffer,
     image: RefCell<Vec<MeshInstance>>,
     last: Cell<UploadCost>,
+    /// Bumped by every `prepare` that changed a face (`FrameData::faces_generation`).
+    generation: Cell<u64>,
 }
 
 impl LibraryFaces {
@@ -99,6 +102,7 @@ impl LibraryFaces {
             instances,
             image: RefCell::new(vec![MeshInstance::zeroed(); count]),
             last: Cell::new(UploadCost::default()),
+            generation: Cell::new(0),
         }
     }
 
@@ -106,12 +110,13 @@ impl LibraryFaces {
         self.sheets.len() as u32
     }
 
-    /// After the frame's resolve: rebuild the face of every sheet the
-    /// resolve reached and upload the ones that changed. Nothing resolved,
+    /// The CPU half, after the frame's resolve: rebuild the face of every
+    /// sheet the resolve reached and plan the runs the changed faces go up
+    /// in (bumping the generation when there are any). Nothing resolved,
     /// nothing done.
-    pub(crate) fn update(&self, queue: &wgpu::Queue, t: &NodeTables, plan: &FramePlan) -> UploadCost {
+    pub(crate) fn prepare(&self, t: &NodeTables, plan: &FramePlan) -> Vec<Range<u32>> {
         if plan.is_empty() || self.sheets.is_empty() {
-            return UploadCost::default();
+            return Vec::new();
         }
         let t0 = std::time::Instant::now();
         let mut image = self.image.borrow_mut();
@@ -128,10 +133,36 @@ impl LibraryFaces {
             }
         }
         changed.sort_unstable();
-        let bytes = upload_rows(queue, &self.instances, bytemuck::cast_slice(&image), std::mem::size_of::<MeshInstance>(), &changed);
-        let cost = UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 };
+        let runs = upload_runs(&changed, image.len() as u32);
+        if !runs.is_empty() {
+            self.generation.set(self.generation.get() + 1);
+        }
+        let bytes = run_rows(&runs) * std::mem::size_of::<MeshInstance>();
+        self.last.set(UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 });
+        runs
+    }
+
+    /// The wgpu half: write `runs` (`prepare`'s) into the instance buffer.
+    pub(crate) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
+        if runs.is_empty() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        write_runs(queue, &self.instances, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<MeshInstance>(), runs);
+        let mut cost = self.last.get();
+        cost.ms += t0.elapsed().as_secs_f64() * 1e3;
         self.last.set(cost);
-        cost
+    }
+
+    /// Every face as the host last built it (what the GPU holds once the
+    /// frame's runs are written).
+    pub(crate) fn image(&self) -> Ref<'_, Vec<MeshInstance>> {
+        self.image.borrow()
+    }
+
+    /// The face generation: bumped whenever a `prepare` planned any run.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// The last frame's face upload that did anything (the instruments).
@@ -193,9 +224,11 @@ mod tests {
         let faces = LibraryFaces::new(&ctx.device, &spec, &slots);
 
         let frame = |g: &GroupNodes| {
-            let plan = g.flush(&ctx).expect("a device-backed table");
-            let up = faces.update(&ctx.queue, &g.tables(), &plan);
-            (g.last_flush().0.bytes, up.bytes)
+            let (plan, rows) = g.prepare();
+            g.upload(&ctx.queue, &rows);
+            let runs = faces.prepare(&g.tables(), &plan);
+            faces.upload(&ctx.queue, &runs);
+            (g.last_flush().0.bytes, faces.last_update().bytes * usize::from(!runs.is_empty()))
         };
         let check = |g: &GroupNodes, what: &str| {
             let (rows_up, faces_up) = frame(g);

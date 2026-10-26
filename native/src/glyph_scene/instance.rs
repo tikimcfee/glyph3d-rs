@@ -46,31 +46,32 @@ pub(super) struct FrameUniform {
     pub(super) _pad1: u32,
 }
 
-/// GlyphField.js GLYPH_LOD_DEFAULTS + group count, one uniform block.
+/// GlyphField.js GLYPH_LOD_DEFAULTS + group count, one uniform block (`Params`
+/// in the glyph shaders; `FrameData::params` hands it to a host).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub(super) struct Params {
-    pub(super) max_groups: u32,
-    pub(super) greek_mode: u32, // 0 = disabled, 1 = smooth blend (default), 2 = pure hard bypass
+pub struct Params {
+    pub max_groups: u32,
+    pub greek_mode: u32, // 0 = disabled, 1 = smooth blend (default), 2 = pure hard bypass
     /// The visible field's debug tint (`--debug-tint`): 0 off, 1 colour by
     /// LOD tier, 2 colour by cull state. Rides in what was a pad lane, so
     /// the Instanced and Derived shaders (which never read it) are byte-
     /// unchanged at 0; only `FramePrepare::debug_tint` carries it anywhere.
-    pub(super) debug_tint: u32,
+    pub debug_tint: u32,
     pub(super) _pad2: u32,
-    pub(super) dilate_px: f32,
-    pub(super) soften: f32,
-    pub(super) min_lo: f32,
-    pub(super) min_hi: f32,
+    pub dilate_px: f32,
+    pub soften: f32,
+    pub min_lo: f32,
+    pub min_hi: f32,
     /// Emoji sheet geometry, mirrored from the G3ES header (atlas.rs) so the
     /// vertex stage can place a cell from its index alone. WGSL `vec2<u32>` /
     /// `vec2<f32>` are 8-byte aligned; this 32-byte tail keeps the struct at a
     /// 16-byte multiple (64 B).
-    pub(super) emoji_cell: [u32; 2],
-    pub(super) emoji_cols: u32,
-    pub(super) emoji_rows: u32,
-    pub(super) emoji_layer: [f32; 2],
-    pub(super) greek_onset_px: f32,
+    pub emoji_cell: [u32; 2],
+    pub emoji_cols: u32,
+    pub emoji_rows: u32,
+    pub emoji_layer: [f32; 2],
+    pub greek_onset_px: f32,
     pub(super) _pad3: u32,
 }
 

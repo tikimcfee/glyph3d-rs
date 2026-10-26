@@ -137,7 +137,11 @@ buffers where the GPU allows it and staging otherwise.
   retired on 2026-10-11 (Ivan: "it should be gone in general"), and with it
   the agent cards' comment-line guess in shown source.
 - Modularized renderer: `glyph_scene.rs` is factored into `setup.rs`, `pipelines.rs`
-  (composite) and `render.rs`; the glyph field itself — slot storage, upload, glyph
+  (composite) and `render.rs`; a frame is two halves (2026-10-26): `frame.rs`'s
+  `GlyphScene::prepare_frame` computes it on the CPU into a `FrameData` with
+  no wgpu type (`SceneLike::prepare_frame` for a host holding a boxed scene),
+  and `render.rs` uploads and draws that; a host with its own renderer (the
+  makepad port) draws the same `FrameData`. The glyph field itself — slot storage, upload, glyph
   pipeline, WGSL — lives behind the `GlyphField` trait in `crates/` (one crate per
   render mode, chosen with `--field-mode`; the scene never touches slot bytes).
 
