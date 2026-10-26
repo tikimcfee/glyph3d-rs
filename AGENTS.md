@@ -482,8 +482,8 @@ directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus `cargo test
 --doc`, all at once (cargo ran them one after another: 29 s serially, 22 s
 at once, measured under load). A failing binary no longer stops the ones
 after it, and a binary that reports no result is red by name. The long
-pole is one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`
-(11 s alone, a serial grid of 24 cases).
+pole was one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`:
+a grid of 24 cases run one after another, 11 s; run at once, 2.7 s.
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; at the time there were
