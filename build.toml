@@ -1271,12 +1271,12 @@ expect = "a_stale_handle_is_refused_and_never_aliases_a_reused_slot"
 [[mutation]]
 name = "resolve-compose-order-swapped"
 gate = "cargo-test"
-why = "the resolve composing child-then-parent (local[child] ∘ parent world) instead of parent-then-child as it walks a range down the depth-first order: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the random 5,000-node tree, held to the chain walk, can. CONSUMED BY: NodeTables::resolve_range, every node of every frame's resolve and of every between-frame mirror (resolve_subtrees). Re-aimed 2026-10-26 from resolve.wgsl's chain composition, when the CPU resolve replaced the GPU pass; reddens the_frame_resolve_matches_the_chain_walk_through_every_kind_of_edit (and tables::tests::resolving_subtrees_on_the_cpu_matches_world_node_for_node)"
+why = "the resolve composing child-then-parent (local[child] ∘ parent world) instead of parent-then-child as it walks a range down the depth-first order: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the random 5,000-node tree, held to the chain walk, can. CONSUMED BY: NodeTables::resolve_range, every node of every frame's resolve and of every between-frame mirror (resolve_subtrees). Re-aimed 2026-10-26 from resolve.wgsl's chain composition, when the CPU resolve replaced the GPU pass; reddens tables::tests::resolving_subtrees_on_the_cpu_matches_world_node_for_node (the crate's lib binary fails first, so cargo test never reaches tests/resolve.rs's the_frame_resolve_matches_the_chain_walk_through_every_kind_of_edit, which reddens too when run alone)"
 file = "crates/glyph-scene-graph/src/tables.rs"
 op = "replace"
 find = "                (Similarity::compose(&pw, &self.local[i]), pa * self.appearance[i].tint[3])"
 with = "                (Similarity::compose(&self.local[i], &pw), pa * self.appearance[i].tint[3])"
-expect = "the_frame_resolve_matches_the_chain_walk_through_every_kind_of_edit"
+expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"
 
 [[mutation]]
 name = "resolve-group-tint-halved"
