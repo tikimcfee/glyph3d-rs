@@ -456,9 +456,9 @@ impl NodeTables {
     /// Resolve every node in the subtrees of `roots` (each node once,
     /// however the subtrees nest), depth-first, into the world table, and
     /// hand `f` each node's slot, output group row, world transform and
-    /// inherited alpha. This is the mirror of a move between frames (the
-    /// rows pick and the CPU cull read); [`Self::resolve_frame`] resolves
-    /// the marked subtrees the same way.
+    /// inherited alpha: the rows of a move for a reader between frames
+    /// (pick, the CPU cull); [`Self::resolve_frame`] resolves the marked
+    /// subtrees the same way.
     pub fn resolve_subtrees(&mut self, roots: &[NodeHandle], mut f: impl FnMut(u32, Option<u32>, &Similarity, f32)) {
         self.ensure_order();
         let spans: Vec<(u32, u32)> = roots

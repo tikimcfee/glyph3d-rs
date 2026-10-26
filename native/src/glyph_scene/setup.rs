@@ -427,7 +427,6 @@ impl GlyphScene {
             assert_eq!(pctx.files.len(), views.len(), "a pick record per view: PickContext::files is indexed by view");
         }
         let controller = staged.controller;
-        let groups_cpu = groups.clone();
         let tint_step = vec![0u32; groups.len()];
         let pipe_dur = t_pipe_start.elapsed();
         log::info!(
@@ -450,7 +449,6 @@ impl GlyphScene {
             fly,
             cull,
             group_buf,
-            groups_cpu,
             nodes,
             views,
             pick,

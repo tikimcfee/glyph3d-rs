@@ -430,8 +430,9 @@ pub(super) fn render_scene(
         // the live group TRS, hidden, tint) for the rows the browser drew
         // last frame (`browser_rows`, a scrolled window of a dozen or so):
         // the pose from the transform tree (O(depth) each — a library
-        // move's CPU mirror is deferred, 2026-10-10), the appearance from
-        // the mirror (verbs write it at once). Until 2026-10-10 every row
+        // move's rows are rebuilt at the flush or a reader's sync, 2026-10-10),
+        // the appearance from the group table (verbs rebuild their row at
+        // once). Until 2026-10-10 every row
         // was refreshed every frame, O(files). Skipped entirely offscreen
         // (no probe installed).
         if !p.files.is_empty() {
@@ -441,7 +442,7 @@ pub(super) fn render_scene(
             }
             for &i in &st.browser_rows {
                 let (Some(r), Some(slot)) = (st.files.get(i), st.file_dyn.get_mut(i)) else { continue };
-                let (Some(g), Some((o, s))) = (scene.groups_cpu.get(r.group_id as usize), scene.nodes.world_offset_scale(r.group_id)) else {
+                let (Some(g), Some((o, s))) = (scene.nodes.row(r.group_id), scene.nodes.world_offset_scale(r.group_id)) else {
                     *slot = UiFileDyn::default();
                     continue;
                 };

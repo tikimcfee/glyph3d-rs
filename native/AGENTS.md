@@ -309,7 +309,7 @@ its staging text predates C22). Key touchpoints:
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
   moved (dir and sheet local rows written), the CPU stages (`ease_ms`, the
   easing loop with its local-row writes; `note_ms`, noting the moved nodes
-  for the deferred CPU mirror and the tree cull), `local_bytes` (the local
+  for their deferred group rows and the tree cull), `local_bytes` (the local
   rows written, 32 B each), the PREVIOUS frame's flush
   (`last_flush_resolved`: nodes the CPU resolve reached;
   `last_flush_rows` / `last_flush_bytes`: group rows that changed and the
@@ -322,8 +322,8 @@ its staging text predates C22). Key touchpoints:
   Since 2026-10-26 the resolve, the faces and the regions are the host's
   (no compute pass): a move costs CPU and upload in proportion to the
   subtrees it moved, and nothing outside them. The move itself is still
-  O(moved nodes): no bevy propagation, no per-file row mirror (it is
-  deferred until pick, a verb or the windowed HUD reads `groups_cpu`) and
+  O(moved nodes): no bevy propagation, no per-file row rebuild (it waits
+  for the flush, or for pick or a verb reading the group table first) and
   no `sync_segment` (the library culls top-down from the tree,
   `glyph_scene/tree_cull.rs`). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
@@ -409,8 +409,9 @@ its staging text predates C22). Key touchpoints:
   transform write; for a bevy-backed controller — the carrel — plus
   `update_transforms`, split into bevy propagation and scene-mesh
   re-extraction, both 0 for a library, whose files and zones are tree
-  nodes), `sync_ms` (the CPU mirror), `upload_ms` (0 for a tree move: the
-  frame's flush uploads its one local row), `seg_ms`. Bevy propagation is
+  nodes), `sync_ms` (the controller's rows into the group table, adopted;
+  for a tree move, noting it), `upload_ms` (0 for a tree move: the frame's
+  flush resolves and uploads), `seg_ms`. Bevy propagation is
   O(every entity): 0.39 ms for one moved card on a 9,241-file library
   before the library left bevy (2026-10-10).
 - `GLYPH_FRAME_SCRIPT="FRAME:STEP[;FRAME:STEP...]"` — offscreen (C32,
