@@ -51,6 +51,9 @@ pub struct GlyphSceneSettings {
     pub file_bg_color: [f32; 4],
     /// Selection tint over the picked glyphs/file (windowed): RGB, A = strength.
     pub selection_tint: [f32; 4],
+    /// Slots per host block of the Derived field, its chunk capacity
+    /// (2026-10-26): the unit of an edit's upload and of a draw item.
+    pub derived_block_slots: u32,
 }
 
 /// Far-LOD substitution (`glyph_scene::cull`) and text detail (the glyph
@@ -442,6 +445,9 @@ impl Settings {
             .map_err(|e: toml::de::Error| e.to_string())?;
         if s.repo.dir_tints.is_empty() {
             return Err("[repo] dir_tints must not be empty".into());
+        }
+        if !(1..=1 << 24).contains(&s.glyph_scene.derived_block_slots) {
+            return Err("[glyph_scene] derived_block_slots must be 1..=16777216".into());
         }
         crate::fold::TabWidth::new(s.layout.tab_width_cells).map_err(|e| format!("[layout] tab_width_cells: {e}"))?;
         crate::fold::TabWidth::new(s.layout.render_file_tab_width_cells)

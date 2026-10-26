@@ -444,16 +444,17 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Two forms: a host `Vec<GlyphInstance>`; and the endpoint form (`Device`,
-/// note 23's E2b) — the 32 B slots on device, bound by the renderer directly,
-/// no host copy anywhere.
+/// Three forms: a host `Vec<GlyphInstance>` (the engine's neutral 48 B
+/// records); the EMITTED form, slots already in the field's own format
+/// ([`EmittedSlots`]: Derived blocks on the host, Instanced slots on the
+/// device); and the visible form, no slots at all.
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
-    /// Present on the ENDPOINT path (note 23, E2b): the chain's 32 B slots
-    /// on device, bound directly — no host copy exists. Mutually exclusive
-    /// with the host form; every slice-returning accessor panics on it.
-    device: Option<DeviceSlots>,
+    /// Present on the emitting path: HyperLayout's Pass 2 wrote the field's
+    /// own slots. No 48 B record exists; every slice-returning accessor
+    /// panics on it.
+    emitted: Option<EmittedSlots>,
     /// The third form (`--field-mode visible`, 2026-10-10): NO slots at all.
     /// Pass 1's line table and the items' own bytes, which the field lays out
     /// per frame on the GPU (`layout_hyper::visible`). `instances` stays
@@ -462,10 +463,6 @@ pub struct GlyphArena {
     visible: Option<crate::layout_hyper::VisibleStaging>,
 }
 
-/// The endpoint's arena form (note 23, E2b): the chain's 32 B RenderSlots
-/// on device, bound directly by the renderer — no host copy exists. The
-/// per-slot tint lanes ride host-side (seg_tint's fold input — the slots
-/// themselves are device-only).
 /// Precomputed per-item tint statistics accumulated during layout Pass 2.
 /// Avoids reading back instance buffers from mapped GPU memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -475,17 +472,15 @@ pub struct FileTintAccum {
     pub has_emoji: bool,
 }
 
-pub struct DeviceSlots {
-    /// One entry per chunk buffer. `offset` is slot 0's byte address in
-    /// the buffer — 0 for the exclusive-page big forms, nonzero where the
-    /// allocator sliced.
-    pub chunks: Vec<DeviceSlotChunk>,
+/// The emitted arena form: Pass 2 wrote the field's own slot format, chunked
+/// by `chunk_slots`, and computed each item's tint inputs and sub-file
+/// blocks on the way (so nothing reads the slots back for them).
+pub struct EmittedSlots {
+    /// Where the slots are.
+    pub residence: SlotResidence,
     /// Slots per chunk (uniform; the last chunk may hold fewer).
     pub chunk_slots: usize,
     pub len: usize,
-    /// When mapped in host-visible memory, base pointer to the RenderSlot slice as usize.
-    /// RenderSlot ONLY — None whenever `format` is Derived (see `derived`).
-    pub mapped_slots: Option<usize>,
     /// Precomputed in-flight tint accumulators per item, avoiding 3 GB mapped memory readback.
     pub file_tints: Vec<FileTintAccum>,
     /// Precomputed in-flight local block bounds per item, avoiding 3 GB mapped memory readback in build_file_blocks.
@@ -493,19 +488,41 @@ pub struct DeviceSlots {
     /// Which field's slot format the chunks hold. A field binds only its own
     /// format; setup refuses a mismatch rather than drawing garbage.
     pub format: glyph_field::GlyphFieldMode,
-    /// The Derived format's companions (None for Instanced).
-    pub derived: Option<DerivedDeviceSlots>,
     /// Per item: `(glyph_id, color)` pairs captured at emission for items
     /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
     /// tint fold never reads device slots back. Empty when not produced.
     pub emoji_tint_pairs: Vec<Vec<u32>>,
 }
 
-/// What a Derived-format device arena carries beside its 20 B slots.
-pub struct DerivedDeviceSlots {
-    /// Host address of the mapped `DerivedSlot` slice (unified memory), for
-    /// in-place bulk color writes. None on staged (discrete) paths.
-    pub mapped_base: Option<usize>,
+/// Where emitted slots live.
+pub enum SlotResidence {
+    /// On the host, in blocks that are the chunks: the Derived field's form
+    /// since 2026-10-26, the one host copy a makepad renderer publishes and
+    /// the wgpu field uploads from.
+    Host(glyph_field::HostSlots),
+    /// On the device, written there directly (mapped unified memory, or
+    /// staged windows): the Instanced field's form. It stays device-direct
+    /// only because Instanced is being retired (step 3 deletes it); it is
+    /// not a second Derived path (2026-10-26).
+    Device {
+        /// One entry per chunk buffer. `offset` is slot 0's byte address in
+        /// the buffer.
+        chunks: Vec<DeviceSlotChunk>,
+        /// When the chunks are one host-visible mapping (unified memory),
+        /// the base address of its `RenderSlot` slice.
+        mapped_slots: Option<usize>,
+    },
+}
+
+impl EmittedSlots {
+    /// The `RenderSlot` mapping, when the slots are one (Instanced on
+    /// unified memory).
+    pub fn mapped_slots(&self) -> Option<usize> {
+        match &self.residence {
+            SlotResidence::Device { mapped_slots, .. } => *mapped_slots,
+            SlotResidence::Host(_) => None,
+        }
+    }
 }
 
 /// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
@@ -519,24 +536,24 @@ impl GlyphArena {
 
     /// Wrap a host Vec (the text and agent-session scenes stage from their own layout).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
-        Self { instances, device: None, visible: None }
+        Self { instances, emitted: None, visible: None }
     }
 
-    /// The endpoint form (note 23, E2b): the chain's slots on device.
-    pub fn from_device(device: DeviceSlots) -> Self {
-        assert!(device.len > 0, "a device arena with zero slots is the host form's job");
-        Self { instances: Vec::new(), device: Some(device), visible: None }
+    /// The emitted form: Pass 2's slots in the field's own format.
+    pub fn from_emitted(emitted: EmittedSlots) -> Self {
+        assert!(emitted.len > 0, "an emitted arena with zero slots is the host form's job");
+        Self { instances: Vec::new(), emitted: Some(emitted), visible: None }
     }
 
     /// The visible form: no slots, the line table and (once the loader moves
     /// them in) the bytes.
     pub fn from_visible(staging: crate::layout_hyper::VisibleStaging) -> Self {
-        Self { instances: Vec::new(), device: None, visible: Some(staging) }
+        Self { instances: Vec::new(), emitted: None, visible: Some(staging) }
     }
 
-    /// True on the endpoint form — 32 B slots on device, bound directly.
-    pub fn is_device(&self) -> bool {
-        self.device.is_some()
+    /// True on the emitted form: the field's own slots, no 48 B records.
+    pub fn is_emitted(&self) -> bool {
+        self.emitted.is_some()
     }
 
     /// True on the visible form — no slots; the field lays out per frame.
@@ -555,16 +572,21 @@ impl GlyphArena {
         self.visible.as_mut()
     }
 
-    /// The device slots (buffer + offset per chunk) for the renderer's
-    /// direct bind. None on the host form.
-    pub fn device_slots(&self) -> Option<&DeviceSlots> {
-        self.device.as_ref()
+    /// The emitted slots, for the field to bind (Instanced) or keep and
+    /// upload (Derived). None on the other forms.
+    pub fn emitted_slots(&self) -> Option<&EmittedSlots> {
+        self.emitted.as_ref()
+    }
+
+    /// The emitted slots, moved out for the field that keeps them.
+    pub fn take_emitted(&mut self) -> Option<EmittedSlots> {
+        self.emitted.take()
     }
 
     /// Slots written so far — the next item's `slot_base`. On the visible
     /// form, the glyphs the items would produce (nothing is written).
     pub fn len(&self) -> usize {
-        if let Some(d) = &self.device {
+        if let Some(d) = &self.emitted {
             d.len
         } else if let Some(v) = &self.visible {
             usize::try_from(v.glyph_count).expect("glyph count exceeds usize")
@@ -580,9 +602,9 @@ impl GlyphArena {
     /// Every committed instance as per-chunk slices, in chunk order.
     pub fn instance_chunks(&self) -> Vec<&[GlyphInstance]> {
         assert!(
-            self.device.is_none(),
-            "instance_chunks on a device arena: the slots never exist on host — \
-             the renderer binds the buffers, seg_tint reads the tint lanes"
+            self.emitted.is_none(),
+            "instance_chunks on an emitted arena: no 48 B record exists — \
+             the field takes the slots, seg_tint reads Pass 2's tint inputs"
         );
         vec![&self.instances]
     }
@@ -590,8 +612,8 @@ impl GlyphArena {
     /// The committed instances as one slice.
     pub fn instances(&self) -> &[GlyphInstance] {
         assert!(
-            self.device.is_none(),
-            "instances() on a device arena: the slots never exist on host"
+            self.emitted.is_none(),
+            "instances() on an emitted arena: no 48 B record exists"
         );
         &self.instances
     }
@@ -603,8 +625,8 @@ impl GlyphArena {
 
     pub fn into_instances(self) -> Vec<GlyphInstance> {
         assert!(
-            self.device.is_none(),
-            "into_instances() on a device arena: the slots never exist on host"
+            self.emitted.is_none(),
+            "into_instances() on an emitted arena: no 48 B record exists"
         );
         self.instances
     }
@@ -615,8 +637,8 @@ impl GlyphArena {
         if colors.is_empty() {
             return 0;
         }
-        if let Some(d) = &self.device {
-            if let Some(addr) = d.mapped_slots {
+        if let Some(d) = &self.emitted {
+            if let Some(addr) = d.mapped_slots() {
                 let count = colors.len().min(d.len.saturating_sub(slot_base));
                 let ptr = addr as *mut crate::glyph_scene::RenderSlot;
                 // SAFETY: `mapped_slots` is set only for RenderSlot arenas, never
@@ -652,8 +674,8 @@ impl GlyphArena {
     /// that has smuggled a fourth layout implementation into the tree.
     pub(crate) fn push(&mut self, instance: GlyphInstance) {
         assert!(
-            self.device.is_none(),
-            "push into a device arena: the chain's scatter fills it on device"
+            self.emitted.is_none(),
+            "push into an emitted arena: Pass 2 fills it"
         );
         self.instances.push(instance);
     }

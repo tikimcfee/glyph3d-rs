@@ -30,7 +30,9 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
-  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`);
+  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`;
+  its slots live in host blocks that are its chunks, 2026-10-26, so a makepad
+  renderer draws from the same copy the wgpu field uploads from);
   `glyph-field-visible` (2026-10-10; `out/VISIBLE-MODE.md`) is the
   Visible mode — no slot per glyph: the source bytes, Pass 1's line table and the atlas
   trie are resident, the lines in view are laid out per frame on the GPU into a

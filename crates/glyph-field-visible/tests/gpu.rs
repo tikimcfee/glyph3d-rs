@@ -543,8 +543,10 @@ impl Dummy {
             emoji_sampler: &self.sampler,
             glyph_advances: &self.glyph_advances,
             item_params,
-            // The Visible field transcodes no host records.
+            // The Visible field transcodes no host records and keeps no
+            // host blocks.
             item_of_group: &[],
+            block_slots: 1,
         }
     }
 }
