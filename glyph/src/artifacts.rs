@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::manifest::{Artifact, Class, Manifest};
-use crate::paths::{root, sh};
+use crate::paths::{root, scratch, sh};
 
 pub(crate) fn verify_committed(m: &Manifest) -> bool {
     let mut ok = true;
@@ -32,7 +32,7 @@ pub(crate) fn verify_committed(m: &Manifest) -> bool {
 /// Rebuild into a scratch dir and byte-compare. The committed files are never
 /// touched, which is the difference between this and the gate it replaced.
 fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
-    let scratch = std::env::temp_dir().join(format!("glyph-verify-{name}"));
+    let scratch = scratch().join(format!("verify-{name}"));
     let _ = std::fs::remove_dir_all(&scratch);
     if std::fs::create_dir_all(&scratch).is_err() {
         println!("FAIL  {name} — could not make a scratch dir");
@@ -59,7 +59,7 @@ fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
 /// declared in the manifest, never counted off the tree being checked — a
 /// deleted case would otherwise lower both sides and stay green.
 fn verify_corpus(name: &str, a: &Artifact) -> bool {
-    let scratch = std::env::temp_dir().join("glyph-verify-corpus");
+    let scratch = scratch().join("verify-corpus");
     let _ = std::fs::remove_dir_all(&scratch);
     let (good, out) = sh(
         &format!(
