@@ -31,6 +31,7 @@ mod manifest;
 mod paths;
 mod products;
 mod prove;
+mod test_build;
 
 use clap::{Parser, Subcommand};
 use std::process::{Command, ExitCode};

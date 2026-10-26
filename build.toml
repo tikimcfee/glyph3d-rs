@@ -30,8 +30,8 @@
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
-# test and float_tables' eight.
-test_floor = 383
+# test and float_tables' eight. 384: the runner's dep-info parse (orphans).
+test_floor = 384
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -368,16 +368,16 @@ compare = "rustdoc warning count vs zero over every workspace crate (the rendere
 blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment names still exists, not that the sentence around it is current"
 
 # A .rs file no `mod` declaration reaches is not compiled, and rustc says
-# nothing (2026-10-11). cargo-modules comes from `pixi run setup`.
+# nothing (2026-10-11). Read off the test build's dep-info since 2026-10-26
+# (rustc's own list of what each unit compiled); until then cargo-modules,
+# which reloaded the workspace for each of 9 targets, 24-48 s every run.
 [[gate]]
 name = "orphans"
 scope = "rust"
-kind = "cmd"
-cmd = "pixi run bash tools/check-orphans.sh"
-pass_line = "ORPHANS OK"
+kind = "orphans"
 needs = []
-compare = "every .rs file under each target's src/ vs the files its module tree reaches (cargo-modules, #[cfg(test)] enabled), over the 7 lib targets plus the glyph and resolve-bench bins"
-blind_to = "a file reached only under a cfg the host does not set (cfg(test) is analysed; target_os branches and non-default features are not — every feature is default today); the glyph3d-native bin, whose modules all live in the lib and read as orphans of the bin; experiments/, its own workspace"
+compare = "every .rs file under each workspace package's src/ vs the union of the source files its units read, from rustc's dep-info for every unit `cargo test --release --no-run` builds (lib, its cfg(test) harness, bins and their harnesses, integration tests) — the same build cargo-test runs"
+blind_to = "a file reached only under a cfg the host does not set (cfg(test) and the default features are compiled; target_os branches and non-default features are not); experiments/, its own workspace"
 
 [[gate]]
 name = "cargo-test"
@@ -666,12 +666,12 @@ expect = "unresolved link to `GlyphFieldMode::NoSuchMode`"
 [[mutation]]
 name = "tests-mod-dropped"
 gate = "orphans"
-why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the agent event reader's suite (gomuxai's conformance corpus, the staging of what it reads); only the cargo-test floor could see its loss, and only by count. CONSUMED BY: cargo-modules' walk of glyph3d-native's lib module tree under --cfg-test"
+why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the agent event reader's suite (gomuxai's conformance corpus, the staging of what it reads); only the cargo-test floor could see its loss, and only by count. CONSUMED BY: the dep-info of glyph3d-native's cfg(test) lib harness, which then no longer lists the file"
 file = "native/src/agent_transcript.rs"
 op = "replace"
 find = "#[cfg(test)]\nmod tests;\n"
 with = ""
-expect = "FAIL  orphans glyph3d-native --lib"
+expect = "native/src/agent_transcript/tests.rs"
 
 [[mutation]]
 name = "clippy-lint"

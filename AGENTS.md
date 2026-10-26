@@ -250,8 +250,9 @@ read by nothing at all.
 earlier agents' picks that no gate used). `pixi install` brings up what
 conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
 ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
-tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
-cargo-modules (the orphans gate's tool). Under `pixi run` both sets are on PATH. **Rust and
+tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga
+(cargo-modules, the orphans gate's tool until 2026-10-26, went when the gate
+began reading rustc's dep-info). Under `pixi run` both sets are on PATH. **Rust and
 rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
 (`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
 Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
@@ -425,20 +426,22 @@ two links to `Engine::records` survived its rename to `read_back` through a full
 green run. Blind to whether the prose is TRUE — it checks that the symbols named
 still exist, not that the sentence around them is current.
 
-**orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
-declaration reaches is not compiled at all, and rustc says nothing about it.
-cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
-lists the files under `src/` it never reaches. It covers the 7 lib targets
-plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
-loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
-and until this gate only the cargo-test floor might have noticed, by count.
-`tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
-the gate runs under `pixi run`. cargo-modules runs its own `cargo check
---compile-time-deps` (build scripts, proc macros), so the gate gives it
-`target/orphans`, as cargo-check-no-ui has `target/no-ui`. Blind to a file reached only under a cfg the
-host does not set (target_os branches; non-default features, of which there
-are none today). Also blind to glyph3d-native's own bin: its modules all live
-in the lib, so cargo-modules reports every one of them as an orphan of the bin.
+**orphans** (2026-10-11; read off rustc since 2026-10-26). A `.rs` file
+that no `mod` declaration reaches is not compiled at all, and rustc says
+nothing about it. The gate lists every `.rs` file under each workspace
+package's `src/` that no unit of the test build read, by rustc's own
+dep-info (`glyph/src/test_build.rs`): every unit `cargo test --release
+--no-run` builds — each lib, its `cfg(test)` harness, the bins and theirs,
+the integration tests — which is the build cargo-test runs, so the gate
+costs a parse. The realistic loss is a dropped `#[cfg(test)] mod tests;`:
+the file's tests stop existing, and until this gate only the cargo-test
+floor might have noticed, by count. `tests-mod-dropped` proves it. Until
+2026-10-26 it was `tools/check-orphans.sh` over cargo-modules, which loaded
+the workspace again for each of its 9 targets (24 s after an edit, 48 s
+with nothing changed, measured under load) and could not check the
+renderer's bin (its modules live in the lib). Blind to a file reached only
+under a cfg the host does not set (target_os branches; non-default
+features, of which there are none today).
 
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
@@ -455,7 +458,14 @@ floor lives in `build.toml [settings]`. That floor is a ratchet, not an
 equality: adding tests never reddens it, and when the real count rises above
 it every green run prints a NOTE naming the number to raise it to — so it
 cannot decay into a figure far below reality without saying so. Raise it in
-the same commit that adds the tests.
+the same commit that adds the tests. The runner runs the binaries itself, not `cargo test` (2026-10-26): the
+ones `cargo test --release --no-run` names, each from its package's
+directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus `cargo test
+--doc`, all at once (cargo ran them one after another: 29 s serially, 22 s
+at once, measured under load). A failing binary no longer stops the ones
+after it, and a binary that reports no result is red by name. The long
+pole is one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`
+(11 s alone, a serial grid of 24 cases).
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; at the time there were

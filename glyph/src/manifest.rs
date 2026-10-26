@@ -97,6 +97,7 @@ pub(crate) enum Kind {
     Cmd,
     Cargo,
     CargoTest,
+    Orphans,
     GoldenVerify,
     RepoVerify,
 }

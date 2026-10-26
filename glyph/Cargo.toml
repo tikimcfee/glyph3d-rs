@@ -23,6 +23,9 @@ sha2 = "0.10"
 # `glyph drift`: decode this host's renders and another platform's golden set
 # to say how far apart two rasterizers are. Already in the lock via `image`.
 png = "0.18"
+# cargo's `--message-format=json`: the test binaries a build made, and the
+# dep-info beside them (cargo-test and orphans). Already in the lock.
+serde_json = "1"
 
 
 [lints]
