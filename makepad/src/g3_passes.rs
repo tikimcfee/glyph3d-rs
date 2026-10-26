@@ -284,6 +284,12 @@ script_mod! {
     // moves with zero per-frame face upload. The arithmetic is
     // library_faces.wgsl's / faces.rs `face_instance`: the face sits at
     // (0, 0, -gap) in the sheet's frame, a unit quad scaled to the page.
+    // PRECONDITION (not met yet, 2026-10-26): the spec's group row must BE
+    // its sheet's world (offset = translation, quat = rotation, scale =
+    // uniform scale). Today sheets have no rows of their own; a file's row is
+    // sheet ∘ mount (contain-fit scale + offset), so leave `group_faces`
+    // empty and draw faces as MeshInstances until sheets route to rows.
+    // Not bit-exact to `face_instance` either (different operation order).
     mod.draw.DrawG3GroupFace = mod.std.set_type_default() do #(DrawG3GroupFace::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
@@ -1222,7 +1228,9 @@ impl G3MeshGeometries {
 }
 
 /// One library page face, static: its size and gap in its sheet's frame and
-/// the sheet's group row. 8 lanes.
+/// the sheet's group row. 8 lanes. Only valid once sheets have group rows
+/// of their own (see `DrawG3GroupFace`); until then leave `group_faces`
+/// empty and use `faces`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct G3GroupFaceSpec {
@@ -1691,7 +1699,8 @@ pub struct G3FrameInputs<'a> {
     /// re-uploads block k only. Appending blocks never moves earlier ones.
     pub blocks: &'a [Arc<[f32]>],
     /// Library faces, scene quads and cubes (MeshInstance), and the static
-    /// group-composed face specs.
+    /// group-composed face specs (empty until sheets have group rows of
+    /// their own; see `DrawG3GroupFace`).
     pub meshes_generation: u64,
     pub faces: &'a [G3MeshInstance],
     pub quads: &'a [G3MeshInstance],
