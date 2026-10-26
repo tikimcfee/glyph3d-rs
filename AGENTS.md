@@ -225,7 +225,14 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   branch touched" — and also selects every mutation of a gate whose own
   script changed, and every mutation whose `build.toml` declaration, or
   whose gate's, is new or edited, so a mutation proves itself on the branch
-  that adds it (`--changed` is `--since HEAD`). `--list` prints a
+  that adds it (`--changed` is `--since HEAD`). Since 2026-10-26 "edited"
+  means a field a gate run reads: prose (`compare`, `blind_to`, `why`) and
+  `glyph test`'s own `scope`, `tier` and `gpu` do not count (declaring
+  `tier` on every gate selected all 116). And a mutation is selected when
+  a changed file other than build.toml or prose holds its `expect`: its
+  witness changed (for a cargo-test mutation, the test that must catch it),
+  though its target did not. On the branch that brought both, 116 became
+  29. `--list` prints a
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
