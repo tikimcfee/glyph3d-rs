@@ -47,10 +47,14 @@ Left click picks; WASD flies, E/R up, Q/F down; the right button held, or
 backquote toggled, is mouse-look (Escape ends it); the wheel sets the speed;
 `h` `g` `t` `x` and the deck keys are the scene's (as in the winit window).
 Keys reach the scene while the viewport has key focus (click it), so typing
-in a panel's field never moves the camera; F1, F6, F7 and F8 work anywhere.
+in a panel's field never moves the camera. F8 works anywhere; F1, F6 and F7
+unless a panel's text field has focus.
 
-## What it draws, for now
+## How it draws
 
-Until the makepad draw passes land, the viewport shows the engine's own wgpu
-frame, read back without blocking (`src/stand_in.rs`), and each panel shows
-its state as text until its widget lands.
+The engine prepares each frame on the CPU (`SceneLike::prepare_frame`:
+camera, cull, environment, the rows that changed) and the six glyph3d passes,
+ported to makepad draw shaders (`src/g3_passes.rs`), draw it; the glyphs come
+from the Derived field's host blocks, published to the GPU as they are
+(`src/frame_feed.rs`). The engine still builds a wgpu device of its own for
+the scene's construction; nothing is drawn through it.

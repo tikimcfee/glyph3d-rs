@@ -10,42 +10,29 @@
 //! physical px from the viewport's own corner, as the scene's ray picks
 //! expect.
 //!
-//! What it draws is the stand-in (`stand_in`) until the makepad passes
-//! (`g3_passes.rs`) land: each frame advances the scene and shows the last
-//! frame whose readback completed.
+//! What it draws: each frame the scene advances (`EngineHost::advance`) on
+//! the next-frame event, and on draw the scene prepares its frame
+//! (`SceneLike::prepare_frame`, the CPU half: camera, cull, environment,
+//! changed rows, the probe sync) which the makepad passes draw
+//! (`g3_passes::G3Renderer`, fed by `frame_feed::FrameFeed`).
 
 use makepad_widgets::*;
 
+use crate::frame_feed::FrameFeed;
+use crate::g3_passes::{G3Draws, G3Renderer};
 use crate::host::EngineHost;
 use crate::input::scene_key;
-use crate::stand_in::StandIn;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
-    mod.draw.DrawG3StandIn = mod.std.set_type_default() do #(DrawG3StandIn::script_shader(vm)){
-        ..mod.draw.DrawQuad
-        frame_texture: texture_2d(float)
-        pixel: fn() {
-            return self.frame_texture.sample(self.pos)
-        }
-    }
-
     mod.widgets.Glyph3dViewportBase = #(Glyph3dViewport::register_widget(vm))
     mod.widgets.Glyph3dViewport = set_type_default() do mod.widgets.Glyph3dViewportBase{
         width: Fill
         height: Fill
-        draw_frame: mod.draw.DrawG3StandIn{}
+        draws: mod.draw.G3Draws{}
     }
-}
-
-/// The stand-in's quad: the engine's last frame as a texture.
-#[derive(Script, ScriptHook, Debug)]
-#[repr(C)]
-pub struct DrawG3StandIn {
-    #[deref]
-    draw_super: DrawQuad,
 }
 
 /// Physical px a wheel line is worth (the winit driver's figure for a pixel
@@ -63,17 +50,15 @@ pub struct Glyph3dViewport {
     #[layout]
     layout: Layout,
     #[live]
-    draw_frame: DrawG3StandIn,
-    #[new]
-    frame_texture: Texture,
+    draws: G3Draws,
+    #[rust]
+    renderer: Option<G3Renderer>,
+    #[rust]
+    feed: FrameFeed,
     #[rust]
     area: Area,
     #[rust]
     next_frame: NextFrame,
-    #[rust]
-    stand_in: StandIn,
-    #[rust]
-    has_frame: bool,
     #[rust]
     focused_once: bool,
     /// The last draw's DPI factor: logical points to physical px.
@@ -121,11 +106,6 @@ impl Widget for Glyph3dViewport {
 
         if self.next_frame.is_event(event).is_some() {
             host.advance();
-            if let Some(frame) = self.stand_in.step(host) {
-                self.frame_texture.set_data_u32(cx, frame.width, frame.height, frame.pixels);
-                self.has_frame = true;
-                host.count_frame();
-            }
             self.next_frame = cx.new_next_frame();
             self.area.redraw(cx);
         }
@@ -205,10 +185,17 @@ impl Widget for Glyph3dViewport {
         self.dpi = cx.current_dpi_factor();
         if let Some(host) = scope.data.get_mut::<EngineHost>() {
             host.set_viewport((rect.size.x * self.dpi).round() as u32, (rect.size.y * self.dpi).round() as u32);
-        }
-        if self.has_frame {
-            self.draw_frame.draw_vars.set_texture(0, &self.frame_texture);
-            self.draw_frame.draw_abs(cx, rect);
+            let renderer = self.renderer.get_or_insert_with(|| G3Renderer::new(cx.cx));
+            let drew = match host.scene.prepare_frame(host.viewport(), host.time()) {
+                Some(frame) => {
+                    self.feed.draw(cx, renderer, &mut self.draws, rect, host.scene_generation(), &frame);
+                    true
+                }
+                None => false,
+            };
+            if drew {
+                host.count_frame();
+            }
         }
         if !self.focused_once {
             self.focused_once = true;
