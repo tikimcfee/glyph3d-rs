@@ -163,7 +163,6 @@ impl EngineHost {
                 println!("{line}");
             }
         }
-        let hud_open = cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible;
         Self {
             ctx,
             choice,
@@ -173,7 +172,7 @@ impl EngineHost {
             viewport,
             pending_relayout: None,
             looking: false,
-            hud_open,
+            hud_open: false,
             debug_open: true,
             sessions_open: false,
             sessions: SessionBrowser::default(),
@@ -283,7 +282,7 @@ mod tests {
 
     #[test]
     fn the_engines_flags_pass_untouched() {
-        let line = ["app", "--render-file", "f.txt", "--field-mode", "visible", "--cam-pose", "1", "2", "3", "4", "5"];
+        let line = ["app", "--render-file", "f.txt", "--field-mode", "derived", "--cam-pose", "1", "2", "3", "4", "5"];
         assert_eq!(args(&line), line);
     }
 }

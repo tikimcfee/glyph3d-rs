@@ -30,10 +30,7 @@ const STRATEGIES: &[(Strategy, &str)] = &[(Strategy::Hyper, "Hyper (CPU)"), (Str
 const FIELD_MODES: &[(GlyphFieldMode, &str)] = &[
     (GlyphFieldMode::Derived, "Derived (20B)"),
     (GlyphFieldMode::Instanced, "Instanced (32B)"),
-    (GlyphFieldMode::Visible, "Visible (no slots)"),
 ];
-
-const DEBUG_TINTS: &[(u32, &str)] = &[(0, "off"), (1, "by LOD tier"), (2, "by cull state")];
 
 /// The camera as the `--cam-pose` argument that reproduces it (degrees).
 pub fn cam_pose_arg(eye: [f32; 3], yaw: f32, pitch: f32) -> String {
@@ -65,21 +62,7 @@ fn hud_lines(snap: &UiProbeState, fps: f32) -> Vec<String> {
             snap.segments, snap.hidden_segments, snap.cull_backdrops, snap.cull_cpu_ms
         ),
     ];
-    match &snap.visible_stats {
-        Some(s) => {
-            lines.push(format!("items {}/{} visible, {} backdrop", s.items_visible, s.items_total, s.items_backdrop));
-            lines.push(format!(
-                "lines {} candidate: {} glyph | {} wash ({} dropped)",
-                s.lines_candidate, s.lines_glyph, s.lines_wash, s.wash_dropped
-            ));
-            lines.push(format!("segments {} | slots {} ({} dropped)", s.segments, s.slots, s.slots_dropped));
-            lines.push(format!("gpu: cull {:.2} | layout {:.2} | draw {:.2} ms", s.cull_ms, s.layout_ms, s.draw_ms));
-        }
-        None => lines.push(format!("instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges)),
-    }
-    if snap.debug_tint != 0 {
-        lines.push(format!("debug tint: {}", if snap.debug_tint == 1 { "by LOD tier" } else { "by cull state" }));
-    }
+    lines.push(format!("instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges));
     if snap.selection.is_some() || snap.pick_key.is_some() {
         lines.push(format!(
             "selection {} | pick {}",
@@ -140,17 +123,13 @@ fn debug_state(snap: &UiProbeState, selected_group: Option<u32>, files: Rc<Vec<G
         Some(g) => Some(format!("Release File #{g} (G)")),
         None => snap.last_pick.as_ref().map(|_| "Grab File (G)".to_string()),
     };
-    let visible = snap.field_mode == Some(GlyphFieldMode::Visible);
     let lod = G3LodState {
         text_detail_px: snap.greek_onset_px,
         show_glyphs_px: snap.lod_min_px,
-        file_rectangle_px: visible.then_some(snap.lod_backdrop_px),
-        visible_mode: visible,
         greeking: snap.greeking,
         greek_pure: snap.greek_pure,
         file_backgrounds: snap.file_backgrounds,
         file_bg_color: snap.file_bg_color,
-        debug_tints: if visible { choices(DEBUG_TINTS, snap.debug_tint) } else { Vec::new() },
         cull_line: format!(
             "cull: {} draw ranges, {} instances | {} backdrops",
             snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
@@ -305,19 +284,10 @@ pub fn apply(host: &mut EngineHost, action: G3UiAction) {
             p.lod_min_px = px;
             p.keep_lod_order(LodHandle::ShowGlyphs);
         }),
-        G3UiAction::SetFileRectanglePx(px) => with_probe(host, |p| {
-            p.lod_backdrop_px = px;
-            p.keep_lod_order(LodHandle::FileRectangle);
-        }),
         G3UiAction::SetGreeking(on) => with_probe(host, |p| p.greeking = on),
         G3UiAction::SetGreekPure(on) => with_probe(host, |p| p.greek_pure = on),
         G3UiAction::SetFileBackgrounds(on) => with_probe(host, |p| p.file_backgrounds = on),
         G3UiAction::SetFileBgColor(rgba) => with_probe(host, |p| p.file_bg_color = rgba),
-        G3UiAction::SetDebugTint(i) => {
-            if let Some((tint, _)) = DEBUG_TINTS.get(i) {
-                with_probe(host, |p| p.debug_tint = *tint);
-            }
-        }
         G3UiAction::SetZWrapSpacing(z) => {
             with_probe(host, |p| p.z_wrap_spacing = Some(z));
             relayout(host, RelayoutRequest { z_wrap_spacing: Some(z), ..Default::default() });
