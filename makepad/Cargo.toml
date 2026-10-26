@@ -1,0 +1,37 @@
+# glyph3d-makepad: the makepad host for the glyph3d engine (2026-10-26).
+#
+# Its OWN workspace, excluded from the root one (root Cargo.toml `exclude`),
+# so the gated build never sees makepad's graph while the host is brought
+# up. It expects a makepad checkout BESIDE this repository:
+#
+#     <dir>/glyph3d-rs/   (this repo)
+#     <dir>/makepad/      (github.com/makepad/makepad)
+#
+# A worktree nested under `.claude/worktrees/` sits two levels deeper, so
+# give it the same sibling with a symlink beside the worktrees:
+# `ln -s <dir>/makepad .claude/worktrees/makepad` (untracked).
+[package]
+name = "glyph3d-makepad"
+version = "0.1.0"
+edition = "2021"
+description = "The glyph3d renderer hosted in makepad: one window, the viewport and the panels"
+publish = false
+
+[[bin]]
+name = "glyph3d-makepad"
+path = "src/main.rs"
+
+[dependencies]
+# The engine without winit, egui and the terminal launcher (once the
+# windowed driver is an optional feature, those go with it).
+glyph3d-native = { path = "../native", default-features = false }
+glyph-field = { path = "../crates/glyph-field" }
+makepad-widgets = { path = "../../makepad/widgets", default-features = false }
+# What the engine's API still takes while it builds against a wgpu device
+# (the scene, the stand-in viewport) and its CLI, which the host parses as
+# its own: the versions the engine resolves, so the graph unifies.
+wgpu = "30"
+pollster = "0.4"
+clap = "4"
+
+[workspace]
