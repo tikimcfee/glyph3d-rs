@@ -21,6 +21,7 @@ pub mod layout_hyper;
 pub mod layout_stack;
 pub mod library;
 pub mod offscreen;
+pub mod relayout;
 pub mod repo;
 pub mod revision;
 pub mod scan;

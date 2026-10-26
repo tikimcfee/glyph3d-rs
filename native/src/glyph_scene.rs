@@ -413,7 +413,7 @@ impl SceneLike for GlyphScene {
         self.field.glyph_count()
     }
 
-    fn on_key(&mut self, ctx: &GpuContext, key: winit::keyboard::KeyCode, pressed: bool) {
+    fn on_key(&mut self, ctx: &GpuContext, key: crate::scene::SceneKey, pressed: bool) {
         if matches!(self.camera_mode, CameraMode::Fly) && self.fly.on_key(key, pressed) {
             return;
         }
