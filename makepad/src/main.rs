@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use makepad_widgets::*;
 
+mod g3_passes;
 mod g3_ui;
 mod host;
 mod input;
@@ -107,6 +108,7 @@ impl MatchEvent for App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
+        crate::g3_passes::script_mod(vm);
         crate::g3_ui::script_mod(vm);
         crate::viewport::script_mod(vm);
         self::script_mod(vm)
