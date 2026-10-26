@@ -819,16 +819,8 @@ impl GlyphScene {
         Some(Selection::Segment { slot_base: slots.start, slot_count: slots.end - slots.start })
     }
 
-    /// Upload one edited group row (96 B) — never the whole table.
-    pub(super) fn write_group_row(&self, ctx: &GpuContext, group_row: u32) {
-        if let Some(g) = self.groups_cpu.get(group_row as usize) {
-            ctx.queue
-                .write_buffer(&self.group_buf, group_row as u64 * 96, bytemuck::bytes_of(g));
-        }
-    }
-
     /// Find an existing matching group row or allocate a new one (up to max_groups).
-    pub(super) fn allocate_group_row(&mut self, ctx: &GpuContext, row: crate::glyph_scene::GroupRow) -> Option<u32> {
+    pub(super) fn allocate_group_row(&mut self, row: crate::glyph_scene::GroupRow) -> Option<u32> {
         let max_groups = (self.group_buf.size() / 96) as u32;
         for (i, r) in self.groups_cpu.iter().enumerate() {
             if bytemuck::bytes_of(r) == bytemuck::bytes_of(&row) {
@@ -838,9 +830,9 @@ impl GlyphScene {
         if (self.groups_cpu.len() as u32) < max_groups {
             let group_row = self.groups_cpu.len() as u32;
             self.groups_cpu.push(row);
-            // The whole row goes up (clip and background are not the
-            // tree's), and the row becomes a node like every other group.
-            self.write_group_row(ctx, group_row);
+            // The row becomes a node like every other group, and the node
+            // uploads the whole row at the next flush (clip and background
+            // are the row's, not the tree's).
             // Two tables keyed by group row, kept in step: no view enters here.
             debug_assert_eq!(self.nodes.len(), group_row as usize, "group rows and nodes stay in step");
             self.nodes.push_row(&row);
@@ -851,9 +843,9 @@ impl GlyphScene {
 
     /// Rows an EXTERNAL writer (the layout controller's bevy sync: carrel
     /// zones, decks, the library's animation) left in the CPU mirror: adopt
-    /// them into the group nodes, which upload the changed local rows and
-    /// resolve them into the table at the next frame (2026-10-10; before
-    /// this, the rows themselves went up, min..max span or row by row). The
+    /// them into the group nodes, which resolve them and upload the rows
+    /// that changed at the next frame (2026-10-10; before this, the rows
+    /// themselves went up, min..max span or row by row). The
     /// adoption keeps a verb's tint and hide that the writer did not change
     /// (`GroupNodes::adopt`, the library probe's E4).
     pub(super) fn write_group_rows(&mut self, _ctx: &GpuContext, group_rows: &[u32]) {
@@ -1135,8 +1127,8 @@ impl GlyphScene {
                 )
             }
             // The group verbs write the group's NODE — one table each (the
-            // local row, or the appearance row) — and the resolve pass writes
-            // the group row; the CPU mirror follows from the tables.
+            // local row, or the appearance row) — and the next flush resolves
+            // and uploads the group row; the CPU mirror follows from the tables.
             Verb::MoveGroup(d) => {
                 if !self.nodes.translate(group_row, *d) {
                     return format!("verb move-group: group {group_row} out of range");
@@ -1187,7 +1179,7 @@ impl GlyphScene {
                 let mut row = self.groups_cpu.get(group_row as usize).copied().unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba; // Set background color
                 
-                if let Some(new_group_row) = self.allocate_group_row(ctx, row) {
+                if let Some(new_group_row) = self.allocate_group_row(row) {
                     self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
                     format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
@@ -1206,7 +1198,7 @@ impl GlyphScene {
                 row.cols[1] = *q;
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 
-                if let Some(new_group_row) = self.allocate_group_row(ctx, row) {
+                if let Some(new_group_row) = self.allocate_group_row(row) {
                     self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
                     format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
@@ -1349,7 +1341,7 @@ impl GlyphScene {
                     .copied()
                     .unwrap_or(crate::glyph_scene::GroupRow::identity([0.0; 3]));
                 row.cols[5] = *bg_rgba;
-                match self.allocate_group_row(ctx, row) {
+                match self.allocate_group_row(row) {
                     Some(new_group_row) => {
                         self.set_visible_override(ctx, key, OverrideEdit::Group(new_group_row));
                         format!("verb set-glyph-background: {rel} item {item} byte {byte} (row {} col {}) -> group {new_group_row} (override)", g.row, g.col)
@@ -1366,7 +1358,7 @@ impl GlyphScene {
                 row.cols[0] = [t[0], t[1], t[2], 0.0];
                 row.cols[1] = *q;
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
-                match self.allocate_group_row(ctx, row) {
+                match self.allocate_group_row(row) {
                     Some(new_group_row) => {
                         self.set_visible_override(ctx, key, OverrideEdit::Group(new_group_row));
                         format!("verb set-glyph-transform: {rel} item {item} byte {byte} (row {} col {}) -> group {new_group_row} (override)", g.row, g.col)

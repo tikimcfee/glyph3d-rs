@@ -18,7 +18,7 @@
 //!
 //! The contract with the renderer is the GroupRow, nothing else: a file's
 //! group carries its world transform (T·R·S; the fit scale rides in S),
-//! written by the scene graph's GPU resolve from the file node's chain; the
+//! resolved by the scene graph from the file node's chain; the
 //! file's item origin is its local zero, and the slot formats and the
 //! group-row format are untouched. Named values live in `[library]` of
 //! `config/defaults.toml`.
@@ -114,8 +114,8 @@ impl LibraryVerb {
     }
 }
 
-/// Each file's group row as the tree resolves it (on the CPU, the same
-/// arithmetic as the GPU resolve): world translation, rotation and the
+/// Each file's group row as the tree resolves it (the chain walk, whose
+/// bits the frame resolve gives every node): world translation, rotation and the
 /// uniform scale, the directory tint at alpha 1, blend 0 — the columns
 /// `sync_all_to_group_rows` used to write off bevy's GlobalTransform, bit
 /// for bit (`tests::the_tree_resolves_the_rows_bevy_composed`).
