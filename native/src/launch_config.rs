@@ -71,13 +71,22 @@ pub struct LaunchConfig {
     pub debug_tint: Option<DebugTint>,
     #[serde(default, with = "value_enum")]
     pub present_mode: Option<PresentMode>,
+    /// gomuxai's `agent`, which lists and reads agent sessions
+    /// (`agent_transcript::agent_cli`); unset is `agent` on PATH.
+    pub agent_binary: Option<PathBuf>,
+    /// Where gomuxai looks for each harness's sessions: a path is the only
+    /// place it looks, `""` turns the harness off, unset is the app's own
+    /// default locations that exist. Passed to gomuxai as its app config
+    /// (the same keys).
     pub claude_projects_dir: Option<PathBuf>,
-    pub antigravity_brain_dir: Option<PathBuf>,
+    pub agy_brain_dir: Option<PathBuf>,
     pub kimi_sessions_dir: Option<PathBuf>,
     /// The launcher's repo cycle (◄/► on its repo field); the scene never
     /// reads it.
     pub repo_presets: Option<Vec<String>>,
-    pub agent_session: Option<PathBuf>,
+    /// `--agent-session`: a session id (or the start of only one), a
+    /// gomuxai agent's name, or a transcript's path.
+    pub agent_session: Option<String>,
     pub frames: Option<u32>,
     /// The file's `[section]` tables: runtime overrides for `config::Settings`,
     /// merged over `config/defaults.toml` (validated there, not here).
@@ -150,22 +159,6 @@ impl LaunchConfig {
         }
     }
 
-    /// The per-harness session locations this config names (unexpanded).
-    pub fn session_overrides(&self) -> glyph_session_dirs::Overrides {
-        glyph_session_dirs::Overrides {
-            claude: self.claude_projects_dir.clone(),
-            antigravity: self.antigravity_brain_dir.clone(),
-            kimi: self.kimi_sessions_dir.clone(),
-        }
-    }
-
-    /// The directories session discovery scans: per harness, the configured
-    /// path if set (an empty value disables that harness), else the app's own
-    /// default locations that exist on this machine. See `glyph-session-dirs`.
-    pub fn session_dirs(&self) -> Vec<glyph_session_dirs::SessionDir> {
-        glyph_session_dirs::resolve(&self.session_overrides())
-    }
-
     /// Load from a file path. Returns Err with a message if reading or parsing fails.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
@@ -207,9 +200,26 @@ impl LaunchConfig {
     }
 }
 
-/// Expand leading `~` or `~/` to the user's home directory. One definition,
-/// shared with the launcher through `glyph-session-dirs`.
-pub use glyph_session_dirs::{expand_home, home_dir};
+/// The user's home directory: `$HOME`, else `%USERPROFILE%` (Windows).
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Expand a leading `~` or `~/` to the home directory.
+pub fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let Some(home) = home_dir() else { return path.to_path_buf() };
+    if s == "~" {
+        return home;
+    }
+    match s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        Some(rest) => home.join(rest),
+        None => path.to_path_buf(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -234,7 +244,8 @@ mod tests {
             load_repo = "/path/to/repo"
             field_mode = "derived"
             claude_projects_dir = "~/my_claude_projects"
-            antigravity_brain_dir = "~/my_antigravity_brain"
+            agy_brain_dir = "~/my_antigravity_brain"
+            agent_binary = "/opt/gomuxai/agent"
             kimi_sessions_dir = ""
             repo_presets = [".", "~/src/big-repo"]
             agent_session = "~/sessions/my_session.jsonl"
@@ -255,15 +266,25 @@ mod tests {
         assert_eq!(cfg.load_repo, Some(PathBuf::from("/path/to/repo")));
         assert_eq!(cfg.field_mode, Some(GlyphFieldMode::Derived));
         assert_eq!(cfg.claude_projects_dir, Some(PathBuf::from("~/my_claude_projects")));
-        assert_eq!(cfg.antigravity_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
+        assert_eq!(cfg.agy_brain_dir, Some(PathBuf::from("~/my_antigravity_brain")));
         // An empty value parses as an empty path, which disables that harness.
         assert_eq!(cfg.kimi_sessions_dir, Some(PathBuf::new()));
-        let dirs = cfg.session_dirs();
-        assert!(dirs.iter().all(|d| d.harness != glyph_session_dirs::Harness::KimiCode));
-        assert!(dirs.iter().any(|d| d.harness == glyph_session_dirs::Harness::ClaudeCode
-            && d.origin == glyph_session_dirs::Origin::Config));
         assert_eq!(cfg.repo_presets, Some(vec![".".to_string(), "~/src/big-repo".to_string()]));
-        assert_eq!(cfg.agent_session, Some(PathBuf::from("~/sessions/my_session.jsonl")));
+        assert_eq!(cfg.agent_session, Some("~/sessions/my_session.jsonl".to_string()));
+
+        // The dirs reach gomuxai as its app config, key for key, "" included.
+        let agent = crate::agent_transcript::AgentCli::from_launch_config(&cfg).expect("the app config writes");
+        assert_eq!(agent.program, PathBuf::from("/opt/gomuxai/agent"));
+        let written = std::fs::read_to_string(agent.app_config.as_ref().expect("dirs are set")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json, serde_json::json!({
+            "claude_projects_dir": "~/my_claude_projects",
+            "agy_brain_dir": "~/my_antigravity_brain",
+            "kimi_sessions_dir": "",
+        }));
+        assert!(agent.describe(&["sessions", "--json"]).contains("--backend-config"), "the app config goes before the subcommand");
+        let bare = crate::agent_transcript::AgentCli::from_launch_config(&LaunchConfig::default()).unwrap();
+        assert_eq!((bare.program, bare.app_config), (PathBuf::from("agent"), None));
         assert_eq!(cfg.frames, Some(1));
     }
 

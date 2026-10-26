@@ -29,15 +29,17 @@ pub(super) struct EguiUi {
     /// Agent session browser search query.
     pub(super) session_filter_text: String,
     /// Agent session browser harness filter tab.
-    pub(super) session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter,
-    /// Cached list of discovered agent sessions.
-    pub(super) discovered_sessions: Option<Vec<crate::agent_transcript::discovery::DiscoveredSession>>,
+    pub(super) session_filter_harness: Option<crate::agent_transcript::HarnessKind>,
+    /// The last `agent sessions --json`: the sessions, or why there are none.
+    pub(super) discovered_sessions: Option<Result<Vec<crate::agent_transcript::SessionInfo>, String>>,
     /// The field HUD (F8 toggles): the always-on top-left readout of what
     /// the glyph field is and what it did this frame. Independent of the
     /// Debug window; open by default in `--field-mode visible`.
     pub(super) hud_open: bool,
-    /// What the last scan looked at, and why: one line from `glyph-session-dirs`.
-    pub(super) session_dirs_report: String,
+    /// The command the last listing ran.
+    pub(super) session_list_source: String,
+    /// Why the last session the browser tried to load didn't load.
+    pub(super) session_load_error: Option<String>,
 }
 
 /// Stage K (K3): Debug-panel verb buttons — CLI `--verb` literals parsed

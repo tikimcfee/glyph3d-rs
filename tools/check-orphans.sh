@@ -31,7 +31,6 @@ TARGETS=(
     "glyph-field-derived --lib"
     "glyph-field-visible --lib"
     "glyph-scene-graph --lib"
-    "glyph-session-dirs --lib"
     "glyph-scene-graph --bin resolve-bench"
     "glyph --bin glyph"
 )

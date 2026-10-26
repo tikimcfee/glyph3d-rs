@@ -26,7 +26,7 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 386
+test_floor = 374
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -655,7 +655,7 @@ expect = "unresolved link to `GlyphFieldMode::NoSuchMode`"
 [[mutation]]
 name = "tests-mod-dropped"
 gate = "orphans"
-why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the transcript parsers' suite; only the cargo-test floor could see its loss, and only by count. CONSUMED BY: cargo-modules' walk of glyph3d-native's lib module tree under --cfg-test"
+why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the agent event reader's suite (gomuxai's conformance corpus, the staging of what it reads); only the cargo-test floor could see its loss, and only by count. CONSUMED BY: cargo-modules' walk of glyph3d-native's lib module tree under --cfg-test"
 file = "native/src/agent_transcript.rs"
 op = "replace"
 find = "#[cfg(test)]\nmod tests;\n"
@@ -1543,3 +1543,67 @@ op = "replace"
 find = "                tab_width: *tab_width,\n                field_mode,"
 with = "                tab_width: fold::TabWidth::ONE_CELL,\n                field_mode,"
 expect = "tabs_take_the_render_file_default"
+
+# The agent event reader (2026-10-26): agent sessions come from gomuxai's
+# `agent` CLI; native/src/agent_transcript/tests.rs holds the reader to
+# gomuxai's vendored conformance corpus (tools/vendor/gomuxai/).
+
+[[mutation]]
+name = "event-update-appended"
+gate = "cargo-test"
+why = "an `update` read as a new event: a tool's result becomes a second beat beside its pending call instead of replacing it in place, so every call shows twice (pending, then done) and every later beat's index shifts. CONSUMED BY: events::AgentSession::apply_line's id lookup, the one place an update finds its event; reddens agent_transcript::tests::every_corpus_stream_folds_to_one_beat_per_event (one beat per event id, all 13 corpus streams) and a_tool_result_updates_its_beat_in_place"
+file = "native/src/agent_transcript/events.rs"
+op = "replace"
+find = "        match (raw.op.as_str(), self.by_id.get(&id).copied()) {"
+with = "        match (raw.op.as_str(), None::<usize>) {"
+expect = "every_corpus_stream_folds_to_one_beat_per_event"
+
+[[mutation]]
+name = "turn-inferred-from-prompts"
+gate = "cargo-test"
+why = "turns inferred instead of read: every prompt opens a turn (the old parsers' rule), so a message queued mid-turn splits its turn and turn navigation and the TURN headers drift from the transcript's own turns. CONSUMED BY: types::AgentSession::linearize_events's turn ordinal, which every beat, the carrel's turn navigation and the revision engine's per-turn lookup read; reddens agent_transcript::tests::turns_come_from_the_events (claude/mid-turn-queued's queued prompt stays in turn 0)"
+file = "native/src/agent_transcript/types.rs"
+op = "replace"
+find = "                let turn_index = self.turn_ordinal(event);"
+with = "                let turn_index = self.events[..=index].iter().filter(|e| matches!(e.body, EventBody::Prompt(_))).count().saturating_sub(1);"
+expect = "turns_come_from_the_events"
+
+[[mutation]]
+name = "agent-cli-failure-silenced"
+gate = "cargo-test"
+why = "a missing or failing `agent` read as no sessions: the F7 browser and the launcher would show an empty list with nothing to say why (the silent fallback this repo refuses at every seam). CONSUMED BY: agent_cli::AgentCli::sessions, the one listing call both read; reddens agent_transcript::tests::a_missing_agent_binary_fails_loud"
+file = "native/src/agent_transcript/agent_cli.rs"
+op = "replace"
+find = "        let args = [\"sessions\", \"--json\"];\n        let stdout = self.run(&args)?;"
+with = "        let args = [\"sessions\", \"--json\"];\n        let Ok(stdout) = self.run(&args) else { return Ok(Vec::new()) };"
+expect = "a_missing_agent_binary_fails_loud"
+
+[[mutation]]
+name = "edit-file-text-ignored"
+gate = "cargo-test"
+why = "an edit's event `file` text (the whole file after the edit) ignored, so its revisions are rebuilt from the disk as they were before gomuxai carried it: the base becomes whatever the file holds now, taken back through the edit, and a file no longer on disk (or moved on) has no history or a wrong one. CONSUMED BY: revision::RevisionEngine::ingest_file_action_with_event's edit arm; reddens agent_transcript::tests::an_edit_with_file_text_builds_its_revisions_without_disk (the disk is asked; spin.go's base is not originalFileContents)"
+file = "native/src/revision/engine.rs"
+op = "replace"
+find = "                if let Some(post) = action.file.as_ref().map(|f| f.text.clone()) {"
+with = "                if let Some(post) = None::<String> {"
+expect = "an_edit_with_file_text_builds_its_revisions_without_disk"
+
+[[mutation]]
+name = "reverse-hunks-last-first"
+gate = "cargo-test"
+why = "reverse_hunks emitting hunks last-first, as it did until 2026-10-26: apply_hunks walks a patch in file order, so a patch of two or more hunks never reverses and an edit has no base revision. No synthetic test held more than one hunk; the corpus's MultiEdit (two hunks) found it. CONSUMED BY: revision::patch::reconstruct_base_from_hunks, the base of every edit with a patch; reddens agent_transcript::tests::an_edit_with_file_text_builds_its_revisions_without_disk (spin.go: the base and the edit)"
+file = "native/src/revision/patch.rs"
+op = "replace"
+find = "    for h in hunks {"
+with = "    for h in hunks.iter().rev() {"
+expect = "an_edit_with_file_text_builds_its_revisions_without_disk"
+
+[[mutation]]
+name = "no-file-edit-cwd-dropped"
+gate = "cargo-test"
+why = "the disk fallback reading an edit's target against the process's cwd instead of the session's: gomuxai writes a target relative to the session cwd, so an agy or Kimi edit (no file text) finds no file, or the wrong one, and loses its history. CONSUMED BY: revision::RevisionEngine::for_session's disk resolver; reddens agent_transcript::tests::an_edit_without_file_text_rebuilds_from_the_disk"
+file = "native/src/revision/engine.rs"
+op = "replace"
+find = "            let full = if path.is_absolute() { path.to_path_buf() } else { cwd.as_ref()?.join(path) };"
+with = "            let full = if path.is_absolute() { path.to_path_buf() } else { cwd.as_ref().map_or(path.to_path_buf(), |_| path.to_path_buf()) };"
+expect = "an_edit_without_file_text_rebuilds_from_the_disk"

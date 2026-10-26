@@ -47,21 +47,22 @@ pub(super) fn apply_relayout(
     let mut changed = false;
     let mut note = String::new();
     let reset_pose = req.switch_agent_session.is_some();
-    if let Some(session_path) = req.switch_agent_session {
+    if let Some((session, agent, loaded)) = req.switch_agent_session {
         let emoji_sheet = match choice {
             SceneChoice::AgentSession { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Text { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Repo { emoji_sheet, .. } => emoji_sheet.clone(),
             SceneChoice::Demo => crate::default_emoji_sheet(),
         };
+        note += &format!("switch_agent_session -> {session} ");
         *choice = SceneChoice::AgentSession {
-            session_path: session_path.clone(),
+            session,
+            agent,
             emoji_sheet,
             layout_options: crate::spatial_scene::CarrelLayoutOptions::default(),
-            cached_session: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            cached_session: std::sync::Arc::new(std::sync::RwLock::new(Some(loaded))),
         };
         changed = true;
-        note += &format!("switch_agent_session -> {} ", session_path.display());
     }
     if let SceneChoice::AgentSession { layout_options, .. } = choice {
         if let Some(new_opts) = req.carrel_options {
@@ -197,7 +198,9 @@ pub(super) struct RelayoutRequest {
     pub(super) z_wrap_spacing: Option<f64>,
     pub(super) toggle_cluster: bool,
     pub(super) toggle_layout: bool,
-    pub(super) switch_agent_session: Option<std::path::PathBuf>,
+    /// A session the F7 browser read (what `agent transcript` was given,
+    /// the `agent` that read it, and what it read).
+    pub(super) switch_agent_session: Option<(String, crate::agent_transcript::AgentCli, crate::agent_transcript::LoadedSession)>,
     pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
     pub(super) set_strategy: Option<crate::repo::Strategy>,
     pub(super) set_field_mode: Option<glyph_field::GlyphFieldMode>,
@@ -396,9 +399,10 @@ impl App<'_> {
                 selected_group: None,
                 session_browser_open: false,
                 session_filter_text: String::new(),
-                session_filter_harness: crate::agent_transcript::discovery::SessionHarnessFilter::All,
+                session_filter_harness: None,
                 discovered_sessions: None,
-                session_dirs_report: String::new(),
+                session_list_source: String::new(),
+                session_load_error: None,
                 // The field HUD starts open where it has the most to say.
                 hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
             })

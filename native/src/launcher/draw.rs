@@ -179,7 +179,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, l: &Launcher) {
     ]));
     lines.push(Line::from(vec![
         Span::styled("Sessions:     ", dim),
-        Span::styled(l.session_dirs_report(), Style::default().fg(Color::White)),
+        Span::styled(l.session_list_report().to_string(), Style::default().fg(Color::White)),
     ]));
     if let Some(p) = &l.last_launch {
         lines.push(Line::from(vec![

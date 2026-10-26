@@ -1788,10 +1788,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glyph-session-dirs"
-version = "0.1.0"
-
-[[package]]
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
@@ -1811,7 +1807,6 @@ dependencies = [
  "glyph-field-instanced",
  "glyph-field-visible",
  "glyph-scene-graph",
- "glyph-session-dirs",
  "image",
  "log",
  "memchr",

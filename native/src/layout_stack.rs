@@ -453,8 +453,8 @@ impl LayoutController {
         let carrel_root = self.scene.spawn_root("agent_carrel_root");
         let carrel_zone = self.scene.spawn_zone(
             carrel_root,
-            format!("agent:carrel:{}", session.session_id),
-            format!("Agent Carrel: {}", session.session_id),
+            format!("agent:carrel:{}", session.session_id()),
+            format!("Agent Carrel: {}", session.session_id()),
             Transform::IDENTITY,
             [280.0, 160.0],
         );
@@ -495,17 +495,8 @@ impl LayoutController {
             }
         }
         let events = session.linearize_events(Some(rev_engine));
-        let total = events.len().max(session.turn_count());
-        let summary = events
-            .get(next_beat)
-            .map(|e| e.summary())
-            .unwrap_or_else(|| {
-                session
-                    .turns
-                    .get(next_beat)
-                    .map(|t| t.summary())
-                    .unwrap_or_default()
-            });
+        let total = events.len();
+        let summary = events.get(next_beat).map(|e| e.summary()).unwrap_or_default();
         Some(format!(
             "carrel: beat {}/{} — \"{}\"",
             next_beat + 1,
@@ -528,17 +519,8 @@ impl LayoutController {
             }
         }
         let events = session.linearize_events(Some(rev_engine));
-        let total = events.len().max(session.turn_count());
-        let summary = events
-            .get(prev_beat)
-            .map(|e| e.summary())
-            .unwrap_or_else(|| {
-                session
-                    .turns
-                    .get(prev_beat)
-                    .map(|t| t.summary())
-                    .unwrap_or_default()
-            });
+        let total = events.len();
+        let summary = events.get(prev_beat).map(|e| e.summary()).unwrap_or_default();
         Some(format!(
             "carrel: beat {}/{} — \"{}\"",
             prev_beat + 1,
@@ -572,17 +554,8 @@ impl LayoutController {
             }
         }
         let events = session.linearize_events(Some(rev_engine));
-        let total = events.len().max(session.turn_count());
-        let summary = events
-            .get(beat_index)
-            .map(|e| e.summary())
-            .unwrap_or_else(|| {
-                session
-                    .turns
-                    .get(beat_index)
-                    .map(|t| t.summary())
-                    .unwrap_or_default()
-            });
+        let total = events.len();
+        let summary = events.get(beat_index).map(|e| e.summary()).unwrap_or_default();
         Some(format!(
             "carrel: beat {}/{} — \"{}\"",
             beat_index + 1,

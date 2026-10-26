@@ -194,6 +194,10 @@ pub struct CardBanners {
     pub command: [[f32; 4]; 2],
     pub tool_invocation: [[f32; 4]; 2],
     pub assistant_response: [[f32; 4]; 2],
+    /// A harness record (turn timing, compaction, an API error, ...).
+    pub system: [[f32; 4]; 2],
+    /// A bookkeeping tool's beat (the tool table's `noise`).
+    pub noise: [[f32; 4]; 2],
 }
 
 /// Workdesk plate accent per file action kind.
@@ -203,7 +207,6 @@ pub struct WorkdeskAccents {
     pub read: [f32; 4],
     pub edit: [f32; 4],
     pub write: [f32; 4],
-    pub ast_analysis: [f32; 4],
 }
 
 /// Transcript card text (`agent_transcript::staging`), sRGB 0-255. Colour
@@ -238,7 +241,7 @@ pub struct AgentTextSettings {
 }
 
 /// One accent per transcript event kind (and per file action kind, which
-/// share the read/edit/write/ast entries).
+/// share the read/edit/write entries).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentKindAccents {
@@ -247,10 +250,11 @@ pub struct AgentKindAccents {
     pub file_read: [u8; 3],
     pub file_edit: [u8; 3],
     pub file_write: [u8; 3],
-    pub ast_analysis: [u8; 3],
     pub command: [u8; 3],
     pub tool_invocation: [u8; 3],
     pub assistant_response: [u8; 3],
+    pub system: [u8; 3],
+    pub noise: [u8; 3],
 }
 
 /// egui overlay label colours, sRGB 0-255.
@@ -263,9 +267,8 @@ pub struct UiSettings {
     pub beat_summary: [u8; 3],
     pub workdesk_bullet: [u8; 3],
     pub harness_claude: [u8; 3],
-    pub harness_antigravity: [u8; 3],
+    pub harness_agy: [u8; 3],
     pub harness_kimi: [u8; 3],
-    pub harness_generic: [u8; 3],
     pub project_name: [u8; 3],
 }
 
@@ -643,11 +646,12 @@ mod tests {
         assert_eq!(b.command, [[0.28f32, 0.28, 0.32, 0.95], [0.20, 0.20, 0.24, 0.95]]);
         assert_eq!(b.tool_invocation, [[0.25f32, 0.35, 0.45, 0.95], [0.18, 0.26, 0.35, 0.95]]);
         assert_eq!(b.assistant_response, [[0.18f32, 0.48, 0.38, 0.95], [0.14, 0.38, 0.30, 0.95]]);
+        assert_eq!(b.system, [[0.40f32, 0.22, 0.50, 0.95], [0.32, 0.18, 0.40, 0.95]]);
+        assert_eq!(b.noise, [[0.16f32, 0.17, 0.20, 0.85], [0.13, 0.14, 0.16, 0.85]]);
         let w = &a.workdesk;
         assert_eq!(w.read, [0.15f32, 0.35, 0.55, 0.90]);
         assert_eq!(w.edit, [0.60f32, 0.40, 0.15, 0.90]);
         assert_eq!(w.write, [0.15f32, 0.50, 0.30, 0.90]);
-        assert_eq!(w.ast_analysis, [0.45f32, 0.20, 0.55, 0.90]);
         // [ui] is integer sRGB, exact by construction; no pin needed.
         assert_eq!(s.quad_demo.clear_color, [0.02, 0.02, 0.04, 1.0]);
     }
@@ -663,10 +667,11 @@ mod tests {
             ("file_read", k.file_read),
             ("file_edit", k.file_edit),
             ("file_write", k.file_write),
-            ("ast_analysis", k.ast_analysis),
             ("command", k.command),
             ("tool_invocation", k.tool_invocation),
             ("assistant_response", k.assistant_response),
+            ("system", k.system),
+            ("noise", k.noise),
         ];
         for (i, (a, x)) in all.iter().enumerate() {
             for (b, y) in &all[i + 1..] {

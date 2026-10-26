@@ -494,54 +494,21 @@ fn test_workdesk_file_revisions_z_stack() {
 
 #[test]
 fn test_agent_carrel_spawning_and_turn_navigation() {
-    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::agent_transcript::test_stream::Stream;
     use crate::revision::RevisionEngine;
     use serde_json::json;
 
-    let transcript = [
-        // Turn 0
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "foo.rs", "content": "base" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "foo.rs", "content": "base" },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
-        }).to_string(),
-        // Turn 1
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 1 prompt" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "foo.rs", "old_string": "base", "new_string": "updated" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "filePath": "foo.rs", "structuredPatch": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-base", "+updated"] }] },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
-        }).to_string(),
-    ].join("\n");
-
-    let session = parse_claude_session(&transcript, "carrel_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
+    // Turn 0 writes foo.rs, turn 1 edits it.
+    let mut stream = Stream::new("carrel_sess", "/work");
+    stream
+        .prompt("p0", 1, "Turn 0 prompt")
+        .write("t1", 1, "foo.rs", "base")
+        .prompt("p1", 2, "Turn 1 prompt")
+        .edit("t2", 2, "foo.rs", ("base", "updated"), "updated", json!({
+            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-base", "+updated"]
+        }));
+    let session = stream.session();
+    let rev_engine = RevisionEngine::for_session(&session);
 
     let mut scene = SpatialScene::new();
     let root = scene.spawn_root("canvas");
@@ -576,37 +543,17 @@ fn test_agent_carrel_spawning_and_turn_navigation() {
 
 #[test]
 fn test_agent_carrel_sliding_window_and_time_scroll() {
-    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::agent_transcript::test_stream::Stream;
     use crate::revision::RevisionEngine;
     use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
-    use serde_json::json;
 
-    // Build a session with 10 turns
-    let mut turns_json = Vec::new();
+    // 10 turns, each a prompt and a write of a.rs: 20 beats.
+    let mut stream = Stream::new("sliding_sess", "/work");
     for i in 0..10 {
-        turns_json.push(json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i} prompt") }] }
-        }).to_string());
-        turns_json.push(json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
-                ]
-            }
-        }).to_string());
-        turns_json.push(json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
-        }).to_string());
+        stream.prompt(&format!("p{i}"), i + 1, &format!("Turn {i} prompt")).write(&format!("t{i}"), i + 1, "a.rs", &format!("v{i}"));
     }
-
-    let session = parse_claude_session(&turns_json.join("\n"), "sliding_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
+    let session = stream.session();
+    let rev_engine = RevisionEngine::for_session(&session);
 
     let mut scene = SpatialScene::new();
     let root = scene.spawn_root("canvas");
@@ -656,36 +603,17 @@ fn test_agent_carrel_sliding_window_and_time_scroll() {
 
 #[test]
 fn test_agent_carrel_page_aware_continuous_navigation() {
-    use crate::agent_transcript::claude::parse_claude_session;
+    use crate::agent_transcript::test_stream::Stream;
     use crate::revision::RevisionEngine;
     use crate::spatial_scene::agent_carrel::CarrelLayoutOptions;
-    use serde_json::json;
 
-    let mut turns_json = Vec::new();
+    // 12 turns, each a prompt and a write of a.rs: 24 beats.
+    let mut stream = Stream::new("paging_sess", "/work");
     for i in 0..12 {
-        turns_json.push(json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": format!("Turn {i}") }] }
-        }).to_string());
-        turns_json.push(json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": format!("t{i}"), "name": "Write", "input": { "file_path": "a.rs", "content": format!("v{i}") } }
-                ]
-            }
-        }).to_string());
-        turns_json.push(json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": format!("v{i}") },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": format!("t{i}") }] }
-        }).to_string());
+        stream.prompt(&format!("p{i}"), i + 1, &format!("Turn {i}")).write(&format!("t{i}"), i + 1, "a.rs", &format!("v{i}"));
     }
-
-    let session = parse_claude_session(&turns_json.join("\n"), "paging_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
+    let session = stream.session();
+    let rev_engine = RevisionEngine::for_session(&session);
 
     let mut scene = SpatialScene::new();
     let root = scene.spawn_root("canvas");
