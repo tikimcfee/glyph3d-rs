@@ -22,9 +22,12 @@ glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
 glyph-field-visible = { path = "../crates/glyph-field-visible" }
 # The transform tree (2026-10-10): every group row a node, resolved on
-# the GPU into the group table (glyph_scene/nodes.rs).
+# the CPU into the group table, whose changed rows are uploaded
+# (glyph_scene/nodes.rs; a GPU compute pass until 2026-10-26).
 glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
-winit = "0.30"
+# The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
+# host that brings its own window links the library without it.
+winit = { version = "0.30", optional = true }
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
@@ -84,13 +87,19 @@ crossterm = { version = "0.28", optional = true }
 toml_edit = { version = "0.25", optional = true }
 
 [features]
-default = ["egui-ui", "launcher"]
+default = ["windowed", "egui-ui", "launcher"]
+# The window: `windowed/` and winit (2026-10-26). Off, the library is the
+# engine alone (scenes, layout, offscreen) for a host that owns its window
+# and event loop (the makepad widget), and the binary refuses a windowed
+# run. `--no-default-features` is that build, no winit or egui in its tree.
+windowed = ["dep:winit"]
 # The terminal launcher. Off, `--launcher` is refused and a bare run opens
-# the default scene, as it did before C27.
-launcher = ["dep:ratatui", "dep:crossterm", "dep:toml_edit"]
+# the default scene, as it did before C27. It starts this binary's window
+# as a child, so it needs one.
+launcher = ["windowed", "dep:ratatui", "dep:crossterm", "dep:toml_edit"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
-egui-ui = ["dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
+egui-ui = ["windowed", "dep:egui", "dep:egui-winit", "dep:egui-wgpu"]
 
 [dev-dependencies]
 # Stage H: validate the hand-written WGSL in `cargo test` with the exact

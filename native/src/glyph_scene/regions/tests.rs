@@ -1,14 +1,14 @@
-//! The bounding regions against the tree cull, a brute-force pick, their
-//! CPU twin and the library's drag (2026-10-10, `regions.rs`).
+//! The bounding regions against the tree cull, a brute-force pick, the
+//! instances that reach the GPU and the library's drag (2026-10-10,
+//! `regions.rs`).
 
 use glam::DVec3;
-use glyph_scene_graph::gpu::read_buffer_words;
-use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, SceneGraph, Similarity};
+use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
 use super::{ray_to_local, region_box, region_instance, LibraryRegions, RegionInstance, RegionSpec, RegionTable};
 use crate::glyph_scene::cull::{CullState, SegCull};
+use crate::glyph_scene::nodes::read_buffer;
 use crate::glyph_scene::tree_cull::{Aabb, TreeCull};
-use crate::glyph_scene::GroupRow;
 use crate::library::plan::LibFile;
 use crate::library::{Form, FormCmd, Library, Page};
 
@@ -258,24 +258,21 @@ fn the_region_pick_is_the_innermost_region_the_ray_enters() {
     sweep(&t, &table, "after a drag");
 }
 
-/// The compose pass (library_regions.wgsl) writes what its CPU twin
-/// computes from the directories' worlds — seated, and after one directory
-/// is dragged and another scaled (the box rides the world; the host
-/// uploads nothing for a moved directory itself).
+/// What reaches the GPU (2026-10-26, the host composes the regions): after
+/// each frame's resolve and `prepare`, the instance buffer read back is
+/// `region_instance` of every region's box under its directory's
+/// chain-walked world, bit for bit, and each instance's eight corners (as
+/// `vs_region` places them) are the box's corners carried through that
+/// world in f64 — seated, after one directory is dragged (its ancestors'
+/// boxes refit, its subtree's directories resolve) and another scaled —
+/// and a settled frame composes and uploads nothing. A region the dirty
+/// tracking missed reads back stale.
 #[test]
-fn the_gpu_composes_the_regions_the_cpu_does() {
+fn the_gpu_draws_the_regions_the_tree_composes() {
     let ctx = pollster::block_on(crate::gpu::init(None));
     let spec = spec();
-    let mut g = SceneGraph::new(&ctx.device);
-    let mut fx = fixture(&ctx, &mut g.tables);
-    let n = fx.file_nodes.len();
-    let table_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test group table"),
-        size: (n * std::mem::size_of::<GroupRow>()) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    g.gpu.set_group_output(&ctx.device, &table_buf, n as u32);
+    let mut t = NodeTables::default();
+    let mut fx = fixture(&ctx, &mut t);
     let camera_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test camera"),
         size: 256,
@@ -285,34 +282,47 @@ fn the_gpu_composes_the_regions_the_cpu_does() {
     let table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
     let regions = LibraryRegions::new(&ctx.device, &camera_buf, crate::glyph_scene::target::POOL_FORMAT, table);
     let nodes = fx.lib.nodes.clone().unwrap();
-    let check = |g: &mut SceneGraph, fx: &mut Fixture, what: &str| {
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test frame") });
-        let st = g.flush(&ctx.device, &ctx.queue, &mut encoder);
-        fx.tree.refit(&g.tables, &fx.cull);
-        regions.prepare(&ctx.device, &ctx.queue, &mut encoder, &mut fx.tree, g.gpu.world_buffer(), Some(&st));
-        ctx.queue.submit([encoder.finish()]);
+    let frame = |t: &mut NodeTables, fx: &mut Fixture| {
+        let plan = t.resolve_frame();
+        fx.tree.refit(t, &fx.cull);
+        regions.prepare(&ctx.queue, &mut fx.tree, t, Some(&plan))
+    };
+    let check = |t: &mut NodeTables, fx: &mut Fixture, what: &str| {
+        let cost = frame(t, fx);
+        assert!(cost.uploaded > 0, "{what}: something moved ({cost:?})");
         let count = regions.table.borrow().len();
-        let got: Vec<RegionInstance> =
-            bytemuck::cast_slice(&read_buffer_words(&ctx.device, &ctx.queue, &regions.instances, (count * 64) as u64)).to_vec();
+        let got: Vec<RegionInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &regions.instances, (count * 64) as u64)).to_vec();
         let table = regions.table.borrow();
         for (r, a) in got.iter().enumerate() {
             let (d, _) = table.dir_of(r as u32);
             let b = table.region_box_of(r as u32).unwrap();
-            let want = region_instance(&g.tables.world(nodes.dir[d]).unwrap().0, b[0], b[1], table.color[r]);
-            let (a, w): (&[f32; 16], &[f32; 16]) = (bytemuck::cast_ref(a), bytemuck::cast_ref(&want));
-            for k in 0..16 {
-                assert!((a[k] - w[k]).abs() <= 1e-4 * (1.0 + w[k].abs()), "{what}: region {r} lane {k}: GPU {} vs CPU {}", a[k], w[k]);
+            let w = t.world(nodes.dir[d]).unwrap().0;
+            let want = region_instance(&w, b[0], b[1], table.color[r]);
+            assert_eq!(bytemuck::bytes_of(a), bytemuck::bytes_of(&want), "{what}: region {r} on the GPU {a:?}, composed {want:?}");
+            let q = glam::DQuat::from_xyzw(f64::from(w.rotation[0]), f64::from(w.rotation[1]), f64::from(w.rotation[2]), f64::from(w.rotation[3]));
+            let wt = DVec3::new(f64::from(w.translation[0]), f64::from(w.translation[1]), f64::from(w.translation[2]));
+            let col = |c: [f32; 4]| DVec3::new(f64::from(c[0]), f64::from(c[1]), f64::from(c[2]));
+            let at = DVec3::new(f64::from(a.col0[3]), f64::from(a.col1[3]), f64::from(a.col2[3]));
+            for k in 0..8 {
+                let c = [k & 1, (k >> 1) & 1, (k >> 2) & 1];
+                let corner = DVec3::new(f64::from(b[c[0]][0]), f64::from(b[c[1]][1]), f64::from(b[c[2]][2]));
+                let expect = wt + q * (corner * f64::from(w.scale));
+                let u = c.map(|i| i as f64 - 0.5);
+                let got = col(a.col0) * u[0] + col(a.col1) * u[1] + col(a.col2) * u[2] + at;
+                assert!((got - expect).length() <= 1e-3 * (1.0 + expect.length()), "{what}: region {r} corner {k} drawn at {got:?}, the box's is {expect:?}");
             }
         }
     };
-    check(&mut g, &mut fx, "seated");
-    let h = fx.lib.move_zone(&mut g.tables, "dir:src/core", [90.0, -30.0, 4.0]).unwrap();
+    check(&mut t, &mut fx, "seated");
+    let settled = frame(&mut t, &mut fx);
+    assert_eq!((settled.composed, settled.bytes), (0, 0), "a settled frame composes and uploads nothing: {settled:?}");
+    let h = fx.lib.move_zone(&mut t, "dir:src/core", [90.0, -30.0, 4.0]).unwrap();
     let s = fx.lib.zone_node("dir:docs").unwrap();
-    let l = g.tables.local(s).unwrap();
-    g.tables.set_local(s, Similarity { scale: 1.25, ..l }).unwrap();
+    let l = t.local(s).unwrap();
+    t.set_local(s, Similarity { scale: 1.25, ..l }).unwrap();
     fx.tree.note_moved(h.index());
     fx.tree.note_moved(s.index());
-    check(&mut g, &mut fx, "dragged and scaled");
+    check(&mut t, &mut fx, "dragged and scaled");
 }
 
 /// A region drag (2026-10-10): `g` with a region picked grabs its

@@ -14,7 +14,9 @@ use winit::window::{Window, WindowId};
 
 use crate::glyph_scene::CameraMode;
 use crate::gpu::GpuContext;
-use crate::scene;
+#[cfg(feature = "egui-ui")]
+use crate::relayout::{rebuild_for_relayout, RelayoutRequest};
+use crate::scene::{self, SceneKey};
 use crate::{Op, SceneChoice};
 
 use super::state::WindowState;
@@ -22,21 +24,47 @@ use super::state::WindowState;
 use super::ui::EguiUi;
 use super::utc_stamp;
 
-/// The relayout arm: mutate the scene choice's layout params, then swap the
-/// scene in place — rebuilt through the same builder startup used, so it is
-/// correct by construction (the one true layout path rebuilds everything the
-/// params touch: cull AABBs, per-file pick params, bounds) at the cost of a
-/// full reload per apply, which is why the panel fires on release/click, not
-/// per tick. The camera pose survives via the old probe's last frame;
-/// pick/selection/grab state resets with the scene (a fresh load has none —
-/// same as the JS `grid.layout` refold). Repo scenes carry the z dial and
-/// the cluster toggle; text scenes carry the toggle only; anything else has
-/// no layout params and a stale signal is a no-op.
+/// The winit boundary for keys: the one translation from a winit physical
+/// key to the engine's [`SceneKey`]. A key the scene does not act on is
+/// None and never reaches it.
+fn scene_key(code: KeyCode) -> Option<SceneKey> {
+    Some(match code {
+        KeyCode::KeyW => SceneKey::W,
+        KeyCode::KeyA => SceneKey::A,
+        KeyCode::KeyS => SceneKey::S,
+        KeyCode::KeyD => SceneKey::D,
+        KeyCode::KeyE => SceneKey::E,
+        KeyCode::KeyR => SceneKey::R,
+        KeyCode::KeyQ => SceneKey::Q,
+        KeyCode::KeyF => SceneKey::F,
+        KeyCode::KeyH => SceneKey::H,
+        KeyCode::KeyT => SceneKey::T,
+        KeyCode::KeyX => SceneKey::X,
+        KeyCode::KeyB => SceneKey::B,
+        KeyCode::KeyG => SceneKey::G,
+        KeyCode::KeyC => SceneKey::C,
+        KeyCode::KeyV => SceneKey::V,
+        KeyCode::KeyN => SceneKey::N,
+        KeyCode::KeyP => SceneKey::P,
+        KeyCode::BracketLeft => SceneKey::BracketLeft,
+        KeyCode::BracketRight => SceneKey::BracketRight,
+        KeyCode::ArrowLeft => SceneKey::ArrowLeft,
+        KeyCode::ArrowRight => SceneKey::ArrowRight,
+        KeyCode::Comma => SceneKey::Comma,
+        KeyCode::Period => SceneKey::Period,
+        KeyCode::Home => SceneKey::Home,
+        KeyCode::End => SceneKey::End,
+        _ => return None,
+    })
+}
+
+/// The relayout arm: the engine rebuilds the scene for the request
+/// ([`rebuild_for_relayout`]) and the window swaps in what it built.
 /// A free function, not an App method: the caller already holds
 /// `state: &mut WindowState` borrowed from `self.state`, so `&mut self`
 /// would double-borrow.
 #[cfg(feature = "egui-ui")]
-pub(super) fn apply_relayout(
+fn relayout(
     ctx: &GpuContext,
     choice: &mut SceneChoice,
     cull_opts: &mut crate::SceneCullOptions,
@@ -44,166 +72,12 @@ pub(super) fn apply_relayout(
     state: &mut WindowState,
     req: RelayoutRequest,
 ) {
-    let mut changed = false;
-    let mut note = String::new();
-    let reset_pose = req.switch_agent_session.is_some();
-    if let Some((session, agent, loaded)) = req.switch_agent_session {
-        let emoji_sheet = match choice {
-            SceneChoice::AgentSession { emoji_sheet, .. } => emoji_sheet.clone(),
-            SceneChoice::Text { emoji_sheet, .. } => emoji_sheet.clone(),
-            SceneChoice::Repo { emoji_sheet, .. } => emoji_sheet.clone(),
-            SceneChoice::Demo => crate::default_emoji_sheet(),
-        };
-        note += &format!("switch_agent_session -> {session} ");
-        *choice = SceneChoice::AgentSession {
-            session,
-            agent,
-            emoji_sheet,
-            layout_options: crate::spatial_scene::CarrelLayoutOptions::default(),
-            cached_session: std::sync::Arc::new(std::sync::RwLock::new(Some(loaded))),
-        };
-        changed = true;
+    let viewport = (state.config.width, state.config.height);
+    let live = state.ui_probe.as_ref();
+    if let Some((scene, probe)) = rebuild_for_relayout(ctx, state.config.format, viewport, choice, cull_opts, live, ui, req) {
+        state.scene = scene;
+        state.ui_probe = probe;
     }
-    if let SceneChoice::AgentSession { layout_options, .. } = choice {
-        if let Some(new_opts) = req.carrel_options {
-            if *layout_options != new_opts {
-                *layout_options = new_opts;
-                changed = true;
-                note += &format!("carrel_options -> limit: {}, scroll: {} ", new_opts.deck_window_limit, new_opts.deck_scroll_offset);
-            }
-        }
-    }
-    // The z dial exists on repo scenes, and on text scenes since they became
-    // one-file repo loads (2026-10-11).
-    if let SceneChoice::Repo { z_wrap_spacing, .. } | SceneChoice::Text { z_wrap_spacing, .. } = choice {
-        if let Some(new_z) = req.z_wrap_spacing {
-            if z_wrap_spacing.to_bits() != new_z.to_bits() {
-                *z_wrap_spacing = new_z;
-                changed = true;
-                note += &format!("z_wrap_spacing -> {new_z} ");
-            }
-        }
-    }
-    // Layout engine strategy (repo scenes only).
-    if let Some(new_strategy) = req.set_strategy {
-        if let SceneChoice::Repo { strategy, .. } = choice {
-            if *strategy != new_strategy {
-                *strategy = new_strategy;
-                changed = true;
-                note += &format!("strategy -> {:?} ", new_strategy);
-            }
-        }
-    }
-    // Glyph field render mode (all scenes).
-    if let Some(new_mode) = req.set_field_mode {
-        if cull_opts.field_mode != new_mode {
-            cull_opts.field_mode = new_mode;
-            changed = true;
-            note += &format!("field_mode -> {:?} ", new_mode);
-        }
-    }
-    // The cluster toggle rides any scene whose choice carries the mode —
-    // repo and text alike (SceneChoice::Text has carried it since the pass
-    // landed; the panel seed for text scenes is GlyphScene's
-    // probe_cluster_mode).
-    if req.toggle_cluster {
-        let mode = match choice {
-            SceneChoice::Repo { cluster_mode, .. } | SceneChoice::Text { cluster_mode, .. } => {
-                Some(cluster_mode)
-            }
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            *mode = match *mode {
-                crate::fold::ClusterMode::Leader => crate::fold::ClusterMode::Cluster,
-                crate::fold::ClusterMode::Cluster => crate::fold::ClusterMode::Leader,
-            };
-            changed = true;
-            note += &format!("cluster_mode -> {mode:?} ");
-        }
-    }
-    if req.toggle_layout {
-        if let SceneChoice::Repo { layout_mode, .. } = choice {
-            *layout_mode = match *layout_mode {
-                crate::repo::RepoLayoutMode::Shelf => crate::repo::RepoLayoutMode::Carrel,
-                crate::repo::RepoLayoutMode::Carrel => crate::repo::RepoLayoutMode::Library,
-                crate::repo::RepoLayoutMode::Library => crate::repo::RepoLayoutMode::Shelf,
-            };
-            changed = true;
-            note += &format!("layout_mode -> {:?} ", *layout_mode);
-        }
-    }
-    if !changed {
-        return; // a release without a move (a click, a typed repeat) rebuilds nothing
-    }
-    // Snapshot the camera and live cull settings BEFORE the swap: the probe holds
-    // last frame's actual eye/yaw/pitch and live background/cull settings, and a rebuild
-    // that teleports the viewer or resets the background would make the dial unusable.
-    let (pose, live_cull_opts) = if let Some(p) = state.ui_probe.as_ref() {
-        let p = p.borrow();
-        (
-            Some((p.eye, p.yaw, p.pitch)),
-            crate::SceneCullOptions {
-                cull: cull_opts.cull,
-                file_backgrounds: p.file_backgrounds,
-                file_bg_color: p.file_bg_color,
-                lod_min_px: Some(p.lod_min_px),
-                greeking: p.greeking,
-                greek_pure: p.greek_pure,
-                greek_onset_px: Some(p.greek_onset_px),
-                field_mode: cull_opts.field_mode,
-                debug_tint: p.debug_tint,
-                environment: p.environment,
-                ground_y: cull_opts.ground_y,
-            },
-        )
-    } else {
-        (None, *cull_opts)
-    };
-    let t = Instant::now();
-    let (mut scene, probe) = if ui {
-        crate::build_scene_probed(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts)
-    } else {
-        (crate::build_scene_with_options(ctx, state.config.format, choice, CameraMode::Fly, live_cull_opts), None)
-    };
-    // The mode the scene BUILT may not be the one asked for (a load past the
-    // Derived lanes falls back to Instanced, loudly — `layout_hyper::
-    // derived_lane_limits`); the options follow the build, so the panel's
-    // selector and the next request start from what is actually drawn.
-    if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
-        if built != cull_opts.field_mode {
-            note += &format!("(built {built}, not {}) ", cull_opts.field_mode);
-            cull_opts.field_mode = built;
-        }
-    }
-    scene.set_viewport(state.config.width, state.config.height);
-    if !reset_pose {
-        if let Some((eye, yaw, pitch)) = pose {
-            scene.set_cam_pose(eye, yaw, pitch);
-        }
-    }
-    state.scene = scene;
-    state.ui_probe = probe;
-    println!(
-        "relayout: {note}(scene rebuilt in {:?}; pick/selection/grab state reset)",
-        t.elapsed()
-    );
-}
-
-/// What the panel asked the rebuild arm to change. Either field alone may be
-/// set; the arm applies both and rebuilds only if one actually moved.
-#[cfg(feature = "egui-ui")]
-#[derive(Clone, Default)]
-pub(super) struct RelayoutRequest {
-    pub(super) z_wrap_spacing: Option<f64>,
-    pub(super) toggle_cluster: bool,
-    pub(super) toggle_layout: bool,
-    /// A session the F7 browser read (what `agent transcript` was given,
-    /// the `agent` that read it, and what it read).
-    pub(super) switch_agent_session: Option<(String, crate::agent_transcript::AgentCli, crate::agent_transcript::LoadedSession)>,
-    pub(super) carrel_options: Option<crate::spatial_scene::CarrelLayoutOptions>,
-    pub(super) set_strategy: Option<crate::repo::Strategy>,
-    pub(super) set_field_mode: Option<glyph_field::GlyphFieldMode>,
 }
 
 pub(super) struct App<'a> {
@@ -548,7 +422,7 @@ impl App<'_> {
                         });
                     }
                     if let Some(req) = state.pending_relayout.take() {
-                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
+                        relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
                     }
                 }
                 state.render(&self.ctx);
@@ -567,7 +441,7 @@ impl App<'_> {
                         });
                     }
                     if let Some(req) = state.pending_relayout.take() {
-                        apply_relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
+                        relayout(&self.ctx, &mut self.choice, &mut self.cull_opts, self.ui, state, req);
                         state.window.request_redraw();
                     }
                 }
@@ -697,7 +571,9 @@ impl App<'_> {
                             state.grab();
                         }
                     } else {
-                        state.scene.on_key(&self.ctx, code, pressed);
+                        if let Some(key) = scene_key(code) {
+                            state.scene.on_key(&self.ctx, key, pressed);
+                        }
                         state.window.request_redraw();
                     }
                 }

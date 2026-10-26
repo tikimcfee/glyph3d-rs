@@ -1,7 +1,6 @@
 //! A two-level dirty set: one bit per row plus one summary bit per 64-row
 //! word, so a frame that changed a few rows of a 100k table walks a few
-//! words, and the rows come out in ascending order — which is exactly what
-//! coalescing them into upload runs needs.
+//! words, and the rows come out in ascending order.
 //!
 //! The summary/bits split is bevy's (`AtomicSparseBufferVec`,
 //! `bevy_render/src/render_resource/sparse_buffer_vec.rs`, bevy 0.16+,

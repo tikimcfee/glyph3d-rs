@@ -22,6 +22,7 @@ pub mod layout_hyper;
 pub mod layout_stack;
 pub mod library;
 pub mod offscreen;
+pub mod relayout;
 pub mod repo;
 pub mod revision;
 pub mod scan;
@@ -30,6 +31,7 @@ pub mod seam;
 pub mod spatial_scene;
 pub mod text;
 pub mod views;
+#[cfg(feature = "windowed")]
 pub mod windowed;
 
 pub use atlas::default_trie;

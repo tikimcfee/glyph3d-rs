@@ -338,9 +338,9 @@ fn assert_tree_matches_bevy(lib: &Library, t: &NodeTables, tints: &[[f32; 3]], w
 /// bit, seated, mid-ease, settled after a page turn and a form change, and
 /// after a directory drag and a file drag. Both sum each translation root
 /// first; every other step is a product with 1 or a sum with 0 — so this
-/// holds exactly, and the GPU resolve (same order) draws the same frame
-/// (`translation_chains_resolve_root_first_and_bit_exact`, and the witness
-/// frames in the findings log).
+/// holds exactly, and the frame resolve (the same bits as the chain walk,
+/// glyph-scene-graph's `tests/resolve.rs`) uploads the same rows and faces
+/// (`glyph_scene::faces::tests`, read back from the device).
 #[test]
 fn the_tree_resolves_the_rows_bevy_composed() {
     let s = &crate::config::settings().library;
@@ -386,7 +386,7 @@ fn the_tree_resolves_the_rows_bevy_composed() {
 
 /// The scene binding, without a GPU: a file's world is the composition of
 /// the plan (dir → volume → sheet slot → mount fit), a page turn writes only
-/// its own volume's sheets (the local rows the GPU uploads), and the ease
+/// its own volume's sheets (the local rows the resolve starts from), and the ease
 /// lands every sheet on its new slot.
 #[test]
 fn a_page_turn_moves_one_volume_and_settles_on_the_slot_law() {

@@ -13,7 +13,9 @@ use crate::gpu::GpuContext;
 use crate::scene::{self, SceneLike};
 
 #[cfg(feature = "egui-ui")]
-use super::app::RelayoutRequest;
+use crate::relayout::RelayoutRequest;
+#[cfg(feature = "egui-ui")]
+use crate::scene::SceneKey;
 #[cfg(feature = "egui-ui")]
 use super::ui::{EguiUi, PANEL_VERBS};
 
@@ -582,7 +584,7 @@ impl WindowState {
                     self.scene.on_cursor(ctx, cx, cy);
                 }
                 2 => {
-                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                    self.scene.on_key(ctx, SceneKey::G, true);
                     println!("GRAB-SELFTEST step 2 (g, grabbed): hud {}", hud(self));
                 }
                 s if s < 3 + DRAG_STEPS => {
@@ -591,7 +593,7 @@ impl WindowState {
                     println!("GRAB-SELFTEST step {s} (drag to {:+.0},{:+.0} px): hud {}", dx * k, dy * k, hud(self));
                 }
                 s if s == 3 + DRAG_STEPS => {
-                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                    self.scene.on_key(ctx, SceneKey::G, true);
                     let verb = crate::parse_verb("move-group 0 0 0").expect("selftest verb literal must parse like the CLI");
                     let line = self.scene.apply_verb(ctx, &verb).unwrap_or_default();
                     println!("GRAB-SELFTEST step {s} (g, released): {line}");
@@ -846,22 +848,22 @@ impl WindowState {
                                 ui.horizontal(|ui| {
                                     if let Some(z) = &snap.grabbed_zone {
                                         if ui.button(format!("Release Carrel '{z}' (C)")).clicked() {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                            self.scene.on_key(ctx, SceneKey::C, true);
                                         }
                                     } else if snap.active_zone.is_some()
                                         && ui.button("Grab Entire Carrel (C)").clicked()
                                     {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyC, true);
+                                        self.scene.on_key(ctx, SceneKey::C, true);
                                     }
 
                                     if let Some(g) = snap.grabbed_group {
                                         if ui.button(format!("Release File #{g} (G)")).clicked() {
-                                            self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                            self.scene.on_key(ctx, SceneKey::G, true);
                                         }
                                     } else if snap.last_pick.is_some()
                                         && ui.button("Grab File (G)").clicked()
                                     {
-                                        self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyG, true);
+                                        self.scene.on_key(ctx, SceneKey::G, true);
                                     }
                                 });
                             }
@@ -1262,13 +1264,13 @@ impl WindowState {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("⏮ Oldest (End)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::End, true);
+                                    self.scene.on_key(ctx, SceneKey::End, true);
                                 }
 
                                 let total_beats = carrel.beat_count.max(carrel.turn_count);
 
                                 if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketLeft, true);
+                                    self.scene.on_key(ctx, SceneKey::BracketLeft, true);
                                 }
 
                                 if carrel.beat_count > 0 {
@@ -1283,16 +1285,16 @@ impl WindowState {
                                 }
 
                                 if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::BracketRight, true);
+                                    self.scene.on_key(ctx, SceneKey::BracketRight, true);
                                 }
 
                                 if ui.button("Latest ⏭ (Home)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::Home, true);
+                                    self.scene.on_key(ctx, SceneKey::Home, true);
                                 }
 
                                 ui.separator();
                                 if ui.button("Mode (V)").clicked() {
-                                    self.scene.on_key(ctx, winit::keyboard::KeyCode::KeyV, true);
+                                    self.scene.on_key(ctx, SceneKey::V, true);
                                 }
                                 ui.separator();
                                 if ui.button("Sessions (F7) 📂").clicked() {

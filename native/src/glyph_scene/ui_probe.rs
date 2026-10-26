@@ -86,7 +86,7 @@ mod lod_order_tests {
 // on the CONCRETE GlyphScene before boxing (see build_scene_probed in
 // main.rs), written once per frame by render(), read by the panel.
 // Offscreen never installs one, so the determinism chain never touches it.
-// Single-threaded: winit's event-loop thread owns both writer and reader.
+// Single-threaded: the host's event-loop thread owns both writer and reader.
 
 /// Read-only snapshot displayed by the windowed debug panel.
 #[derive(Clone, Default)]
@@ -196,7 +196,7 @@ pub struct UiProbeState {
     /// panel): `file_dyn` is refreshed for these only (2026-10-10). The
     /// browser draws a scrolled window of rows; refreshing every row each
     /// frame was O(files) per frame, and under a library move it needed the
-    /// whole CPU mirror of the group rows synced every frame (O(the moved
+    /// moved group rows rebuilt before every flush (O(the moved
     /// subtrees): a directory drag's per-file cost, back by the side door).
     pub browser_rows: Vec<usize>,
 }

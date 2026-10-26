@@ -10,16 +10,19 @@
 //!   whatever moved; a region is its directory's box padded
 //!   (`region_box`). The cull logs the slots each refit rewrites
 //!   (`TreeCull::log_refits`), and `RegionTable::sync` re-pads exactly
-//!   those regions — so the host's work per frame is O(refit directories),
-//!   never O(directories), and a settled library does none. When regions
-//!   are on, each sheet's box also takes its page face
-//!   (`TreeCull::with_own_box`), so a box encloses the pages, not only the
-//!   ink on them.
-//! - **The world is the GPU's.** The box stays in its directory's frame;
-//!   a compute pass (`shaders/library_regions.wgsl`) composes it with the
-//!   directory's resolved world after any resolve or box upload, so a drag,
-//!   an ease, a page turn or a form change moves every region for free.
-//!   `region_instance` is its CPU twin (`tests`).
+//!   those regions. When regions are on, each sheet's box also takes its
+//!   page face (`TreeCull::with_own_box`), so a box encloses the pages, not
+//!   only the ink on them.
+//! - **The world is the resolve's.** The box stays in its directory's
+//!   frame; `region_instance` composes it with the directory's resolved
+//!   world into the drawn instance, for exactly the regions whose box a
+//!   refit changed or whose directory the frame's resolve reached, and only
+//!   the instances whose bytes changed go up (`nodes::upload_rows`). So the
+//!   host's work per frame is O(moved directories + refits), never
+//!   O(directories), and a settled library does none. (From 2026-10-10 to
+//!   2026-10-26 a compute pass composed every region on the GPU after any
+//!   resolve or box upload; `region_instance` was its twin and is the path
+//!   now.)
 //! - **Draw order.** After the page faces, before the glyphs; depth tested,
 //!   not written; shallowest first (the JS `BACKDROP_BASE + depth`). A
 //!   page hides the box faces behind it, a box face in front of a page
@@ -48,8 +51,9 @@ use std::cell::{Cell, RefCell};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DQuat, DVec3};
-use glyph_scene_graph::{NodeHandle, NodeTables, Similarity, NONE};
+use glyph_scene_graph::{FramePlan, NodeHandle, NodeTables, Similarity, NONE};
 
+use super::nodes::upload_rows;
 use super::tree_cull::{is_empty, Aabb, TreeCull};
 use crate::library::plan::Plan;
 use crate::library::LibNodes;
@@ -126,16 +130,7 @@ pub(super) fn region_color(depth: u32, max_depth: u32, spec: &RegionSpec) -> [f3
     [c[0], c[1], c[2], a]
 }
 
-/// `Region` in library_regions.wgsl, 48 B.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
-struct RegionGpu {
-    lo: [f32; 4],
-    hi: [f32; 4],
-    color: [f32; 4],
-}
-
-/// `RegionInstance` in library_regions.wgsl, 64 B.
+/// The instance library_regions.wgsl draws (its vertex attributes), 64 B.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub(super) struct RegionInstance {
@@ -145,7 +140,8 @@ pub(super) struct RegionInstance {
     pub color: [f32; 4],
 }
 
-/// `RegionParams` in library_regions.wgsl, 32 B.
+/// `RegionParams` in library_regions.wgsl, 32 B (`count` is read by no
+/// shader since the compose pass went; the layout stays the shader's).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RegionParamsGpu {
@@ -158,13 +154,13 @@ struct RegionParamsGpu {
     _pad: [u32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<RegionGpu>() == 48, "Region in library_regions.wgsl is 48 B");
-const _: () = assert!(std::mem::size_of::<RegionInstance>() == 64, "RegionInstance in library_regions.wgsl is 64 B");
+const _: () = assert!(std::mem::size_of::<RegionInstance>() == 64, "library_regions.wgsl draws 64 B instances");
 const _: () = assert!(std::mem::size_of::<RegionParamsGpu>() == 32, "RegionParams in library_regions.wgsl is 32 B");
 
 /// The region box `lo..hi` (its directory's frame) under the directory's
-/// world `w`: library_regions.wgsl's `write_regions`, term for term.
-#[cfg(test)]
+/// world `w`: three axes scaled by the box (glam's `Mat3::from_quat` times
+/// the world scale, as the page faces) and its centre carried through the
+/// world.
 pub(super) fn region_instance(w: &Similarity, lo: [f32; 3], hi: [f32; 3], color: [f32; 4]) -> RegionInstance {
     let (s, q) = (w.scale, w.rotation);
     let size = [0, 1, 2].map(|k| hi[k] - lo[k]);
@@ -208,8 +204,6 @@ pub(super) struct RegionTable {
     color: Vec<[f32; 4]>,
     /// Per region: its box in its directory's frame (None: empty subtree).
     boxes: Vec<Option<Aabb>>,
-    /// Per region: the row the GPU reads (an empty box is a zero box).
-    rows: Vec<RegionGpu>,
     /// `Plan::dirs` index → region (NONE: the root).
     region_of_dir: Vec<u32>,
     /// Pool slot → region (NONE: not a region's directory).
@@ -218,7 +212,7 @@ pub(super) struct RegionTable {
     kids: Vec<Vec<u32>>,
     /// Every directory's node (`LibNodes::dir`).
     dir_nodes: Vec<NodeHandle>,
-    /// Regions whose row changed since the last `take_dirty`.
+    /// Regions whose box changed since the last `take_dirty`.
     dirty: Vec<u32>,
     dirty_mark: Vec<bool>,
     scratch: Vec<u32>,
@@ -249,7 +243,6 @@ impl RegionTable {
             depth: Vec::with_capacity(order.len()),
             color: Vec::with_capacity(order.len()),
             boxes: Vec::with_capacity(order.len()),
-            rows: Vec::with_capacity(order.len()),
             region_of_dir: Vec::new(),
             region_of_slot: Vec::new(),
             kids,
@@ -270,16 +263,17 @@ impl RegionTable {
             this.depth.push(depth);
             this.color.push(color);
             this.boxes.push(b);
-            this.rows.push(Self::row(slot, b, color));
         }
         this.region_of_dir = region_of_dir;
         this.region_of_slot = region_of_slot;
         this
     }
 
-    fn row(slot: u32, b: Option<Aabb>, color: [f32; 4]) -> RegionGpu {
-        let [lo, hi] = b.unwrap_or([[0.0; 3]; 2]);
-        RegionGpu { lo: [lo[0], lo[1], lo[2], f32::from_bits(slot)], hi: [hi[0], hi[1], hi[2], 0.0], color }
+    /// Region `r`'s instance under its directory's resolved world (an
+    /// empty box is the zero box at the directory's origin).
+    fn instance(&self, r: usize, t: &NodeTables) -> RegionInstance {
+        let [lo, hi] = self.boxes[r].unwrap_or([[0.0; 3]; 2]);
+        region_instance(&t.resolved_world(self.slot[r]).0, lo, hi, self.color[r])
     }
 
     pub(super) fn len(&self) -> usize {
@@ -320,7 +314,6 @@ impl RegionTable {
                 continue;
             }
             self.boxes[ri] = b;
-            self.rows[ri] = Self::row(slot, b, self.color[ri]);
             if !self.dirty_mark[ri] {
                 self.dirty_mark[ri] = true;
                 self.dirty.push(r);
@@ -329,7 +322,7 @@ impl RegionTable {
         self.scratch.len()
     }
 
-    /// The regions whose row changed since the last call.
+    /// The regions whose box changed since the last call.
     fn take_dirty(&mut self, out: &mut Vec<u32>) {
         for &r in &self.dirty {
             self.dirty_mark[r as usize] = false;
@@ -368,24 +361,21 @@ impl RegionTable {
     }
 }
 
-const WG: u32 = 64;
-
 /// What one frame's region work did and cost on the CPU (`REGIONTIME`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RegionCost {
     /// Refit slots taken from the tree cull (any library node).
     pub refits: usize,
-    /// Region rows changed, and the bytes written for them (the whole
-    /// table when more than a quarter changed: one write, not thousands).
+    /// Instances recomposed (a refit box or a resolved directory).
+    pub composed: usize,
+    /// Instances whose bytes changed, and the bytes written for them.
     pub uploaded: usize,
     pub bytes: usize,
-    /// Whether the compose pass was encoded.
-    pub composed: bool,
     pub ms: f64,
 }
 
-/// The regions on the GPU: the boxes (host-written when a refit changes
-/// one), the instances (GPU-written), and the draw.
+/// The regions on the GPU: the instances (host-composed, written when one
+/// changes) and the draw.
 pub(super) struct LibraryRegions {
     pub(super) table: RefCell<RegionTable>,
     count: u32,
@@ -394,14 +384,14 @@ pub(super) struct LibraryRegions {
     picked_written: Cell<u32>,
     params_cpu: RegionParamsGpu,
     params: wgpu::Buffer,
-    regions: wgpu::Buffer,
+    /// The instances the render half draws, and what the host last wrote
+    /// to them (the buffer starts zeroed, as wgpu creates it, and so does
+    /// this).
     pub(super) instances: wgpu::Buffer,
-    compute: wgpu::ComputePipeline,
-    compute_bgl: wgpu::BindGroupLayout,
-    compute_bg: RefCell<Option<wgpu::BindGroup>>,
+    image: RefCell<Vec<RegionInstance>>,
     render: wgpu::RenderPipeline,
     render_bg: wgpu::BindGroup,
-    /// Regions uploaded but not yet composed (the first frame: all).
+    /// Nothing composed yet (the first frame composes every region).
     pending_compose: Cell<bool>,
     dirty: RefCell<Vec<u32>>,
 }
@@ -411,16 +401,10 @@ impl LibraryRegions {
         use wgpu::util::DeviceExt;
         let count = table.len() as u32;
         let spec = table.spec;
-        let rows: &[RegionGpu] = if table.rows.is_empty() { &[RegionGpu { lo: [0.0; 4], hi: [0.0; 4], color: [0.0; 4] }] } else { &table.rows };
-        let regions = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("library regions"),
-            contents: bytemuck::cast_slice(rows),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("library region instances"),
             size: u64::from(count.max(1)) * std::mem::size_of::<RegionInstance>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let params_cpu = RegionParamsGpu {
@@ -447,29 +431,6 @@ impl LibraryRegions {
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
-            count: None,
-        };
-        let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("library regions compute bgl"),
-            entries: &[uniform(0, wgpu::ShaderStages::COMPUTE), storage(1, true), storage(2, true), storage(3, false)],
-        });
-        let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("library regions compute pl"),
-            bind_group_layouts: &[Some(&compute_bgl)],
-            immediate_size: 0,
-        });
-        let compute = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("library regions"),
-            layout: Some(&compute_layout),
-            module: &module,
-            entry_point: Some("write_regions"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
         let render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("library regions render bgl"),
             entries: &[uniform(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT), uniform(4, wgpu::ShaderStages::VERTEX)],
@@ -532,11 +493,8 @@ impl LibraryRegions {
             picked_written: Cell::new(NONE),
             params_cpu,
             params,
-            regions,
+            image: RefCell::new(vec![RegionInstance::zeroed(); count as usize]),
             instances,
-            compute,
-            compute_bgl,
-            compute_bg: RefCell::new(None),
             render,
             render_bg,
             pending_compose: Cell::new(true),
@@ -551,66 +509,44 @@ impl LibraryRegions {
     }
 
     /// The frame's region work, after the cull (whose refit logged what
-    /// changed) and before the glyph pass: take the refits, upload the rows
-    /// they changed and the picked index if it moved, and compose the
-    /// instances when the frame's flush resolved anything or a row was
-    /// uploaded. A settled frame does nothing. `world` is the scene graph's
-    /// world table, rebound when the flush says it was replaced (`grew`).
-    pub(super) fn prepare(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, tree: &mut TreeCull, world: &wgpu::Buffer, flush: Option<&glyph_scene_graph::FlushStats>) -> RegionCost {
+    /// changed) and before the glyph pass: take the refits, recompose the
+    /// regions whose box changed or whose directory the frame's resolve
+    /// (`plan`) reached, upload the instances that changed, and the picked
+    /// index if it moved. A settled frame does nothing.
+    pub(super) fn prepare(&self, queue: &wgpu::Queue, tree: &mut TreeCull, t: &NodeTables, plan: Option<&FramePlan>) -> RegionCost {
         let t0 = std::time::Instant::now();
         let mut cost = RegionCost::default();
         if self.count == 0 {
             return cost;
         }
-        let (resolved, rebind) = flush.map_or((false, false), |st| (st.dispatched, st.grew));
         let mut table = self.table.borrow_mut();
         cost.refits = table.sync(tree);
         let mut dirty = self.dirty.borrow_mut();
         dirty.clear();
         table.take_dirty(&mut dirty);
-        cost.uploaded = dirty.len();
-        if !dirty.is_empty() {
-            let stride = std::mem::size_of::<RegionGpu>() as u64;
-            if dirty.len() * 4 > table.len() {
-                queue.write_buffer(&self.regions, 0, bytemuck::cast_slice(&table.rows));
-                cost.bytes = std::mem::size_of_val(table.rows.as_slice());
-            } else {
-                cost.bytes = dirty.len() * stride as usize;
-                for &r in dirty.iter() {
-                    queue.write_buffer(&self.regions, u64::from(r) * stride, bytemuck::bytes_of(&table.rows[r as usize]));
-                }
-            }
+        if self.pending_compose.replace(false) {
+            dirty.clear();
+            dirty.extend(0..self.count);
+        } else if let Some(plan) = plan {
+            dirty.extend(plan.slots(t).filter_map(|s| table.region_of_slot.get(s as usize).copied().filter(|&r| r != NONE)));
         }
+        dirty.sort_unstable();
+        dirty.dedup();
+        cost.composed = dirty.len();
+        let mut image = self.image.borrow_mut();
+        dirty.retain(|&r| {
+            let inst = table.instance(r as usize, t);
+            let same = bytemuck::bytes_of(&inst) == bytemuck::bytes_of(&image[r as usize]);
+            image[r as usize] = inst;
+            !same
+        });
+        cost.uploaded = dirty.len();
+        cost.bytes = upload_rows(queue, &self.instances, bytemuck::cast_slice(&image), std::mem::size_of::<RegionInstance>(), &dirty);
         if self.picked.get() != self.picked_written.get() {
             let p = RegionParamsGpu { picked: self.picked.get(), ..self.params_cpu };
             queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
             self.picked_written.set(self.picked.get());
         }
-        if !(resolved || rebind || !dirty.is_empty() || self.pending_compose.get()) {
-            cost.ms = t0.elapsed().as_secs_f64() * 1e3;
-            return cost;
-        }
-        self.pending_compose.set(false);
-        let mut bg = self.compute_bg.borrow_mut();
-        if rebind || bg.is_none() {
-            *bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("library regions compute bg"),
-                layout: &self.compute_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: world.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: self.regions.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: self.instances.as_entire_binding() },
-                ],
-            }));
-        }
-        let groups = self.count.div_ceil(WG);
-        assert!(groups <= 65_535, "library regions: {} regions is past one dispatch row", self.count);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("library regions"), timestamp_writes: None });
-        pass.set_pipeline(&self.compute);
-        pass.set_bind_group(0, bg.as_ref().expect("just built"), &[]);
-        pass.dispatch_workgroups(groups, 1, 1);
-        cost.composed = true;
         cost.ms = t0.elapsed().as_secs_f64() * 1e3;
         cost
     }

@@ -26,6 +26,41 @@ pub struct FrameTarget<'a> {
     pub height: u32,
 }
 
+/// The keys a scene acts on, by physical position (a US layout's names):
+/// the fly camera's WASD/E R/Q F, the verb keys and the deck/page keys
+/// (`GlyphScene::verb_key`). Engine-owned since 2026-10-26, so the scene
+/// takes no windowing crate's key type: the host translates its own key
+/// events (`windowed::app::scene_key` in the windowed driver) and drops the rest, and
+/// offscreen scripts and the panel's buttons name these directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneKey {
+    W,
+    A,
+    S,
+    D,
+    E,
+    R,
+    Q,
+    F,
+    H,
+    T,
+    X,
+    B,
+    G,
+    C,
+    V,
+    N,
+    P,
+    BracketLeft,
+    BracketRight,
+    ArrowLeft,
+    ArrowRight,
+    Comma,
+    Period,
+    Home,
+    End,
+}
+
 /// Mode-agnostic scene interface: windowed and offscreen modes drive any scene
 /// (Stage A quad field, Stage C glyph field, …) through exactly this.
 pub trait SceneLike {
@@ -45,7 +80,7 @@ pub trait SceneLike {
     // feed it. `dt` is wall-clock seconds since the previous frame.
     // Stage G: the hooks take &GpuContext so scenes can issue partial buffer
     // uploads from event handlers (pick flash, group drags, verb keys).
-    fn on_key(&mut self, _ctx: &GpuContext, _key: winit::keyboard::KeyCode, _pressed: bool) {}
+    fn on_key(&mut self, _ctx: &GpuContext, _key: SceneKey, _pressed: bool) {}
     fn on_mouse_look(&mut self, _ctx: &GpuContext, _dx: f32, _dy: f32) {}
     fn on_scroll(&mut self, _ctx: &GpuContext, _lines: f32) {}
     /// Cursor position in physical px (tracked even without pointer grab).
