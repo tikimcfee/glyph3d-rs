@@ -43,6 +43,10 @@ pub struct FieldResources<'a> {
     /// no single item draws with. Read by the Derived field's host transcode
     /// only.
     pub item_of_group: &'a [u32],
+    /// Slots per host block for a field that keeps its slots on the host
+    /// (Derived: `[glyph_scene] derived_block_slots`), when it builds its
+    /// blocks itself from host records. The other modes ignore it.
+    pub block_slots: usize,
 }
 
 /// What a frame hands a self-culling field before its glyph pass
@@ -101,6 +105,11 @@ pub enum SlotSource<'a> {
         /// address — lets bulk color writes skip the queue.
         mapped_base: Option<usize>,
     },
+    /// Already on the host in the mode's own slot format, in blocks that are
+    /// the field's chunks ([`crate::HostSlots`]; the Derived field's form
+    /// since 2026-10-26). The storage keeps them, uploads one buffer per
+    /// block, and patches the block with every slot write.
+    Blocks(crate::HostSlots),
     /// The engine's neutral records on the host, possibly in several slices
     /// that concatenate to the glyph sequence. The mode converts and uploads.
     Host {

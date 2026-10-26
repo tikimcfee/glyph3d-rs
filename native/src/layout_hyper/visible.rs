@@ -237,7 +237,7 @@ mod tests {
         let mut engine = crate::layout_hyper::HyperLayout::with_field_mode(GlyphFieldMode::Visible);
         let mut arena = GlyphArena::new();
         let placements = engine.layout_items(&items, &mut arena).unwrap();
-        assert!(arena.is_visible() && !arena.is_device());
+        assert!(arena.is_visible() && !arena.is_emitted());
         let staging = arena.visible_staging().unwrap();
         assert_eq!(staging.seeds.len(), items.len());
         assert!(staging.buffer_bytes.is_empty() && staging.item_buffers.is_empty(), "the loader, not the seam, owns the bytes");
@@ -256,7 +256,7 @@ mod tests {
         let mut plain = crate::layout_hyper::HyperLayout::with_field_mode(GlyphFieldMode::Derived);
         let mut host = GlyphArena::new();
         plain.layout_items(&items, &mut host).unwrap();
-        assert!(!host.is_visible() && !host.is_device());
+        assert!(!host.is_visible() && !host.is_emitted());
         assert_eq!(host.len() as u64, staging.glyph_count);
     }
 

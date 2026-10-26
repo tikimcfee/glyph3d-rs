@@ -990,8 +990,26 @@ fn save_cache(
     Ok(())
 }
 
-impl EmojiTexture {
-    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
+/// The emoji sheet's texels on the host, ready to upload (2026-10-26, split
+/// from the wgpu upload so a host with its own renderer, the makepad port,
+/// loads the same bytes): the sheet parsed, and every layer's mip chain
+/// from the mip cache beside it, or decoded and box-filtered (and the cache
+/// written) when there is none.
+pub struct EmojiLevels {
+    pub sheet: EmojiSheet,
+    pub mip_levels: u32,
+    /// Per cell: alpha-weighted mean linear rgb + mean alpha (see
+    /// `EmojiSheet::decode_layers`).
+    pub cell_ink: Vec<[f32; 4]>,
+    levels: CachedLevels,
+    from_cache: bool,
+    t_parse: std::time::Duration,
+    t_decode: std::time::Duration,
+    t_mips: std::time::Duration,
+}
+
+impl EmojiLevels {
+    pub fn load(path: &Path) -> Self {
         let t0 = std::time::Instant::now();
         let sheet = EmojiSheet::load(path);
         let t_parse = t0.elapsed();
@@ -1011,7 +1029,7 @@ impl EmojiTexture {
                     let mut chain = vec![base];
                     let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
                     for _ in 1..mip_levels {
-                        let next = box_down_straight(chain.last().unwrap(), w, h);
+                        let next = box_down_straight(chain.last().expect("a chain starts with its base level"), w, h);
                         w /= 2;
                         h /= 2;
                         chain.push(next);
@@ -1025,27 +1043,66 @@ impl EmojiTexture {
                 (CachedLevels::Owned(levels), cell_ink, false, t_decode, t_mips)
             }
         };
+        Self { sheet, mip_levels, cell_ink, levels, from_cache, t_parse, t_decode, t_mips }
+    }
 
+    /// Every layer's chain in bytes: layers × levels of `w × h × 4`.
+    pub fn byte_len(&self) -> usize {
+        let mut total = 0usize;
+        for _ in 0..self.sheet.layers {
+            let (mut w, mut h) = (self.sheet.layer_w, self.sheet.layer_h);
+            for _ in 0..self.mip_levels {
+                total += (w * h * 4) as usize;
+                w /= 2;
+                h /= 2;
+            }
+        }
+        total
+    }
+
+    /// The texels into `dst` (exactly [`Self::byte_len`] bytes): layer-major,
+    /// each layer's levels from 0 down, rows tight, sRGB-encoded RGBA8 with
+    /// straight alpha — what the device upload stages.
+    pub fn copy_into(&self, dst: &mut [u8]) {
+        assert_eq!(dst.len(), self.byte_len(), "the destination holds every layer's chain");
+        match &self.levels {
+            CachedLevels::Mmap { mmap, data_offset, total_bytes } => {
+                use rayon::prelude::*;
+                const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+                // `try_load_cache` accepted the cache only with layers, layer
+                // size and mip count equal to the sheet's, so its data is
+                // `byte_len` long.
+                let src = &mmap[*data_offset..*data_offset + *total_bytes];
+                dst.par_chunks_mut(CHUNK_SIZE).zip(src.par_chunks(CHUNK_SIZE)).for_each(|(d, s)| d.copy_from_slice(s));
+            }
+            CachedLevels::Owned(layers) => {
+                let mut cursor = 0;
+                for chain in layers {
+                    for data in chain {
+                        dst[cursor..cursor + data.len()].copy_from_slice(data);
+                        cursor += data.len();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl EmojiTexture {
+    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
+        let t0 = std::time::Instant::now();
+        let host = EmojiLevels::load(path);
+        let total_texture_bytes = host.byte_len() as u64;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("emoji sheet"),
-            size: wgpu::Extent3d { width: sheet.layer_w, height: sheet.layer_h, depth_or_array_layers: sheet.layers },
-            mip_level_count: mip_levels,
+            size: wgpu::Extent3d { width: host.sheet.layer_w, height: host.sheet.layer_h, depth_or_array_layers: host.sheet.layers },
+            mip_level_count: host.mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let mut total_texture_bytes = 0u64;
-        for _ in 0..sheet.layers {
-            let (mut w, mut h) = (sheet.layer_w, sheet.layer_h);
-            for _ in 0..mip_levels {
-                total_texture_bytes += (w * h * 4) as u64;
-                w /= 2;
-                h /= 2;
-            }
-        }
-
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("emoji sheet staging"),
             size: total_texture_bytes,
@@ -1057,34 +1114,13 @@ impl EmojiTexture {
                 .slice(..)
                 .get_mapped_range_mut()
                 .expect("staging mapped range");
-            match &levels {
-                CachedLevels::Mmap { mmap, data_offset, total_bytes } => {
-                    use rayon::prelude::*;
-                    const CHUNK_SIZE: usize = 32 * 1024 * 1024;
-                    let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
-                    // SAFETY: the staging mapping is `total_texture_bytes` long, which
-                    // equals `total_bytes`: `try_load_cache` accepted the cache only
-                    // with layers, layer size and mip count equal to the sheet's, and
-                    // both sums run over those. The mapping is this scope's alone.
-                    let dst: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(dest_ptr, *total_bytes) };
-                    let src = &mmap[*data_offset..*data_offset + *total_bytes];
-                    dst.par_chunks_mut(CHUNK_SIZE)
-                        .zip(src.par_chunks(CHUNK_SIZE))
-                        .for_each(|(d, s)| {
-                            d.copy_from_slice(s);
-                        });
-                }
-                CachedLevels::Owned(layers) => {
-                    let mut cursor = 0;
-                    for chain in layers {
-                        for data in chain {
-                            mapped.slice(cursor..cursor + data.len()).copy_from_slice(data);
-                            cursor += data.len();
-                        }
-                    }
-                }
-            }
+            let dest_ptr = mapped.slice(..).as_raw_element_ptr().as_ptr();
+            // SAFETY: the staging buffer was created mapped, `total_texture_bytes`
+            // = `host.byte_len()` long, and this scope's mapping is its only view.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dest_ptr, total_texture_bytes as usize) };
+            host.copy_into(dst);
         }
+        let EmojiLevels { sheet, mip_levels, cell_ink, from_cache, t_parse, t_decode, t_mips, .. } = host;
         staging.unmap();
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

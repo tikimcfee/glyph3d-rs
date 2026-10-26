@@ -9,7 +9,7 @@
 //! them, so no field crate depends on the layout engine.
 
 use crate::storage::SlotRecord;
-use crate::GlyphInstance;
+use crate::{GlyphInstance, HostSlots};
 
 /// How a mode turns one engine record into its slot.
 ///
@@ -48,7 +48,7 @@ pub struct HostUpload {
 
 /// COPY_DST for partial per-slot edit uploads; COPY_SRC for the slot-dump
 /// verification readback.
-const SLOT_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+pub(crate) const SLOT_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_DST)
     .union(wgpu::BufferUsages::COPY_SRC);
 
@@ -298,24 +298,46 @@ pub fn upload_host_slots<T: Transcode>(
             *c = 1;
         }
     }
-    // The transcode walk: render chunks (slot stride) intersect the arena's
-    // own chunks (host Vec or mapped slices) — the two chunkings do not in
-    // general coincide, and a straddling range must transcode bit-identically
-    // to a contiguous one (the transcode is per record).
-    let mut ac = 0usize;
-    let mut arena_base = 0usize;
-    let buffers: Vec<wgpu::Buffer> = chunk_counts
+    let buffers: Vec<wgpu::Buffer> = chunk_sources(slices, &chunk_counts, chunk_cap)
         .iter()
         .enumerate()
-        .map(|(i, &count)| {
+        .map(|(i, chunk)| {
             let label = if chunk_counts.len() == 1 {
                 labels.buffers.to_string()
             } else {
                 format!("{} {i}/{}", labels.buffers, chunk_counts.len())
             };
+            if direct_host_upload {
+                #[cfg(target_os = "macos")]
+                {
+                    upload_direct_metal(device, &label, chunk, transcode)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    upload_staged_discrete(device, queue, &label, chunk, transcode, labels)
+                }
+            } else {
+                upload_staged_discrete(device, queue, &label, chunk, transcode, labels)
+            }
+        })
+        .collect();
+    HostUpload { chunk_capacity: chunk_cap, chunk_counts, buffers }
+}
+
+/// The host records' pieces covering each chunk of `chunk_cap` slots. The
+/// render chunks (slot stride) intersect the arena's own chunks (host Vec or
+/// mapped slices): the two chunkings do not in general coincide, and a
+/// straddling range must transcode bit-identically to a contiguous one (the
+/// transcode is per record).
+fn chunk_sources<'s>(slices: &[&'s [GlyphInstance]], chunk_counts: &[u32], chunk_cap: usize) -> Vec<ChunkSources<'s>> {
+    let mut ac = 0usize;
+    let mut arena_base = 0usize;
+    chunk_counts
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| {
             let first = i * chunk_cap;
             let need_end = first + count as usize;
-            // Gather the arena slice sub-ranges covering this chunk:
             let mut chunk = ChunkSources { pieces: Vec::new(), written: 0, count: count as usize };
             while chunk.written < chunk.count && ac < slices.len() {
                 let c = slices[ac];
@@ -335,20 +357,37 @@ pub fn upload_host_slots<T: Transcode>(
                     ac += 1;
                 }
             }
-
-            if direct_host_upload {
-                #[cfg(target_os = "macos")]
-                {
-                    upload_direct_metal(device, &label, &chunk, transcode)
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    upload_staged_discrete(device, queue, &label, &chunk, transcode, labels)
-                }
-            } else {
-                upload_staged_discrete(device, queue, &label, &chunk, transcode, labels)
-            }
+            chunk
         })
-        .collect();
-    HostUpload { chunk_capacity: chunk_cap, chunk_counts, buffers }
+        .collect()
+}
+
+/// The host records transcoded into host blocks of `block_slots` slots (a
+/// field that keeps its slots on the host: Derived, 2026-10-26), for
+/// [`crate::SlotSource::Blocks`]. Bit for bit the slots
+/// [`upload_host_slots`] would upload; only where they land differs.
+pub fn transcode_host_slots<T: Transcode>(
+    slices: &[&[GlyphInstance]],
+    glyph_count: usize,
+    block_slots: usize,
+    transcode: &T,
+) -> HostSlots {
+    let slot_bytes = std::mem::size_of::<T::Slot>();
+    assert!(
+        slot_bytes.is_multiple_of(4) && std::mem::align_of::<T::Slot>() <= 4,
+        "a host block is u32 words: the slot must be whole words, aligned to at most 4"
+    );
+    let mut slots = HostSlots::zeroed(glyph_count, block_slots, slot_bytes / 4);
+    let counts: Vec<u32> = (0..slots.blocks().len()).map(|k| slots.block_len(k) as u32).collect();
+    let sources = chunk_sources(slices, &counts, block_slots);
+    for (block, chunk) in slots.block_words_mut().into_iter().zip(&sources) {
+        // SAFETY: the block holds exactly `chunk.count` slots (its words are
+        // `count * slot_bytes / 4`, the counts came from the blocks), is
+        // aligned for a u32 and so for the slot (asserted above), and is
+        // borrowed mutably for the call.
+        unsafe {
+            chunk.transcode_into(block.as_mut_ptr().cast::<T::Slot>(), transcode);
+        }
+    }
+    slots
 }

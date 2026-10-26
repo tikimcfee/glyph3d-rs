@@ -163,6 +163,16 @@ pub struct FrameData<'a> {
     pub meshes_generation: u64,
     pub quads: &'a [MeshInstance],
     pub cubes: &'a [MeshInstance],
+    // ── what a host renderer draws the glyphs from (2026-10-26; the wgpu
+    // half binds the field's own buffers) ──
+    /// The field's slots on the host, in blocks that are its chunks
+    /// (Derived; None for a field without them). A block's `Arc` identity
+    /// is its generation: a write gives the block it touched a new one.
+    pub slots: Option<Ref<'a, glyph_field::HostSlots>>,
+    /// The Derived field's group overrides table (index 0 unused).
+    pub group_overrides: Option<Ref<'a, [u32]>>,
+    /// The item table the Derived shader reads, fixed for the scene's life.
+    pub item_table: &'a [glyph_field::ItemParamsGpu],
     // ── for the wgpu half only ──
     /// The self-culling (Visible) field's per-frame inputs.
     pub field_prepare: Option<glyph_field::FramePrepare>,
@@ -377,6 +387,9 @@ impl GlyphScene {
             meshes_generation: meshes.map_or(0, |m| m.revision),
             quads: meshes.map_or(&[], |m| &m.quads),
             cubes: meshes.map_or(&[], |m| &m.cubes),
+            slots: self.field.host_slots(),
+            group_overrides: self.field.group_overrides(),
+            item_table: &self.item_table,
             field_prepare,
             costs,
             uniform,

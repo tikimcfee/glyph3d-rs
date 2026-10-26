@@ -1,10 +1,17 @@
 //! The chunked slot buffers and per-slot byte addressing, for any slot record.
 //!
 //! Hoisted from the two mode crates (C1, 2026-10-09), which carried this
-//! twice with only the slot type renamed.
+//! twice with only the slot type renamed. A storage built from host blocks
+//! ([`SlotSource::Blocks`], the Derived field since 2026-10-26) also keeps
+//! the blocks, and every slot write patches the block as well as the
+//! buffer, so the host copy a makepad renderer draws from stays current.
 
-use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels};
-use crate::{split_at_chunks, SlotChunk, SlotSource};
+use std::cell::{Ref, RefCell};
+
+use wgpu::util::DeviceExt;
+
+use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels, SLOT_USAGE};
+use crate::{split_at_chunks, HostSlots, SlotChunk, SlotSource};
 
 /// A mode's per-glyph record, as the shared storage and upload see it.
 ///
@@ -33,6 +40,9 @@ pub struct SlotStorage<S: SlotRecord> {
     /// When mapped in host-visible memory, base address of the contiguous
     /// slot slice.
     mapped_base: Option<usize>,
+    /// The host blocks the buffers were uploaded from, one per chunk, kept
+    /// current by every write (None unless built from them).
+    host: Option<RefCell<HostSlots>>,
     _slot: std::marker::PhantomData<S>,
 }
 
@@ -53,8 +63,42 @@ impl<S: SlotRecord> SlotStorage<S> {
             chunk_capacity: chunk_capacity as u32,
             glyph_count: glyph_count as u32,
             mapped_base,
+            host: None,
             _slot: std::marker::PhantomData,
         }
+    }
+
+    /// One buffer per host block, uploaded from it; the blocks are kept.
+    pub fn from_host_slots(device: &wgpu::Device, slots: HostSlots, labels: &UploadLabels) -> Self {
+        assert_eq!(
+            slots.slot_words() * 4,
+            std::mem::size_of::<S>(),
+            "host blocks hold this mode's slots ({} B), not {} words each",
+            std::mem::size_of::<S>(),
+            slots.slot_words()
+        );
+        use rayon::prelude::*;
+        let n = slots.blocks().len();
+        // In parallel: one block's create-and-fill is a memcpy into a
+        // mapped buffer, and one thread left them serial (measured on a
+        // 71.6M-slot tree, 274 blocks: 198 ms of the scene's build).
+        let chunks = slots
+            .blocks()
+            .par_iter()
+            .enumerate()
+            .map(|(k, block)| {
+                let label = if n == 1 { labels.buffers.to_string() } else { format!("{} {k}/{n}", labels.buffers) };
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(&label),
+                    contents: bytemuck::cast_slice(block),
+                    usage: SLOT_USAGE,
+                });
+                SlotChunk { buffer, offset: 0, slots: slots.block_len(k) as u32 }
+            })
+            .collect();
+        let mut storage = Self::new(chunks, slots.block_slots(), slots.len(), None);
+        storage.host = Some(RefCell::new(slots));
+        storage
     }
 
     /// The storage `source` describes: a Device source's buffers bound as-is
@@ -71,6 +115,7 @@ impl<S: SlotRecord> SlotStorage<S> {
             SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
                 Self::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
             }
+            SlotSource::Blocks(slots) => Self::from_host_slots(device, slots, labels),
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {
                 let HostUpload { chunk_capacity, chunk_counts, buffers } =
                     upload_host_slots(device, queue, &slices, glyph_count, direct_host_upload, transcode, labels);
@@ -100,6 +145,21 @@ impl<S: SlotRecord> SlotStorage<S> {
         self.glyph_count
     }
 
+    /// The host blocks, when the storage keeps them.
+    pub fn host_slots(&self) -> Option<Ref<'_, HostSlots>> {
+        self.host.as_ref().map(RefCell::borrow)
+    }
+
+    /// Patch the host block too (when kept): `data` at byte `field_offset`
+    /// of `slot`, whole words.
+    fn patch_host(&self, slot: u32, field_offset: u64, data: &[u8]) {
+        if let Some(host) = &self.host {
+            let (whole, _) = data.as_chunks::<4>();
+            let words: Vec<u32> = whole.iter().map(|w| u32::from_le_bytes(*w)).collect();
+            host.borrow_mut().write(slot, (field_offset / 4) as usize, &words);
+        }
+    }
+
     /// The buffer holding `slot` and the byte address of `slot`'s first byte
     /// plus `field_offset` within it.
     pub fn address(&self, slot: u32, field_offset: u64) -> (&wgpu::Buffer, u64) {
@@ -111,6 +171,7 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// Partial slot upload: `data` at byte `field_offset` within a slot
     /// (4-aligned offsets — write_buffer's requirement).
     pub fn write_field(&self, queue: &wgpu::Queue, slot: u32, field_offset: u64, data: &[u8]) {
+        self.patch_host(slot, field_offset, data);
         let (buffer, offset) = self.address(slot, field_offset);
         queue.write_buffer(buffer, offset, data);
     }
@@ -119,6 +180,9 @@ impl<S: SlotRecord> SlotStorage<S> {
     pub fn write_slots(&self, queue: &wgpu::Queue, first_slot: u32, slots: &[S]) {
         for (_chunk, local, run_offset) in split_at_chunks(first_slot, slots.len() as u32, self.chunk_capacity) {
             let piece = &slots[run_offset as usize..(run_offset + local.len() as u32) as usize];
+            for (i, slot) in piece.iter().enumerate() {
+                self.patch_host(first_slot + run_offset + i as u32, 0, bytemuck::bytes_of(slot));
+            }
             let (buffer, offset) = self.address(first_slot + run_offset, 0);
             queue.write_buffer(buffer, offset, bytemuck::cast_slice(piece));
         }
