@@ -30,7 +30,7 @@
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back).
-test_floor = 374
+test_floor = 375
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1300,7 +1300,7 @@ expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"
 [[mutation]]
 name = "resolve-group-tint-halved"
 gate = "pixel-ab"
-why = "the flush writing a wrong appearance column into the group table: the proof that the draw path reads what the flush uploads (every group row is a node, and the first frame's resolve rebuilds columns 0-3 of every row; a row whose bytes changed goes up). A flush that wrote nothing, or wrote to the wrong buffer, would leave every golden byte-equal for the wrong reason. CONSUMED BY: nodes.rs write_row, behind every row GroupNodes::flush uploads (and the CPU mirror), every group of every scene on its first frame; text.png is the first framed view with a group. Re-aimed 2026-10-26 from resolve.wgsl's group-row output, when the CPU resolve replaced the GPU pass"
+why = "the flush writing a wrong appearance column into the group table: the proof that the draw path reads what the flush uploads (every group row is a node, and the first frame's resolve rebuilds columns 0-3 of every row; a row whose bytes changed goes up). A flush that wrote nothing, or wrote to the wrong buffer, would leave every golden byte-equal for the wrong reason. CONSUMED BY: nodes.rs write_row, behind every row GroupNodes::prepare plans and the frame uploads (the readers' table too), every group of every scene on its first frame; text.png is the first framed view with a group. Re-aimed 2026-10-26 from resolve.wgsl's group-row output, when the CPU resolve replaced the GPU pass"
 file = "native/src/glyph_scene/nodes.rs"
 op = "replace"
 find = "    row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];"
@@ -1330,7 +1330,7 @@ expect = "the_tree_resolves_the_rows_bevy_composed"
 [[mutation]]
 name = "library-face-offset-dropped"
 gate = "cargo-test"
-why = "each page face placed ON its sheet instead of page_face_gap behind it (2026-10-10: faces are built from the sheets' resolved worlds, no longer extracted from bevy). The face writes depth and the content's front sits on the page plane, so a face on the plane z-fights the text it backs. No golden view renders the library; the bevy test holds face_instance to bevy's extraction. CONSUMED BY: faces.rs face_instance, behind every face LibraryFaces::update rebuilds (every sheet the frame's resolve reaches). Re-aimed 2026-10-26 from library_faces.wgsl, when the host took the faces over from the compute pass; reddens library::tests::the_tree_resolves_the_rows_bevy_composed"
+why = "each page face placed ON its sheet instead of page_face_gap behind it (2026-10-10: faces are built from the sheets' resolved worlds, no longer extracted from bevy). The face writes depth and the content's front sits on the page plane, so a face on the plane z-fights the text it backs. No golden view renders the library; the bevy test holds face_instance to bevy's extraction. CONSUMED BY: faces.rs face_instance, behind every face LibraryFaces::prepare rebuilds (every sheet the frame's resolve reaches). Re-aimed 2026-10-26 from library_faces.wgsl, when the host took the faces over from the compute pass; reddens library::tests::the_tree_resolves_the_rows_bevy_composed"
 file = "native/src/glyph_scene/faces.rs"
 op = "replace"
 find = "    let t = [sheet.translation[0] + r[0], sheet.translation[1] + r[1], sheet.translation[2] + r[2]];"
@@ -1450,7 +1450,7 @@ expect = "the_gpu_draws_the_regions_the_tree_composes"
 [[mutation]]
 name = "group-flush-drops-changed-row"
 gate = "cargo-test"
-why = "the flush rebuilding a moved group row in its image of the GPU table but not uploading it (2026-10-26, the CPU resolve as the path): the GPU keeps the row's old transform while pick, cull and the HUD read the new one. No golden view moves a group after its first frame. CONSUMED BY: GroupNodes::flush, every resolved node with a group row; reddens glyph_scene::nodes::tests::flush_uploads_exactly_the_rows_that_changed (the table read back against the mirror)"
+why = "the flush rebuilding a moved group row in its image of the GPU table but not uploading it (2026-10-26, the CPU resolve as the path): the GPU keeps the row's old transform while pick, cull and the HUD read the new one. No golden view moves a group after its first frame. CONSUMED BY: GroupNodes::prepare (the frame's CPU half), every resolved node with a group row; reddens glyph_scene::nodes::tests::flush_uploads_exactly_the_rows_that_changed (the table read back against the mirror)"
 file = "native/src/glyph_scene/nodes.rs"
 op = "replace"
 find = "                changed.push(gid);"
@@ -1460,7 +1460,7 @@ expect = "flush_uploads_exactly_the_rows_that_changed"
 [[mutation]]
 name = "faces-update-drops-changed-face"
 gate = "cargo-test"
-why = "a page face rebuilt from its sheet's new world but not uploaded (2026-10-26, the host writes the faces): the face stays where its sheet was while the page's text moves on. No golden view renders the library. CONSUMED BY: LibraryFaces::update, every sheet the frame's resolve reaches; reddens glyph_scene::faces::tests::the_gpu_tables_hold_the_rows_and_faces_the_tree_composes"
+why = "a page face rebuilt from its sheet's new world but not uploaded (2026-10-26, the host writes the faces): the face stays where its sheet was while the page's text moves on. No golden view renders the library. CONSUMED BY: LibraryFaces::prepare (the frame's CPU half), every sheet the frame's resolve reaches; reddens glyph_scene::faces::tests::the_gpu_tables_hold_the_rows_and_faces_the_tree_composes"
 file = "native/src/glyph_scene/faces.rs"
 op = "replace"
 find = "                changed.push(k);"

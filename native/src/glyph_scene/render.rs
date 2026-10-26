@@ -1,14 +1,14 @@
-//! Stage F/H/L — Render pass orchestration (cull, backdrops, glyphs, selection, composite).
-//! Extracted from `glyph_scene.rs` to modularize frame rendering.
+//! The wgpu half of a frame (2026-10-26): `render_scene` prepares the
+//! frame on the CPU (`frame.rs`, `GlyphScene::prepare_frame`) and
+//! `encode_frame` uploads and draws it — the group rows, faces and regions
+//! it changed, the uniforms, the backdrops, the self-culling field's
+//! compute, then the passes: environment, backdrops, faces and regions,
+//! scene meshes, glyphs; the selection mask and tint; the composite.
 
 use crate::gpu::GpuContext;
-use crate::glyph_scene::camera::fov_y_deg;
-use crate::glyph_scene::environment::EnvCamera;
-use crate::glyph_scene::cull::{cull_segments, frustum_planes, CullView, Phase, PhaseDraws};
-use crate::glyph_scene::instance::FrameUniform;
-use crate::glyph_scene::pick::format_pick;
-use crate::glyph_scene::target::{Selection, POOL_FORMAT};
-use crate::glyph_scene::ui_probe::UiFileDyn;
+use crate::glyph_scene::cull::Phase;
+use crate::glyph_scene::frame::FrameData;
+use crate::glyph_scene::target::POOL_FORMAT;
 use crate::glyph_scene::GlyphScene;
 
 pub(super) fn render_scene(
@@ -17,6 +17,18 @@ pub(super) fn render_scene(
     encoder: &mut wgpu::CommandEncoder,
     target: &crate::scene::FrameTarget<'_>,
     t: f32,
+) {
+    let frame = scene.prepare_frame((target.width, target.height), t);
+    encode_frame(scene, ctx, encoder, target, &frame);
+}
+
+/// Upload and draw a prepared frame into `target`.
+pub(super) fn encode_frame(
+    scene: &GlyphScene,
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    target: &crate::scene::FrameTarget<'_>,
+    frame: &FrameData<'_>,
 ) {
     let crate::scene::FrameTarget {
         color_view,
@@ -28,23 +40,39 @@ pub(super) fn render_scene(
         width,
         height,
     } = *target;
-    // The transform tree first: the moved subtrees resolve on the CPU and
-    // the group rows they changed go up before any pass reads a row (the
-    // Visible field's cull below, the glyph pass). Nothing moved, nothing
-    // uploaded.
-    let flush = scene.nodes.flush(ctx);
-    // The library's page faces follow their sheets' resolved worlds: the
-    // faces of the sheets the resolve reached, rebuilt and uploaded where
-    // they changed (faces.rs).
-    if let (Some(faces), Some(plan)) = (&scene.library_faces, &flush) {
-        let cost = faces.update(&ctx.queue, &scene.nodes.tables(), plan);
-        if cost.rows > 0 && ctx.profiler.is_some() {
-            crate::gpu::record_cpu_scope(ctx, "library faces (CPU)", cost.ms);
+    let t = frame.time;
+    // The tables first: the group rows the resolve changed go up before any
+    // pass reads a row (the Visible field's cull below, the glyph pass);
+    // the page faces and regions with them. Nothing moved, nothing written.
+    scene.nodes.upload(&ctx.queue, &frame.group_runs);
+    if let Some(faces) = &scene.library_faces {
+        faces.upload(&ctx.queue, &frame.face_runs);
+    }
+    if let Some(regions) = &scene.library_regions {
+        regions.upload(&ctx.queue, &frame.region_runs);
+    }
+    if ctx.profiler.is_some() {
+        let c = &frame.costs;
+        if !frame.group_runs.is_empty() {
+            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", scene.nodes.last_flush().0.ms);
+        }
+        if c.faces.rows > 0 {
+            crate::gpu::record_cpu_scope(ctx, "library faces (CPU)", c.faces.ms);
+        }
+        if c.regions.composed > 0 {
+            crate::gpu::record_cpu_scope(ctx, "library regions (CPU)", c.regions.ms);
+        }
+        if scene.cull.is_some() {
+            crate::gpu::record_cpu_scope(ctx, "cull (CPU)", f64::from(c.cull_ms));
         }
     }
-    let aspect = width as f32 / height.max(1) as f32;
-    scene.viewport.set((width, height));
-    let frame = scene.camera_frame(t, aspect);
+    // GLYPH_LIBRARY_TIMING: one line per frame the regions did anything (a
+    // settled library prints nothing): refits taken, instances composed,
+    // instances and bytes uploaded, and the CPU time of it all.
+    let rc = &frame.costs.regions;
+    if (rc.refits > 0 || rc.composed > 0) && std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
+        println!("REGIONTIME refits={} composed={} uploaded={} upload_bytes={} prepare_ms={:.4}", rc.refits, rc.composed, rc.uploaded, rc.bytes, rc.ms);
+    }
 
     // Stage L (L3): the phase lists draw into the pooled view target
     // (ping-pong slot selected here) and composite into the driver's
@@ -62,83 +90,15 @@ pub(super) fn render_scene(
     let pool_slot = (comp.parity.get() % 2) as usize;
     comp.parity.set(comp.parity.get() + 1);
 
-    // Stage K (K4): apply live UI controls BEFORE culling so a slider
-    // drag takes effect this frame. This is the SINGLE write site of
-    // CullState::lod_min_px, and it runs only when a windowed probe is
-    // installed — offscreen never installs one, so offscreen culls with
-    // the `[lod] show_glyphs_px` setting by construction (gate 6's byte-equal
-    // PNGs are the proof).
-    if let (Some(probe), Some(cull)) = (&scene.ui_probe, &scene.cull) {
-        let p = probe.borrow();
-        cull.lod_min_px.set(p.lod_min_px);
-        cull.lod_backdrop_px.set(p.lod_backdrop_px);
-        cull.file_backgrounds.set(p.file_backgrounds);
-        cull.file_bg_color.set(p.file_bg_color);
+    ctx.queue.write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&frame.uniform));
+    if scene.params_uploaded.get() != frame.params_generation {
+        ctx.queue.write_buffer(&scene.params_buf, 0, bytemuck::bytes_of(&frame.params));
+        scene.params_uploaded.set(frame.params_generation);
     }
-    if let Some(probe) = &scene.ui_probe {
-        let p = probe.borrow();
-        let mode = if !p.greeking {
-            0
-        } else if p.greek_pure {
-            2
-        } else {
-            1
-        };
-        scene.set_greek_mode(&ctx.queue, mode);
-        scene.set_greek_onset_px(&ctx.queue, p.greek_onset_px);
-        scene.set_debug_tint(&ctx.queue, p.debug_tint);
-    }
-    // A field that culls and draws itself (Visible): the scene's per-file
-    // glyph ranges are not built for it, its slot math is never asked, and
-    // the CPU cull keeps only two jobs — the BACKDROP quads (under the
-    // field's backdrop threshold, not the glyph one, so a washed item is not
-    // also a backdrop) and the hidden flags.
-    let self_drawing = scene.field.draws_itself();
-
-    // Stage L (L1): fill every lane of the widened frame uniform from
-    // values already computed here. px_scale is computed once and shared
-    // with the cull block below (it was CullView-local before L1 — the
-    // uniform needs it even under --no-cull). flags bit 0
-    // (deterministic_rendering) stays 0 — reserved.
-    let px_scale = height as f32 / (2.0 * (fov_y_deg().to_radians() * 0.5).tan());
-    let cam = FrameUniform {
-        view_proj: frame.view_proj.to_cols_array(),
-        eye: frame.eye.to_array(),
-        _pad0: 0.0,
-        viewport: [width as f32, height as f32],
-        px_scale,
-        time: t,
-        flags: 0,
-        _pad1: 0,
-    };
-    ctx.queue
-        .write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&cam));
     // The self-culling field's per-frame work (cull, LOD sort, layout of the
     // glyph-tier lines into its transient slots) goes into THIS encoder
-    // before the glyph pass. The thresholds are the cull cells (live from the
-    // panel in windowed runs, the `[lod]` settings offscreen): the glyph tier
-    // is the existing `show_glyphs_px`, the backdrop tier the visible mode's own.
-    if self_drawing {
-        let p = scene.params.get();
-        let (lod_glyph_px, lod_backdrop_px) = scene
-            .cull
-            .as_ref()
-            .map(|c| (c.lod_min_px.get(), c.lod_backdrop_px.get()))
-            .unwrap_or_else(|| {
-                let s = &crate::config::settings().lod;
-                (s.show_glyphs_px, s.visible_backdrop_px)
-            });
-        let prepare = glyph_field::FramePrepare {
-            view_proj: frame.view_proj.to_cols_array_2d(),
-            eye: frame.eye.to_array(),
-            viewport: [width as f32, height as f32],
-            px_scale,
-            lod_glyph_px,
-            lod_backdrop_px,
-            greek_mode: p.greek_mode,
-            debug_tint: p.debug_tint,
-            time: t,
-        };
+    // before the glyph pass.
+    if let Some(prepare) = &frame.field_prepare {
         // C29 (2026-10-10): under GLYPH_CULL_DEBUG, the field's own cull
         // counters for frame 0 — the F8 HUD's figures, offscreen — read back
         // BLOCKING at the start of frame 1, before this frame's `prepare`
@@ -177,7 +137,7 @@ pub(super) fn render_scene(
         if timing {
             let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
         }
-        scene.field.prepare(&ctx.queue, encoder, &prepare);
+        scene.field.prepare(&ctx.queue, encoder, prepare);
         if timing {
             if let Some(v) = scene.field.visible() {
                 let s = v.stats();
@@ -195,272 +155,24 @@ pub(super) fn render_scene(
         // unconditional — an offscreen frame with a pick carries the
         // highlight too, which is what lets `tests/visible_verbs.rs` witness
         // this pass by pixel).
-        if let (Some(visible), Some(Selection::ByteRange { item, start, end }), true, true) = (
+        if let (Some(visible), Some((item, start, end)), true, true) = (
             scene.field.visible(),
-            scene.selection.as_ref(),
+            frame.selection.as_ref().and_then(|s| s.byte_range),
             comp.selection_fx.is_some(),
             vt.mask.is_some(),
         ) {
-            visible.prepare_mask(&ctx.queue, encoder, *item, *start, *end);
+            visible.prepare_mask(&ctx.queue, encoder, item, start, end);
         }
     }
-    if scene.environment.is_on() {
-        let env_cam = EnvCamera {
-            eye: frame.eye.as_dvec3(),
-            vp_rel: frame.view_proj_rel,
-            far: frame.far,
-            fit: scene.fit,
-        };
-        let ground_y = scene.environment.ground_y(scene.scene_min_y);
-        scene.environment.write(&ctx.queue, &env_cam, ground_y);
+    if let Some(env) = &frame.env {
+        scene.environment.write(&ctx.queue, env);
     }
-
-    // --- Stage F: CPU segment cull (frustum + LOD) ----------------------
-    // Stage L (L2): the cull output IS the phase lists (PhaseDraws). The
-    // legacy --no-cull path builds the Glyphs list straight from the
-    // chunk counts (one full range per chunk — identical draws to the
-    // pre-L2 per-chunk loop) and has no Backdrop phase content.
-    let mut cull_cpu_ms = 0.0f32;
-    let phase_draws: PhaseDraws = if let Some(cull) = &scene.cull {
-        // Stage H: CPU scope timing (only when GLYPH_PROFILE=1 built a
-        // profiler); the HUD's cull figure reads the same clock.
-        let cull_t0 = (ctx.profiler.is_some() || scene.ui_probe.is_some()).then(std::time::Instant::now);
-        let view = CullView {
-            planes: frustum_planes(&frame.view_proj),
-            eye: frame.eye,
-            px_scale,
-            lod_min_px: if self_drawing { cull.lod_backdrop_px.get() } else { cull.lod_min_px.get() },
-            file_backgrounds: cull.file_backgrounds.get(),
-            file_bg_color: cull.file_bg_color.get(),
-            backdrop_at_front: cull.backdrop_at_front,
-        };
-        // No chunks for a self-drawing field: zero chunks means the cull
-        // builds no glyph range (and never asks the field for its slot math).
-        let (chunk_cap, chunk_count) = if self_drawing {
-            (1, 0)
-        } else {
-            (scene.field.chunk_capacity(), scene.field.chunk_count())
-        };
-        let phase_draws = match &cull.tree {
-            // A library load: top-down over the transform tree, the flat
-            // cull's draws without a per-file box write per move.
-            Some(tree) => tree.borrow_mut().cull(&scene.nodes.tables(), cull, &view, chunk_cap, chunk_count),
-            None => cull_segments(&cull.segments, &cull.hidden, &cull.em_scale, &view, chunk_cap, chunk_count),
-        };
-        if !phase_draws.backdrops.is_empty() {
-            let max_cap = (cull.backdrop_insts_buf.size()
-                / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64)
-                as usize;
-            let slice_to_write = if phase_draws.backdrops.len() > max_cap {
-                &phase_draws.backdrops[..max_cap]
-            } else {
-                &phase_draws.backdrops[..]
-            };
-            ctx.queue.write_buffer(
-                &cull.backdrop_insts_buf,
-                0,
-                bytemuck::cast_slice(slice_to_write),
-            );
-        }
-        if let Some(t0) = cull_t0 {
-            cull_cpu_ms = t0.elapsed().as_secs_f32() * 1000.0;
-            if ctx.profiler.is_some() {
-                crate::gpu::record_cpu_scope(ctx, "cull (CPU)", f64::from(cull_cpu_ms));
-            }
-        }
-        if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && t == 0.0 {
-            let insts: u64 = phase_draws
-                .glyph_ranges
-                .iter()
-                .map(|(_, r)| (r.end - r.start) as u64)
-                .sum();
-            println!(
-                "CULLDBG glyph draws={} instances={} | backdrops={}",
-                phase_draws.glyph_ranges.len(),
-                insts,
-                phase_draws.backdrops.len(),
-            );
-        }
-        phase_draws
-    } else if self_drawing {
-        // --no-cull on a self-drawing field: it still culls itself; the
-        // scene simply has no backdrops to offer.
-        PhaseDraws { backdrops: Vec::new(), glyph_ranges: Vec::new() }
-    } else {
-        PhaseDraws {
-            backdrops: Vec::new(),
-            glyph_ranges: scene
-                .field
-                .chunk_glyph_counts()
-                .iter()
-                .enumerate()
-                .map(|(c, &n)| (c as u32, 0..n))
-                .collect(),
-        }
-    };
-
-    // The library's regions: the cull's refits re-pad their boxes, and the
-    // regions whose box changed or whose directory resolved are composed
-    // with their directories' worlds and uploaded where they changed.
-    if let (Some(regions), Some(tree)) = (&scene.library_regions, scene.cull.as_ref().and_then(|c| c.tree.as_ref())) {
-        let cost = regions.prepare(&ctx.queue, &mut tree.borrow_mut(), &scene.nodes.tables(), flush.as_ref());
-        if cost.composed > 0 && ctx.profiler.is_some() {
-            crate::gpu::record_cpu_scope(ctx, "library regions (CPU)", cost.ms);
-        }
-        // GLYPH_LIBRARY_TIMING: one line per frame the regions did anything
-        // (a settled library prints nothing): refits taken, instances
-        // composed, instances and bytes uploaded, and the CPU time of it all.
-        if (cost.refits > 0 || cost.composed > 0) && std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
-            println!("REGIONTIME refits={} composed={} uploaded={} upload_bytes={} prepare_ms={:.4}", cost.refits, cost.composed, cost.uploaded, cost.bytes, cost.ms);
-        }
-    }
-
-    // Stage K: refresh the windowed debug-UI probe (installed only by
-    // windowed runs; offscreen skips this entirely). Camera fields are
-    // this frame's ACTUAL products; the pick line is the same string
-    // format_pick produces for the stdout log; the K4 cull counters are
-    // the same sums GLYPH_CULL_DEBUG prints (zeros under --no-cull).
-    if let Some(probe) = &scene.ui_probe {
-        let mut p = probe.borrow_mut();
-        p.camera_mode = Some(scene.camera_mode);
-        p.eye = frame.eye.to_array();
-        p.yaw = scene.fly.yaw;
-        p.pitch = scene.fly.pitch;
-        p.environment = scene.environment.mode.get();
-        p.last_pick = scene.picked.as_ref().map(|h| format_pick(h, scene.views.group_row(h.view)));
-        p.selection = scene.selection.as_ref().map(Selection::describe);
-        p.pick_key = scene.picked.as_ref().map(|h| match &h.glyph {
-            Some(g) => format!("{} byte {}", h.rel_path, g.byte_off),
-            None => format!("{} (file)", h.rel_path),
-        });
-        p.grabbed_group = scene.grabbed_group;
-        p.grabbed_zone = scene.grabbed_zone.clone();
-        p.active_zone = scene.picked.as_ref().map(|h| {
-            if let Some(ctrl) = &scene.controller {
-                let dir = h.rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                ctrl.zone_for_file(&h.rel_path, dir)
-            } else {
-                format!("group:{}", scene.views.group_row(h.view))
-            }
-        });
-        p.carrel = scene.controller.as_ref().and_then(|ctrl| {
-            let carrel_e = ctrl.active_carrel?;
-            let carrel_comp = ctrl.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?;
-            let session = ctrl.session.as_ref()?;
-            let prompt = session.turn_prompt(carrel_comp.active_turn).unwrap_or("—");
-            let touched = if let Some(desk) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::Workdesk>(carrel_comp.workdesk_entity) {
-                let mut files: Vec<(String, usize, usize)> = desk.file_stacks.iter().map(|(path, &stack_e)| {
-                    let (act, cnt) = if let Some(st) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::FileRevisionStack>(stack_e) {
-                        (st.active_revision, st.revision_count)
-                    } else {
-                        (0, 0)
-                    };
-                    (path.clone(), act, cnt)
-                }).collect();
-                files.sort_by(|a, b| a.0.cmp(&b.0));
-                files
-            } else {
-                Vec::new()
-            };
-            let events = session.linearize_events(ctrl.revision_engine.as_ref());
-            let beat_summary = events.get(carrel_comp.active_beat).map(|e| e.summary()).unwrap_or_default();
-
-            let total_items = carrel_comp.beat_count;
-            let limit = carrel_comp.layout_options.deck_window_limit.max(1);
-            let max_deck_scroll = total_items.saturating_sub(limit);
-            let k = carrel_comp.layout_options.deck_scroll_offset.min(max_deck_scroll);
-            let m = limit.min(total_items.saturating_sub(k));
-            let window_item_range = if total_items > 0 && m > 0 {
-                let newest = total_items - k;
-                let oldest = total_items - k - m + 1;
-                (oldest, newest)
-            } else {
-                (0, 0)
-            };
-
-            let max_desk_scroll = ctrl.revision_engine.as_ref().map(|re| {
-                re.all_histories().values().map(|h| h.revisions.len().saturating_sub(carrel_comp.layout_options.desk_revision_limit.max(1))).max().unwrap_or(0)
-            }).unwrap_or(0);
-
-            Some(crate::glyph_scene::UiCarrelState {
-                session_id: carrel_comp.session_id.clone(),
-                active_turn: carrel_comp.active_turn,
-                turn_count: carrel_comp.turn_count,
-                active_beat: carrel_comp.active_beat,
-                beat_count: carrel_comp.beat_count,
-                prompt_summary: prompt.to_string(),
-                beat_summary,
-                touched_files: touched,
-                layout_options: carrel_comp.layout_options,
-                window_item_range,
-                max_deck_scroll,
-                max_desk_scroll,
-            })
-        });
-        if scene.cull.is_some() {
-            p.cull_ranges = phase_draws.glyph_ranges.len();
-            p.cull_instances = phase_draws
-                .glyph_ranges
-                .iter()
-                .map(|(_, r)| (r.end - r.start) as u64)
-                .sum();
-            p.cull_backdrops = phase_draws.backdrops.len();
-        } else {
-            p.cull_ranges = 0;
-            p.cull_instances = 0;
-            p.cull_backdrops = 0;
-        }
-        // The HUD's readout: what the field is, what the CPU cull cost, and
-        // the self-culling field's own counters (its readback lags a frame
-        // or two; nothing here waits for it).
-        p.field_mode = Some(scene.field.mode());
-        p.cull_cpu_ms = cull_cpu_ms;
-        p.segments = scene.cull.as_ref().map_or(0, |c| c.segments.len());
-        p.hidden_segments = scene.cull.as_ref().map_or(0, |c| c.hidden.iter().filter(|h| **h).count());
-        p.visible_stats = scene.field.visible().map(|v| v.stats());
-        // The layout dial's readout: the field's depth extent over the
-        // segment table (per frame, so group z-moves show too). None
-        // under --no-cull — no segment table to measure.
-        p.z_extent = scene.cull.as_ref().map(|c| {
-            c.segments.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], s| {
-                [lo.min(s.min[2]), hi.max(s.max[2])]
-            })
-        });
-        // K5: refresh the browser's dynamic row state (world pose under
-        // the live group TRS, hidden, tint) for the rows the browser drew
-        // last frame (`browser_rows`, a scrolled window of a dozen or so):
-        // the pose from the transform tree (O(depth) each — a library
-        // move's rows are rebuilt at the flush or a reader's sync, 2026-10-10),
-        // the appearance from the group table (verbs rebuild their row at
-        // once). Until 2026-10-10 every row
-        // was refreshed every frame, O(files). Skipped entirely offscreen
-        // (no probe installed).
-        if !p.files.is_empty() {
-            let st = &mut *p;
-            if st.file_dyn.len() != st.files.len() {
-                st.file_dyn = vec![UiFileDyn::default(); st.files.len()];
-            }
-            for &i in &st.browser_rows {
-                let (Some(r), Some(slot)) = (st.files.get(i), st.file_dyn.get_mut(i)) else { continue };
-                let (Some(g), Some((o, s))) = (scene.nodes.row(r.group_id), scene.nodes.world_offset_scale(r.group_id)) else {
-                    *slot = UiFileDyn::default();
-                    continue;
-                };
-                let (ox, oy) = (o[0], o[1]);
-                let (sx, sy) = (s[0].max(0.0), s[1].max(0.0));
-                let wmin = [r.aabb_min[0] * sx + ox, r.aabb_min[1] * sy + oy];
-                let wmax = [r.aabb_max[0] * sx + ox, r.aabb_max[1] * sy + oy];
-                *slot = UiFileDyn {
-                    center: [(wmin[0] + wmax[0]) * 0.5, (wmin[1] + wmax[1]) * 0.5],
-                    half: [(wmax[0] - wmin[0]) * 0.5, (wmax[1] - wmin[1]) * 0.5],
-                    hidden: g.cols[2][3] == 0.0,
-                    tint: [
-                        (g.cols[2][0].clamp(0.0, 1.0) * 255.0) as u8,
-                        (g.cols[2][1].clamp(0.0, 1.0) * 255.0) as u8,
-                        (g.cols[2][2].clamp(0.0, 1.0) * 255.0) as u8,
-                    ],
-                };
-            }
+    // The CPU cull's backdrop survivors, up to the buffer's capacity.
+    if let Some(cull) = &scene.cull {
+        if !frame.backdrops.is_empty() {
+            let max_cap = (cull.backdrop_insts_buf.size() / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64) as usize;
+            let n = frame.backdrops.len().min(max_cap);
+            ctx.queue.write_buffer(&cull.backdrop_insts_buf, 0, bytemuck::cast_slice(&frame.backdrops[..n]));
         }
     }
 
@@ -468,6 +180,7 @@ pub(super) fn render_scene(
     if let Some(meshes) = scene_meshes {
         scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
     }
+    let glyph_ranges = frame.glyph_ranges.pairs();
 
     // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
     // so it works on Metal). Nested in-pass scopes below additionally need
@@ -492,9 +205,7 @@ pub(super) fn render_scene(
             view: draw_color_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(crate::config::wgpu_color(
-                    crate::config::settings().glyph_scene.clear_color,
-                )),
+                load: wgpu::LoadOp::Clear(crate::config::wgpu_color(frame.clear_color)),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -511,7 +222,7 @@ pub(super) fn render_scene(
     });
     // The environment (ground/sky) goes down first, opaque, writing depth;
     // everything after sorts against it. Off: nothing recorded.
-    if scene.environment.is_on() {
+    if frame.env.is_some() {
         scene.environment.draw(&mut pass);
     }
     // Stage L (L2): record the phase lists in phase order — Backdrop
@@ -532,14 +243,14 @@ pub(super) fn render_scene(
                 // in CullState; the legacy branch never reaches in here
                 // (its backdrops list is empty).
                 if let Some(cull) = &scene.cull {
-                    if !phase_draws.backdrops.is_empty() {
+                    if !frame.backdrops.is_empty() {
                         let q = ctx
                             .profiler
                             .as_ref()
                             .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
                         pass.set_pipeline(&cull.backdrop_pipeline);
                         pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
-                        pass.draw(0..6, 0..phase_draws.backdrops.len() as u32);
+                        pass.draw(0..6, 0..frame.backdrops.len() as u32);
                         if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                             p.borrow().end_query(&mut pass, q);
                         }
@@ -584,7 +295,7 @@ pub(super) fn render_scene(
                 // (the ranges are empty for it by construction); then its
                 // wash tier — one quad per line too small for glyphs —
                 // under its own pipeline.
-                scene.field.record_draws(&mut pass, &phase_draws.glyph_ranges);
+                scene.field.record_draws(&mut pass, &glyph_ranges);
                 if let Some(visible) = scene.field.visible() {
                     visible.record_wash_draw(&mut pass);
                 }
@@ -608,14 +319,14 @@ pub(super) fn render_scene(
     // The Visible field's selection is a byte range (M3): `prepare_mask`
     // above laid its glyphs out into the field's selection buffer, and the
     // mask pass draws that buffer under the same mask pipeline.
-    let selection_phase = scene.selection.is_some().then_some(Phase::Selection);
+    let selection_phase = frame.selection.is_some().then_some(Phase::Selection);
     // The pool slot the composite will read: the scene slot, or the
     // tinted ping-pong partner when a selection was rendered.
     let mut final_slot = pool_slot;
     if let (Some(Phase::Selection), Some(fx), Some(mask)) =
         (selection_phase, &comp.selection_fx, &vt.mask)
     {
-        let sel = scene.selection.as_ref().expect("selection_phase implies selection");
+        let sel = frame.selection.as_ref().expect("selection_phase implies selection");
         // Mask pass: the selected glyph quads into the mask target
         // (glyph coverage in alpha). Blend disabled; no depth.
         let mask_query = ctx
@@ -645,30 +356,14 @@ pub(super) fn render_scene(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
-            match sel {
+            if sel.byte_range.is_some() {
                 // The Visible field: what `prepare_mask` emitted, one
                 // indirect draw over its selection buffer.
-                Selection::ByteRange { .. } => {
-                    if let Some(visible) = scene.field.visible() {
-                        visible.record_mask_draw(&mut pass);
-                    }
+                if let Some(visible) = scene.field.visible() {
+                    visible.record_mask_draw(&mut pass);
                 }
-                Selection::Glyph { .. } | Selection::Segment { .. } => {
-                    let mask_draws: Vec<(u32, std::ops::Range<u32>)> = match sel {
-                        Selection::Glyph { chunk, local } => vec![(*chunk, *local..*local + 1)],
-                        // Per-chunk split — the same math cull_segments uses.
-                        Selection::Segment { slot_base, slot_count } => glyph_field::split_at_chunks(
-                            *slot_base,
-                            *slot_count,
-                            scene.field.chunk_capacity(),
-                        )
-                        .filter(|(chunk, _, _)| *chunk < scene.field.chunk_count())
-                        .map(|(chunk, local, _)| (chunk, local))
-                        .collect(),
-                        Selection::ByteRange { .. } => unreachable!("matched above"),
-                    };
-                    scene.field.record_draws(&mut pass, &mask_draws);
-                }
+            } else {
+                scene.field.record_draws(&mut pass, &sel.ranges.pairs());
             }
         }
         if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {

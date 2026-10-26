@@ -472,6 +472,8 @@ impl GlyphScene {
             composite,
             params_buf,
             params: Cell::new(params),
+            params_generation: Cell::new(0),
+            params_uploaded: Cell::new(0),
             mesh_pipeline,
             mesh_frame_bg,
             library_faces,
@@ -482,36 +484,42 @@ impl GlyphScene {
         }
     }
 
-    /// Configure Greeking mode: 0 = disabled, 1 = smooth fade, 2 = pure hard bypass.
-    pub fn set_greek_mode(&self, queue: &wgpu::Queue, mode: u32) {
+    /// Configure Greeking mode: 0 = disabled, 1 = smooth fade, 2 = pure hard
+    /// bypass. Like every Params setter it changes the host's Params only;
+    /// the next frame carries it (`FrameData::params`).
+    pub fn set_greek_mode(&self, mode: u32) {
         let mut p = self.params.get();
         if p.greek_mode != mode {
             p.greek_mode = mode;
-            self.params.set(p);
-            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+            self.set_params(p);
         }
     }
 
+    /// The Params uniform's host copy, and a new generation for the frame.
+    fn set_params(&self, p: Params) {
+        self.params.set(p);
+        self.params_generation.set(self.params_generation.get() + 1);
+    }
+
     /// Configure whether Greeking (anti-Moiré subpixel bars) is enabled.
-    pub fn set_greeking(&self, queue: &wgpu::Queue, on: bool) {
+    pub fn set_greeking(&self, on: bool) {
         let cur = self.params.get().greek_mode;
         let mode = if on {
             if cur == 1 { 1 } else { 2 }
         } else {
             0
         };
-        self.set_greek_mode(queue, mode);
+        self.set_greek_mode(mode);
     }
 
     /// The visible field's debug tint (`--debug-tint`; `FramePrepare::debug_tint`):
     /// 0 off, 1 colour by LOD tier, 2 colour by cull state. Lives in the
     /// Params uniform's spare lane; the stored modes' shaders never read it.
-    pub fn set_debug_tint(&self, queue: &wgpu::Queue, mode: u32) {
+    pub fn set_debug_tint(&self, mode: u32) {
         let mut p = self.params.get();
         if p.debug_tint != mode {
             p.debug_tint = mode;
-            self.params.set(p);
-            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+            self.set_params(p);
         }
     }
 
@@ -523,12 +531,11 @@ impl GlyphScene {
     }
 
     /// Configure the on-screen glyph height in px/em where Greeking begins (default: 10.0).
-    pub fn set_greek_onset_px(&self, queue: &wgpu::Queue, onset: f32) {
+    pub fn set_greek_onset_px(&self, onset: f32) {
         let mut p = self.params.get();
         if (p.greek_onset_px - onset).abs() > 1e-3 {
             p.greek_onset_px = onset;
-            self.params.set(p);
-            queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+            self.set_params(p);
         }
     }
 
