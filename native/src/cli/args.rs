@@ -161,15 +161,6 @@ pub struct Cli {
     /// EVERY lane of EVERY byte plus boxes and the batch union, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub fixture_fold: Vec<PathBuf>,
-    /// Scan form: run the ported scan form over each .pipe.bin at a SWEEP of
-    /// chunk/group/shard tunings and compare under the tiered contract, then
-    /// exit. Invariance across the tunings is associativity in situ.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub fixture_scan: Vec<PathBuf>,
-    /// Bake: replay each .bake.bin through the ported bake and diff the
-    /// record AND every seed-protocol query bit-exact, then exit.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub fixture_bake: Vec<PathBuf>,
     /// HyperLayout against the oracle-backed fold: lay each input out with the
     /// production engine and with `fold.rs` (held to the JS oracle by
     /// `--fixture-fold`), diff records, instances and placements bit-exact,
@@ -402,8 +393,6 @@ pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
         || !cli.fixture_reference.is_empty()
         || !cli.fixture_trie.is_empty()
         || !cli.fixture_fold.is_empty()
-        || !cli.fixture_scan.is_empty()
-        || !cli.fixture_bake.is_empty()
         || !cli.hyper_oracle_check.is_empty()
         || !cli.line_table_stats.is_empty();
     cli.screenshot.is_none() && !checks

@@ -64,8 +64,8 @@ fn verify_corpus(name: &str, a: &Artifact) -> bool {
     let (good, out) = sh(
         &format!(
             "rm -rf {0} && mkdir -p {0} && cp -R engine/fixtures {0}/fixtures && cp engine/glyph_schema.mjs {0}/ \
-             && rm -f {0}/fixtures/*.pipe.bin {0}/fixtures/*.bake.bin \
-             && cd {0}/fixtures && node gen.mjs >/dev/null && node gen-bake.mjs >/dev/null",
+             && rm -f {0}/fixtures/*.pipe.bin \
+             && cd {0}/fixtures && node gen.mjs >/dev/null",
             scratch.to_string_lossy()
         ),
         &root(),

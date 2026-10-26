@@ -96,8 +96,6 @@ fn main() {
             FixtureTask::Reference(paths) => fixture::run_fixture_reference(&paths),
             FixtureTask::Trie(paths) => fixture::run_fixture_trie(&paths),
             FixtureTask::Fold(paths) => fixture::run_fixture_fold(&paths),
-            FixtureTask::Scan(paths) => scan::run_fixture_scan(&paths),
-            FixtureTask::Bake(paths) => bake::run_fixture_bake(&paths),
             FixtureTask::HyperOracle(paths, mode, tab_width) => hyper_oracle::run_hyper_oracle_check(&paths, mode, tab_width),
             FixtureTask::LineTableStats(paths, mode) => {
                 glyph3d_native::layout_hyper::line_table::run_line_table_stats(&paths, mode)

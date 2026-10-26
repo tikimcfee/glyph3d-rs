@@ -754,8 +754,6 @@ fn check_runs_never_discover_launch_config() {
         &["--load-repo", "r", "--repo-scan-only"],
         &["--fixture-trie", "f"],
         &["--fixture-fold", "f"],
-        &["--fixture-scan", "f"],
-        &["--fixture-bake", "f"],
         &["--fixture-reference", "f"],
         &["--hyper-oracle-check", "f"],
         &["--line-table-stats", "f"],

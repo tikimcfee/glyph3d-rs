@@ -76,13 +76,6 @@ pub const TRIE_FLAG_MISSING: u32 = 1;
 /// (each segment starts at x = 0), and the wrap SEGMENT index still exists in both
 /// modes — under `Back` it feeds z and no longer feeds row. Picking by (row, col)
 /// still resolves uniquely because col differs between segments.
-///
-/// WHY IT IS ITEM-LEVEL AND MUST STAY THAT WAY: `scan::scan_combine`'s junction term
-/// evaluates `rows_for_line` with `b`'s parameters, so it is not associative across a
-/// change of them. Mode joins wrap in that term, which makes the non-associative
-/// surface WIDER, not narrower. What keeps the scan form safe is structural and
-/// unchanged: an item boundary emits a resetting leaf, so no interval without a reset
-/// spans two items. See `scan::tests::mixed_mode_is_outside_the_monoid_s_domain`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum WrapMode {
@@ -413,23 +406,11 @@ impl Slots {
     pub fn base_x(&self, id: usize) -> f32 {
         self.lm[id * 4 + 3]
     }
-    /// The scan form writes these from `resolve_x`, a separate dispatch from
-    /// the one that assigns row/col — hence setters the serial fold does not
-    /// need, since it computes a position and its lanes in the same breath.
-    #[inline]
-    pub(crate) fn set_position(&mut self, id: usize, x: f32, y: f32, z: f32) {
-        self.lm[id * 4] = x;
-        self.lm[id * 4 + 1] = y;
-        self.lm[id * 4 + 2] = z;
-    }
+    /// A test's way to plant a base x (the fold computes it with the position).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn set_base_x(&mut self, id: usize, v: f32) {
         self.lm[id * 4 + 3] = v;
-    }
-    #[inline]
-    pub(crate) fn zero_positional(&mut self, id: usize) {
-        self.lm[id * 4..id * 4 + 4].fill(0.0);
-        self.lc[id * 2..id * 2 + 2].fill(0);
     }
 
     #[inline]

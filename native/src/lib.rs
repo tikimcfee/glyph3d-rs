@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 pub mod agent_transcript;
 pub mod atlas;
-pub mod bake;
 pub mod cli;
 pub mod config;
 pub mod fixture;
@@ -25,7 +24,6 @@ pub mod offscreen;
 pub mod relayout;
 pub mod repo;
 pub mod revision;
-pub mod scan;
 pub mod scene;
 pub mod seam;
 pub mod spatial_scene;

@@ -16,7 +16,7 @@ pub enum CliCommand {
     },
     /// Inspect and print GPU device profile / key, then exit.
     GpuInfo(GpuInfoMode),
-    /// Reference port parity check over .pipe.bin / .bake.bin fixtures.
+    /// Reference port parity check over .pipe.bin fixtures.
     Fixture(FixtureTask),
     /// Headless repo scan, layout, and statistics measurement without a GPU.
     RepoScanOnly {
@@ -42,8 +42,6 @@ pub enum FixtureTask {
     Reference(Vec<PathBuf>),
     Trie(Vec<PathBuf>),
     Fold(Vec<PathBuf>),
-    Scan(Vec<PathBuf>),
-    Bake(Vec<PathBuf>),
     /// HyperLayout vs the oracle-backed fold; the mode and the tab width
     /// apply to directory and text inputs (fixtures carry their own).
     HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode, crate::fold::TabWidth),
@@ -113,12 +111,6 @@ impl Cli {
         }
         if !self.fixture_fold.is_empty() {
             return CliCommand::Fixture(FixtureTask::Fold(self.fixture_fold.clone()));
-        }
-        if !self.fixture_scan.is_empty() {
-            return CliCommand::Fixture(FixtureTask::Scan(self.fixture_scan.clone()));
-        }
-        if !self.fixture_bake.is_empty() {
-            return CliCommand::Fixture(FixtureTask::Bake(self.fixture_bake.clone()));
         }
         if !self.hyper_oracle_check.is_empty() {
             return CliCommand::Fixture(FixtureTask::HyperOracle(
