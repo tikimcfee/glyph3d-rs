@@ -25,21 +25,23 @@ use crate::config::EnvironmentMode;
 /// `struct Env` in environment.wgsl: two mat4 then eleven vec4, 304 B. Pinned
 /// on both sides — here and in `native/tests/wgsl.rs` (naga's span).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(super) struct EnvUniform {
-    inv_vp_rel: [f32; 16],
-    vp_rel: [f32; 16],
-    eye: [f32; 4],
-    grid_origin: [f32; 4],
-    spacing: [f32; 4],
-    fade: [f32; 4],
-    ground: [f32; 4],
-    minor_line: [f32; 4],
-    major_line: [f32; 4],
-    axis_x: [f32; 4],
-    axis_z: [f32; 4],
-    sky_horizon: [f32; 4],
-    sky_zenith: [f32; 4],
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct EnvUniform {
+    /// The inverse of proj × view-rotation (camera-relative), column-major.
+    pub inv_vp_rel: [f32; 16],
+    pub vp_rel: [f32; 16],
+    /// xyz = eye (world), w = ground_y.
+    pub eye: [f32; 4],
+    pub grid_origin: [f32; 4],
+    pub spacing: [f32; 4],
+    pub fade: [f32; 4],
+    pub ground: [f32; 4],
+    pub minor_line: [f32; 4],
+    pub major_line: [f32; 4],
+    pub axis_x: [f32; 4],
+    pub axis_z: [f32; 4],
+    pub sky_horizon: [f32; 4],
+    pub sky_zenith: [f32; 4],
 }
 
 /// What the environment needs from the frame's camera.
@@ -165,9 +167,14 @@ impl Environment {
             .unwrap_or_else(|| scene_min_y - crate::config::settings().environment.ground_gap)
     }
 
-    /// Upload this frame's uniform. Call only when on.
-    pub(super) fn write(&self, queue: &wgpu::Queue, cam: &EnvCamera, ground_y: f32) {
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform(cam, ground_y)));
+    /// This frame's uniform (the CPU half; `write` uploads it).
+    pub(super) fn frame_uniform(&self, cam: &EnvCamera, ground_y: f32) -> EnvUniform {
+        uniform(cam, ground_y)
+    }
+
+    /// Upload a frame's uniform. Call only when on.
+    pub(super) fn write(&self, queue: &wgpu::Queue, u: &EnvUniform) {
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
     }
 
     /// Record the draw. Call first in the glyph field pass, only when on.

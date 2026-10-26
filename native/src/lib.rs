@@ -249,11 +249,11 @@ fn build_scene_impl(
         } else {
             1
         };
-        scene.set_greek_mode(&ctx.queue, mode);
+        scene.set_greek_mode(mode);
         if let Some(onset) = cull_opts.greek_onset_px {
-            scene.set_greek_onset_px(&ctx.queue, onset);
+            scene.set_greek_onset_px(onset);
         }
-        scene.set_debug_tint(&ctx.queue, cull_opts.debug_tint);
+        scene.set_debug_tint(cull_opts.debug_tint);
         scene.set_environment(cull_opts.environment, cull_opts.ground_y);
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)

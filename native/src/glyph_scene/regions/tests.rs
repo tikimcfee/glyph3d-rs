@@ -285,7 +285,9 @@ fn the_gpu_draws_the_regions_the_tree_composes() {
     let frame = |t: &mut NodeTables, fx: &mut Fixture| {
         let plan = t.resolve_frame();
         fx.tree.refit(t, &fx.cull);
-        regions.prepare(&ctx.queue, &mut fx.tree, t, Some(&plan))
+        let (cost, runs) = regions.prepare(&mut fx.tree, t, Some(&plan));
+        regions.upload(&ctx.queue, &runs);
+        cost
     };
     let check = |t: &mut NodeTables, fx: &mut Fixture, what: &str| {
         let cost = frame(t, fx);

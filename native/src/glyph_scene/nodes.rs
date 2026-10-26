@@ -19,12 +19,14 @@
 //! resolve rebuilds each row with the bits it had and every golden frame
 //! stays byte-equal.
 //!
-//! **The frame** (`flush`, first thing in the frame): the tables resolve
-//! the moved subtrees on the CPU (`NodeTables::resolve_frame`), each
-//! resolved node with a group row has its row rebuilt in the table, and the
-//! rows whose bytes changed since the last upload (`unsent`: the flush's,
-//! and any written between frames) go up, coalesced into runs
-//! (`upload_rows`). Between a write and the next flush the table is
+//! **The frame's flush**, first thing in the frame, in two halves (the
+//! frame's CPU half, `frame.rs`, and its drawing half): `prepare` resolves
+//! the moved subtrees on the CPU (`NodeTables::resolve_frame`), rebuilds
+//! the row of each resolved node with a group row in the table, and plans
+//! the runs that the rows whose bytes changed since the last flush
+//! (`unsent`: the flush's, and any written between frames) go up in
+//! (`upload_runs`); the frame hands those runs to its consumer, and
+//! `upload` writes them for wgpu. Between a write and the next flush the table is
 //! therefore what the readers see and the GPU table is a frame behind by
 //! exactly `unsent`. A settled frame resolves nothing and uploads nothing.
 //! The resolved ranges are handed on: the library's
@@ -54,46 +56,48 @@
 //! carrel that hides a card still hides it.
 
 use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::time::Instant;
 
 use glyph_scene_graph::upload::{plan_upload, UploadPlan};
 use glyph_scene_graph::{Appearance, FramePlan, NodeHandle, NodeTables, Similarity};
 
 use super::GroupRow;
-use crate::gpu::GpuContext;
 
 /// What one host table's upload did and cost (the instruments:
 /// `GLYPH_LIBRARY_TIMING`, the profiler's CPU scopes).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct UploadCost {
+pub struct UploadCost {
     /// Rows whose bytes changed.
     pub rows: usize,
-    /// Bytes written to the queue (whole runs: a run may carry clean rows).
+    /// Bytes the runs cover (whole runs: a run may carry clean rows).
     pub bytes: usize,
-    /// Host time: rebuilding the rows and queueing the writes.
+    /// Host time: rebuilding the rows, planning and queueing the writes.
     pub ms: f64,
 }
 
-/// Write `rows` (ascending, unique) of a host table `data` (`row_bytes` a
-/// row, `len` rows) into `buffer` by `plan_upload`'s choice; returns the
-/// bytes queued.
-pub(super) fn upload_rows(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8], row_bytes: usize, rows: &[u32]) -> usize {
-    let len = (data.len() / row_bytes) as u32;
+/// The runs `rows` (ascending, unique) of a `len`-row table go up in, by
+/// `plan_upload`'s choice: a few coalesced runs, or the whole table as one.
+/// What a frame hands every consumer of a host table (`FrameData`): the
+/// wgpu half writes exactly these, a host copies exactly these.
+pub(crate) fn upload_runs(rows: &[u32], len: u32) -> Vec<Range<u32>> {
     match plan_upload(rows, len) {
-        UploadPlan::None => 0,
-        UploadPlan::Full => {
-            queue.write_buffer(buffer, 0, data);
-            data.len()
-        }
-        UploadPlan::Runs(runs) => {
-            let mut bytes = 0;
-            for (first, n) in runs {
-                let (a, b) = (first as usize * row_bytes, (first + n) as usize * row_bytes);
-                queue.write_buffer(buffer, a as u64, &data[a..b]);
-                bytes += b - a;
-            }
-            bytes
-        }
+        UploadPlan::None => Vec::new(),
+        UploadPlan::Full => std::iter::once(0..len).collect(),
+        UploadPlan::Runs(runs) => runs.into_iter().map(|(first, n)| first..first + n).collect(),
+    }
+}
+
+/// Rows covered by `runs`.
+pub(crate) fn run_rows(runs: &[Range<u32>]) -> usize {
+    runs.iter().map(|r| r.len()).sum()
+}
+
+/// Write `runs` of a host table `data` (`row_bytes` a row) into `buffer`.
+pub(super) fn write_runs(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8], row_bytes: usize, runs: &[Range<u32>]) {
+    for r in runs {
+        let (a, b) = (r.start as usize * row_bytes, r.end as usize * row_bytes);
+        queue.write_buffer(buffer, a as u64, &data[a..b]);
     }
 }
 
@@ -136,6 +140,8 @@ pub(crate) struct GroupNodes {
     /// The last flush's group-row upload and nodes resolved, for the
     /// instruments.
     last_flush: Cell<(UploadCost, u32)>,
+    /// Bumped by every flush that changed a row (`FrameData::groups_generation`).
+    generation: Cell<u64>,
     /// Moved subtree roots whose rows are not rebuilt yet (`defer_rows`;
     /// each slot once, `pending_mark`). The flush clears them: its resolve
     /// covers every moved node.
@@ -165,6 +171,7 @@ impl GroupNodes {
             nodes: Vec::with_capacity(groups.len()),
             ext: Vec::with_capacity(groups.len()),
             last_flush: Cell::new((UploadCost::default(), 0)),
+            generation: Cell::new(0),
             pending: RefCell::new(Vec::new()),
             pending_mark: RefCell::new(Vec::new()),
         };
@@ -304,14 +311,14 @@ impl GroupNodes {
         }
     }
 
-    /// Resolve the frame's node edits and upload the group rows they
-    /// changed — first thing in the frame, before any pass reads a group
-    /// row (the writes land at the frame's submit, ahead of its passes). A
-    /// settled scene resolves and uploads nothing. Returns what resolved
-    /// (None without a device), which the faces and regions rebuild from;
-    /// the rows' cost is kept for the instruments (`last_flush`).
-    pub(crate) fn flush(&self, ctx: &GpuContext) -> Option<FramePlan> {
-        let buffer = self.buffer.as_ref()?;
+    /// The CPU half of the frame's flush, first thing in the frame: resolve
+    /// the node edits, rebuild the rows they reach, and plan the runs the
+    /// rows changed since the last flush go up in (every row written between
+    /// frames included). Returns what resolved, which the faces and regions
+    /// rebuild from, and those runs, which the frame's consumer must write
+    /// (`upload` for wgpu); bumps the generation when there are any. A
+    /// settled scene resolves nothing and plans nothing.
+    pub(crate) fn prepare(&self) -> (FramePlan, Vec<Range<u32>>) {
         let t0 = Instant::now();
         let mut t = self.tables.borrow_mut();
         let plan = t.resolve_frame();
@@ -333,13 +340,31 @@ impl GroupNodes {
         }
         changed.sort_unstable();
         changed.dedup();
-        let bytes = upload_rows(&ctx.queue, buffer, bytemuck::cast_slice(&rows), std::mem::size_of::<GroupRow>(), &changed);
-        let rows = UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 };
-        if (!plan.is_empty() || bytes > 0) && ctx.profiler.is_some() {
-            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", rows.ms);
+        let runs = upload_runs(&changed, rows.len() as u32);
+        if !runs.is_empty() {
+            self.generation.set(self.generation.get() + 1);
         }
-        self.last_flush.set((rows, plan.resolved));
-        Some(plan)
+        let bytes = run_rows(&runs) * std::mem::size_of::<GroupRow>();
+        let cost = UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 };
+        self.last_flush.set((cost, plan.resolved));
+        (plan, runs)
+    }
+
+    /// The wgpu half of the flush: write `runs` (`prepare`'s) into the GPU
+    /// group table, before any pass reads a row (the writes land at the
+    /// frame's submit, ahead of its passes). Its time joins the flush's.
+    pub(crate) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
+        let Some(buffer) = &self.buffer else { return };
+        let t0 = Instant::now();
+        write_runs(queue, buffer, bytemuck::cast_slice(&self.rows.borrow()), std::mem::size_of::<GroupRow>(), runs);
+        let (mut cost, resolved) = self.last_flush.get();
+        cost.ms += t0.elapsed().as_secs_f64() * 1e3;
+        self.last_flush.set((cost, resolved));
+    }
+
+    /// The flush generation: bumped whenever a flush planned any run.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     /// The last flush's group-row upload and nodes resolved — the previous
@@ -452,7 +477,7 @@ fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Ap
 /// Block on a readback of `bytes` of `src` (tests only, never the frame
 /// path).
 #[cfg(test)]
-pub(crate) fn read_buffer(ctx: &GpuContext, src: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+pub(crate) fn read_buffer(ctx: &crate::gpu::GpuContext, src: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
     let size = bytes.div_ceil(4) * 4;
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test readback"),
@@ -548,7 +573,8 @@ mod tests {
         ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&rows));
         let mut n = GroupNodes::new(&buf, &rows);
         let flush = |n: &GroupNodes| {
-            let plan = n.flush(&ctx).expect("a device-backed table");
+            let (plan, runs) = n.prepare();
+            n.upload(&ctx.queue, &runs);
             (plan.resolved, n.last_flush().0)
         };
         let (resolved, up) = flush(&n);
