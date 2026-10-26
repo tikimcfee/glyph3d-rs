@@ -6,17 +6,19 @@
 //! anything moved, ~88 % of a drag or page-turn frame, findings E16). A
 //! move writes the LOCAL rows of the nodes that moved: a page turn its
 //! sheets, a `c` drag its directory, a `g` drag its file. The frame's flush
-//! uploads those rows and the GPU resolve composes the moved subtrees into
-//! the group rows the draw shaders read; the page faces follow on the GPU
-//! (`faces.rs`). Nothing on the CPU is per moved FILE either: the move is
-//! noted on the tree cull (`tree_cull.rs`, which refits its bounds along
-//! the moved nodes' ancestors and computes moved files' boxes as it walks)
-//! and deferred for the CPU mirror of the group rows, which a reader (pick,
-//! a verb, the windowed HUD) brings up to date when it asks
+//! resolves the moved subtrees on the CPU and uploads the group rows they
+//! changed; the page faces and regions of the resolved sheets and
+//! directories follow the same way (`faces.rs`, `regions.rs`). Nothing in
+//! the move itself is per moved FILE: it is noted on the tree cull
+//! (`tree_cull.rs`, which refits its bounds along the moved nodes'
+//! ancestors and computes moved files' boxes as it walks) and deferred for
+//! the CPU mirror of the group rows, which a reader (pick, a verb, the
+//! windowed HUD) brings up to date when it asks
 //! (`GroupNodes::defer_mirror` / `sync_group_mirror`).
 //!
 //! `GLYPH_LIBRARY_TIMING=1` prints one `LIBTIME` line per animated frame:
-//! what moved, what each stage cost, and the bytes the last flush queued.
+//! what moved, what each stage cost, and what the last flush and face
+//! update resolved, uploaded and cost.
 
 use std::time::Instant;
 
@@ -92,8 +94,8 @@ impl GlyphScene {
     }
 
     /// Move a library zone by a WORLD delta: its directory node's local row
-    /// takes the delta in its parent's frame (one row; the GPU carries the
-    /// subtree), and the library keeps it through every later re-plan
+    /// takes the delta in its parent's frame (one row; the resolve carries
+    /// the subtree), and the library keeps it through every later re-plan
     /// (`Library::move_zone`). Returns the move's cost, or None for no such
     /// zone.
     pub(super) fn library_move_zone(&mut self, zone_id: &str, d: [f32; 3]) -> Option<(f64, MoveCost)> {
@@ -129,17 +131,24 @@ impl GlyphScene {
             crate::gpu::record_cpu_scope(ctx, "library move notes (CPU)", cost.note_ms);
         }
         if std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
-            let (flush_bytes, flush_resolved, _) = self.nodes.last_flush();
+            let (rows, resolved) = self.nodes.last_flush();
+            let faces = self.library_faces.as_ref().map(|f| f.last_update()).unwrap_or_default();
             let (cull_ms, visited, cands) = self.last_tree_cull();
             println!(
-                "LIBTIME nodes_moved={} ease_ms={:.4} note_ms={:.4} local_bytes={} last_flush_bytes={} last_flush_resolved={} \
+                "LIBTIME nodes_moved={} ease_ms={:.4} note_ms={:.4} local_bytes={} last_flush_resolved={} last_flush_rows={} \
+                 last_flush_bytes={} last_flush_ms={:.4} last_faces={} last_faces_bytes={} last_faces_ms={:.4} \
                  last_cull_ms={:.4} last_cull_visited={} last_cull_candidates={} animating={}",
                 tick.nodes_moved,
                 tick.ease_ms,
                 cost.note_ms,
                 tick.nodes_moved * std::mem::size_of::<glyph_scene_graph::Similarity>(),
-                flush_bytes,
-                flush_resolved,
+                resolved,
+                rows.rows,
+                rows.bytes,
+                rows.ms,
+                faces.rows,
+                faces.bytes,
+                faces.ms,
                 cull_ms,
                 visited,
                 cands,

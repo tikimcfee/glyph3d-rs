@@ -5,38 +5,39 @@
 //! when the handle was issued (slotmap's scheme; Weissflog, "Handles are the
 //! better pointers", 2018). Freeing bumps the slot's generation, so every
 //! handle to the old occupant is refused with [`NodeError::Stale`] — before
-//! the slot is reused and after. A freed slot is also QUARANTINED for
-//! `frames_in_flight` frames before it can be reused: the CPU has forgotten
-//! the node, but a frame still in flight on the GPU may read its rows, and a
-//! reused row would hand that frame someone else's transform. A slot whose
-//! generation would wrap is retired, never reused.
+//! the slot is reused and after. A slot whose generation would wrap is
+//! retired, never reused. Nothing on the GPU is keyed by pool slot (the
+//! renderer uploads rows keyed by its own tables: group rows, face and
+//! region instances), so a freed slot is reusable at once.
 //!
 //! **Topology.** Parent, first/last child and sibling links per node, and a
 //! depth-first (pre-order) ORDER the CPU keeps, so any node's subtree is the
 //! contiguous range `pos[n] .. pos[n] + size[n]` of it. A structural edit
 //! (insert, remove, reparent) marks the order stale and the next
-//! [`NodeTables::prepare_frame`] rebuilds it in one O(n) walk — measured at
+//! [`NodeTables::resolve_frame`] rebuilds it in one O(n) walk — measured at
 //! ~0.3 ms for the 102k-node Linux tree (`resolve-bench`); a later step can
 //! splice instead if structure ever changes per frame. Children keep their
 //! insertion order, so a rebuild moves only what the edit moved.
 //!
 //! **Tables.** `local` (a [`Similarity`], 32 B), `post` (the non-inherited
-//! per-axis scale, 16 B), `appearance` (tint, alpha, blend, 32 B) and the
-//! GPU's topology row (parent, output group row; 8 B). Each has its own
-//! setter and its own dirty set, so a transform write cannot touch a node's
-//! appearance and an appearance write cannot touch its transform — the
-//! library probe's E4, where one writer owned the whole group row and an
-//! animation erased every tint and hide it crossed.
+//! per-axis scale, 16 B), `appearance` (tint, alpha, blend, 32 B), the
+//! output group row, and `world` (the composed similarity and inherited
+//! alpha, written by the resolve alone). Each input has its own setter, so
+//! a transform write cannot touch a node's appearance and an appearance
+//! write cannot touch its transform — the library probe's E4, where one
+//! writer owned the whole group row and an animation erased every tint and
+//! hide it crossed.
 //!
-//! **Per frame.** [`NodeTables::prepare_frame`] turns the dirty sets into a
-//! [`FramePlan`]: the rows each table must upload (ascending), the span of
-//! the order that changed, and the depth-first RANGES the resolve pass must
-//! cover — the union of every dirty node's subtree, merged, then coalesced to
-//! at most [`MAX_RESOLVE_RANGES`]. Coalescing may resolve a few clean nodes
-//! between two dirty subtrees; that is harmless because the resolve walks
-//! every node's whole parent chain from the LOCAL rows (no node reads
-//! another's world row), so resolving a clean node rewrites the bits it
-//! already had, whatever order the edits arrived in.
+//! **Per frame.** [`NodeTables::resolve_frame`] takes every node a setter
+//! marked, covers the union of their subtrees as merged depth-first RANGES,
+//! and resolves exactly those nodes into the world table: a node's world is
+//! its parent's composed with its local row, top-down (`acc = acc ∘ child`
+//! from the root), so a world translation is summed root first, as
+//! bevy_transform sums it, and every node gets the bits [`NodeTables::world`]
+//! composes from its chain. The returned [`FramePlan`] names the ranges, so
+//! the renderer rebuilds and uploads only what derives from a resolved node
+//! (2026-10-26: before, the ranges drove a GPU compute pass and the host
+//! uploaded the dirty input rows instead). Nothing marked, nothing resolved.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -44,16 +45,11 @@ use std::fmt;
 use crate::dirty::DirtyBits;
 use crate::transform::{Appearance, PostScale, Similarity};
 
-/// "No node" / "no group row" in a u32 lane, on both sides.
+/// "No node" / "no group row" in a u32 lane.
 pub const NONE: u32 = u32::MAX;
-/// Frames a freed slot waits before reuse: the renderer submits one frame per
-/// encoder and wgpu keeps at most a few in flight.
-pub const DEFAULT_FRAMES_IN_FLIGHT: u64 = 3;
-/// The resolve pass reads its ranges from a uniform; past this many the
-/// smallest gaps are filled (see the module header for why that is safe).
-pub const MAX_RESOLVE_RANGES: usize = 64;
-/// The longest parent chain the resolve walks: a corrupted parent cycle must
-/// not hang the GPU. The Linux tree is 11 deep below its root.
+/// The longest parent chain [`NodeTables::world`] walks (reparenting refuses
+/// a cycle; this caps the walk regardless). The Linux tree is 11 deep below
+/// its root.
 pub const MAX_DEPTH: u32 = 64;
 
 /// An index into the node pool plus the generation it was issued at.
@@ -94,34 +90,25 @@ impl fmt::Display for NodeError {
 
 impl std::error::Error for NodeError {}
 
-/// What one frame must upload and resolve; produced (and the dirty sets
-/// cleared) by [`NodeTables::prepare_frame`].
+/// What one frame resolved; produced (and the marks cleared) by
+/// [`NodeTables::resolve_frame`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FramePlan {
-    /// Depth-first `(start, len)` ranges to resolve, ascending, disjoint.
+    /// Depth-first `(start, len)` ranges resolved, ascending, disjoint and
+    /// non-adjacent: positions into [`NodeTables::order_rows`].
     pub ranges: Vec<(u32, u32)>,
-    /// Sum of the ranges' lengths: the resolve pass's thread count.
-    pub resolve_count: u32,
-    /// Positions `[start, end)` of the order that changed since last frame.
-    pub order_span: Option<(u32, u32)>,
-    pub local_rows: Vec<u32>,
-    pub post_rows: Vec<u32>,
-    pub appearance_rows: Vec<u32>,
-    pub topo_rows: Vec<u32>,
-    /// Pool slots in use or quarantined (every table's row count).
-    pub slot_count: u32,
-    /// Live nodes (the order's length).
-    pub live_count: u32,
+    /// Sum of the ranges' lengths: the nodes resolved.
+    pub resolved: u32,
 }
 
 impl FramePlan {
     pub fn is_empty(&self) -> bool {
-        self.resolve_count == 0
-            && self.order_span.is_none()
-            && self.local_rows.is_empty()
-            && self.post_rows.is_empty()
-            && self.appearance_rows.is_empty()
-            && self.topo_rows.is_empty()
+        self.resolved == 0
+    }
+
+    /// The pool slots resolved, in depth-first order (parents first).
+    pub fn slots<'a>(&'a self, t: &'a NodeTables) -> impl Iterator<Item = u32> + 'a {
+        self.ranges.iter().flat_map(move |&(s, n)| t.order[s as usize..(s + n) as usize].iter().copied())
     }
 }
 
@@ -130,9 +117,6 @@ pub struct NodeTables {
     generation: Vec<u32>,
     alive: Vec<bool>,
     free: VecDeque<u32>,
-    quarantine: VecDeque<(u32, u64)>,
-    frame: u64,
-    frames_in_flight: u64,
     live: u32,
 
     parent: Vec<u32>,
@@ -147,38 +131,30 @@ pub struct NodeTables {
     pos: Vec<u32>,
     size: Vec<u32>,
     order_stale: bool,
-    order_changed: Option<(u32, u32)>,
 
     local: Vec<Similarity>,
     post: Vec<PostScale>,
     appearance: Vec<Appearance>,
+    /// Each slot's world and inherited alpha as its last resolve left them
+    /// (`resolve_frame`, `resolve_subtrees`).
+    world: Vec<(Similarity, f32)>,
 
-    dirty_local: DirtyBits,
-    dirty_post: DirtyBits,
-    dirty_appearance: DirtyBits,
-    dirty_topo: DirtyBits,
-    dirty_subtree: DirtyBits,
-
-    /// Scratch for [`NodeTables::resolve_subtrees`]: the last world it
-    /// computed per slot (valid only inside one call).
-    cpu_world: Vec<(Similarity, f32)>,
+    /// Nodes whose subtrees the next resolve must cover.
+    dirty: DirtyBits,
 }
 
 impl Default for NodeTables {
     fn default() -> Self {
-        Self::new(DEFAULT_FRAMES_IN_FLIGHT)
+        Self::new()
     }
 }
 
 impl NodeTables {
-    pub fn new(frames_in_flight: u64) -> Self {
+    pub fn new() -> Self {
         Self {
             generation: Vec::new(),
             alive: Vec::new(),
             free: VecDeque::new(),
-            quarantine: VecDeque::new(),
-            frame: 0,
-            frames_in_flight,
             live: 0,
             parent: Vec::new(),
             first_child: Vec::new(),
@@ -191,32 +167,21 @@ impl NodeTables {
             pos: Vec::new(),
             size: Vec::new(),
             order_stale: false,
-            order_changed: None,
             local: Vec::new(),
             post: Vec::new(),
             appearance: Vec::new(),
-            dirty_local: DirtyBits::default(),
-            dirty_post: DirtyBits::default(),
-            dirty_appearance: DirtyBits::default(),
-            dirty_topo: DirtyBits::default(),
-            dirty_subtree: DirtyBits::default(),
-            cpu_world: Vec::new(),
+            world: Vec::new(),
+            dirty: DirtyBits::default(),
         }
     }
 
-    /// Pool slots ever allocated (live, quarantined or free): every table's
-    /// row count, and the GPU buffers' minimum capacity.
+    /// Pool slots ever allocated (live or free): every table's row count.
     pub fn slot_count(&self) -> u32 {
         self.alive.len() as u32
     }
 
     pub fn live_count(&self) -> u32 {
         self.live
-    }
-
-    /// The frame counter [`Self::prepare_frame`] advances (quarantine clock).
-    pub fn frame(&self) -> u64 {
-        self.frame
     }
 
     pub fn is_live(&self, h: NodeHandle) -> bool {
@@ -261,6 +226,7 @@ impl NodeTables {
                 self.local.push(Similarity::IDENTITY);
                 self.post.push(PostScale::IDENTITY);
                 self.appearance.push(Appearance::IDENTITY);
+                self.world.push((Similarity::IDENTITY, 1.0));
                 i
             }
         };
@@ -273,11 +239,7 @@ impl NodeTables {
         self.appearance[i] = appearance;
         self.link(index, p);
         self.order_stale = true;
-        self.dirty_local.set(index);
-        self.dirty_post.set(index);
-        self.dirty_appearance.set(index);
-        self.dirty_topo.set(index);
-        self.dirty_subtree.set(index);
+        self.dirty.set(index);
         Ok(NodeHandle { index, generation: self.generation[i] })
     }
 
@@ -327,8 +289,7 @@ impl NodeTables {
     }
 
     /// Free `h` and its whole subtree; returns how many nodes went. Every
-    /// handle to them is stale from here on; their slots wait out the
-    /// quarantine before reuse.
+    /// handle to them is stale from here on; their slots are free for reuse.
     pub fn remove(&mut self, h: NodeHandle) -> Result<usize, NodeError> {
         let root = self.check(h)? as u32;
         self.unlink(root);
@@ -353,7 +314,7 @@ impl NodeTables {
             match self.generation[i].checked_add(1) {
                 Some(g) if g != u32::MAX => {
                     self.generation[i] = g;
-                    self.quarantine.push_back((n, self.frame));
+                    self.free.push_back(n);
                 }
                 // Retired: a wrapped generation could match a handle from
                 // four billion frees ago.
@@ -387,8 +348,7 @@ impl NodeTables {
         self.unlink(n);
         self.link(n, p);
         self.order_stale = true;
-        self.dirty_topo.set(n);
-        self.dirty_subtree.set(n);
+        self.dirty.set(n);
         Ok(())
     }
 
@@ -430,8 +390,7 @@ impl NodeTables {
     pub fn set_local(&mut self, h: NodeHandle, local: Similarity) -> Result<(), NodeError> {
         let i = self.check(h)?;
         self.local[i] = local;
-        self.dirty_local.set(i as u32);
-        self.dirty_subtree.set(i as u32);
+        self.dirty.set(i as u32);
         Ok(())
     }
 
@@ -439,10 +398,9 @@ impl NodeTables {
     pub fn set_post_scale(&mut self, h: NodeHandle, xyz: [f32; 3]) -> Result<(), NodeError> {
         let i = self.check(h)?;
         self.post[i] = PostScale { xyz, _pad: 0.0 };
-        self.dirty_post.set(i as u32);
-        // Only the node's own output row reads it, but that row is written
-        // by the resolve, so the node must be in a range.
-        self.dirty_subtree.set(i as u32);
+        // Only the node's own output row reads it, but that row is rebuilt
+        // from the resolve, so the node must be in a range.
+        self.dirty.set(i as u32);
         Ok(())
     }
 
@@ -450,26 +408,30 @@ impl NodeTables {
     pub fn set_appearance(&mut self, h: NodeHandle, a: Appearance) -> Result<(), NodeError> {
         let i = self.check(h)?;
         self.appearance[i] = a;
-        self.dirty_appearance.set(i as u32);
-        self.dirty_subtree.set(i as u32);
+        self.dirty.set(i as u32);
         Ok(())
     }
 
     /// Route the node's resolved transform and appearance into row `row` of
-    /// an output group table (the transitional draw path), or stop (None).
+    /// an output group table (the renderer's draw rows), or stop (None).
     pub fn set_group_row(&mut self, h: NodeHandle, row: Option<u32>) -> Result<(), NodeError> {
         let i = self.check(h)?;
         self.group_row[i] = row.unwrap_or(NONE);
-        self.dirty_topo.set(i as u32);
-        self.dirty_subtree.set(i as u32);
+        self.dirty.set(i as u32);
         Ok(())
     }
 
-    /// The node's world transform and inherited alpha, composed on the CPU
-    /// in the order the GPU resolve composes it: the chain is collected node
-    /// first, then composed TOP-DOWN from its root (`acc = acc ∘ child`), so
-    /// a world translation is summed root first, as bevy_transform sums it.
-    /// O(depth).
+    /// Slot `i`'s output group row, if it routes to one.
+    pub fn slot_group_row(&self, i: u32) -> Option<u32> {
+        let r = self.group_row[i as usize];
+        (r != NONE).then_some(r)
+    }
+
+    /// The node's world transform and inherited alpha, composed from its
+    /// LOCAL rows: the chain is collected node first, then composed TOP-DOWN
+    /// from its root (`acc = acc ∘ child`), so a world translation is summed
+    /// root first, as bevy_transform sums it. O(depth); the resolve gives
+    /// every node these bits at O(1).
     pub fn world(&self, h: NodeHandle) -> Result<(Similarity, f32), NodeError> {
         let i = self.check(h)?;
         let mut chain = [0u32; MAX_DEPTH as usize + 1];
@@ -491,50 +453,52 @@ impl NodeTables {
         Ok((acc, alpha))
     }
 
-    /// Resolve on the CPU every node in the subtrees of `roots` (each node
-    /// once, however the subtrees nest), depth-first, and hand `f` each
-    /// node's slot, output group row, world transform and inherited alpha —
-    /// the same bits [`Self::world`] gives, at O(1) a node instead of
-    /// O(depth): a node's world is its parent's world composed with its
-    /// local row, and pre-order visits the parent first. This is the CPU
-    /// mirror of a move (the rows pick and the CPU cull read); the GPU
-    /// resolves the same nodes from the dirty ranges.
+    /// Resolve every node in the subtrees of `roots` (each node once,
+    /// however the subtrees nest), depth-first, into the world table, and
+    /// hand `f` each node's slot, output group row, world transform and
+    /// inherited alpha. This is the mirror of a move between frames (the
+    /// rows pick and the CPU cull read); [`Self::resolve_frame`] resolves
+    /// the marked subtrees the same way.
     pub fn resolve_subtrees(&mut self, roots: &[NodeHandle], mut f: impl FnMut(u32, Option<u32>, &Similarity, f32)) {
         self.ensure_order();
-        let mut spans: Vec<(u32, u32)> = roots
+        let spans: Vec<(u32, u32)> = roots
             .iter()
             .filter(|h| self.is_live(**h))
             .map(|h| (self.pos[h.index as usize], self.pos[h.index as usize] + self.size[h.index as usize]))
             .collect();
-        spans.sort_unstable();
-        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
-        for (s, e) in spans {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
+        for (s, n) in merge(spans) {
+            self.resolve_range(s, n);
+            for p in s..s + n {
+                let i = self.order[p as usize] as usize;
+                let row = self.group_row[i];
+                let (w, a) = &self.world[i];
+                f(i as u32, (row != NONE).then_some(row), w, *a);
             }
         }
-        if self.cpu_world.len() < self.alive.len() {
-            self.cpu_world.resize(self.alive.len(), (Similarity::IDENTITY, 1.0));
+    }
+
+    /// Resolve depth-first positions `s .. s + n` into the world table, at
+    /// O(1) a node: a node's world is its parent's composed with its local
+    /// row, and pre-order visits the parent first. The range's first node,
+    /// and any whose parent lies before the range, walks its chain once
+    /// (`world`), so the bits are `world`'s for every node.
+    fn resolve_range(&mut self, s: u32, n: u32) {
+        for p in s..s + n {
+            let i = self.order[p as usize] as usize;
+            let parent = self.parent[i];
+            self.world[i] = if p == s || parent == NONE || self.pos[parent as usize] < s {
+                self.world(NodeHandle { index: i as u32, generation: self.generation[i] }).expect("an ordered node is live")
+            } else {
+                let (pw, pa) = self.world[parent as usize];
+                (Similarity::compose(&pw, &self.local[i]), pa * self.appearance[i].tint[3])
+            };
         }
-        for (s, e) in merged {
-            for p in s..e {
-                let n = self.order[p as usize] as usize;
-                let parent = self.parent[n];
-                // The span's first node (and any node whose parent lies
-                // outside the merged span) walks its chain once.
-                let (w, a) = if p == s || parent == NONE || self.pos[parent as usize] < s {
-                    let h = NodeHandle { index: n as u32, generation: self.generation[n] };
-                    self.world(h).expect("an ordered node is live")
-                } else {
-                    let (pw, pa) = self.cpu_world[parent as usize];
-                    (Similarity::compose(&pw, &self.local[n]), pa * self.appearance[n].tint[3])
-                };
-                self.cpu_world[n] = (w, a);
-                let row = self.group_row[n];
-                f(n as u32, (row != NONE).then_some(row), &w, a);
-            }
-        }
+    }
+
+    /// Slot `i`'s world and inherited alpha as its last resolve left them:
+    /// current for every live node after [`Self::resolve_frame`].
+    pub fn resolved_world(&self, i: u32) -> &(Similarity, f32) {
+        &self.world[i as usize]
     }
 
     /// The world transform of the node's parent (identity for a root): the
@@ -546,13 +510,12 @@ impl NodeTables {
         }
     }
 
-    /// Bring the depth-first order up to date (prepare_frame does this; a
+    /// Bring the depth-first order up to date (resolve_frame does this; a
     /// caller asking for positions between frames may too).
     pub fn ensure_order(&mut self) {
         if !self.order_stale {
             return;
         }
-        let old = std::mem::take(&mut self.order);
         let mut order = Vec::with_capacity(self.live as usize);
         let mut stack: Vec<u32> = Vec::with_capacity(64);
         for &r in &self.roots {
@@ -576,21 +539,6 @@ impl NodeTables {
             }
         }
         debug_assert_eq!(order.len() as u32, self.live, "every live node is under a root");
-        // The span a GPU copy must refresh: first to last differing position
-        // (positions past the new length are never dispatched).
-        let first = order.iter().zip(&old).position(|(a, b)| a != b).unwrap_or(order.len().min(old.len()));
-        if first < order.len() {
-            let last = if order.len() == old.len() {
-                order.iter().zip(&old).rposition(|(a, b)| a != b).unwrap_or(first)
-            } else {
-                order.len() - 1
-            };
-            let span = (first as u32, last as u32 + 1);
-            self.order_changed = Some(match self.order_changed {
-                Some((a, b)) => (a.min(span.0), b.max(span.1).min(order.len() as u32)),
-                None => span,
-            });
-        }
         self.order = order;
         self.order_stale = false;
     }
@@ -617,16 +565,12 @@ impl NodeTables {
     pub fn appearance_rows(&self) -> &[Appearance] {
         &self.appearance
     }
-    /// The GPU's topology row for slot `i`: (parent, output group row).
-    pub fn topo_row(&self, i: u32) -> [u32; 2] {
-        [self.parent[i as usize], self.group_row[i as usize]]
-    }
     pub fn order_rows(&self) -> &[u32] {
         &self.order
     }
     /// Slot → depth-first position, and slot → subtree size (the node and
     /// its descendants): a subtree is `order_rows()[pos .. pos + size]`.
-    /// Current only after [`Self::ensure_order`] (every flush runs it);
+    /// Current only after [`Self::ensure_order`] (every resolve runs it);
     /// a top-down walk that skips a subtree jumps `size` positions.
     pub fn positions(&self) -> &[u32] {
         &self.pos
@@ -657,62 +601,17 @@ impl NodeTables {
         })
     }
 
-    /// Mark every live row of every table dirty and the whole order changed
-    /// (a fresh GPU mirror, e.g. after its buffers grew).
-    pub fn mark_all_dirty(&mut self) {
-        for i in 0..self.alive.len() as u32 {
-            if self.alive[i as usize] {
-                self.dirty_local.set(i);
-                self.dirty_post.set(i);
-                self.dirty_appearance.set(i);
-                self.dirty_topo.set(i);
-                self.dirty_subtree.set(i);
-            }
-        }
+    /// Resolve the frame: every marked node's subtree, merged into ranges,
+    /// into the world table; then clear the marks. See the module header.
+    pub fn resolve_frame(&mut self) -> FramePlan {
         self.ensure_order();
-        if !self.order.is_empty() {
-            self.order_changed = Some((0, self.order.len() as u32));
+        let ranges = self.dirty_ranges();
+        for &(s, n) in &ranges {
+            self.resolve_range(s, n);
         }
-    }
-
-    /// Close the frame's edits into a plan, clear the dirty sets, and advance
-    /// the quarantine clock.
-    pub fn prepare_frame(&mut self) -> FramePlan {
-        self.ensure_order();
-        let ranges = coalesce(self.dirty_ranges(), MAX_RESOLVE_RANGES);
-        let resolve_count = ranges.iter().map(|r| r.1).sum();
-        let live_rows = |d: &DirtyBits, alive: &[bool]| -> Vec<u32> { d.iter().filter(|&i| alive[i as usize]).collect() };
-        let plan = FramePlan {
-            ranges,
-            resolve_count,
-            order_span: self.order_changed.take(),
-            local_rows: live_rows(&self.dirty_local, &self.alive),
-            post_rows: live_rows(&self.dirty_post, &self.alive),
-            appearance_rows: live_rows(&self.dirty_appearance, &self.alive),
-            topo_rows: live_rows(&self.dirty_topo, &self.alive),
-            slot_count: self.slot_count(),
-            live_count: self.live,
-        };
-        self.dirty_local.clear();
-        self.dirty_post.clear();
-        self.dirty_appearance.clear();
-        self.dirty_topo.clear();
-        self.dirty_subtree.clear();
-        self.advance_frame();
-        plan
-    }
-
-    /// One frame has been handed to the GPU: release the slots whose
-    /// quarantine has run out.
-    pub fn advance_frame(&mut self) {
-        self.frame += 1;
-        while let Some(&(i, freed)) = self.quarantine.front() {
-            if freed + self.frames_in_flight > self.frame {
-                break;
-            }
-            self.quarantine.pop_front();
-            self.free.push_back(i);
-        }
+        self.dirty.clear();
+        let resolved = ranges.iter().map(|r| r.1).sum();
+        FramePlan { ranges, resolved }
     }
 
     /// The union of every dirty node's subtree, merged, ascending. Few dirty
@@ -720,48 +619,41 @@ impl NodeTables {
     /// tens of thousands of ranges).
     fn dirty_ranges(&self) -> Vec<(u32, u32)> {
         let n = self.order.len();
-        let dirty = self.dirty_subtree.len();
+        let dirty = self.dirty.len();
         if dirty == 0 || n == 0 {
             return Vec::new();
         }
-        let mut out: Vec<(u32, u32)> = Vec::new();
         if dirty <= 4096 {
-            let mut spans: Vec<(u32, u32)> = self
-                .dirty_subtree
+            let spans: Vec<(u32, u32)> = self
+                .dirty
                 .iter()
                 .filter(|&i| self.alive[i as usize])
                 .map(|i| (self.pos[i as usize], self.pos[i as usize] + self.size[i as usize]))
                 .collect();
-            spans.sort_unstable();
-            for (s, e) in spans {
-                match out.last_mut() {
-                    Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                    _ => out.push((s, e)),
-                }
-            }
-        } else {
-            let mut end_at = vec![0u32; n];
-            for i in self.dirty_subtree.iter().filter(|&i| self.alive[i as usize]) {
-                let (s, e) = (self.pos[i as usize] as usize, self.pos[i as usize] + self.size[i as usize]);
-                end_at[s] = end_at[s].max(e);
-            }
-            let mut cur: Option<(u32, u32)> = None;
-            for (p, &e) in end_at.iter().enumerate() {
-                let p = p as u32;
-                match &mut cur {
-                    Some(c) if p <= c.1 => c.1 = c.1.max(e),
-                    _ => {
-                        if let Some(c) = cur.take() {
-                            out.push(c);
-                        }
-                        if e > p {
-                            cur = Some((p, e));
-                        }
+            return merge(spans);
+        }
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        let mut end_at = vec![0u32; n];
+        for i in self.dirty.iter().filter(|&i| self.alive[i as usize]) {
+            let (s, e) = (self.pos[i as usize] as usize, self.pos[i as usize] + self.size[i as usize]);
+            end_at[s] = end_at[s].max(e);
+        }
+        let mut cur: Option<(u32, u32)> = None;
+        for (p, &e) in end_at.iter().enumerate() {
+            let p = p as u32;
+            match &mut cur {
+                Some(c) if p <= c.1 => c.1 = c.1.max(e),
+                _ => {
+                    if let Some(c) = cur.take() {
+                        out.push(c);
+                    }
+                    if e > p {
+                        cur = Some((p, e));
                     }
                 }
             }
-            out.extend(cur);
         }
+        out.extend(cur);
         out.into_iter().map(|(s, e)| (s, e - s)).collect()
     }
 
@@ -791,29 +683,18 @@ impl NodeTables {
     }
 }
 
-/// Fill the smallest gaps until at most `max` ranges remain.
-fn coalesce(ranges: Vec<(u32, u32)>, max: usize) -> Vec<(u32, u32)> {
-    if ranges.len() <= max {
-        return ranges;
-    }
-    let mut gaps: Vec<(u32, usize)> =
-        ranges.windows(2).enumerate().map(|(k, w)| (w[1].0 - (w[0].0 + w[0].1), k)).collect();
-    gaps.sort_unstable();
-    let mut fill = vec![false; ranges.len()];
-    for &(_, k) in gaps.iter().take(ranges.len() - max) {
-        fill[k] = true; // merge range k with k + 1
-    }
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(max);
-    let mut start = ranges[0].0;
-    for (k, r) in ranges.iter().enumerate() {
-        if !fill[k] {
-            out.push((start, r.0 + r.1 - start));
-            if let Some(next) = ranges.get(k + 1) {
-                start = next.0;
-            }
+/// `[start, end)` spans, in any order, as sorted disjoint `(start, len)`
+/// ranges with overlapping and adjacent spans merged.
+fn merge(mut spans: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    spans.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
+    for (s, e) in spans {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
         }
     }
-    out
+    out.into_iter().map(|(s, e)| (s, e - s)).collect()
 }
 
 #[cfg(test)]
@@ -826,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_stale_handle_is_refused_and_never_aliases_a_reused_slot() {
-        let mut t = NodeTables::new(2);
+        let mut t = NodeTables::default();
         let root = leaf(&mut t, None);
         let a = leaf(&mut t, Some(root));
         assert_eq!(t.remove(a), Ok(1));
@@ -836,17 +717,10 @@ mod tests {
         assert_eq!(t.world(a).map(|_| ()), Err(NodeError::Stale(a)));
         assert_eq!(t.remove(a), Err(NodeError::Stale(a)));
         assert_eq!(t.insert(Some(a), Similarity::IDENTITY, Appearance::IDENTITY), Err(NodeError::Stale(a)));
-        // Quarantined: an insert inside the frames in flight takes a new slot.
-        let b = leaf(&mut t, Some(root));
-        assert_ne!(b.index(), a.index(), "a freed slot is not reused while frames are in flight");
-        t.prepare_frame();
-        let c = leaf(&mut t, Some(root));
-        assert_ne!(c.index(), a.index(), "still in quarantine after one of two frames");
-        t.prepare_frame();
-        // Released: the slot is reused under a new generation, and the old
-        // handle still cannot reach it.
+        // The slot is reused under a new generation, and the old handle
+        // still cannot reach it.
         let d = leaf(&mut t, Some(root));
-        assert_eq!(d.index(), a.index(), "the quarantined slot is reused once it has run out");
+        assert_eq!(d.index(), a.index(), "a freed slot is reused");
         assert_ne!(d.generation(), a.generation());
         t.set_local(d, Similarity::from_translation([5.0, 0.0, 0.0])).unwrap();
         assert_eq!(t.local(a), Err(NodeError::Stale(a)), "the old handle must not read the new occupant");
@@ -898,40 +772,37 @@ mod tests {
         };
         assert_eq!(names(&mut t, &[root, a, a1, a2, a2x, b, b1, c, lone]), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(t.subtree_range(a).unwrap(), (1, 4));
-        t.prepare_frame();
+        assert_eq!(t.resolve_frame().resolved, 9, "a new node resolves");
 
         // One dirty node: exactly its subtree.
         t.set_local(a2, Similarity::from_translation([1.0, 0.0, 0.0])).unwrap();
-        let plan = t.prepare_frame();
+        let plan = t.resolve_frame();
         assert_eq!(plan.ranges, vec![(3, 2)]);
-        assert_eq!(plan.local_rows, vec![a2.index()]);
-        assert!(plan.appearance_rows.is_empty(), "a transform write leaves the appearance table clean");
+        assert_eq!(plan.slots(&t).collect::<Vec<_>>(), [a2.index(), a2x.index()]);
 
         // An ancestor subsumes its descendants; disjoint siblings stay apart.
         t.set_local(a2x, Similarity::IDENTITY).unwrap();
         t.set_local(a, Similarity::IDENTITY).unwrap();
         t.set_appearance(c, Appearance::IDENTITY).unwrap();
-        let plan = t.prepare_frame();
+        let plan = t.resolve_frame();
         assert_eq!(plan.ranges, vec![(1, 4), (7, 1)]);
-        assert_eq!(plan.resolve_count, 5);
-        assert_eq!(plan.appearance_rows, vec![c.index()]);
-        assert!(t.prepare_frame().is_empty(), "nothing dirty, nothing to do");
+        assert_eq!(plan.resolved, 5);
+        assert!(t.resolve_frame().is_empty(), "nothing dirty, nothing to do");
 
         // Reparent a2 (with a2x) under b: the order stays pre-order, the
         // moved subtree's range follows it, and its world now follows b.
         t.set_local(b, Similarity::from_translation([0.0, 10.0, 0.0])).unwrap();
         t.set_local(a2, Similarity::from_translation([1.0, 0.0, 0.0])).unwrap();
-        t.prepare_frame();
+        t.resolve_frame();
         t.reparent(a2, Some(b)).unwrap();
         t.assert_invariants();
         assert_eq!(names(&mut t, &[root, a, a1, b, b1, a2, a2x, c, lone]), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(t.subtree_range(b).unwrap(), (3, 4));
         assert_eq!(t.subtree_range(a).unwrap(), (1, 2));
-        let plan = t.prepare_frame();
+        let plan = t.resolve_frame();
         assert_eq!(plan.ranges, vec![(5, 2)], "only the moved subtree re-resolves");
-        assert_eq!(plan.order_span, Some((3, 7)), "the order changed from a2's old place to its new one");
-        assert_eq!(plan.topo_rows, vec![a2.index()]);
         assert_eq!(t.world(a2x).unwrap().0.translation, [1.0, 10.0, 0.0]);
+        assert_eq!(t.resolved_world(a2x.index()).0.translation, [1.0, 10.0, 0.0], "the resolve wrote the moved world");
 
         // To a root and back; a cycle is refused and changes nothing.
         t.reparent(a, None).unwrap();
@@ -958,7 +829,7 @@ mod tests {
             }
             dirs.push(d);
         }
-        t.prepare_frame();
+        t.resolve_frame();
         for (k, &d) in dirs.iter().enumerate() {
             if k % 3 != 1 {
                 for (j, f) in t.children(d).unwrap().into_iter().enumerate() {
@@ -973,13 +844,13 @@ mod tests {
         }
         // The brute-force cover: every dirty node's whole subtree.
         let mut cover = vec![false; t.live_count() as usize];
-        for i in t.dirty_subtree.iter() {
+        for i in t.dirty.iter() {
             let (s, n) = (t.pos[i as usize], t.size[i as usize]);
             for p in s..s + n {
                 cover[p as usize] = true;
             }
         }
-        assert!(t.dirty_subtree.len() > 4096, "the test must reach the sweep");
+        assert!(t.dirty.len() > 4096, "the test must reach the sweep");
         let ranges = t.dirty_ranges();
         let mut got = vec![false; cover.len()];
         for (s, n) in &ranges {
@@ -991,14 +862,6 @@ mod tests {
         for w in ranges.windows(2) {
             assert!(w[0].0 + w[0].1 < w[1].0, "merged ranges are disjoint and non-adjacent: {w:?}");
         }
-    }
-
-    #[test]
-    fn coalescing_fills_the_smallest_gaps_first() {
-        let r = vec![(0, 2), (3, 1), (10, 1), (12, 3), (40, 1)];
-        assert_eq!(coalesce(r.clone(), 5), r);
-        assert_eq!(coalesce(r.clone(), 3), vec![(0, 4), (10, 5), (40, 1)]);
-        assert_eq!(coalesce(r, 1), vec![(0, 41)]);
     }
 
     #[test]

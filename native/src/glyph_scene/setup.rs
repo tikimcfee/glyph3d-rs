@@ -69,8 +69,9 @@ impl GlyphScene {
         });
         ctx.queue.write_buffer(&group_buf, 0, bytemuck::cast_slice(&groups));
         // The rows as nodes under an identity root: the first frame's resolve
-        // rewrites columns 0-3 of every row with the bits uploaded here.
-        let mut nodes = super::nodes::GroupNodes::new(device, &group_buf, max_groups as u32, &groups);
+        // rebuilds columns 0-3 of every row with the bits uploaded here, so
+        // only a row a library load moved goes up again.
+        let mut nodes = super::nodes::GroupNodes::new(&group_buf, &groups);
         // Each view's node is its group row's (`crate::views`).
         let mut views = staged.views;
         views.attach_nodes(|group_row| nodes.node(group_row));
@@ -85,7 +86,7 @@ impl GlyphScene {
             lib.attach(nodes.tables_mut(), Some(root), &files);
             let spec = lib.face?;
             let slots: Vec<u32> = lib.nodes.as_ref().expect("just attached").sheet.iter().map(|h| h.index()).collect();
-            Some(super::faces::LibraryFaces::new(device, &ctx.queue, &spec, &slots))
+            Some(super::faces::LibraryFaces::new(device, &spec, &slots))
         });
         log::info!(
             "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
