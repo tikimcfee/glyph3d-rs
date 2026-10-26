@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use super::agent_cli::{nest_subagents, parse_rfc3339, AgentCli};
+use super::agent_cli::{describe_dirs, nest_subagents, parse_rfc3339, AgentCli, SessionDir};
 use super::events::{AgentSession, Applied, PromptOrigin, ToolStatus};
 use super::test_stream::Stream;
 use super::types::{truncate_chars, truncate_with_ellipsis, TranscriptEventKind};
@@ -297,6 +297,47 @@ fn an_edit_with_file_text_builds_its_revisions_without_disk() {
     }
 }
 
+/// agy's and Kimi's reads carry the lines they read (gomuxai 7238f18): the
+/// read beats show that text, and the revision engine never goes to the disk
+/// for them. agy's reads are whole files (their revision); Kimi's says no
+/// file length, so it is a window, not a revision.
+#[test]
+fn agy_and_kimi_reads_use_their_file_text_not_the_disk() {
+    for (case, reads) in [
+        ("agy/conversation", &[("step_1_tool_1", "main.go", true), ("step_1_tool_2", "spin.go", true)][..]),
+        ("kimi/interleaved", &[("tc-read-1", "config/load.go", false)][..]),
+    ] {
+        let session = read(case);
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let mut engine = RevisionEngine::new().with_disk_resolver(move |p: &str| {
+            log.lock().unwrap().push(p.to_string());
+            None
+        });
+        engine.ingest_session(&session);
+        assert!(asked.lock().unwrap().is_empty(), "{case}: asked the disk for {:?}", asked.lock().unwrap());
+
+        let lines = event_lines(case);
+        let beats = session.linearize_events(None);
+        for &(id, target, whole) in reads {
+            let text = lines.iter().rev().find(|l| l["id"] == id).unwrap()["tool"]["file"]["text"].clone();
+            assert!(text.is_string(), "{case}: {id} carries its file text");
+            match &beats.iter().find(|b| b.id == id).unwrap().kind {
+                TranscriptEventKind::FileRead { file_path, content, first_line, .. } => {
+                    assert_eq!((file_path.as_str(), *first_line), (target, 1));
+                    assert_eq!(content.as_deref(), text.as_str(), "{case}: {id}'s beat shows the lines it read");
+                }
+                k => panic!("{case}: {id} is a read, got {k:?}"),
+            }
+            match engine.history(target) {
+                Some(h) if whole => assert_eq!(h.get(0).unwrap().text.as_str(), text, "{case}: {target}'s revision is the read"),
+                None if !whole => {}
+                h => panic!("{case}: {target}: whole read {whole}, history {h:?}"),
+            }
+        }
+    }
+}
+
 /// An edit whose event has no file text (agy's, or an Edit whose result
 /// lacked the file) falls back to the disk: the target, joined to the
 /// session's cwd, read now and taken back through the edit.
@@ -369,6 +410,8 @@ fn a_missing_agent_binary_fails_loud() {
     let missing = AgentCli::new("/nonexistent/glyph3d-test-agent");
     let e = missing.sessions().unwrap_err();
     assert!(e.contains("could not run `/nonexistent/glyph3d-test-agent sessions --json`"), "{e}");
+    let e = missing.dirs().unwrap_err();
+    assert!(e.contains("glyph3d-test-agent sessions --dirs --json"), "{e}");
     let e = missing.transcript("abc").unwrap_err();
     assert!(e.contains("glyph3d-test-agent transcript abc"), "{e}");
 
@@ -392,6 +435,18 @@ fn a_stream_off_the_contract_is_refused() {
     let twice = [session.clone(), event("a", "add", "prompt"), event("a", "add", "prompt")].join("\n");
     assert!(AgentSession::from_stream_str(&twice).unwrap_err().contains("added twice"));
     assert!(AgentSession::from_stream_str(&[session, "{not json".to_string()].join("\n")).unwrap_err().contains("line 2"));
+}
+
+/// `agent sessions --dirs --json` as gomuxai prints it, in one line.
+#[test]
+fn the_dirs_report_reads_gomuxais_scan_list() {
+    let dirs: Vec<SessionDir> = serde_json::from_str(
+        r#"[{"harness":"claude","path":"/nowhere/.claude/projects","origin":"default","exists":true},
+            {"harness":"kimi","path":"/nowhere/k","origin":"config","exists":false}]"#,
+    )
+    .unwrap();
+    assert_eq!(describe_dirs(&dirs), "claude /nowhere/.claude/projects (default); kimi /nowhere/k (config, missing)");
+    assert!(describe_dirs(&[]).contains("no session directories"));
 }
 
 #[test]

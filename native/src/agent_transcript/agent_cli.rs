@@ -9,6 +9,9 @@
 //! app config (JSON, the same three keys, `""` turning a harness off) that
 //! every call passes as `--backend-config`.
 //!
+//! `agent sessions --dirs --json` says where it looks, per harness, for the
+//! session browser's report.
+//!
 //! A binary that can't be run, or a call that exits nonzero, is an error
 //! naming the command and what it printed on stderr — never an empty list.
 
@@ -113,6 +116,14 @@ impl AgentCli {
             .map_err(|e| format!("`{}` printed something that is not a session list: {e}", self.describe(&args)))
     }
 
+    /// Where gomuxai looks for each harness's sessions, in its scan order.
+    pub fn dirs(&self) -> Result<Vec<SessionDir>, String> {
+        let args = ["sessions", "--dirs", "--json"];
+        let stdout = self.run(&args)?;
+        serde_json::from_slice(&stdout)
+            .map_err(|e| format!("`{}` printed something that is not a directory list: {e}", self.describe(&args)))
+    }
+
     /// One session's events: `session` is a session id (or the start of
     /// only one), a workgroup agent's name, or a transcript's path.
     pub fn transcript(&self, session: &str) -> Result<AgentSession, String> {
@@ -123,6 +134,40 @@ impl AgentCli {
         let stdout = self.run(&args)?;
         AgentSession::read_stream(stdout.as_slice()).map_err(|e| format!("`{}`: {e}", self.describe(&args)))
     }
+}
+
+/// One directory gomuxai scans for one harness's sessions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SessionDir {
+    pub harness: String,
+    pub path: String,
+    /// `config` (named in the app config) or `default` (the app's own
+    /// location, found on this machine).
+    pub origin: String,
+    pub exists: bool,
+}
+
+/// The scan list in one line, as the browser and the launcher show it:
+/// `claude ~/.claude/projects (default); kimi ~/k (config, missing)`.
+pub fn describe_dirs(dirs: &[SessionDir]) -> String {
+    if dirs.is_empty() {
+        return "no session directories: none configured and no app default found (set claude_projects_dir, \
+                agy_brain_dir or kimi_sessions_dir in launch_config.toml)"
+            .to_string();
+    }
+    let home = crate::launch_config::home_dir();
+    dirs.iter()
+        .map(|d| {
+            let path = match home.as_deref().and_then(|h| std::path::Path::new(&d.path).strip_prefix(h).ok()) {
+                Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                Some(rest) => format!("~/{}", rest.display()),
+                None => d.path.clone(),
+            };
+            let missing = if d.exists { "" } else { ", missing" };
+            format!("{} {path} ({}{missing})", d.harness, d.origin)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The sessions a listing shows: those with a transcript (a workgroup agent

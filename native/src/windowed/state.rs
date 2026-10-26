@@ -689,7 +689,7 @@ impl WindowState {
             let session_filter_text = &mut egui.session_filter_text;
             let session_filter_harness = &mut egui.session_filter_harness;
             let discovered_sessions = &mut egui.discovered_sessions;
-            let session_list_source = &mut egui.session_list_source;
+            let session_dirs_report = &mut egui.session_dirs_report;
             let session_load_error = &mut egui.session_load_error;
             let hud_open = egui.hud_open;
             // The layout dial's apply signal: the panel's slider sets it on
@@ -1389,16 +1389,17 @@ impl WindowState {
                 }
 
                 if *session_browser_open {
-                    // Listed by gomuxai (`agent sessions --json`), read again on ⟳.
-                    let list_sessions = |source: &mut String| -> Result<Vec<crate::agent_transcript::SessionInfo>, String> {
+                    // Listed by gomuxai (`agent sessions --json`, and where it
+                    // looked: `--dirs`), read again on ⟳.
+                    let list_sessions = |report: &mut Result<String, String>| -> Result<Vec<crate::agent_transcript::SessionInfo>, String> {
                         let agent = crate::agent_transcript::AgentCli::from_launch_config(
                             &crate::launch_config::LaunchConfig::load_or_default(),
                         )?;
-                        *source = agent.describe(&["sessions", "--json"]);
+                        *report = agent.dirs().map(|d| crate::agent_transcript::agent_cli::describe_dirs(&d));
                         agent.sessions()
                     };
                     if discovered_sessions.is_none() {
-                        *discovered_sessions = Some(list_sessions(session_list_source));
+                        *discovered_sessions = Some(list_sessions(session_dirs_report));
                     }
 
                     egui::Window::new("Agent Sessions (F7)")
@@ -1419,7 +1420,7 @@ impl WindowState {
                                     session_filter_text.clear();
                                 }
                                 if ui.button("⟳ Refresh").clicked() {
-                                    *discovered_sessions = Some(list_sessions(session_list_source));
+                                    *discovered_sessions = Some(list_sessions(session_dirs_report));
                                 }
                             });
 
@@ -1431,7 +1432,14 @@ impl WindowState {
                                 }
                             });
                             ui.separator();
-                            ui.small(format!("Listed by: {session_list_source}"));
+                            match session_dirs_report {
+                                Ok(report) => {
+                                    ui.small(format!("Scanning: {report}"));
+                                }
+                                Err(e) => {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Scanning: {e}"));
+                                }
+                            }
                             if let Some(e) = session_load_error.as_ref() {
                                 ui.colored_label(egui::Color32::LIGHT_RED, e);
                             }

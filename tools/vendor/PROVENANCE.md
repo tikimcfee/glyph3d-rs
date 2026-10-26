@@ -112,7 +112,7 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
 
 The streams gomuxai's `agent transcript` must print for each conformance case
 (and the corpus README that explains them), copied verbatim from
-`tikimcfee/gomuxai` at commit `a33c68b9772b9a465fc329b283607fa9a1edb175`, under
+`tikimcfee/gomuxai` at commit `7238f185475f8ba33d94a0abb6dcb3b5fa327044`, under
 `tools/vendor/gomuxai/internal/transcript/testdata/corpus` (gomuxai's own layout). The renderer reads agent sessions
 only through gomuxai's `agent` CLI; `native/src/agent_transcript/tests.rs`
 holds its reader to these. The last column says whether the file is gomuxai's
@@ -123,7 +123,7 @@ the new commit, update `GOMUXAI_COMMIT`, regenerate.
 | local path | bytes | sha256 | matches the pinned commit |
 |---|---:|---|:--:|
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/README.md` | 28465 | `dddc64277f67fc0e…` | yes |
-| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/agy/conversation.events.jsonl` | 10262 | `2d8bea16227f4ef3…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/agy/conversation.events.jsonl` | 10478 | `62ba16142fb775dc…` | yes |
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/basic-turn.events.jsonl` | 4185 | `fa0ba18eedc98d43…` | yes |
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/derived-turns.events.jsonl` | 5176 | `b79160cd3af00cec…` | yes |
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/held-delivery.events.jsonl` | 4185 | `51e7e3a88e737038…` | yes |
@@ -135,7 +135,7 @@ the new commit, update `GOMUXAI_COMMIT`, regenerate.
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/subagent/subagents/agent-a3f9c2e17b4d5e608.events.jsonl` | 3597 | `1932e34b9349999f…` | yes |
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/system-records.events.jsonl` | 4794 | `606af86352a9a482…` | yes |
 | `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/tool-results.events.jsonl` | 11159 | `bfd57a5f8b207197…` | yes |
-| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/kimi/interleaved.events.jsonl` | 3181 | `556758b4cc8c2bb0…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/kimi/interleaved.events.jsonl` | 3369 | `b1488761034a84a0…` | yes |
 
 ## Notes
 
