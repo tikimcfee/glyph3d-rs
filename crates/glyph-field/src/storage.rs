@@ -77,10 +77,14 @@ impl<S: SlotRecord> SlotStorage<S> {
             std::mem::size_of::<S>(),
             slots.slot_words()
         );
+        use rayon::prelude::*;
         let n = slots.blocks().len();
+        // In parallel: one block's create-and-fill is a memcpy into a
+        // mapped buffer, and one thread left them serial (measured on a
+        // 71.6M-slot tree, 274 blocks: 198 ms of the scene's build).
         let chunks = slots
             .blocks()
-            .iter()
+            .par_iter()
             .enumerate()
             .map(|(k, block)| {
                 let label = if n == 1 { labels.buffers.to_string() } else { format!("{} {k}/{n}", labels.buffers) };
