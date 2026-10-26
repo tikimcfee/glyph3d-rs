@@ -1349,7 +1349,7 @@ impl DrawG3Region {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 5: glyphs — tables, params and the retained chunks
+// Pass 5: glyphs — tables, params and the retained blocks
 // ---------------------------------------------------------------------------
 
 /// The emoji sheet: `layers` RGBA8 images, each with its mip chain
@@ -1565,29 +1565,40 @@ pub struct DrawG3GlyphMask {
     pub draw_super: DrawG3Glyph,
 }
 
-/// One slot chunk: a DerivedSlot block published once as a retained
-/// instance resource (one memcpy, byte-identical), drawn per frame with
-/// the CPU cull's segment ranges. One draw item per chunk, in arena order,
-/// so blend order is glyph3d's.
-pub struct G3GlyphChunk {
+/// One slot block: a DerivedSlot chunk of the Derived field (a fixed slot
+/// count, ~256K slots = 5.2 MB), published once as a retained instance
+/// resource exactly as the field holds it (no copy, byte-identical), drawn
+/// per frame with the CPU cull's segment ranges. One draw item per block,
+/// in arena order, so blend order is glyph3d's.
+///
+/// The native HAL keeps a retained publication's GPU buffer per draw ITEM
+/// POSITION, `(draw list, item index)`, and re-uploads it whenever the
+/// publication id at that position changes (frame_build.rs `fb_instances`).
+/// So a block keeps ONE publication for as long as the host hands in the same
+/// `Arc` (`Arc::ptr_eq`: identity is the generation), and every block draws
+/// at a stable index in a list of its own (`G3Renderer`).
+pub struct G3GlyphBlock {
+    source: Arc<[f32]>,
     retained: RetainedInstances,
 }
 
-impl G3GlyphChunk {
-    /// From DerivedSlot words (`x` as its f32 bits): `5 × slots` words.
-    pub fn from_words(words: &[u32]) -> Result<Self, &'static str> {
-        // f32 is only the byte carrier: the GPU reads these lanes as u32
-        // (`instance(u32)`), never as float.
-        let data: Arc<[f32]> = words.iter().map(|&w| f32::from_bits(w)).collect();
-        Self::from_arc(data)
+impl G3GlyphBlock {
+    /// Wrap the field's block: DerivedSlot words carried as f32 bits
+    /// (`f32::from_bits`), 5 a slot. f32 is only the byte carrier: the GPU
+    /// reads these lanes as u32 (`instance(u32)`), never as float.
+    pub fn new(words_as_f32: &Arc<[f32]>) -> Result<Self, &'static str> {
+        Ok(Self {
+            source: words_as_f32.clone(),
+            retained: RetainedInstances::new(G3_DERIVED_SLOT_WORDS, words_as_f32.clone())?,
+        })
     }
 
-    /// From an already-built word buffer (zero copy).
-    pub fn from_arc(words_as_f32: Arc<[f32]>) -> Result<Self, &'static str> {
-        Ok(Self { retained: RetainedInstances::new(G3_DERIVED_SLOT_WORDS, words_as_f32)? })
+    /// Whether this is still the host's block (same allocation).
+    pub fn is(&self, words_as_f32: &Arc<[f32]>) -> bool {
+        Arc::ptr_eq(&self.source, words_as_f32)
     }
 
-    /// Draw this chunk's visible `ranges` (slot ranges, ascending) with
+    /// Draw this block's visible `ranges` (slot ranges, ascending) with
     /// `draw_vars` (a `DrawG3Glyph`'s, or a `DrawG3GlyphMask`'s for the
     /// selection). An empty `ranges` draws nothing while the publication
     /// stays resident: it is submitted as `[0..0]`, because an empty range
@@ -1656,7 +1667,7 @@ pub struct G3Draws {
     pub composite: DrawG3Composite,
 }
 
-/// The selection: per-chunk slot ranges into the mask pass, and the tint
+/// The selection: per-block slot ranges into the mask pass, and the tint
 /// (rgb, strength) the composite adds where the mask covers.
 #[derive(Clone, Copy)]
 pub struct G3Selection<'a> {
@@ -1667,15 +1678,18 @@ pub struct G3Selection<'a> {
 /// One frame's inputs, split by rate. Each slow group carries a generation:
 /// the renderer re-uploads that group only when its generation differs from
 /// the one it last consumed (`G3Renderer::seen`), so a host may pass the
-/// same borrowed data every frame at no cost.
+/// same borrowed data every frame at no cost. Glyph blocks need no
+/// generation: a block's identity (`Arc::ptr_eq`) is its generation.
 #[derive(Clone, Copy)]
 pub struct G3FrameInputs<'a> {
     // ── on load / on edit ──
     pub tables_generation: u64,
     pub tables: &'a G3StaticTables<'a>,
-    /// DerivedSlot words per chunk (5 words a slot), in arena order.
-    pub chunks_generation: u64,
-    pub chunks: &'a [&'a [u32]],
+    /// The Derived field's chunks, in arena order: DerivedSlot words as f32
+    /// bits, 5 a slot, a fixed slot count each. A block whose `Arc` is the
+    /// one already held is not re-published; a new `Arc` at index k
+    /// re-uploads block k only. Appending blocks never moves earlier ones.
+    pub blocks: &'a [Arc<[f32]>],
     /// Library faces, scene quads and cubes (MeshInstance), and the static
     /// group-composed face specs.
     pub meshes_generation: u64,
@@ -1700,8 +1714,8 @@ pub struct G3FrameInputs<'a> {
     pub picked_region: Option<usize>,
     /// The CPU cull's compacted backdrop survivors.
     pub backdrops: &'a [G3BackdropInst],
-    /// The CPU cull's visible slot ranges per chunk; a chunk past the end of
-    /// this list draws nothing.
+    /// The CPU cull's visible slot ranges per block (chunk); a block past
+    /// the end of this list draws nothing.
     pub chunk_ranges: &'a [&'a [Range<u32>]],
     pub selection: Option<G3Selection<'a>>,
 }
@@ -1712,7 +1726,6 @@ pub struct G3FrameInputs<'a> {
 pub struct G3Seen {
     pub tables: Option<u64>,
     pub groups: Option<u64>,
-    pub chunks: Option<u64>,
     pub meshes: Option<u64>,
 }
 
@@ -1723,20 +1736,62 @@ struct G3MeshPublications {
     group_faces: RetainedInstances,
 }
 
+/// One retained phase's own draw list. A retained publication's GPU buffer
+/// is keyed by its draw item's position (see `G3GlyphBlock`), so every
+/// retained draw sits in a list where nothing optional precedes it: an env
+/// toggling or a backdrop list going empty can never shift it and re-upload.
+struct G3PhaseList(DrawList);
+
+impl G3PhaseList {
+    fn new(cx: &mut Cx) -> Self {
+        Self(DrawList::new(cx))
+    }
+
+    /// Record `f`'s draws as a child of the current list, at this point in
+    /// draw order (a child list sits where it is begun).
+    fn draw(&mut self, cx: &mut CxDraw, f: impl FnOnce(&mut CxDraw)) {
+        self.0.begin_always(cx);
+        f(cx);
+        self.0.end(cx);
+    }
+}
+
 /// Owns the scene pass (RGBA16F + Depth32), the selection mask pass
-/// (BGRA8), the tables, the chunk and mesh publications; draws one frame in
+/// (BGRA8), the tables, the block and mesh publications; draws one frame in
 /// glyph3d's phase order and composites it into a rect.
+///
+/// FIRST-FRAME HITCH: the native frame builder uploads every new retained
+/// publication in the frame that first draws it (no per-frame upload budget
+/// on native: `fb_instances` ignores `list_and_upload_budget`). The
+/// flagship's 95M slots × 20 B = ~1.9 GB in ~360 blocks of 5.2 MB therefore
+/// lands in ONE frame: a CPU copy of 1.9 GB into upload buffers plus the PCIe
+/// transfer, on the order of 0.2–0.5 s at PCIe 4 rates, plus the same again
+/// in resident VRAM (as glyph3d's own storage buffers). To spread it, append
+/// blocks over several frames (a block appended never moves the ones before
+/// it, so nothing re-uploads); a block not yet handed in simply draws
+/// nothing. Selecting glyphs costs one more upload per selected block (its
+/// mask copy, kept per block index in `mask_lists` so it is not repeated as
+/// the selection changes).
 pub struct G3Renderer {
     pass: DrawPass,
     mask_pass: DrawPass,
     draw_list: DrawList,
     mask_list: DrawList,
+    faces_list: G3PhaseList,
+    group_faces_list: G3PhaseList,
+    quads_list: G3PhaseList,
+    cubes_list: G3PhaseList,
+    glyph_list: G3PhaseList,
+    /// One mask list per block index, made on first selection: a block's
+    /// mask item stays at index 0 of its own list, so re-selecting it never
+    /// re-uploads.
+    mask_lists: Vec<Option<G3PhaseList>>,
     color: Texture,
     depth: Texture,
     mask: Texture,
     geoms: G3MeshGeometries,
     tables: Option<G3Tables>,
-    chunks: Vec<G3GlyphChunk>,
+    blocks: Vec<G3GlyphBlock>,
     meshes: Option<G3MeshPublications>,
     scratch: Vec<f32>,
     seen: G3Seen,
@@ -1765,12 +1820,18 @@ impl G3Renderer {
             mask_pass: DrawPass::new(cx),
             draw_list: DrawList::new(cx),
             mask_list: DrawList::new(cx),
+            faces_list: G3PhaseList::new(cx),
+            group_faces_list: G3PhaseList::new(cx),
+            quads_list: G3PhaseList::new(cx),
+            cubes_list: G3PhaseList::new(cx),
+            glyph_list: G3PhaseList::new(cx),
+            mask_lists: Vec::new(),
             color: Texture::new_with_format(cx, TextureFormat::RenderRGBAf16 { size: TextureSize::Auto, initial: true }),
             depth: Texture::new_with_format(cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true }),
             mask: Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true }),
             geoms: G3MeshGeometries::new(cx),
             tables: None,
-            chunks: Vec::new(),
+            blocks: Vec::new(),
             meshes: None,
             scratch: Vec::new(),
             seen: G3Seen::default(),
@@ -1793,13 +1854,18 @@ impl G3Renderer {
             }
             self.seen.groups = Some(inputs.groups_generation);
         }
-        if self.seen.chunks != Some(inputs.chunks_generation) {
-            self.chunks = inputs
-                .chunks
-                .iter()
-                .map(|words| G3GlyphChunk::from_words(words).expect("DerivedSlot chunks are 5 words a slot"))
-                .collect();
-            self.seen.chunks = Some(inputs.chunks_generation);
+        // Blocks by identity: only a new Arc at an index is re-published.
+        self.blocks.truncate(inputs.blocks.len());
+        for (k, words) in inputs.blocks.iter().enumerate() {
+            if self.blocks.get(k).is_some_and(|b| b.is(words)) {
+                continue;
+            }
+            let block = G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot");
+            if k < self.blocks.len() {
+                self.blocks[k] = block;
+            } else {
+                self.blocks.push(block);
+            }
         }
         if self.seen.meshes != Some(inputs.meshes_generation) || self.meshes.is_none() {
             self.meshes = Some(G3MeshPublications {
@@ -1838,6 +1904,9 @@ impl G3Renderer {
             let cxd: &mut CxDraw = cx;
             self.draw_list.begin_always(cxd);
 
+            // Streamed phases (re-recorded each frame, position-free) draw
+            // straight into the pass list; each retained phase draws into
+            // its own child list at its place in the order.
             if let Some(env) = &inputs.env {
                 draws.sky.far_z = if reverse_z { 0.0 } else { 1.0 };
                 draws.sky.set_env(cxd, env);
@@ -1846,17 +1915,23 @@ impl G3Renderer {
                 draws.ground.draw(cxd, env);
             }
             draws.backdrop.draw_all(cxd, inputs.backdrops, &mut self.scratch);
-            draws.mesh.draw_retained(cxd, self.geoms.quad.geometry_id(), &meshes.faces);
-            draws.group_face.draw_retained(cxd, self.geoms.quad.geometry_id(), tables, &meshes.group_faces);
+            let (quad, cube) = (self.geoms.quad.geometry_id(), self.geoms.cube.geometry_id());
+            self.faces_list.draw(cxd, |cx| draws.mesh.draw_retained(cx, quad, &meshes.faces));
+            self.group_faces_list.draw(cxd, |cx| draws.group_face.draw_retained(cx, quad, tables, &meshes.group_faces));
             draws.region.draw_all(cxd, &inputs.region_params, inputs.regions, inputs.picked_region, &mut self.scratch);
-            draws.mesh.draw_retained(cxd, self.geoms.quad.geometry_id(), &meshes.quads);
-            draws.mesh.draw_retained(cxd, self.geoms.cube.geometry_id(), &meshes.cubes);
+            self.quads_list.draw(cxd, |cx| draws.mesh.draw_retained(cx, quad, &meshes.quads));
+            self.cubes_list.draw(cxd, |cx| draws.mesh.draw_retained(cx, cube, &meshes.cubes));
 
+            // Every block draws, at its own index, even with nothing visible
+            // ([0..0]), so block k is always item k.
             draws.glyph.prepare(cxd, tables, &inputs.glyph_params);
-            for (k, chunk) in self.chunks.iter().enumerate() {
-                let ranges = inputs.chunk_ranges.get(k).copied().unwrap_or(&[]);
-                chunk.draw(cxd, &mut draws.glyph.draw_vars, ranges);
-            }
+            let blocks = &self.blocks;
+            self.glyph_list.draw(cxd, |cx| {
+                for (k, block) in blocks.iter().enumerate() {
+                    let ranges = inputs.chunk_ranges.get(k).copied().unwrap_or(&[]);
+                    block.draw(cx, &mut draws.glyph.draw_vars, ranges);
+                }
+            });
 
             self.draw_list.end(cxd);
         }
@@ -1876,10 +1951,15 @@ impl G3Renderer {
                 self.mask_list.begin_always(cxd);
                 let mask = &mut draws.glyph_mask.draw_super;
                 mask.prepare(cxd, tables, &inputs.glyph_params);
-                for (k, chunk) in self.chunks.iter().enumerate() {
-                    if let Some(ranges) = selection.chunk_ranges.get(k).filter(|r| !r.is_empty()) {
-                        chunk.draw(cxd, &mut mask.draw_vars, ranges);
-                    }
+                self.mask_lists.resize_with(self.blocks.len(), || None);
+                for (k, block) in self.blocks.iter().enumerate() {
+                    let Some(ranges) = selection.chunk_ranges.get(k).filter(|r| !r.is_empty()) else {
+                        continue;
+                    };
+                    let list = self.mask_lists[k].get_or_insert_with(|| G3PhaseList::new(cxd));
+                    list.draw(cxd, |cx| {
+                        block.draw(cx, &mut mask.draw_vars, ranges);
+                    });
                 }
                 self.mask_list.end(cxd);
             }
