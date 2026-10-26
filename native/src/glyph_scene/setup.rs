@@ -4,6 +4,7 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
+use crate::layout::{EmittedSlots, SlotResidence};
 use crate::text::StagedText;
 use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
 use glyph_field_instanced::InstancedField;
@@ -37,7 +38,7 @@ impl GlyphScene {
 
         // --- instance + group buffers --------------------------------------
         let mut arena = staged.instances;
-        if arena.is_empty() && !arena.is_device() && !arena.is_visible() {
+        if arena.is_empty() && !arena.is_emitted() && !arena.is_visible() {
             arena.push(GlyphInstance {
                 pos: [0.0; 3],
                 glyph_id: 0,
@@ -187,6 +188,7 @@ impl GlyphScene {
             glyph_advances: &atlas.glyph_advances,
             item_params: &item_table,
             item_of_group: &item_of_group,
+            block_slots: crate::config::settings().glyph_scene.derived_block_slots as usize,
         };
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let targets = FieldTargets {
@@ -195,12 +197,12 @@ impl GlyphScene {
             depth_format,
             sample_count: SCENE_SAMPLE_COUNT,
         };
-        // The arena's two forms map onto the field's two sources. A DEVICE
-        // arena is already slots in the field's OWN format (the producer was
-        // told the mode — 32 B RenderSlots for Instanced, 20 B DerivedSlots
-        // plus a line table for Derived), chunked by its producer; a HOST
-        // arena is the engine's neutral records, which the mode converts and
-        // uploads. Unified-memory direct upload is a property of the adapter,
+        // The arena's forms map onto the field's sources. An EMITTED arena is
+        // already slots in the field's OWN format (the producer was told the
+        // mode), chunked by its producer: 20 B DerivedSlots in host blocks
+        // the Derived field keeps, or 32 B RenderSlots on the device for
+        // Instanced. A HOST arena is the engine's neutral records, which the
+        // mode converts and uploads. Unified-memory direct upload is a property of the adapter,
         // decided here (Metal + MAPPABLE_PRIMARY_BUFFERS — see
         // glyph_field::upload_host_slots).
         // The field the scene BUILDS follows the arena, not the request: the
@@ -212,7 +214,7 @@ impl GlyphScene {
         // Visible field draws through, and the default (since 2026-10-11;
         // Instanced until then). The probe reads `field.mode()`, so the
         // panel and the HUD show what was built.
-        let built_mode = match (arena.device_slots(), arena.visible_staging()) {
+        let built_mode = match (arena.emitted_slots(), arena.visible_staging()) {
             (Some(dev), _) if dev.format != field_mode => {
                 log::warn!(
                     "field mode {field_mode} requested, but the layout emitted {} slots — building a {} field",
@@ -267,15 +269,20 @@ impl GlyphScene {
                 glyph_field_visible::VisibleLimits::default(),
             )))
         } else {
-            let source = match arena.device_slots() {
-                Some(dev) => SlotSource::Device {
-                    chunk_capacity: dev.chunk_slots,
-                    chunks: &dev.chunks,
-                    glyph_count: instances_len,
-                    mapped_base: dev
-                        .mapped_slots
-                        .or_else(|| dev.derived.as_ref().and_then(|d| d.mapped_base)),
-                },
+            // The field takes the emitted slots: host blocks move into the
+            // Derived field, which keeps them.
+            let device_chunks;
+            let source = match arena.take_emitted() {
+                Some(EmittedSlots { residence: SlotResidence::Host(slots), .. }) => SlotSource::Blocks(slots),
+                Some(EmittedSlots { residence: SlotResidence::Device { chunks, mapped_slots }, chunk_slots, .. }) => {
+                    device_chunks = chunks;
+                    SlotSource::Device {
+                        chunk_capacity: chunk_slots,
+                        chunks: &device_chunks,
+                        glyph_count: instances_len,
+                        mapped_base: mapped_slots,
+                    }
+                }
                 None => SlotSource::Host {
                     slices: arena.instance_chunks(),
                     glyph_count: instances_len,
@@ -356,7 +363,7 @@ impl GlyphScene {
                 min: staged.bounds_min,
                 max: staged.bounds_max,
                 slot_base: 0,
-                slot_count: arena.len() as u32,
+                slot_count: instances_len as u32,
                 tint: seg_tint(
                     arena.instances(),
                     staged.bounds_max[0] - staged.bounds_min[0],
@@ -565,5 +572,62 @@ impl GlyphScene {
         if let Some(cull) = &self.cull {
             cull.lod_min_px.set(lod);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::glyph_scene::{CameraMode, GlyphScene, PickCommand};
+    use crate::repo::{self, RepoParams, Strategy};
+    use crate::scene::SceneLike;
+    use glyph_field::GlyphFieldMode;
+
+    /// The Derived field keeps its slots in host blocks (2026-10-26), and a
+    /// renderer that draws from them (makepad) sees only them: every write
+    /// must land in the block as it lands in the buffer. A load of
+    /// g-pick-repo (two blocks at the default 262144 slots) is held as a
+    /// renderer holds it, edited by the verbs that write slots (a glyph's
+    /// colour, x and group, a line, a whole file through the highlight
+    /// sidecar), then every block is compared with its buffer read back.
+    /// Only the edited block may change identity: an untouched one
+    /// republished would re-upload for nothing.
+    #[test]
+    fn derived_host_blocks_follow_every_slot_write() {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/g-pick-repo");
+        let params = RepoParams { field_mode: GlyphFieldMode::Derived, ..Default::default() };
+        let prefetched = repo::prefetch_repo(&dir, params, Strategy::Hyper);
+        let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, false, Some(&ctx), crate::layout::GlyphArena::new(), None);
+        let atlas = crate::atlas::Atlas::load_device(&ctx.device, &ctx.queue, &crate::default_emoji_sheet());
+        let staged = load.into_staged(None, &atlas.slot_ink);
+        let mut scene = GlyphScene::new(&ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
+        scene.set_viewport(crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
+
+        let held: Vec<Arc<[u32]>> = scene.field.host_slots().expect("a Derived field keeps host blocks").blocks().to_vec();
+        assert!(held.len() >= 2, "g-pick-repo spans more than one block");
+
+        let pick = SceneLike::apply_pick(&mut scene, &ctx, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
+        assert!(pick.is_some_and(|l| l.contains("alpha.rs")), "the pick resolves in alpha.rs");
+        for verb in ["recolor-glyph ff0000", "nudge-glyph 0.5 0", "set-glyph-transform 1 2 0", "recolor-line 00ff00", "reset-glyph-group"] {
+            let verb = crate::parse_verb(verb).expect("a verb literal parses");
+            SceneLike::apply_verb(&mut scene, &ctx, &verb).expect("the scene applies the verb");
+        }
+        let sidecar = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/highlight-alpha.tsv");
+        SceneLike::apply_highlight_sidecar(&scene, &ctx, &sidecar).expect("the sidecar applies");
+
+        let host = scene.field.host_slots().expect("a Derived field keeps host blocks");
+        let mut changed = 0;
+        for (k, block) in host.blocks().iter().enumerate() {
+            let mut gpu = vec![0u32; block.len()];
+            scene.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
+            assert!(gpu[..] == block[..], "block {k}: the host block and its buffer differ after the edits");
+            if !Arc::ptr_eq(block, &held[k]) {
+                changed += 1;
+                assert!(block[..] != held[k][..], "block {k} changed identity with no change of content");
+            }
+        }
+        assert_eq!(changed, 1, "the edits are all in alpha.rs, one block: only it is a fresh allocation");
     }
 }

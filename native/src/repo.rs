@@ -953,21 +953,21 @@ impl RepoLoad {
         // Stage G: the SAME local AABB goes into the pick table (pre-TRS; the
         // pick path applies the live group TRS itself).
         //
-        // The tint fold reads the endpoint's tint STREAM on the Device
-        // path (note 23, E2b — no host instances exist there) and the
-        // arena chunks on the 48 B paths; same values in the same slot
-        // order either way, so the tints are bit-identical.
+        // The tint fold reads Pass 2's tint inputs on the emitted path (no
+        // 48 B records exist there) and the arena chunks on the 48 B paths;
+        // same values in the same slot order either way, so the tints are
+        // bit-identical.
         let mapped_slots = self
             .arena
-            .device_slots()
-            .and_then(|d| d.mapped_slots)
+            .emitted_slots()
+            .and_then(|d| d.mapped_slots())
             .map(|addr| {
-                let len = self.arena.device_slots().unwrap().len;
+                let len = self.arena.emitted_slots().expect("a mapping belongs to an emitted arena").len;
                 // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
                 unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
             });
         let tint_stream: Option<&[u32]> = None;
-        let chunks = if self.arena.device_slots().is_none() {
+        let chunks = if self.arena.emitted_slots().is_none() {
             self.arena.instance_chunks()
         } else {
             Vec::new()
@@ -977,9 +977,9 @@ impl RepoLoad {
         // field culls its own lines.
         let visible = self.arena.is_visible();
         let is_flat = self.painted_flat || visible;
-        let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
-        let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
-        let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);
+        let file_tints = self.arena.emitted_slots().map(|d| &d.file_tints);
+        let file_blocks = self.arena.emitted_slots().map(|d| &d.file_blocks);
+        let emoji_tint_pairs = self.arena.emitted_slots().map(|d| &d.emoji_tint_pairs);
         // The file's group scale (1 in every mode but the library, whose fit
         // rides in the group). Applied as `offset + local * s`, so at s = 1
         // every expression below is the unscaled one bit for bit.
@@ -1010,9 +1010,9 @@ impl RepoLoad {
                         // chunk boundary tints bit-identically to the contiguous fold.
                         let mut tint = crate::glyph_scene::SegTintAccum::new(slot_ink);
                         let want = v.slot_base..v.slot_base + v.slot_count;
-                        // Derived device emission: no 32 B slots exist to read
-                        // back, so Pass 2 captured this item's (glyph, color)
-                        // pairs — its whole slot range, in slot order.
+                        // An emitted arena: Pass 2 captured this item's
+                        // (glyph, color) pairs, its whole slot range in slot
+                        // order, so no emitted slot is read back.
                         let emitted_pairs = emoji_tint_pairs
                             .and_then(|e| e.get(view))
                             .filter(|p| !p.is_empty());

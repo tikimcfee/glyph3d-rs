@@ -28,6 +28,9 @@
 //!   what a mode is built from.
 //! - [`SlotStorage`] / [`upload_host_slots`]: the chunked slot buffers and the
 //!   host upload, generic over a mode's [`SlotRecord`] and its [`Transcode`].
+//! - [`HostSlots`]: a field's slots kept on the host in blocks that are its
+//!   chunks, which the storage uploads from and patches (the Derived field,
+//!   2026-10-26).
 //! - [`FieldCore`]: the glyph and mask pipelines, the per-chunk bind groups,
 //!   draw recording and the slot dump; a mode adds its WGSL and any extra
 //!   bindings through a [`FieldShape`].
@@ -41,6 +44,7 @@
 mod copy;
 mod field;
 mod field_core;
+mod host_slots;
 mod mode;
 mod records;
 mod resources;
@@ -50,6 +54,7 @@ mod upload;
 pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN};
 pub use field::{split_at_chunks, GlyphField};
 pub use field_core::{FieldCore, FieldShape};
+pub use host_slots::HostSlots;
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 pub use resources::{
@@ -57,6 +62,6 @@ pub use resources::{
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
 pub use storage::{SlotRecord, SlotStorage};
-pub use upload::{upload_host_slots, HostUpload, Transcode, UploadLabels};
+pub use upload::{transcode_host_slots, upload_host_slots, HostUpload, Transcode, UploadLabels};
 #[cfg(target_os = "macos")]
 pub use upload::create_mapped_slot_buffer;

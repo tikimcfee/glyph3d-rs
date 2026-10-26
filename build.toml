@@ -30,8 +30,10 @@
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
-# test and float_tables' eight.
-test_floor = 383
+# test and float_tables' eight. 383 -> 387 (2026-10-26): the Derived host
+# blocks' four (the block store's two, the blocks against the contiguous
+# emission, the blocks against their buffers after every slot write).
+test_floor = 387
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1008,6 +1010,26 @@ op = "replace"
 find = "        for (out, pairs) in done {"
 with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
+
+[[mutation]]
+name = "host-block-write-dropped"
+gate = "cargo-test"
+why = "2026-10-26: the Derived field keeps its slots in host blocks a makepad renderer draws from, so a slot write that reaches the buffer and not the block leaves that renderer drawing the glyph as loaded. CONSUMED BY: SlotStorage::write_field, which every Derived verb goes through, via derived_host_blocks_follow_every_slot_write (verbs and a sidecar on g-pick-repo, blocks compared with their buffers)"
+file = "crates/glyph-field/src/storage.rs"
+op = "replace"
+find = "        self.patch_host(slot, field_offset, data);\n"
+with = ""
+expect = "derived_host_blocks_follow_every_slot_write"
+
+[[mutation]]
+name = "host-block-scatter-shifted"
+gate = "cargo-test"
+why = "2026-10-26: Pass 2 writes the Derived slots window by window into scratch, then each window into the host blocks it covers; a block-relative offset one slot off moves every glyph past a block edge by a slot (and loses the block's last). CONSUMED BY: BlockSink::end, via host_blocks_match_the_contiguous_emission (block sizes 1, 7, 700 and past the stream, edges inside windows, layout chunks and emoji items)"
+file = "native/src/layout_hyper/device_alloc.rs"
+op = "replace"
+find = "            let to = (lo - block_start) * slot_words..(hi - block_start) * slot_words;"
+with = "            let to = (lo - block_start + 1).min(block_slots - (hi - lo)) * slot_words..((lo - block_start + 1).min(block_slots - (hi - lo)) + hi - lo) * slot_words;"
+expect = "host_blocks_match_the_contiguous_emission"
 
 [[mutation]]
 name = "egui-use-ungated"
