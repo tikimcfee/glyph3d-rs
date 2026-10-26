@@ -56,9 +56,14 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   the pass writes the group table's transform and appearance columns.
   `resolve-bench` (in the crate, run by hand) times it;
   `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built".
-  `crates/glyph-session-dirs` (2026-10-09, std only) is the one table of where agent
-  apps keep session transcripts, shared by the renderer's F7 browser and the
-  renderer's launcher; `launch_config.example.toml` documents the overrides.
+  Agent sessions come from gomuxai's `agent` CLI, the one reader of agent
+  transcripts: `agent sessions --json` lists them (the F7 browser and the
+  launcher), `agent transcript <session>` prints one session's events, and
+  `native/src/agent_transcript/` reads that stream (gomuxai's `docs/EVENTS.md`).
+  Nothing in this tree parses a harness's transcript or scans its directories;
+  where gomuxai looks is the launch config's `claude_projects_dir`,
+  `agy_brain_dir` and `kimi_sessions_dir`, passed to it as its app config
+  (`launch_config.example.toml`).
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin` + 8 `.bake.bin`, their generators and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
@@ -416,7 +421,8 @@ renderer's and each field-mode crate's), CLI parity, encase lane layout,
 `ItemParams` validation, the layout-seam suites, the fixture loader and its
 refusals, the fold/scan/bake unit suites (monoid domain, wrap and paginate
 rules), `text::reference_layout` bit-exact against every in-domain fixture's
-recorded answers, the transcript parsers, the launcher, and the runner's own
+recorded answers, the agent event reader against gomuxai's vendored
+conformance corpus (`tools/vendor/gomuxai/`), the launcher, and the runner's own
 verdict logic. The count is deliberately not written here — `cargo glyph test`
 prints it next to the floor on every run, and a number in this paragraph would
 be one more thing to forget. Red when a test fails, when a whole test binary

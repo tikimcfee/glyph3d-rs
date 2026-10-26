@@ -84,20 +84,21 @@ no_ui = false
 # "cull", present_mode = "fifo" | "mailbox" | "immediate".
 # repo_presets = [".", "native/fixtures/g-pick-repo", "~/src/some-large-repo"]
 
-# Default agent session transcript path to load at startup (optional)
-# agent_session = "~/.claude/projects/<project-slug>/<session-id>.jsonl"
+# Agent sessions come from gomuxai's `agent` CLI (`agent sessions --json`,
+# `agent transcript <session>`); nothing here reads a transcript itself.
+# The `agent` binary, if it isn't on PATH (optional):
+# agent_binary = "~/.local/bin/agent"
 
-# Agent session discovery (optional). Per app: a path set here is the ONLY
-# place scanned for that app; "" turns the app off; unset uses the app's own
-# default locations that exist on this machine (the same home-relative paths
-# on macOS, Linux and Windows):
-#   claude       $CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects
-#   antigravity  ~/.gemini/antigravity/brain (desktop app)
-#                ~/.gemini/antigravity-cli/brain (CLI)
-#   kimi         ~/.kimi-code/sessions
-# The F7 session browser and the launcher both print what they scanned.
+# The agent session to load at startup (optional): a session id (or the start
+# of only one), a gomuxai agent's name, or a transcript's path.
+# agent_session = "3f34adff-9ebe-405a-aac0-8f69e8fd85f5"
+
+# Where gomuxai looks for each app's sessions (optional). Per app: a path set
+# here is the ONLY place it looks; "" turns the app off; unset uses the app's
+# own default locations that exist on this machine (`agent sessions --help`
+# lists them). Set, these are passed to gomuxai as its app config.
 # claude_projects_dir = "~/.claude/projects"
-# antigravity_brain_dir = "~/.gemini/antigravity/brain"
+# agy_brain_dir = "~/.gemini/antigravity/brain"
 # kimi_sessions_dir = ""
 
 # ── Settings overrides ───────────────────────────────────────────────────────

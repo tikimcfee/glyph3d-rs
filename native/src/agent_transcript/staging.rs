@@ -2,7 +2,8 @@ use bevy_ecs::prelude::{ChildOf, Entity};
 use bevy_transform::prelude::Transform;
 use glam::{Quat, Vec3};
 
-use crate::agent_transcript::{AgentSession, AgentTurn, TranscriptEvent, TranscriptEventKind};
+use crate::agent_transcript::events::ToolStatus;
+use crate::agent_transcript::{AgentSession, TranscriptEvent, TranscriptEventKind};
 use crate::atlas::TrieTable;
 use crate::glyph_scene::{GlyphInstance, GroupRow};
 use crate::layout::GlyphArena;
@@ -196,176 +197,6 @@ fn layout_colored_lines(
     }
 }
 
-/// Format the fixed header lines for the Left Page (Mind) of an Agent Turn Card.
-fn format_turn_left_header(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
-    vec![
-        (
-            format!("TURN {}: {}", turn.turn_index + 1, turn.summary()),
-            pal().title,
-        ),
-        (
-            format!(
-                "Mind • {} tool call(s) • {} think block(s)",
-                turn.tool_calls.len(),
-                turn.thinking.len()
-            ),
-            pal().subtitle,
-        ),
-        (
-            "─────────────────────────────────────────────────────────────".to_string(),
-            pal().rule,
-        ),
-    ]
-}
-
-/// Format the body lines for the Left Page (Mind) of an Agent Turn Card.
-fn format_turn_left_body(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
-    let mut lines = Vec::new();
-
-    // 1. User Prompt
-    lines.push(("[ USER PROMPT ]".to_string(), pal().kinds.user_prompt));
-    if let Some(ref prompt) = turn.prompt {
-        for l in wrap_prose(prompt, 72) {
-            lines.push((format!("  {l}"), pal().body));
-        }
-    } else {
-        lines.push(("  (No user prompt in this turn)".to_string(), pal().muted));
-    }
-
-    lines.push((
-        "─────────────────────────────────────────────────────────────".to_string(),
-        pal().rule,
-    ));
-
-    // 2. Reasoning / Chain of Thought
-    lines.push((
-        "[ CHAIN OF THOUGHT / REASONING ]".to_string(),
-        pal().kinds.thinking,
-    ));
-    let thinking_text = turn.combined_thinking();
-    if !thinking_text.is_empty() {
-        for l in wrap_prose(&thinking_text, 72) {
-            lines.push((format!("  {l}"), pal().body));
-        }
-    } else {
-        lines.push((
-            "  (No internal chain-of-thought logged in transcript)".to_string(),
-            pal().muted,
-        ));
-    }
-
-    lines
-}
-
-/// Format the fixed header lines for the Right Page (Material Impact) of an Agent Turn Card.
-fn format_turn_right_header(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
-    vec![
-        (
-            format!("TURN {} MATERIAL IMPACT", turn.turn_index + 1),
-            pal().title,
-        ),
-        (
-            format!(
-                "Impact • {} file action(s) • {} tool invocation(s)",
-                turn.file_actions.len(),
-                turn.tool_calls.len()
-            ),
-            pal().subtitle,
-        ),
-        (
-            "─────────────────────────────────────────────────────────────".to_string(),
-            pal().rule,
-        ),
-    ]
-}
-
-/// Format the body lines for the Right Page (Material Impact) of an Agent Turn Card.
-fn format_turn_right_body(turn: &AgentTurn) -> Vec<(String, [u8; 3])> {
-    let mut lines = Vec::new();
-
-    // 1. Touched Files
-    lines.push((
-        format!("[ TOUCHED FILES ({}) ]", turn.file_actions.len()),
-        pal().heading,
-    ));
-    if turn.file_actions.is_empty() {
-        lines.push((
-            "  • No file modifications in this turn".to_string(),
-            pal().muted,
-        ));
-    } else {
-        for fa in &turn.file_actions {
-            let (tag, color) = match fa.action {
-                crate::spatial_scene::workdesk::FileActionKind::Edit => ("Edit", pal().kinds.file_edit),
-                crate::spatial_scene::workdesk::FileActionKind::Write => ("Write", pal().kinds.file_write),
-                crate::spatial_scene::workdesk::FileActionKind::Read => ("Read", pal().kinds.file_read),
-                crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => ("Ast", pal().kinds.ast_analysis),
-            };
-            let diff_note = if !fa.hunks.is_empty() {
-                let added: usize = fa
-                    .hunks
-                    .iter()
-                    .map(|h| h.lines.iter().filter(|l| l.starts_with('+')).count())
-                    .sum();
-                let removed: usize = fa
-                    .hunks
-                    .iter()
-                    .map(|h| h.lines.iter().filter(|l| l.starts_with('-')).count())
-                    .sum();
-                format!(" (+{added} -{removed})")
-            } else {
-                String::new()
-            };
-            let summary_suffix = if !fa.summary.is_empty() {
-                format!(" — {}", fa.summary)
-            } else {
-                String::new()
-            };
-            lines.push((
-                format!("  • {tag} {}{diff_note}{summary_suffix}", fa.file_path),
-                color,
-            ));
-        }
-    }
-
-    lines.push((
-        "─────────────────────────────────────────────────────────────".to_string(),
-        pal().rule,
-    ));
-
-    // 2. Assistant Response
-    lines.push(("[ ASSISTANT RESPONSE ]".to_string(), pal().kinds.assistant_response));
-    let assistant_text = turn.combined_assistant_text();
-    if !assistant_text.is_empty() {
-        for l in wrap_prose(&assistant_text, 72) {
-            lines.push((format!("  {l}"), pal().body));
-        }
-    } else {
-        lines.push((
-            "  (No assistant text message recorded in this turn)".to_string(),
-            pal().muted,
-        ));
-    }
-
-    // 3. Tool Invocations
-    if !turn.tool_calls.is_empty() {
-        lines.push((
-            "─────────────────────────────────────────────────────────────".to_string(),
-            pal().rule,
-        ));
-        lines.push((
-            format!("[ TOOL INVOCATIONS ({}) ]", turn.tool_calls.len()),
-            pal().kinds.tool_invocation,
-        ));
-        for tc in &turn.tool_calls {
-            let status = if tc.is_error { "error" } else { "ok" };
-            lines.push((format!("  • {} [{status}]", tc.name), pal().body));
-        }
-    }
-
-    lines
-}
-
 /// Format the fixed header lines for the Left Page (Spec / Metadata) of an Atomic Beat Card.
 fn format_beat_left_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
     let (tag, subtitle) = match &event.kind {
@@ -383,12 +214,16 @@ fn format_beat_left_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
         TranscriptEventKind::Command { .. } => {
             ("COMMAND CONSOLE", "Shell Execution • Process Spec")
         }
+        TranscriptEventKind::ToolInvocation { .. } if event.kind.is_noise() => {
+            ("BOOKKEEPING TOOL", "Agent Housekeeping • Invocation Spec")
+        }
         TranscriptEventKind::ToolInvocation { .. } => {
             ("TOOL INVOCATION", "Agent Action • Invocation Spec")
         }
         TranscriptEventKind::AssistantResponse { .. } => {
             ("ASSISTANT RESPONSE", "Agent Dialogue • Outgoing Message")
         }
+        TranscriptEventKind::System { .. } => ("HARNESS RECORD", "Session Bookkeeping • System"),
     };
 
     vec![
@@ -397,7 +232,7 @@ fn format_beat_left_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
             pal().title,
         ),
         (
-            format!("Turn {} • {subtitle}", event.turn_index + 1),
+            format!("{} • {subtitle}", event.turn_label()),
             pal().subtitle,
         ),
         (
@@ -407,13 +242,29 @@ fn format_beat_left_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
     ]
 }
 
+/// A tool status's colour: ok and still running read as fine, the rest as trouble.
+fn status_color(status: ToolStatus) -> [u8; 3] {
+    match status {
+        ToolStatus::Ok | ToolStatus::Background => pal().ok,
+        ToolStatus::Pending => pal().muted,
+        ToolStatus::Error | ToolStatus::Interrupted => pal().error,
+    }
+}
+
 /// Format the body lines for the Left Page (Spec / Metadata) of an Atomic Beat Card.
 fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
     let mut lines = Vec::new();
 
     match &event.kind {
-        TranscriptEventKind::UserPrompt { prompt } => {
+        TranscriptEventKind::UserPrompt { prompt, origin, command, images } => {
             lines.push(("[ USER REQUEST SPEC ]".to_string(), pal().kinds.user_prompt));
+            lines.push((format!("  From: {}", origin.label()), pal().emphasis));
+            if let Some(command) = command {
+                lines.push((format!("  Command: {command}"), pal().meta));
+            }
+            if *images > 0 {
+                lines.push((format!("  Images: {images}"), pal().meta));
+            }
             lines.push((
                 format!(
                     "  Length: {} chars │ {} lines",
@@ -431,7 +282,14 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
                 lines.push((format!("  {l}"), pal().body));
             }
         }
-        TranscriptEventKind::Thinking { thought } => {
+        TranscriptEventKind::Thinking { redacted: true, .. } => {
+            lines.push(("[ REASONING METRICS ]".to_string(), pal().kinds.thinking));
+            lines.push((
+                "  Redacted: the harness kept the block's signature, not its text".to_string(),
+                pal().muted,
+            ));
+        }
+        TranscriptEventKind::Thinking { thought, .. } => {
             lines.push(("[ REASONING METRICS ]".to_string(), pal().kinds.thinking));
             let word_count = thought.split_whitespace().count();
             lines.push((
@@ -456,6 +314,7 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
             file_path,
             action_record,
             content,
+            first_line,
         } => {
             lines.push(("[ FILE READ SPEC ]".to_string(), pal().kinds.file_read));
             lines.push((format!("  Target: {file_path}"), pal().emphasis));
@@ -484,10 +343,13 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
                 format!("  Tool ID: {}", action_record.tool_id),
                 pal().meta,
             ));
-            lines.push((
-                "  Kind: Inspect / Read whole file into context".to_string(),
-                pal().meta,
-            ));
+            let kind = match (&action_record.file, content) {
+                (Some(f), Some(c)) if !f.is_whole() => {
+                    format!("  Kind: Read lines {}-{} into context", first_line, first_line + c.lines().count().saturating_sub(1))
+                }
+                _ => "  Kind: Inspect / Read whole file into context".to_string(),
+            };
+            lines.push((kind, pal().meta));
         }
         TranscriptEventKind::FileEdit {
             file_path,
@@ -507,16 +369,10 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
                 pal().rule,
             ));
             lines.push(("[ DIFF STATISTICS ]".to_string(), pal().kinds.file_edit));
-            let added: usize = action_record
-                .hunks
-                .iter()
-                .map(|h| h.lines.iter().filter(|l| l.starts_with('+')).count())
-                .sum();
-            let removed: usize = action_record
-                .hunks
-                .iter()
-                .map(|h| h.lines.iter().filter(|l| l.starts_with('-')).count())
-                .sum();
+            let count = |c: char| -> usize {
+                action_record.hunks.iter().map(|h| h.lines.iter().filter(|l| l.starts_with(c)).count()).sum()
+            };
+            let (added, removed) = action_record.added_removed.unwrap_or_else(|| (count('+'), count('-')));
             lines.push((
                 format!(
                     "  +{added} additions │ -{removed} deletions │ {} hunks",
@@ -594,20 +450,18 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
             name,
             command_line,
             output,
-            is_error,
+            status,
         } => {
             lines.push(("[ COMMAND SPEC ]".to_string(), pal().kinds.command));
             lines.push((format!("  Tool: {name}"), pal().emphasis));
-            let status_str = if *is_error {
-                "FAILED (Non-zero exit)"
-            } else {
-                "SUCCESS (0)"
+            let status_str = match status {
+                ToolStatus::Ok => "SUCCESS (0)",
+                ToolStatus::Error => "FAILED (Non-zero exit)",
+                ToolStatus::Pending => "PENDING (no result recorded)",
+                ToolStatus::Interrupted => "INTERRUPTED",
+                ToolStatus::Background => "RUNNING IN BACKGROUND",
             };
-            let status_color = if *is_error {
-                pal().error
-            } else {
-                pal().ok
-            };
+            let status_color = status_color(*status);
             lines.push((format!("  Status: {status_str}"), status_color));
             if let Some(out) = output {
                 lines.push((
@@ -630,19 +484,24 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
         }
         TranscriptEventKind::ToolInvocation {
             name,
+            action,
+            detail,
             input,
             output,
-            is_error,
+            status,
+            sub_sessions,
         } => {
-            lines.push(("[ TOOL INVOCATION SPEC ]".to_string(), pal().kinds.tool_invocation));
-            lines.push((format!("  Tool: {name}"), pal().emphasis));
-            let status_str = if *is_error { "ERROR" } else { "SUCCESS" };
-            let status_color = if *is_error {
-                pal().error
-            } else {
-                pal().ok
-            };
-            lines.push((format!("  Status: {status_str}"), status_color));
+            let accent = if event.kind.is_noise() { pal().kinds.noise } else { pal().kinds.tool_invocation };
+            lines.push(("[ TOOL INVOCATION SPEC ]".to_string(), accent));
+            lines.push((format!("  Tool: {name} ({action})"), pal().emphasis));
+            lines.push((format!("  Status: {}", status.label().to_uppercase()), status_color(*status)));
+            if !detail.is_empty() {
+                let first = detail.lines().next().unwrap_or("");
+                lines.push((format!("  Detail: {}", super::types::truncate_with_ellipsis(first, 60)), pal().meta));
+            }
+            for s in sub_sessions {
+                lines.push((format!("  Started session: {s}"), pal().meta));
+            }
             if let Some(out) = output {
                 lines.push((
                     format!(
@@ -657,14 +516,17 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
                 "─────────────────────────────────────────────────────────────".to_string(),
                 pal().rule,
             ));
-            lines.push(("[ INPUT ARGUMENTS ]".to_string(), pal().kinds.tool_invocation));
+            lines.push(("[ INPUT ARGUMENTS ]".to_string(), accent));
             let input_str = serde_json::to_string_pretty(input).unwrap_or_default();
             for l in input_str.lines().take(20) {
                 lines.push((format!("  {l}"), pal().body));
             }
         }
-        TranscriptEventKind::AssistantResponse { message } => {
+        TranscriptEventKind::AssistantResponse { message, is_final } => {
             lines.push(("[ ASSISTANT MESSAGE SPEC ]".to_string(), pal().kinds.assistant_response));
+            if *is_final {
+                lines.push(("  The turn's closing reply".to_string(), pal().emphasis));
+            }
             lines.push((
                 format!(
                     "  Length: {} chars │ {} lines",
@@ -681,6 +543,14 @@ fn format_beat_left_body(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
             for l in wrap_prose(message, 72).into_iter().take(20) {
                 lines.push((format!("  {l}"), pal().body));
             }
+        }
+        TranscriptEventKind::System { subtype, text } => {
+            lines.push(("[ HARNESS RECORD ]".to_string(), pal().kinds.system));
+            lines.push((format!("  Subtype: {subtype}"), pal().emphasis));
+            lines.push((
+                format!("  Length: {} chars │ {} lines", text.len(), text.lines().count()),
+                pal().meta,
+            ));
         }
     }
 
@@ -710,6 +580,7 @@ fn format_beat_right_header(event: &TranscriptEvent) -> Vec<(String, [u8; 3])> {
         TranscriptEventKind::AssistantResponse { .. } => {
             ("ASSISTANT MESSAGE BODY", "Complete conversational response")
         }
+        TranscriptEventKind::System { .. } => ("HARNESS RECORD TEXT", "What the harness recorded"),
     };
 
     vec![
@@ -736,12 +607,12 @@ fn format_beat_right_body(
     let mut lines = Vec::new();
 
     match &event.kind {
-        TranscriptEventKind::UserPrompt { prompt } => {
+        TranscriptEventKind::UserPrompt { prompt, .. } => {
             for l in wrap_prose(prompt, 72) {
                 lines.push((l, pal().body));
             }
         }
-        TranscriptEventKind::Thinking { thought } => {
+        TranscriptEventKind::Thinking { thought, .. } => {
             for l in wrap_prose(thought, 72) {
                 lines.push((l, pal().body));
             }
@@ -749,6 +620,7 @@ fn format_beat_right_body(
         TranscriptEventKind::FileRead {
             file_path,
             content,
+            first_line,
             ..
         } => {
             let text_opt = content.as_deref().or_else(|| {
@@ -760,7 +632,7 @@ fn format_beat_right_body(
             if let Some(raw_text) = text_opt {
                 let text = normalize_multiline_text(raw_text);
                 for (line_idx, l) in text.lines().take(5000).enumerate() {
-                    lines.push((format!("{:4} │ {}", line_idx + 1, l), pal().body));
+                    lines.push((format!("{:4} │ {}", line_idx + first_line, l), pal().body));
                 }
             } else {
                 lines.push((
@@ -864,11 +736,11 @@ fn format_beat_right_body(
             }
         }
         TranscriptEventKind::Command {
-            output, is_error, ..
+            output, status, ..
         } => {
             if let Some(raw_out) = output {
                 let out = normalize_multiline_text(raw_out);
-                let color = if *is_error {
+                let color = if *status == ToolStatus::Error {
                     pal().error
                 } else {
                     pal().body
@@ -884,11 +756,11 @@ fn format_beat_right_body(
             }
         }
         TranscriptEventKind::ToolInvocation {
-            output, is_error, ..
+            output, status, ..
         } => {
             if let Some(raw_out) = output {
                 let out = normalize_multiline_text(raw_out);
-                let color = if *is_error {
+                let color = if *status == ToolStatus::Error {
                     pal().error
                 } else {
                     pal().body
@@ -903,8 +775,16 @@ fn format_beat_right_body(
                 ));
             }
         }
-        TranscriptEventKind::AssistantResponse { message } => {
+        TranscriptEventKind::AssistantResponse { message, .. } => {
             for l in wrap_prose(message, 72) {
+                lines.push((l, pal().body));
+            }
+        }
+        TranscriptEventKind::System { text, .. } => {
+            if text.is_empty() {
+                lines.push(("  (The record carries no text)".to_string(), pal().muted));
+            }
+            for l in wrap_prose(text, 72) {
                 lines.push((l, pal().body));
             }
         }
@@ -933,7 +813,6 @@ fn format_revision_card_header(rev: &FileRevision, file_path: &str) -> Vec<(Stri
         crate::spatial_scene::workdesk::FileActionKind::Edit => ("Edit", pal().kinds.file_edit),
         crate::spatial_scene::workdesk::FileActionKind::Write => ("Write", pal().kinds.file_write),
         crate::spatial_scene::workdesk::FileActionKind::Read => ("Read", pal().kinds.file_read),
-        crate::spatial_scene::workdesk::FileActionKind::AstAnalysis => ("Ast", pal().kinds.ast_analysis),
     };
     let short_name = format_short_file_name(file_path);
     vec![
@@ -1138,13 +1017,6 @@ pub fn stage_agent_session_with_options(
                     format_beat_left_body(event),
                     format_beat_right_header(event),
                     format_beat_right_body(event, &revision_engine),
-                )
-            } else if let Some(turn) = session.turns.get(card.turn_index) {
-                (
-                    format_turn_left_header(turn),
-                    format_turn_left_body(turn),
-                    format_turn_right_header(turn),
-                    format_turn_right_body(turn),
                 )
             } else {
                 continue;

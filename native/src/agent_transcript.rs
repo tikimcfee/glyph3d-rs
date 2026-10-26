@@ -1,60 +1,39 @@
-//! Agent transcript ingestion, turn pairing, and normalization.
+//! Agent sessions, read from gomuxai's `agent` CLI and staged as an Agent Carrel.
 //!
-//! Provides the primary ingestion seam for agent session histories:
-//! - [`claude`]: Claude Code session JSONL adapter (2-pass tool pairing, distance matching, metadata harvesting).
-//! - [`antigravity`]: Antigravity session JSONL adapter.
-//! - [`kimi`]: Kimi Code `wire.jsonl` event-log adapter.
-//! - [`types`]: Harness-agnostic domain models (`AgentSession`, `AgentTurn`, `ToolCallRecord`, `FileActionRecord`).
+//! gomuxai is the one reader of agent transcripts (Claude Code, agy, Kimi
+//! Code); this renderer reads only what its `agent` CLI prints, and nothing
+//! here opens a harness's transcript or scans a harness's directories.
+//! - [`agent_cli`]: runs `agent sessions --json` (the session list) and
+//!   `agent transcript <session>` (one session's events).
+//! - [`events`]: the event stream (gomuxai's `docs/EVENTS.md`) folded into an
+//!   [`AgentSession`]: events in stream order, updates applied in place.
+//! - [`types`]: beats, one per event (`AgentSession::linearize_events`).
+//! - [`staging`]: beats and file revisions staged as glyph records.
+//!
+//! The first three are UI-free: the terminal launcher, the F7 session
+//! browser and any other view call the same functions.
 
-pub mod antigravity;
-pub mod claude;
-pub mod discovery;
-pub mod kimi;
+pub mod agent_cli;
+pub mod events;
 pub mod staging;
 pub mod types;
 
 #[cfg(test)]
+pub(crate) mod test_stream;
+#[cfg(test)]
 mod tests;
 
-pub use antigravity::parse_antigravity_session;
-pub use claude::parse_claude_session;
-pub use discovery::{scan_agent_sessions, DiscoveredSession, SessionHarnessFilter};
-pub use kimi::parse_kimi_session;
+pub use agent_cli::AgentCli;
+pub use events::{AgentSession, HarnessKind, SessionInfo};
 pub use staging::{stage_agent_session, stage_agent_session_with_options};
-pub use types::{
-    AgentSession, AgentTurn, DiffHunkRecord, FileActionRecord, HarnessKind, ToolCallRecord,
-    TranscriptEvent, TranscriptEventKind,
-};
+pub use types::{DiffHunkRecord, FileActionRecord, TranscriptEvent, TranscriptEventKind};
 
-/// Automatically detect transcript format and parse an [`AgentSession`].
-pub fn detect_and_parse_session(content: &str, session_id: &str) -> AgentSession {
-    if kimi::looks_like_kimi(content) {
-        return parse_kimi_session(content, session_id);
-    }
-    for line in content.lines().take(30) {
-        if line.contains("\"step_index\"")
-            || line.contains("\"PLANNER_RESPONSE\"")
-            || line.contains("\"USER_INPUT\"")
-        {
-            return parse_antigravity_session(content, session_id);
-        }
-    }
-    parse_claude_session(content, session_id)
+/// A session read and its file revisions built: what an Agent Carrel shows.
+pub type LoadedSession = std::sync::Arc<(AgentSession, crate::revision::RevisionEngine)>;
+
+/// Read one session through `agent transcript` and build its revisions.
+pub fn load_session(agent: &AgentCli, session: &str) -> Result<LoadedSession, String> {
+    let session = agent.transcript(session)?;
+    let engine = crate::revision::RevisionEngine::for_session(&session);
+    Ok(std::sync::Arc::new((session, engine)))
 }
-
-/// Load and parse an agent transcript from a filesystem path.
-pub fn load_session_from_path(path: &std::path::Path) -> Result<AgentSession, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read session file {}: {e}", path.display()))?;
-    let session_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session");
-    // A Kimi transcript is `wire.jsonl` inside a session directory, which
-    // holds the id, title and working directory the log itself does not.
-    if kimi::looks_like_kimi(&content) {
-        return Ok(kimi::parse_kimi_session_at(&content, path, session_id));
-    }
-    Ok(detect_and_parse_session(&content, session_id))
-}
-

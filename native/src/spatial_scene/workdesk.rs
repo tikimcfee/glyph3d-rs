@@ -21,7 +21,6 @@ pub enum FileActionKind {
     Read,
     Edit,
     Write,
-    AstAnalysis,
 }
 
 impl FileActionKind {
@@ -33,7 +32,6 @@ impl FileActionKind {
             Self::Read => w.read,
             Self::Edit => w.edit,
             Self::Write => w.write,
-            Self::AstAnalysis => w.ast_analysis,
         }
     }
 }

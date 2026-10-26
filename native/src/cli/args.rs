@@ -124,9 +124,11 @@ pub struct Cli {
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
-    /// Load an agent transcript session (JSONL from Claude Code or Antigravity) into an Agent Carrel
-    #[arg(long, value_name = "PATH")]
-    pub agent_session: Option<PathBuf>,
+    /// Load an agent session into an Agent Carrel: a session id (or the start of only one), a gomuxai
+    /// agent's name, or a transcript's path (Claude Code, Antigravity or Kimi Code), read through
+    /// gomuxai's `agent transcript` (`agent sessions` lists them)
+    #[arg(long, value_name = "SESSION")]
+    pub agent_session: Option<String>,
     /// Sliding window limit for Agent Carrel turn/beat deck (default 20)
     #[arg(long, value_name = "N", default_value_t = 20)]
     pub deck_window_limit: usize,
@@ -343,6 +345,10 @@ pub struct Cli {
     /// to the most recent pick.
     #[arg(skip)]
     pub ops: Vec<Op>,
+    /// How to run gomuxai's `agent` (the launch config's `agent_binary` and
+    /// session dirs; else `agent` on PATH).
+    #[arg(skip)]
+    pub agent: crate::agent_transcript::AgentCli,
 }
 
 /// The op-stream flags exactly as clap captures them (per-flag vectors).
@@ -426,6 +432,8 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
             crate::config::install(cfg.settings.clone())
                 .map_err(|e| format!("launch config '{}': {e}", path.display()))?;
         }
+        cli.agent = crate::agent_transcript::AgentCli::from_launch_config(&cfg)
+            .map_err(|e| format!("launch config '{}': {e}", path.display()))?;
         merge_launch_config(&mut cli, &matches, cfg);
     }
 
@@ -433,8 +441,9 @@ pub fn parse_cli_from(matches: clap::ArgMatches) -> Result<Cli, String> {
     // verb's default colour), and config::install refuses once anything has.
     cli.ops = build_ops(&matches, &cli.raw_ops);
 
+    // A path typed with `~` (or written so in a config) names the home dir.
     if let Some(session) = &cli.agent_session {
-        cli.agent_session = Some(crate::launch_config::expand_home(session));
+        cli.agent_session = Some(crate::launch_config::expand_home(Path::new(session)).to_string_lossy().into_owned());
     }
 
     Ok(cli)

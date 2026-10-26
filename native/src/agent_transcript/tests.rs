@@ -1,808 +1,513 @@
-//! Unit tests for agent transcript ingestion and normalization.
-//!
-//! Includes behavioral parity test against `tools/sessionAdapter.test.mjs`
-//! from `glyph3d-js`.
+//! The reader held to gomuxai's conformance corpus (the event streams it
+//! promises for every harness, vendored at a pinned commit under
+//! `tools/vendor/gomuxai/`), and the staging of what it reads.
 
-use super::claude::{parse_claude_session, parse_iso_ts, user_prompt_text};
-use super::antigravity::parse_antigravity_session;
-use super::types::HarnessKind;
-use crate::spatial_scene::workdesk::FileActionKind;
-use serde_json::json;
+use std::sync::{Arc, Mutex};
 
-#[test]
-fn test_parse_iso_ts() {
-    assert_eq!(parse_iso_ts("1970-01-01T00:00:00.000Z"), Some(0));
-    assert_eq!(parse_iso_ts("1970-01-01T00:00:00Z"), Some(0));
-    assert_eq!(
-        parse_iso_ts("2026-08-01T10:00:00.000Z"),
-        Some(1785578400000)
-    );
-    assert_eq!(
-        parse_iso_ts("2026-08-01T10:00:05.500Z"),
-        Some(1785578405500)
-    );
-    assert_eq!(parse_iso_ts("not a timestamp"), None);
-}
+use serde_json::{json, Value};
 
-#[test]
-fn test_synthetic_claude_session_parity() {
-    // Exact synthetic session from glyph3d-js/tools/sessionAdapter.test.mjs
-    let t = |s: u32| format!("2026-08-01T10:00:0{s}.000Z");
+use super::agent_cli::{nest_subagents, parse_rfc3339, AgentCli};
+use super::events::{AgentSession, Applied, PromptOrigin, ToolStatus};
+use super::test_stream::Stream;
+use super::types::{truncate_chars, truncate_with_ellipsis, TranscriptEventKind};
+use crate::revision::RevisionEngine;
 
-    let lines = vec![
-        // non-message bookkeeping line → no event
-        json!({ "type": "mode", "mode": "normal" }).to_string(),
-        // malformed line → skipped, parse survives
-        "{this is not json".to_string(),
-        // sidechain line → skipped wholesale: prose, tool_use, cwd must not leak
-        json!({
-            "type": "assistant",
-            "isSidechain": true,
-            "cwd": "/side/land",
-            "timestamp": t(0),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "text", "text": "sidechain prose" },
-                    { "type": "tool_use", "id": "tu-side", "name": "Bash", "input": { "command": "rm -rf /" } }
-                ]
-            }
-        }).to_string(),
-        // thinking + text blocks, in block order; first-seen cwd
-        json!({
-            "type": "assistant",
-            "cwd": "/main/repo",
-            "timestamp": t(0),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "thinking", "thinking": "let me think" },
-                    { "type": "text", "text": "hello world" }
-                ]
-            }
-        }).to_string(),
-        // whitespace-only text dropped; the tool_use beside it still emits
-        json!({
-            "type": "assistant",
-            "timestamp": t(1),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "text", "text": "   \n  " },
-                    { "type": "tool_use", "id": "tu-edit", "name": "Edit", "input": { "file_path": "/main/repo/a.js" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "timestamp": t(2),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "tu-bash", "name": "Bash", "input": { "command": "ls" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "timestamp": t(3),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "tu-grep", "name": "Grep", "input": { "pattern": "x" } }
-                ]
-            }
-        }).to_string(),
-        // no timestamp on this line → ts null; its result never arrives → response null
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "tu-read", "name": "Read", "input": { "file_path": "/main/repo/b.js" } }
-                ]
-            }
-        }).to_string(),
-        // USER prompt: starts a new turn
-        json!({
-            "type": "user",
-            "timestamp": t(5),
-            "message": {
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": "do the thing" }
-                ]
-            }
-        }).to_string(),
-        // structured toolUseResult HAS stdout → kept verbatim, result text NOT merged in
-        json!({
-            "type": "user",
-            "timestamp": t(6),
-            "toolUseResult": { "stdout": "one\ntwo\n", "interrupted": false },
-            "message": {
-                "role": "user",
-                "content": [
-                    { "type": "tool_result", "tool_use_id": "tu-bash", "content": [{ "type": "text", "text": "one" }, { "type": "text", "text": "two" }] }
-                ]
-            }
-        }).to_string(),
-        // no structured object → the plain result text IS the response
-        json!({
-            "type": "user",
-            "timestamp": t(7),
-            "message": {
-                "role": "user",
-                "content": [
-                    { "type": "tool_result", "tool_use_id": "tu-grep", "content": "src/a.js:1:x" }
-                ]
-            }
-        }).to_string(),
-        // pairing across distance: first tool's result lands LAST; structured lacks text field → text merged in as `content`
-        json!({
-            "type": "user",
-            "timestamp": t(8),
-            "toolUseResult": { "structuredPatch": [{ "newStart": 1, "lines": ["+a"] }] },
-            "message": {
-                "role": "user",
-                "content": [
-                    { "type": "tool_result", "tool_use_id": "tu-edit", "content": "The file has been updated" }
-                ]
-            }
-        }).to_string(),
-        // trailing prose after the last tool
-        json!({
-            "type": "assistant",
-            "timestamp": t(9),
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "text", "text": "all done" }
-                ]
-            }
-        }).to_string(),
-    ];
-
-    let transcript = lines.join("\n") + "\n";
-    let session = parse_claude_session(&transcript, "test_session");
-
-    assert_eq!(session.harness, HarnessKind::ClaudeCode);
-    assert_eq!(session.cwd.as_deref(), Some("/main/repo"));
-    assert_eq!(session.first_ts, parse_iso_ts(&t(0)));
-    assert_eq!(session.last_ts, parse_iso_ts(&t(9)));
-
-    // Total tool invocations across turns: 4 tools (Edit, Bash, Grep, Read)
-    assert_eq!(session.total_tool_calls(), 4);
-
-    // Verify turn structure:
-    // Turn 0: initial thinking, greeting, 4 tools
-    // Turn 1: user prompt "do the thing", trailing prose "all done"
-    assert_eq!(session.turns.len(), 2);
-
-    let turn0 = &session.turns[0];
-    assert_eq!(turn0.thinking, vec!["let me think"]);
-    assert_eq!(turn0.assistant_messages, vec!["hello world"]);
-    assert_eq!(turn0.tool_calls.len(), 4);
-    assert_eq!(turn0.tool_calls[0].name, "Edit");
-    assert_eq!(turn0.tool_calls[1].name, "Bash");
-    assert_eq!(turn0.tool_calls[2].name, "Grep");
-    assert_eq!(turn0.tool_calls[3].name, "Read");
-
-    // Check response merge branches:
-    // 1. Bash: kept verbatim { stdout: "one\ntwo\n", interrupted: false }
-    let bash_resp = turn0.tool_calls[1].response.as_ref().unwrap();
-    assert_eq!(bash_resp["stdout"], "one\ntwo\n");
-    assert_eq!(bash_resp["interrupted"], false);
-
-    // 2. Grep: bare string "src/a.js:1:x"
-    let grep_resp = turn0.tool_calls[2].response.as_ref().unwrap();
-    assert_eq!(grep_resp, "src/a.js:1:x");
-
-    // 3. Edit: structuredPatch with merged "content": "The file has been updated"
-    let edit_resp = turn0.tool_calls[0].response.as_ref().unwrap();
-    assert_eq!(edit_resp["content"], "The file has been updated");
-    assert!(edit_resp.get("structuredPatch").is_some());
-
-    // 4. Read: result never arrived -> response is None
-    assert!(turn0.tool_calls[3].response.is_none());
-
-    // File actions:
-    assert_eq!(turn0.file_actions.len(), 2);
-    assert_eq!(turn0.file_actions[0].action, FileActionKind::Edit);
-    assert_eq!(turn0.file_actions[0].file_path, "/main/repo/a.js");
-    assert_eq!(turn0.file_actions[1].action, FileActionKind::Read);
-    assert_eq!(turn0.file_actions[1].file_path, "/main/repo/b.js");
-
-    let turn1 = &session.turns[1];
-    assert_eq!(turn1.prompt.as_deref(), Some("do the thing"));
-    assert_eq!(turn1.assistant_messages, vec!["all done"]);
-}
-
-#[test]
-fn test_degenerate_inputs() {
-    let empty_session = parse_claude_session("", "empty");
-    assert_eq!(empty_session.turns.len(), 0);
-    assert_eq!(empty_session.cwd, None);
-
-    let garbage = "null\n42\n\"str\"\n{invalid json";
-    let garbage_session = parse_claude_session(garbage, "garbage");
-    assert_eq!(garbage_session.turns.len(), 0);
-    assert_eq!(garbage_session.cwd, None);
-}
-
-#[test]
-fn test_antigravity_transcript_parsing() {
-    let lines = [
-        json!({
-            "step_index": 0,
-            "type": "USER_INPUT",
-            "content": "Add a new button component",
-            "created_at": "2026-10-04T12:00:00Z"
-        }).to_string(),
-        json!({
-            "step_index": 1,
-            "type": "PLANNER_RESPONSE",
-            "thinking": "I need to edit Button.rs",
-            "content": "Editing Button.rs now",
-            "tool_calls": [
-                {
-                    "name": "replace_file_content",
-                    "args": {
-                        "TargetFile": "/path/Button.rs",
-                        "TargetContent": "fn old() {}",
-                        "ReplacementContent": "fn new() {}",
-                        "StartLine": 10,
-                        "EndLine": 12
-                    }
-                }
-            ],
-            "created_at": "2026-10-04T12:00:02Z"
-        }).to_string(),
-        json!({
-            "step_index": 2,
-            "type": "GENERIC",
-            "content": "Success replacing content",
-            "created_at": "2026-10-04T12:00:03Z"
-        }).to_string(),
-    ];
-
-    let transcript = lines.join("\n");
-    let session = parse_antigravity_session(&transcript, "ag_session");
-
-    assert_eq!(session.harness, HarnessKind::Antigravity);
-    assert_eq!(session.turns.len(), 1);
-
-    let turn = &session.turns[0];
-    assert_eq!(turn.prompt.as_deref(), Some("Add a new button component"));
-    assert_eq!(turn.thinking, vec!["I need to edit Button.rs"]);
-    assert_eq!(turn.assistant_messages, vec!["Editing Button.rs now"]);
-    assert_eq!(turn.tool_calls.len(), 1);
-    assert_eq!(turn.tool_calls[0].name, "replace_file_content");
-    assert_eq!(turn.tool_calls[0].response.as_ref().unwrap(), "Success replacing content");
-
-    assert_eq!(turn.file_actions.len(), 1);
-    assert_eq!(turn.file_actions[0].action, FileActionKind::Edit);
-    assert_eq!(turn.file_actions[0].file_path, "/path/Button.rs");
-    assert_eq!(turn.file_actions[0].old_content.as_deref(), Some("fn old() {}"));
-    assert_eq!(turn.file_actions[0].new_content.as_deref(), Some("fn new() {}"));
-}
-
-#[test]
-fn test_antigravity_encoded_strings_and_multiline_revisions() {
-    use crate::revision::RevisionEngine;
-
-    // Real-world Antigravity transcript format with double-encoded JSON string args:
-    let lines = [
-        json!({
-            "step_index": 0,
-            "type": "USER_INPUT",
-            "content": "Add helper functions to file",
-            "created_at": "2026-10-04T12:00:00Z"
-        }).to_string(),
-        json!({
-            "step_index": 1,
-            "type": "PLANNER_RESPONSE",
-            "thinking": "Viewing file first",
-            "content": "Viewing file now",
-            "tool_calls": [
-                {
-                    "name": "view_file",
-                    "args": {
-                        "AbsolutePath": "\"/virtual/Workspace/file.rs\"",
-                        "StartLine": "1",
-                        "EndLine": "3"
-                    }
-                }
-            ],
-            "created_at": "2026-10-04T12:00:01Z"
-        }).to_string(),
-        json!({
-            "step_index": 2,
-            "type": "GENERIC",
-            "content": "Created At: 2026-10-04T12:00:01Z\nShowing lines 1 to 3\nThe following code has been modified to include line numbers.\n1: fn line_one() {}\n2: fn line_two() {}\n3: fn line_three() {}",
-            "created_at": "2026-10-04T12:00:02Z"
-        }).to_string(),
-        json!({
-            "step_index": 3,
-            "type": "PLANNER_RESPONSE",
-            "thinking": "Editing file now",
-            "content": "Replacing line_two with expanded helper",
-            "tool_calls": [
-                {
-                    "name": "replace_file_content",
-                    "args": {
-                        "TargetFile": "\"/virtual/Workspace/file.rs\"",
-                        "TargetContent": "\"fn line_two() {}\"",
-                        "ReplacementContent": "\"fn line_two() {\\n    println!(\\\"expanded\\\");\\n}\"",
-                        "StartLine": "2",
-                        "EndLine": "2"
-                    }
-                }
-            ],
-            "created_at": "2026-10-04T12:00:03Z"
-        }).to_string(),
-    ];
-
-    let transcript = lines.join("\n");
-    let session = parse_antigravity_session(&transcript, "test_encoded_ag");
-
-    assert_eq!(session.turns.len(), 1);
-    let turn = &session.turns[0];
-    assert_eq!(turn.file_actions.len(), 2);
-
-    // 1. view_file: path cleaned without quotes, content extracted from GENERIC step
-    let read_action = &turn.file_actions[0];
-    assert_eq!(read_action.file_path, "/virtual/Workspace/file.rs");
-    let read_content = read_action.original_file.as_ref().expect("view_file content extracted");
-    assert_eq!(
-        read_content,
-        "fn line_one() {}\nfn line_two() {}\nfn line_three() {}"
-    );
-
-    // 2. replace_file_content: path cleaned, ReplacementContent unescaped with actual newlines
-    let edit_action = &turn.file_actions[1];
-    assert_eq!(edit_action.file_path, "/virtual/Workspace/file.rs");
-    assert_eq!(edit_action.old_content.as_deref(), Some("fn line_two() {}"));
-    assert_eq!(
-        edit_action.new_content.as_deref(),
-        Some("fn line_two() {\n    println!(\"expanded\");\n}")
-    );
-
-    // Ingest into RevisionEngine and verify revisions have real multi-line text
-    let mut engine = RevisionEngine::new();
-    engine.ingest_session(&session);
-
-    let history = engine.history("/virtual/Workspace/file.rs").expect("history exists");
-    assert_eq!(history.count(), 2);
-
-    let r0 = history.get(0).unwrap();
-    assert_eq!(r0.text.lines().count(), 3);
-
-    let r1 = history.get(1).unwrap();
-    // After replacing single line with 3-line function, total lines should be 5
-    assert_eq!(r1.text.lines().count(), 5);
-}
-
-#[test]
-fn test_multi_turn_file_actions() {
-    let lines = [
-        // Turn 1: user asks to create file
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Create server.rs" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "src/server.rs", "content": "fn main() {}" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "src/server.rs", "content": "fn main() {}" },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
-        }).to_string(),
-        // Turn 2: user asks to add route
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Add route to server.rs" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": {
-                        "file_path": "src/server.rs",
-                        "old_string": "fn main() {}",
-                        "new_string": "fn main() { route(); }"
-                    } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": {
-                "filePath": "src/server.rs",
-                "structuredPatch": [
-                    { "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-fn main() {}", "+fn main() { route(); }"] }
-                ]
-            },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
-        }).to_string(),
-    ];
-
-    let session = parse_claude_session(&lines.join("\n"), "multi_turn");
-    assert_eq!(session.turns.len(), 2);
-    assert_eq!(session.touched_files(), vec!["src/server.rs"]);
-    assert_eq!(session.total_file_actions(), 2);
-
-    let t1 = &session.turns[0];
-    assert_eq!(t1.prompt.as_deref(), Some("Create server.rs"));
-    assert_eq!(t1.file_actions[0].action, FileActionKind::Write);
-    assert_eq!(t1.file_actions[0].new_content.as_deref(), Some("fn main() {}"));
-
-    let t2 = &session.turns[1];
-    assert_eq!(t2.prompt.as_deref(), Some("Add route to server.rs"));
-    assert_eq!(t2.file_actions[0].action, FileActionKind::Edit);
-    assert_eq!(t2.file_actions[0].hunks.len(), 1);
-    assert_eq!(t2.file_actions[0].hunks[0].lines, vec!["-fn main() {}", "+fn main() { route(); }"]);
-}
-
-/// Opt-in smoke test against a real transcript on this machine:
-/// `GLYPH_REAL_CLAUDE_SESSION=/path/to/<id>.jsonl cargo test`. Unset, it
-/// checks nothing, so it never depends on whose machine runs the suite.
-#[test]
-fn test_real_claude_session_if_present() {
-    let Some(session_path) = std::env::var_os("GLYPH_REAL_CLAUDE_SESSION").map(std::path::PathBuf::from) else {
-        return;
+macro_rules! corpus {
+    ($($case:literal),* $(,)?) => {
+        [$(($case, include_str!(concat!("../../../tools/vendor/gomuxai/internal/transcript/testdata/corpus/", $case, ".events.jsonl")))),*]
     };
-    let content = std::fs::read_to_string(&session_path).expect("read GLYPH_REAL_CLAUDE_SESSION");
-    let id = session_path.file_stem().and_then(|s| s.to_str()).unwrap_or("session").to_string();
-    let session = parse_claude_session(&content, &id);
-    assert_eq!(session.harness, HarnessKind::ClaudeCode);
-    assert_eq!(session.session_id, id);
-    assert!(session.cwd.is_some());
+}
+
+/// Every expected stream in the vendored corpus. Pinned by count below, so
+/// a stream dropped from the vendor dir (or this list) is seen.
+const CORPUS: [(&str, &str); 13] = corpus![
+    "agy/conversation",
+    "claude/basic-turn",
+    "claude/derived-turns",
+    "claude/held-delivery",
+    "claude/mid-turn-queued",
+    "claude/notification-and-commands",
+    "claude/requests",
+    "claude/session-meta",
+    "claude/subagent",
+    "claude/subagent/subagents/agent-a3f9c2e17b4d5e608",
+    "claude/system-records",
+    "claude/tool-results",
+    "kimi/interleaved",
+];
+
+fn corpus(case: &str) -> &'static str {
+    CORPUS.iter().find(|(c, _)| *c == case).unwrap_or_else(|| panic!("no corpus case {case}")).1
+}
+
+fn read(case: &str) -> AgentSession {
+    AgentSession::from_stream_str(corpus(case)).unwrap_or_else(|e| panic!("{case}: {e}"))
+}
+
+/// A beat's kind, as a word.
+fn kind_name(kind: &TranscriptEventKind) -> &'static str {
+    match kind {
+        TranscriptEventKind::UserPrompt { .. } => "prompt",
+        TranscriptEventKind::Thinking { .. } => "think",
+        TranscriptEventKind::FileRead { .. } => "read",
+        TranscriptEventKind::FileEdit { .. } => "edit",
+        TranscriptEventKind::FileWrite { .. } => "write",
+        TranscriptEventKind::Command { .. } => "command",
+        TranscriptEventKind::ToolInvocation { .. } => "tool",
+        TranscriptEventKind::AssistantResponse { .. } => "say",
+        TranscriptEventKind::System { .. } => "system",
+    }
+}
+
+/// The stream's event lines, parsed apart from the reader: the test's own
+/// account of what the fold must hold.
+fn event_lines(case: &str) -> Vec<Value> {
+    corpus(case)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("corpus lines are JSON"))
+        .filter(|v| v["type"] == "event")
+        .collect()
+}
+
+/// One beat per event id, in the order the adds came, each holding its
+/// event's LAST line: for every stream of the corpus.
+#[test]
+fn every_corpus_stream_folds_to_one_beat_per_event() {
+    assert_eq!(CORPUS.len(), 13, "the vendored corpus is 13 streams");
+    for (case, text) in CORPUS {
+        let session = read(case);
+        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(session.session_id(), first["session_id"], "{case}: the session line");
+        let lines = event_lines(case);
+        let mut ids: Vec<&str> = Vec::new();
+        for l in &lines {
+            let id = l["id"].as_str().unwrap();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let beats = session.linearize_events(None);
+        assert_eq!(beats.len(), ids.len(), "{case}: one beat per event id");
+        for (i, (beat, id)) in beats.iter().zip(&ids).enumerate() {
+            assert_eq!((beat.index, beat.id.as_str()), (i, *id), "{case}: beat {i} is the {i}th event added");
+            let last = lines.iter().rev().find(|l| l["id"] == *id).unwrap();
+            assert_eq!(session.events[i].seq, last["seq"].as_u64().unwrap(), "{case}: {id} holds its last line");
+            let expected = match last["kind"].as_str().unwrap() {
+                "tool" => {
+                    let tool = &last["tool"];
+                    let returned = tool["result"]["status"] == "ok" && tool["target"].as_str().is_some_and(|t| !t.is_empty());
+                    match tool["action"].as_str().unwrap() {
+                        a @ ("read" | "edit" | "write") if returned => a,
+                        "bash" => "command",
+                        _ => "tool",
+                    }
+                }
+                other => other,
+            };
+            assert_eq!(kind_name(&beat.kind), expected, "{case}: {id}'s beat kind");
+        }
+    }
+}
+
+/// Kimi's thinking, text and tool calls interleave across a turn; the beats
+/// keep that order (a grouped order, all thinking then all tools then all
+/// text, is the bug `kimi/interleaved` exists for).
+#[test]
+fn kimi_beats_keep_the_wire_order() {
+    let beats = read("kimi/interleaved").linearize_events(None);
+    let kinds: Vec<&str> = beats.iter().map(|b| kind_name(&b.kind)).collect();
+    assert_eq!(kinds, ["prompt", "think", "read", "say", "think", "command", "say"]);
+}
+
+/// agy's three calls in one step each get their own result (positional
+/// pairing gave only the last one a result).
+#[test]
+fn agy_calls_in_one_step_each_hold_their_result() {
+    let beats = read("agy/conversation").linearize_events(None);
+    let by_id = |id: &str| &beats.iter().find(|b| b.id == id).unwrap().kind;
+    match by_id("step_1_tool_0") {
+        TranscriptEventKind::Command { status, output, .. } => {
+            assert_eq!(*status, ToolStatus::Ok);
+            assert!(output.as_deref().is_some_and(|o| !o.is_empty()));
+        }
+        k => panic!("run_command is a command beat, got {k:?}"),
+    }
+    for (id, target) in [("step_1_tool_1", "main.go"), ("step_1_tool_2", "spin.go")] {
+        match by_id(id) {
+            TranscriptEventKind::FileRead { file_path, action_record, .. } => {
+                assert_eq!((file_path.as_str(), action_record.tool_id.as_str()), (target, id));
+            }
+            k => panic!("{id} is a read that returned, got {k:?}"),
+        }
+    }
+}
+
+/// A tool's result is an update of its event: applied line by line (as a
+/// live feed would apply them), the call's beat stays where its add put it
+/// and changes from pending to its result.
+#[test]
+fn a_tool_result_updates_its_beat_in_place() {
+    let text = corpus("claude/tool-results");
+    let mut lines = text.lines();
+    let mut session = AgentSession::default();
+    assert_eq!(session.apply_line(lines.next().unwrap()), Ok(Applied::Session));
+    let bash = "toolu_011tw69VnI2pYtiPQnqaknd1";
+    let multi = "toolu_01zwI74ek5gSV6soBvRy3h61";
+    let mut bash_at = None;
+    let mut multi_updated = None;
+    for line in lines {
+        let applied = session.apply_line(line).unwrap();
+        let id = serde_json::from_str::<Value>(line).unwrap()["id"].as_str().unwrap().to_string();
+        match applied {
+            Applied::Added(i) if id == bash => {
+                bash_at = Some(i);
+                let beats = session.linearize_events(None);
+                assert!(matches!(beats[i].kind, TranscriptEventKind::Command { status: ToolStatus::Pending, .. }));
+            }
+            Applied::Updated(i) if id == bash => assert_eq!(Some(i), bash_at, "the update replaces the add's beat"),
+            Applied::Updated(i) if id == multi => multi_updated = Some(i),
+            _ => {}
+        }
+    }
+    let beats = session.linearize_events(None);
+    assert_eq!(beats.len(), 11);
+    let i = bash_at.expect("the Bash call was added");
+    match &beats[i].kind {
+        TranscriptEventKind::Command { status, output, .. } => {
+            assert_eq!(*status, ToolStatus::Error);
+            assert!(output.is_some(), "an error's output lands with it");
+        }
+        k => panic!("{k:?}"),
+    }
+    assert_eq!(multi_updated, Some(1), "the MultiEdit is the second event");
+    match &beats[1].kind {
+        TranscriptEventKind::FileEdit { file_path, post_edit_content, action_record } => {
+            assert_eq!(file_path, "spin.go");
+            assert!(post_edit_content.as_deref().unwrap().contains("func Spin(ctx context.Context, n int) error {"));
+            assert_eq!(action_record.hunks.len(), 2, "meta.patch's two hunks");
+            assert_eq!(action_record.added_removed, Some((2, 2)));
+        }
+        k => panic!("the MultiEdit returned: a file edit, got {k:?}"),
+    }
+}
+
+/// Turns are the events' own: a message queued mid-turn stays in its turn,
+/// a later update stays in the turn of the call it completes, and turn
+/// numbers are the transcript's (a notification's turn shares its index).
+#[test]
+fn turns_come_from_the_events() {
+    let session = read("claude/mid-turn-queued");
+    let beats = session.linearize_events(None);
+    assert_eq!(session.turn_count(), 2);
+    let turns: Vec<usize> = beats.iter().map(|b| b.turn_index).collect();
+    assert_eq!(turns, [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]);
+    assert!(matches!(beats[2].kind, TranscriptEventKind::UserPrompt { origin: PromptOrigin::Queued, .. }), "the mid-turn message");
+    assert!(matches!(beats[6].kind, TranscriptEventKind::UserPrompt { origin: PromptOrigin::Queued, .. }), "the message that opened turn 2");
+    assert_eq!(beats[6].turn_label(), "Turn 2");
+
+    let session = read("claude/notification-and-commands");
+    let beats = session.linearize_events(None);
+    assert_eq!(session.turn_count(), 4);
+    let labels: Vec<String> = (0..4)
+        .map(|t| beats.iter().find(|b| b.turn_index == t).unwrap().turn_label())
+        .collect();
+    assert_eq!(labels, ["Turn 1", "Turn 1", "Turn 1", "Turn 2"]);
+    let bash = beats.iter().find(|b| b.id.starts_with("toolu_01AnWev7")).unwrap();
+    assert_eq!(bash.turn_index, 0, "completed by a notification in turn 1, it stays in turn 0");
+    assert!(matches!(bash.kind, TranscriptEventKind::Command { status: ToolStatus::Ok, .. }));
+
+    let session = read("claude/derived-turns");
+    assert_eq!(session.turn_count(), 3);
+    assert!(session.events.iter().all(|e| e.turn.as_ref().unwrap().derived));
+    assert_eq!(session.linearize_events(None)[0].turn_label(), "Turn 1 (derived)");
+}
+
+/// Every origin a prompt can have reaches its beat, and the minor beats are
+/// there too: redacted thinking, noise tools, harness records.
+#[test]
+fn prompt_origins_and_minor_beats_reach_the_deck() {
+    let mut origins = Vec::new();
+    for (case, _) in CORPUS {
+        for beat in read(case).linearize_events(None) {
+            if let TranscriptEventKind::UserPrompt { origin, command, .. } = &beat.kind {
+                if !origins.contains(origin) {
+                    origins.push(*origin);
+                }
+                assert_eq!(*origin == PromptOrigin::Command, command.is_some(), "{case}: {}", beat.id);
+                assert!(beat.summary().starts_with(origin.label()), "{case}: {}", beat.summary());
+            }
+        }
+    }
+    for o in [
+        PromptOrigin::Human,
+        PromptOrigin::Queued,
+        PromptOrigin::Delivered,
+        PromptOrigin::TaskNotification,
+        PromptOrigin::Peer,
+        PromptOrigin::Command,
+    ] {
+        assert!(origins.contains(&o), "no {o:?} prompt in the corpus");
+    }
+    let beats = read("claude/notification-and-commands").linearize_events(None);
+    assert!(beats.iter().any(|b| matches!(&b.kind, TranscriptEventKind::UserPrompt { command: Some(c), .. } if c == "/context")));
+
+    let beats = read("claude/basic-turn").linearize_events(None);
+    assert!(matches!(beats[1].kind, TranscriptEventKind::Thinking { redacted: true, .. }));
+    assert_eq!(beats[1].summary(), "Thinking: (redacted)");
+    let noise = beats.iter().find(|b| b.kind.is_noise()).expect("ToolSearch is shown");
+    assert_eq!(noise.summary(), "Noise: ToolSearch");
+    let command = beats.iter().find(|b| kind_name(&b.kind) == "command").unwrap();
+    assert_ne!(noise.banner_colors(), command.banner_colors());
+    let systems: Vec<String> = read("claude/system-records")
+        .linearize_events(None)
+        .iter()
+        .filter(|b| kind_name(&b.kind) == "system")
+        .map(|b| b.summary())
+        .collect();
+    assert!(systems.iter().any(|s| s == "System: compact_boundary") && systems.iter().any(|s| s == "System: api_error"), "{systems:?}");
+}
+
+/// An edit whose event carries the file after it builds its revisions from
+/// that text alone: the base is the file with the edit's patch undone, and
+/// the disk is never asked (a partial read before it is a window, not a
+/// revision).
+#[test]
+fn an_edit_with_file_text_builds_its_revisions_without_disk() {
+    let session = read("claude/tool-results");
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let log = asked.clone();
+    let mut engine = RevisionEngine::new().with_disk_resolver(move |p: &str| {
+        log.lock().unwrap().push(p.to_string());
+        None
+    });
+    engine.ingest_session(&session);
+    assert!(asked.lock().unwrap().is_empty(), "asked the disk for {:?}", asked.lock().unwrap());
+
+    let lines = event_lines("claude/tool-results");
+    let tool_of = |id: &str| lines.iter().rev().find(|l| l["id"] == id).unwrap()["tool"].clone();
+    for (path, id, original_key) in [
+        ("spin.go", "toolu_01zwI74ek5gSV6soBvRy3h61", "originalFileContents"),
+        ("spin_test.go", "toolu_01rVkaQppDqV2ZGzzkSAkAJw", "originalFile"),
+    ] {
+        let tool = tool_of(id);
+        let history = engine.history(path).unwrap_or_else(|| panic!("{path} has a history"));
+        assert_eq!(history.count(), 2, "{path}: the base and the edit: {:#?}", history.revisions.iter().map(|r| (r.action, r.text.as_str())).collect::<Vec<_>>());
+        assert_eq!(history.get(0).unwrap().text.as_str(), tool["result"]["structured"][original_key], "{path}: the base is the file before the edit");
+        assert_eq!(history.get(1).unwrap().text.as_str(), tool["file"]["text"], "{path}: the edit's revision is its file text");
+    }
+}
+
+/// An edit whose event has no file text (agy's, or an Edit whose result
+/// lacked the file) falls back to the disk: the target, joined to the
+/// session's cwd, read now and taken back through the edit.
+#[test]
+fn an_edit_without_file_text_rebuilds_from_the_disk() {
+    let dir = std::env::temp_dir().join(format!("glyph3d-no-file-edit-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("pkg")).unwrap();
+    std::fs::write(dir.join("pkg/a.go"), "func a() int {\n\treturn 2\n}\n").unwrap();
+    let mut stream = Stream::new("agy-like", dir.to_str().unwrap());
+    stream.prompt("p", 1, "make a return 2").tool(
+        "step_1_tool_0",
+        1,
+        json!({ "name": "replace_file_content", "action": "edit", "target": "pkg/a.go",
+                "input": { "TargetFile": dir.join("pkg/a.go"), "TargetContent": "return 1", "ReplacementContent": "return 2" } }),
+        json!({ "status": "ok", "output": "replaced 1 occurrence" }),
+        json!({ "meta": { "added": 1, "removed": 1 } }),
+    );
+    let session = stream.session();
+    let engine = RevisionEngine::for_session(&session);
+    let history = engine.history("pkg/a.go").expect("the edit has a history");
+    assert_eq!(history.get(0).unwrap().text.as_str(), "func a() int {\n\treturn 1\n}\n", "the base, taken back from the disk");
+    assert_eq!(history.get(1).unwrap().text.as_str(), "func a() int {\n\treturn 2\n}\n");
+    match &session.linearize_events(Some(&engine))[1].kind {
+        TranscriptEventKind::FileEdit { post_edit_content, .. } => {
+            assert_eq!(post_edit_content.as_deref(), Some("func a() int {\n\treturn 2\n}\n"));
+        }
+        k => panic!("{k:?}"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A subagent is a session of its own, linked both ways: `parent_session`
+/// on it, `sub_sessions` on the call that started it; a listing puts it
+/// under its parent.
+#[test]
+fn a_subagent_is_a_session_of_its_own() {
+    let parent = read("claude/subagent");
+    let sub = read("claude/subagent/subagents/agent-a3f9c2e17b4d5e608");
+    let link = sub.info.parent_session.as_ref().expect("a subagent names its parent");
+    assert_eq!(link.session_id, parent.session_id());
+    let call = parent
+        .linearize_events(None)
+        .into_iter()
+        .find(|b| b.id == link.tool_id)
+        .expect("the call that started it");
+    match call.kind {
+        TranscriptEventKind::ToolInvocation { sub_sessions, status, .. } => {
+            assert_eq!(sub_sessions, [sub.session_id().to_string()]);
+            assert_eq!(status, ToolStatus::Ok);
+        }
+        k => panic!("{k:?}"),
+    }
+    assert!(sub.events.iter().all(|e| !e.agent.is_empty()), "a subagent's events carry its id");
+    assert!(matches!(sub.linearize_events(None)[0].kind, TranscriptEventKind::UserPrompt { origin: PromptOrigin::Peer, .. }));
+
+    let mut ghost = parent.info.clone();
+    ghost.session_id = "no-transcript".into();
+    ghost.path.clear();
+    let listed = vec![sub.info.clone(), parent.info.clone(), ghost];
+    let nested = nest_subagents(&listed);
+    assert_eq!(nested.len(), 1, "the subagent sits under its parent; a session with no transcript isn't listed");
+    assert_eq!(nested[0].0.session_id, parent.session_id());
+    assert_eq!(nested[0].1.len(), 1);
+}
+
+/// No `agent` to run, or a run that fails, is an error naming the command
+/// (and what it printed), never an empty list.
+#[test]
+fn a_missing_agent_binary_fails_loud() {
+    let missing = AgentCli::new("/nonexistent/glyph3d-test-agent");
+    let e = missing.sessions().unwrap_err();
+    assert!(e.contains("could not run `/nonexistent/glyph3d-test-agent sessions --json`"), "{e}");
+    let e = missing.transcript("abc").unwrap_err();
+    assert!(e.contains("glyph3d-test-agent transcript abc"), "{e}");
+
+    // `sh sessions --json` runs and fails: sh can't open a script named `sessions`.
+    let e = AgentCli::new("sh").sessions().unwrap_err();
+    assert!(e.contains("`sh sessions --json` failed") && e.contains("sessions"), "{e}");
+    assert!(AgentCli::default().transcript(" ").is_err(), "an empty session name is refused");
+}
+
+/// A stream that breaks the contract is refused, naming the line.
+#[test]
+fn a_stream_off_the_contract_is_refused() {
+    let session = r#"{"type":"session","session_id":"s","harness":"claude"}"#.to_string();
+    let event = |id: &str, op: &str, kind: &str| {
+        format!(r#"{{"type":"event","id":"{id}","op":"{op}","seq":0,"at":0,"kind":"{kind}","{kind}":{{"text":"x","origin":"human"}}}}"#)
+    };
+    assert!(AgentSession::from_stream_str("").unwrap_err().contains("no session line"));
+    assert!(AgentSession::from_stream_str(&event("a", "add", "prompt")).unwrap_err().contains("before the session line"));
+    let e = AgentSession::from_stream_str(&[session.clone(), event("a", "add", "request")].join("\n")).unwrap_err();
+    assert!(e.contains("line 2") && e.contains("\"request\""), "{e}");
+    let twice = [session.clone(), event("a", "add", "prompt"), event("a", "add", "prompt")].join("\n");
+    assert!(AgentSession::from_stream_str(&twice).unwrap_err().contains("added twice"));
+    assert!(AgentSession::from_stream_str(&[session, "{not json".to_string()].join("\n")).unwrap_err().contains("line 2"));
 }
 
 #[test]
-fn test_detect_and_parse_session_claude_and_antigravity() {
-    use super::{detect_and_parse_session, HarnessKind};
+fn rfc3339_times_read_as_system_times() {
+    let t = parse_rfc3339("2026-10-26T16:38:34.551436199Z").unwrap();
+    let d = t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap();
+    assert_eq!((d.as_secs(), d.subsec_nanos()), (1_793_032_714, 551_436_199));
+    assert_eq!(parse_rfc3339("2026-10-26T09:38:34.551436199-07:00"), Some(t));
+    assert_eq!(parse_rfc3339("2026-10-26 16:38:34Z").unwrap(), t - std::time::Duration::new(0, 551_436_199));
+    assert_eq!(parse_rfc3339("2026-10-26"), None);
+    assert_eq!(parse_rfc3339("2026-13-26T16:38:34Z"), None);
+}
 
-    // Claude Code snippet
-    let claude_snippet = json!({
-        "type": "user",
-        "message": { "role": "user", "content": [{ "type": "text", "text": "Claude prompt" }] }
-    }).to_string();
-    let s_claude = detect_and_parse_session(&claude_snippet, "claude_sess");
-    assert_eq!(s_claude.harness, HarnessKind::ClaudeCode);
-    assert_eq!(s_claude.session_id, "claude_sess");
+/// Every corpus session stages: each beat kind formats into card text.
+#[test]
+fn every_corpus_session_stages() {
+    for (case, _) in CORPUS {
+        let session = read(case);
+        let engine = RevisionEngine::for_session(&session);
+        let beats = session.linearize_events(Some(&engine)).len();
+        let staged = super::stage_agent_session(None, &[], session, engine);
+        let ctrl = staged.controller.expect("a carrel controller");
+        let carrel = ctrl.scene.world.get::<crate::spatial_scene::AgentCarrel>(ctrl.active_carrel.unwrap()).unwrap();
+        assert_eq!(carrel.beat_count, beats, "{case}");
+    }
+}
 
-    // Antigravity snippet
-    let antigravity_snippet = json!({
-        "step_index": 0,
-        "type": "USER_INPUT",
-        "content": "Antigravity prompt"
-    }).to_string();
-    let s_antigravity = detect_and_parse_session(&antigravity_snippet, "ag_sess");
-    assert_eq!(s_antigravity.harness, HarnessKind::Antigravity);
-    assert_eq!(s_antigravity.session_id, "ag_sess");
+/// Two turns: a write, then an edit of the written file.
+fn two_turn_session() -> AgentSession {
+    let mut s = Stream::new("staged_sess", "/work");
+    s.prompt("p0", 1, "Turn 0 prompt")
+        .write("t1", 1, "a.rs", "hello\n")
+        .prompt("p1", 2, "Turn 1 prompt")
+        .edit("t2", 2, "a.rs", ("hello", "world"), "world\n", json!({
+            "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-hello", "+world"]
+        }));
+    s.session()
 }
 
 #[test]
 fn test_stage_agent_session_creates_controller_and_navigates() {
-    use super::{stage_agent_session, parse_claude_session};
-    use crate::revision::RevisionEngine;
-
-    let transcript = [
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 0 prompt" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "a.rs", "content": "hello" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "a.rs", "content": "hello" },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Turn 1 prompt" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "a.rs", "old_string": "hello", "new_string": "world" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "filePath": "a.rs", "structuredPatch": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-hello", "+world"] }] },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
-        }).to_string(),
-    ].join("\n");
-
-    let session = parse_claude_session(&transcript, "staged_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
-
-    let staged = stage_agent_session(None, &[], session, rev_engine);
-    assert!(staged.controller.is_some());
-
-    let mut ctrl = staged.controller.unwrap();
+    let session = two_turn_session();
+    let rev_engine = RevisionEngine::for_session(&session);
+    let staged = super::stage_agent_session(None, &[], session, rev_engine);
+    let mut ctrl = staged.controller.expect("a controller");
     assert!(ctrl.active_carrel.is_some());
 
     // Navigation checks: carrel starts at latest beat (4/4)
     let prev_msg = ctrl.carrel_prev().unwrap();
-    assert!(prev_msg.contains("beat 3/4"));
-
+    assert!(prev_msg.contains("beat 3/4"), "{prev_msg}");
     let next_msg = ctrl.carrel_next().unwrap();
-    assert!(next_msg.contains("beat 4/4"));
-
+    assert!(next_msg.contains("beat 4/4"), "{next_msg}");
     let jump_msg = ctrl.carrel_set_turn(1).unwrap();
-    assert!(jump_msg.contains("jump to turn 2/2"));
+    assert!(jump_msg.contains("jump to turn 2/2"), "{jump_msg}");
 }
 
 #[test]
 fn test_stage_agent_session_formats_and_populates_text() {
-    use super::{parse_claude_session, stage_agent_session};
-    use crate::revision::RevisionEngine;
-
-    let transcript = [
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Plan refactor for rendering" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "thinking", "thinking": "We should first inspect the scene graph and then apply deltas." },
-                    { "type": "text", "text": "I will inspect the workspace and begin the refactor." },
-                    { "type": "tool_use", "id": "t1", "name": "Write", "input": { "file_path": "main.rs", "content": "fn main() {\n    println!(\"hello\");\n}\n" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "type": "create", "filePath": "main.rs", "content": "fn main() {\n    println!(\"hello\");\n}\n" },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1" }] }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "message": { "role": "user", "content": [{ "type": "text", "text": "Change greeting to hello world" }] }
-        }).to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    { "type": "thinking", "thinking": "Replacing hello with hello world in main.rs." },
-                    { "type": "text", "text": "Replaced greeting." },
-                    { "type": "tool_use", "id": "t2", "name": "Edit", "input": { "file_path": "main.rs", "old_string": "hello", "new_string": "hello world" } }
-                ]
-            }
-        }).to_string(),
-        json!({
-            "type": "user",
-            "toolUseResult": { "filePath": "main.rs", "structuredPatch": [{ "oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1, "lines": ["-    println!(\"hello\");", "+    println!(\"hello world\");"] }] },
-            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t2" }] }
-        }).to_string(),
-    ].join("\n");
-
-    let session = parse_claude_session(&transcript, "text_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
-
-    let staged = stage_agent_session(None, &[], session, rev_engine);
+    let mut s = Stream::new("text_sess", "/work");
+    s.prompt("p0", 1, "Plan refactor for rendering")
+        .think("k0", 1, "We should first inspect the scene graph and then apply deltas.")
+        .say("s0", 1, "I will inspect the workspace and begin the refactor.")
+        .write("t1", 1, "main.rs", "fn main() {\n    println!(\"hello\");\n}\n")
+        .prompt("p1", 2, "Change greeting to hello world")
+        .edit("t2", 2, "main.rs", ("hello", "hello world"), "fn main() {\n    println!(\"hello world\");\n}\n", json!({
+            "oldStart": 2, "oldLines": 1, "newStart": 2, "newLines": 1,
+            "lines": ["-    println!(\"hello\");", "+    println!(\"hello world\");"]
+        }));
+    let session = s.session();
+    let rev_engine = RevisionEngine::for_session(&session);
+    let staged = super::stage_agent_session(None, &[], session, rev_engine);
     // Groups allocated for: identity(0) + Turn0(1) + Turn1(2) + Rev0(3) + Rev1(4)
     assert!(staged.groups.len() >= 5);
 }
 
 #[test]
 fn test_utf8_multibyte_truncation_no_panic() {
-    use super::types::{truncate_chars, truncate_with_ellipsis, TranscriptEventKind, AgentTurn};
-
-    // Construct a string where byte 52 lands in the middle of a 3-byte em-dash '—'
-    // 50 ASCII bytes + '—' (bytes 50, 51, 52) + more text
+    // Byte 52 lands in the middle of a 3-byte em-dash: slicing [..52] would panic.
     let prefix = "a".repeat(50);
     let hostile_str = format!("{prefix}—and more text that exceeds the limit");
+    assert_eq!(truncate_chars(&hostile_str, 51), format!("{prefix}—"));
+    assert!(truncate_with_ellipsis(&hostile_str, 55).ends_with("..."));
 
-    // Slicing &hostile_str[..52] would panic!
-    let truncated = truncate_chars(&hostile_str, 51);
-    assert_eq!(truncated, format!("{prefix}—"));
-
-    let with_dots = truncate_with_ellipsis(&hostile_str, 55);
-    assert!(with_dots.ends_with("..."));
-
-    // Test AgentTurn::summary with hostile string
-    let turn = AgentTurn {
-        turn_index: 0,
-        prompt: Some(hostile_str.clone()),
-        thinking: Vec::new(),
-        file_actions: Vec::new(),
-        tool_calls: Vec::new(),
-        assistant_messages: vec![hostile_str.clone()],
-        timestamp: None,
-        steps: Vec::new(),
-    };
-    let turn_summary = turn.summary();
-    assert!(!turn_summary.is_empty());
-
-    // Test TranscriptEventKind::summary with hostile string (reproduces the user's exact panic condition)
-    let ev = TranscriptEventKind::AssistantResponse {
-        message: hostile_str.clone(),
-    };
-    let ev_summary = ev.summary();
-    assert!(ev_summary.starts_with("Assistant: "));
-
-    let ev_user = TranscriptEventKind::UserPrompt {
-        prompt: hostile_str.clone(),
-    };
-    assert!(ev_user.summary().starts_with("User: "));
-
+    let ev = TranscriptEventKind::AssistantResponse { message: hostile_str.clone(), is_final: false };
+    assert!(ev.summary().starts_with("Assistant: "));
+    let ev_user = TranscriptEventKind::UserPrompt { prompt: hostile_str.clone(), origin: PromptOrigin::Human, command: None, images: 0 };
+    assert!(ev_user.summary().starts_with("You: "));
     let ev_cmd = TranscriptEventKind::Command {
         name: "Bash".to_string(),
         command_line: hostile_str.clone(),
         output: None,
-        is_error: false,
+        status: ToolStatus::Ok,
     };
     assert!(ev_cmd.summary().starts_with("$ "));
 }
 
-/// Typed prompts are STRING content; everything a user record carries that the
-/// user did not type to the agent is not a prompt. Shapes from real
-/// transcripts (Claude Code 2.1.x).
-#[test]
-fn user_prompt_text_classifies_real_record_shapes() {
-    let rec = |content: serde_json::Value, extra: serde_json::Value| {
-        let mut o = json!({ "type": "user", "message": { "role": "user", "content": content } });
-        for (k, v) in extra.as_object().unwrap() {
-            o[k] = v.clone();
-        }
-        o
-    };
-    let none = json!({});
-    assert_eq!(user_prompt_text(&rec(json!("  Fix the fog  "), none.clone())).as_deref(), Some("Fix the fog"));
-    assert_eq!(
-        user_prompt_text(&rec(json!([{ "type": "text", "text": "pasted" }]), none.clone())).as_deref(),
-        Some("pasted")
-    );
-    assert_eq!(
-        user_prompt_text(&rec(
-            json!("<command-name>/code-review</command-name>\n<command-message>code-review</command-message>\n<command-args>high</command-args>"),
-            none.clone()
-        ))
-        .as_deref(),
-        Some("/code-review high")
-    );
-    assert_eq!(
-        user_prompt_text(&rec(json!("<command-name>/model</command-name>\n<command-args></command-args>"), none.clone())).as_deref(),
-        Some("/model")
-    );
-    for not_a_prompt in [
-        rec(json!("<local-command-caveat>Caveat: ...</local-command-caveat>"), json!({ "isMeta": true })),
-        rec(json!("[Image: original 2876x792]"), json!({ "isMeta": true })),
-        rec(json!("This session is being continued from a previous conversation..."), json!({ "isCompactSummary": true })),
-        rec(json!("<local-command-stdout>Set model</local-command-stdout>"), none.clone()),
-        rec(json!("<bash-input>claude stop</bash-input>"), none.clone()),
-        rec(json!("<bash-stdout>stopped</bash-stdout><bash-stderr></bash-stderr>"), none.clone()),
-        rec(json!([{ "type": "text", "text": "[Request interrupted by user]" }]), none.clone()),
-        rec(json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]), none.clone()),
-        rec(json!("   "), none.clone()),
-    ] {
-        assert_eq!(user_prompt_text(&not_a_prompt), None, "{not_a_prompt}");
-    }
-}
-
-/// The folding regression: string prompts must start turns, and a turn's
-/// thinking / tool calls / text must linearize in the order they happened,
-/// not grouped by kind. One API message spans several lines (one block each).
-#[test]
-fn claude_turns_split_on_string_prompts_and_keep_block_order() {
-    use super::types::TranscriptEventKind as K;
-    let line = |v: serde_json::Value| v.to_string();
-    let asst = |id: &str, block: serde_json::Value| {
-        line(json!({ "type": "assistant", "message": { "id": id, "role": "assistant", "content": [block] } }))
-    };
-    let result = |id: &str| {
-        line(json!({ "type": "user", "message": { "role": "user", "content": [
-            { "type": "tool_result", "tool_use_id": id, "content": "ok" } ] } }))
-    };
-    let lines = [
-        line(json!({ "type": "user", "message": { "role": "user", "content": "first prompt" } })),
-        asst("m1", json!({ "type": "thinking", "thinking": "plan" })),
-        asst("m1", json!({ "type": "tool_use", "id": "b1", "name": "Bash", "input": { "command": "ls" } })),
-        result("b1"),
-        asst("m2", json!({ "type": "text", "text": "listed" })),
-        asst("m2", json!({ "type": "tool_use", "id": "r1", "name": "Read", "input": { "file_path": "/r/a.rs" } })),
-        result("r1"),
-        asst("m3", json!({ "type": "text", "text": "read it" })),
-        line(json!({ "type": "user", "isMeta": true, "message": { "role": "user", "content": "<local-command-caveat>x</local-command-caveat>" } })),
-        line(json!({ "type": "user", "message": { "role": "user", "content": "second prompt" } })),
-        asst("m4", json!({ "type": "text", "text": "done" })),
-    ];
-    let session = parse_claude_session(&(lines.join("\n") + "\n"), "order");
-    assert_eq!(session.turns.len(), 2, "each string prompt starts a turn; the meta record does not");
-    assert_eq!(session.turns[0].prompt.as_deref(), Some("first prompt"));
-    assert_eq!(session.turns[1].prompt.as_deref(), Some("second prompt"));
-
-    let kinds: Vec<&str> = session
-        .linearize_events(None)
-        .iter()
-        .map(|e| match &e.kind {
-            K::UserPrompt { .. } => "prompt",
-            K::Thinking { .. } => "thinking",
-            K::Command { .. } => "command",
-            K::FileRead { .. } => "read",
-            K::AssistantResponse { .. } => "text",
-            _ => "other",
-        })
-        .collect();
-    assert_eq!(
-        kinds,
-        ["prompt", "thinking", "command", "text", "read", "text", "prompt", "text"],
-        "events follow transcript order, not kind groups"
-    );
-}
-
-/// One item per block (2026-10-11): every staged session glyph, transcoded
-/// to a Derived slot by the field's own host transcode and placed by the
-/// vertex stage's `derive_yz` over the staged item table, lands at the
-/// absolute y/z the Instanced field reads — bit for bit (tolerance 0: the
-/// block origins and the 1.25 line pitch make every product exact, so the
-/// shader's `fma` and the stager's subtraction round the same value), and is
-/// drawn with the group its block was staged in. Covers the card blocks (at
-/// their group's origin) and the stack labels (each at its stack's position,
-/// in its own group since that day; they shared group 0 before, which no
-/// single item can describe).
+/// The Carrel stages one item per text block, so the Derived field (the
+/// default) derives each glyph's y/z from its item where the staged
+/// (absolute) positions put it: the card blocks (each at its group's origin)
+/// and the stack labels (each at its stack's position, in its own group
+/// since that day; they shared group 0 before, which no single item can
+/// describe).
 #[test]
 fn derived_positions_match_the_staged_ones() {
-    use super::{parse_claude_session, stage_agent_session};
-    use crate::revision::RevisionEngine;
     use glyph_field::Transcode;
 
-    let write = |id: &str, path: &str, body: &str| {
-        [
-            json!({
-                "type": "assistant",
-                "message": { "role": "assistant", "content": [
-                    { "type": "text", "text": format!("Writing {path}.") },
-                    { "type": "tool_use", "id": id, "name": "Write", "input": { "file_path": path, "content": body } }
-                ] }
-            }).to_string(),
-            json!({
-                "type": "user",
-                "toolUseResult": { "type": "create", "filePath": path, "content": body },
-                "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": id }] }
-            }).to_string(),
-        ]
-    };
-    let mut lines = vec![json!({
-        "type": "user",
-        "message": { "role": "user", "content": [{ "type": "text", "text": "Create two files" }] }
-    }).to_string()];
-    lines.extend(write("t1", "src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n"));
-    lines.extend(write("t2", "README.md", "# Title\n\nSome prose, é and ✓.\n"));
-    let session = parse_claude_session(&lines.join("\n"), "derived_sess");
-    let mut rev_engine = RevisionEngine::new();
-    rev_engine.ingest_session(&session);
+    let mut s = Stream::new("derived_sess", "/work");
+    s.prompt("p0", 1, "Create two files")
+        .say("s1", 1, "Writing src/main.rs.")
+        .write("t1", 1, "src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n")
+        .say("s2", 1, "Writing README.md.")
+        .write("t2", 1, "README.md", "# Title\n\nSome prose, é and ✓.\n");
+    let session = s.session();
+    let rev_engine = RevisionEngine::for_session(&session);
 
-    let staged = stage_agent_session(Some(crate::atlas::default_trie_ref()), &[], session, rev_engine);
+    let staged = super::stage_agent_session(Some(crate::atlas::default_trie_ref()), &[], session, rev_engine);
     // The item table and the group → item map, as the scene builds them from
     // the view registry (`GlyphScene::new`).
     let items = &staged.views.item_table();
@@ -853,4 +558,3 @@ fn derived_positions_match_the_staged_ones() {
     assert!(rows_below_origin > 0, "no card glyph below its block's first row");
     assert_eq!(off_origin_groups.len(), 2, "one off-origin group per stack label: {off_origin_groups:?}");
 }
-

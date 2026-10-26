@@ -689,7 +689,8 @@ impl WindowState {
             let session_filter_text = &mut egui.session_filter_text;
             let session_filter_harness = &mut egui.session_filter_harness;
             let discovered_sessions = &mut egui.discovered_sessions;
-            let session_dirs_report = &mut egui.session_dirs_report;
+            let session_list_source = &mut egui.session_list_source;
+            let session_load_error = &mut egui.session_load_error;
             let hud_open = egui.hud_open;
             // The layout dial's apply signal: the panel's slider sets it on
             // release; the RedrawRequested arm consumes it and rebuilds.
@@ -1388,10 +1389,16 @@ impl WindowState {
                 }
 
                 if *session_browser_open {
+                    // Listed by gomuxai (`agent sessions --json`), read again on ⟳.
+                    let list_sessions = |source: &mut String| -> Result<Vec<crate::agent_transcript::SessionInfo>, String> {
+                        let agent = crate::agent_transcript::AgentCli::from_launch_config(
+                            &crate::launch_config::LaunchConfig::load_or_default(),
+                        )?;
+                        *source = agent.describe(&["sessions", "--json"]);
+                        agent.sessions()
+                    };
                     if discovered_sessions.is_none() {
-                        let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
-                        *session_dirs_report = glyph_session_dirs::describe(&dirs);
-                        *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
+                        *discovered_sessions = Some(list_sessions(session_list_source));
                     }
 
                     egui::Window::new("Agent Sessions (F7)")
@@ -1412,80 +1419,59 @@ impl WindowState {
                                     session_filter_text.clear();
                                 }
                                 if ui.button("⟳ Refresh").clicked() {
-                                    let dirs = crate::launch_config::LaunchConfig::load_or_default().session_dirs();
-                                    *session_dirs_report = glyph_session_dirs::describe(&dirs);
-                                    *discovered_sessions = Some(crate::agent_transcript::discovery::scan_session_dirs(&dirs));
+                                    *discovered_sessions = Some(list_sessions(session_list_source));
                                 }
                             });
 
                             // 2. Filter tabs
                             ui.horizontal(|ui| {
-                                ui.selectable_value(
-                                    session_filter_harness,
-                                    crate::agent_transcript::discovery::SessionHarnessFilter::All,
-                                    "All",
-                                );
-                                ui.selectable_value(
-                                    session_filter_harness,
-                                    crate::agent_transcript::discovery::SessionHarnessFilter::ClaudeCode,
-                                    "Claude Code",
-                                );
-                                ui.selectable_value(
-                                    session_filter_harness,
-                                    crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity,
-                                    "Antigravity",
-                                );
-                                ui.selectable_value(
-                                    session_filter_harness,
-                                    crate::agent_transcript::discovery::SessionHarnessFilter::KimiCode,
-                                    "Kimi",
-                                );
+                                ui.selectable_value(session_filter_harness, None, "All");
+                                for h in crate::agent_transcript::HarnessKind::ALL {
+                                    ui.selectable_value(session_filter_harness, Some(h), h.label());
+                                }
                             });
                             ui.separator();
-                            ui.small(format!("Scanning: {session_dirs_report}"));
+                            ui.small(format!("Listed by: {session_list_source}"));
+                            if let Some(e) = session_load_error.as_ref() {
+                                ui.colored_label(egui::Color32::LIGHT_RED, e);
+                            }
 
-                            let Some(all_sessions) = discovered_sessions.as_ref() else {
-                                ui.label("No sessions scanned yet.");
-                                return;
+                            let all_sessions = match discovered_sessions.as_ref() {
+                                Some(Ok(list)) => list,
+                                Some(Err(e)) => {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, e);
+                                    return;
+                                }
+                                None => return,
                             };
-                            if all_sessions.is_empty() {
+                            let nested = crate::agent_transcript::agent_cli::nest_subagents(all_sessions);
+                            if nested.is_empty() {
                                 ui.label(
-                                    "No sessions found in those directories. Point claude_projects_dir, \
-                                     antigravity_brain_dir or kimi_sessions_dir in launch_config.toml \
-                                     elsewhere, or set one to \"\" to skip that app.",
+                                    "gomuxai found no sessions. Point claude_projects_dir, agy_brain_dir or \
+                                     kimi_sessions_dir in launch_config.toml elsewhere, or set one to \"\" \
+                                     to skip that app.",
                                 );
                                 return;
                             }
 
                             let filter_lower = session_filter_text.to_lowercase();
-                            let filtered: Vec<&crate::agent_transcript::discovery::DiscoveredSession> = all_sessions
-                                .iter()
-                                .filter(|s| {
-                                    match *session_filter_harness {
-                                        crate::agent_transcript::discovery::SessionHarnessFilter::All => true,
-                                        crate::agent_transcript::discovery::SessionHarnessFilter::ClaudeCode => {
-                                            s.harness == crate::agent_transcript::types::HarnessKind::ClaudeCode
-                                        }
-                                        crate::agent_transcript::discovery::SessionHarnessFilter::Antigravity => {
-                                            s.harness == crate::agent_transcript::types::HarnessKind::Antigravity
-                                        }
-                                        crate::agent_transcript::discovery::SessionHarnessFilter::KimiCode => {
-                                            s.harness == crate::agent_transcript::types::HarnessKind::KimiCode
-                                        }
-                                    }
-                                })
-                                .filter(|s| {
-                                    if filter_lower.is_empty() {
-                                        return true;
-                                    }
-                                    s.title.to_lowercase().contains(&filter_lower)
-                                        || s.id.to_lowercase().contains(&filter_lower)
-                                        || s.project_name.as_deref().unwrap_or("").to_lowercase().contains(&filter_lower)
-                                        || s.path.to_string_lossy().to_lowercase().contains(&filter_lower)
+                            let shown = |s: &crate::agent_transcript::SessionInfo| {
+                                session_filter_harness.is_none_or(|h| s.harness_kind() == Some(h))
+                                    && (filter_lower.is_empty()
+                                        || [&s.title, &s.session_id, &s.project, &s.path]
+                                            .iter()
+                                            .any(|f| f.to_lowercase().contains(&filter_lower)))
+                            };
+                            // A parent stays when a subagent of it matches.
+                            let filtered: Vec<(&crate::agent_transcript::SessionInfo, Vec<&crate::agent_transcript::SessionInfo>)> = nested
+                                .into_iter()
+                                .filter_map(|(top, subs)| {
+                                    let subs: Vec<_> = subs.into_iter().filter(|s| shown(s)).collect();
+                                    (shown(top) || !subs.is_empty()).then_some((top, subs))
                                 })
                                 .collect();
-
-                            ui.label(format!("Showing {} of {} sessions", filtered.len(), all_sessions.len()));
+                            let count = filtered.iter().map(|(_, subs)| 1 + subs.len()).sum::<usize>();
+                            ui.label(format!("Showing {count} of {} sessions", all_sessions.iter().filter(|s| !s.path.is_empty()).count()));
                             ui.separator();
 
                             egui::ScrollArea::vertical()
@@ -1495,45 +1481,61 @@ impl WindowState {
                                         ui.label("No matching sessions found.");
                                         return;
                                     }
-                                    for s in filtered {
+                                    let rows = filtered.iter().flat_map(|(top, subs)| {
+                                        std::iter::once((*top, false)).chain(subs.iter().map(|s| (*s, true)))
+                                    });
+                                    for (s, is_sub) in rows {
                                         ui.group(|ui| {
                                             ui.horizontal(|ui| {
-                                                match s.harness {
-                                                    crate::agent_transcript::types::HarnessKind::ClaudeCode => {
-                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_claude), "[Claude]");
-                                                    }
-                                                    crate::agent_transcript::types::HarnessKind::Antigravity => {
-                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_antigravity), "[Antigravity]");
-                                                    }
-                                                    crate::agent_transcript::types::HarnessKind::KimiCode => {
-                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_kimi), "[Kimi]");
-                                                    }
-                                                    crate::agent_transcript::types::HarnessKind::Generic => {
-                                                        ui.colored_label(ui_rgb(crate::config::settings().ui.harness_generic), "[Agent]");
-                                                    }
+                                                if is_sub {
+                                                    ui.label("  └ subagent");
                                                 }
-                                                if let Some(proj) = &s.project_name {
-                                                    ui.colored_label(ui_rgb(crate::config::settings().ui.project_name), format!("📂 {proj}"));
+                                                let ui_colors = &crate::config::settings().ui;
+                                                let (color, tag) = match s.harness_kind() {
+                                                    Some(crate::agent_transcript::HarnessKind::Claude) => (ui_colors.harness_claude, "[Claude]"),
+                                                    Some(crate::agent_transcript::HarnessKind::Agy) => (ui_colors.harness_agy, "[Antigravity]"),
+                                                    Some(crate::agent_transcript::HarnessKind::Kimi) => (ui_colors.harness_kimi, "[Kimi]"),
+                                                    None => (ui_colors.project_name, s.harness.as_str()),
+                                                };
+                                                ui.colored_label(ui_rgb(color), tag);
+                                                if !s.project.is_empty() {
+                                                    ui.colored_label(ui_rgb(ui_colors.project_name), format!("📂 {}", s.project));
+                                                }
+                                                if !s.status.is_empty() {
+                                                    ui.label(egui::RichText::new(&s.status).weak().small());
                                                 }
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                     if ui.button("▶ Load").clicked() {
-                                                        *pending_relayout = Some(RelayoutRequest {
-                                                            switch_agent_session: Some(s.path.clone()),
-                                                            ..Default::default()
+                                                        let loaded = crate::agent_transcript::AgentCli::from_launch_config(
+                                                            &crate::launch_config::LaunchConfig::load_or_default(),
+                                                        )
+                                                        .and_then(|agent| {
+                                                            crate::agent_transcript::load_session(&agent, &s.path).map(|l| (agent, l))
                                                         });
+                                                        match loaded {
+                                                            Ok((agent, loaded)) => {
+                                                                *session_load_error = None;
+                                                                *pending_relayout = Some(RelayoutRequest {
+                                                                    switch_agent_session: Some((s.path.clone(), agent, loaded)),
+                                                                    ..Default::default()
+                                                                });
+                                                            }
+                                                            Err(e) => *session_load_error = Some(e),
+                                                        }
                                                     }
-                                                    if let Some(m) = s.modified {
+                                                    if let Some(m) = crate::agent_transcript::agent_cli::parse_rfc3339(&s.mtime) {
                                                         if let Ok(dur) = std::time::SystemTime::now().duration_since(m) {
                                                             ui.label(egui::RichText::new(format_relative_time(dur)).weak().small());
                                                         }
                                                     }
                                                 });
                                             });
-                                            ui.label(egui::RichText::new(&s.title).strong());
+                                            let title = if s.title.is_empty() { "(untitled)" } else { s.title.as_str() };
+                                            ui.label(egui::RichText::new(title).strong());
                                             ui.horizontal(|ui| {
-                                                let prefix = crate::agent_transcript::types::truncate_chars(&s.id, 16);
+                                                let prefix = crate::agent_transcript::types::truncate_chars(&s.session_id, 16);
                                                 ui.label(egui::RichText::new(format!("ID: {prefix}…")).weak().small());
-                                                let kb = (s.file_size_bytes as f64) / 1024.0;
+                                                let kb = (s.size as f64) / 1024.0;
                                                 ui.label(egui::RichText::new(format!("{kb:.1} KB")).weak().small());
                                             });
                                         });

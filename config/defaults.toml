@@ -187,13 +187,14 @@ file_write = [[0.15, 0.55, 0.30, 0.95], [0.12, 0.45, 0.25, 0.95]]           # em
 command = [[0.28, 0.28, 0.32, 0.95], [0.20, 0.20, 0.24, 0.95]]              # terminal graphite
 tool_invocation = [[0.25, 0.35, 0.45, 0.95], [0.18, 0.26, 0.35, 0.95]]      # steel blue
 assistant_response = [[0.18, 0.48, 0.38, 0.95], [0.14, 0.38, 0.30, 0.95]]   # deep teal / forest
+system = [[0.40, 0.22, 0.50, 0.95], [0.32, 0.18, 0.40, 0.95]]               # plum: harness records
+noise = [[0.16, 0.17, 0.20, 0.85], [0.13, 0.14, 0.16, 0.85]]                # dim slate: bookkeeping tools
 
 [agent_cards.workdesk]
 # Workdesk plate accent per file action.
 read = [0.15, 0.35, 0.55, 0.90]           # cyan-slate
 edit = [0.60, 0.40, 0.15, 0.90]           # amber
 write = [0.15, 0.50, 0.30, 0.90]          # emerald
-ast_analysis = [0.45, 0.20, 0.55, 0.90]   # purple
 
 [agent_text]
 # Transcript card text, sRGB 0-255. Colour says which KIND of event a card is:
@@ -219,17 +220,18 @@ diff_context = [195, 205, 220]
 [agent_text.kinds]
 # One accent per event kind, each in the hue family of that kind's card banner
 # ([agent_cards.banners]). File actions (touched-file lists, revision cards)
-# share the read / edit / write / ast entries. Keep these mutually distinct:
+# share the read / edit / write entries. Keep these mutually distinct:
 # telling kinds apart at a glance is their whole job.
 user_prompt = [140, 160, 255]          # periwinkle (banner: slate blue / indigo)
 thinking = [245, 210, 100]             # gold
 file_read = [100, 205, 250]            # cyan
 file_edit = [250, 150, 70]             # flame orange (distinct from thinking's gold)
 file_write = [110, 235, 140]           # emerald
-ast_analysis = [210, 155, 250]         # purple
 command = [200, 205, 215]              # silver (banner: terminal graphite)
 tool_invocation = [150, 190, 215]      # steel blue
 assistant_response = [120, 225, 190]   # teal-mint
+system = [210, 155, 250]               # purple (banner: plum)
+noise = [120, 125, 140]                # dim slate: a bookkeeping tool's beat
 
 [ui]
 # egui overlay label colours, sRGB 0-255 integers.
@@ -239,9 +241,8 @@ history_live = [100, 240, 140]        # deck at the live / latest beat
 beat_summary = [250, 220, 120]
 workdesk_bullet = [100, 220, 160]
 harness_claude = [230, 140, 70]
-harness_antigravity = [100, 180, 240]
+harness_agy = [100, 180, 240]
 harness_kimi = [160, 120, 240]
-harness_generic = [180, 180, 180]
 project_name = [180, 200, 120]
 
 [environment]

@@ -344,9 +344,7 @@ pub(super) fn render_scene(
             let carrel_e = ctrl.active_carrel?;
             let carrel_comp = ctrl.scene.world.get::<crate::spatial_scene::AgentCarrel>(carrel_e)?;
             let session = ctrl.session.as_ref()?;
-            let prompt = session.turns.get(carrel_comp.active_turn)
-                .and_then(|t| t.prompt.as_deref())
-                .unwrap_or("—");
+            let prompt = session.turn_prompt(carrel_comp.active_turn).unwrap_or("—");
             let touched = if let Some(desk) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::Workdesk>(carrel_comp.workdesk_entity) {
                 let mut files: Vec<(String, usize, usize)> = desk.file_stacks.iter().map(|(path, &stack_e)| {
                     let (act, cnt) = if let Some(st) = ctrl.scene.world.get::<crate::spatial_scene::workdesk::FileRevisionStack>(stack_e) {
@@ -362,13 +360,9 @@ pub(super) fn render_scene(
                 Vec::new()
             };
             let events = session.linearize_events(ctrl.revision_engine.as_ref());
-            let beat_summary = events.get(carrel_comp.active_beat)
-                .map(|e| e.summary())
-                .unwrap_or_else(|| {
-                    session.turns.get(carrel_comp.active_turn).map(|t| t.summary()).unwrap_or_default()
-                });
+            let beat_summary = events.get(carrel_comp.active_beat).map(|e| e.summary()).unwrap_or_default();
 
-            let total_items = if !events.is_empty() { carrel_comp.beat_count } else { carrel_comp.turn_count };
+            let total_items = carrel_comp.beat_count;
             let limit = carrel_comp.layout_options.deck_window_limit.max(1);
             let max_deck_scroll = total_items.saturating_sub(limit);
             let k = carrel_comp.layout_options.deck_scroll_offset.min(max_deck_scroll);

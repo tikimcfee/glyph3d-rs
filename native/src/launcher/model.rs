@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 
-use crate::agent_transcript::discovery::{scan_session_dirs, DiscoveredSession};
+use crate::agent_transcript::{agent_cli::nest_subagents, AgentCli, SessionInfo};
 use crate::cli::Cli;
 use crate::launch_config::{value_name, LaunchConfig};
 
@@ -19,7 +19,7 @@ use crate::launch_config::{value_name, LaunchConfig};
 /// Both are repo-relative, so they exist in every checkout.
 pub const DEFAULT_REPO_PRESETS: &[&str] = &[".", "native/fixtures/g-pick-repo"];
 
-/// Most-recent transcripts the session field cycles through.
+/// Most-recent sessions (subagents left out) the session field cycles through.
 const SESSION_PICKS: usize = 20;
 
 /// How many repos `repo_presets` keeps once launches start adding to it;
@@ -203,8 +203,11 @@ pub struct Launcher {
     /// A config that failed to load: shown, and launching is refused until
     /// it loads (`r`), because the launch would silently drop it.
     pub config_error: Option<String>,
-    /// Newest first; scanned on first use, and again on reload.
-    sessions: Option<Vec<DiscoveredSession>>,
+    /// Newest first, as gomuxai lists them; listed on first use, and again
+    /// on reload.
+    sessions: Option<Vec<SessionInfo>>,
+    /// What the last listing ran, or why it failed.
+    session_list_report: String,
     /// The file the last launch wrote, kept so a launch can be repeated.
     pub last_launch: Option<PathBuf>,
 }
@@ -227,6 +230,7 @@ impl Launcher {
             config_source: None,
             config_error: None,
             sessions: Some(Vec::new()),
+            session_list_report: "not listed (tests)".to_string(),
             last_launch: None,
         };
         l.resolve_lod_defaults();
@@ -301,7 +305,7 @@ impl Launcher {
         }
         if let Some(p) = cfg.agent_session.take() {
             // As written (`~` and all): a save writes it back unchanged.
-            self.session_path = p.display().to_string();
+            self.session_path = p;
         }
         cfg.demo = None;
         self.cfg = cfg;
@@ -463,37 +467,42 @@ impl Launcher {
         }
     }
 
-    /// The recent sessions, scanned once (the scan reads each transcript's
-    /// head for its title).
-    pub fn sessions(&mut self) -> &[DiscoveredSession] {
+    /// The recent sessions, listed once by gomuxai's `agent sessions`
+    /// (top-level sessions only: a subagent is opened by its id or path).
+    /// A listing that fails says why in the status line and the sidebar.
+    pub fn sessions(&mut self) -> &[SessionInfo] {
         if self.sessions.is_none() {
-            let mut found = scan_session_dirs(&self.cfg.session_dirs());
-            found.truncate(SESSION_PICKS);
+            let listed = AgentCli::from_launch_config(&self.cfg).and_then(|agent| {
+                self.session_list_report = format!("`{}`", agent.describe(&["sessions", "--json"]));
+                agent.sessions()
+            });
+            let found = match listed {
+                Ok(all) => nest_subagents(&all).into_iter().map(|(top, _)| top.clone()).take(SESSION_PICKS).collect(),
+                Err(e) => {
+                    self.session_list_report = e;
+                    Vec::new()
+                }
+            };
             self.sessions = Some(found);
         }
         self.sessions.as_deref().unwrap_or_default()
     }
 
-    /// The selected session's title and project, when it is a scanned one.
+    /// The selected session's title and project, when it is a listed one.
     pub fn session_title(&self) -> Option<String> {
-        let current = crate::launch_config::expand_home(Path::new(&self.session_path));
-        let s = self.sessions.as_ref()?.iter().find(|s| s.path == current)?;
-        Some(match &s.project_name {
-            Some(p) => format!("{} — {}", p, s.title),
-            None => s.title.clone(),
+        let current = crate::launch_config::expand_home(Path::new(&self.session_path)).display().to_string();
+        let s = self.sessions.as_ref()?.iter().find(|s| s.path == current || s.session_id == current)?;
+        Some(match s.project.as_str() {
+            "" => s.title.clone(),
+            p => format!("{p} — {}", s.title),
         })
     }
 
     fn step_session(&mut self, dir: i32) {
         let current = crate::launch_config::expand_home(Path::new(&self.session_path)).display().to_string();
-        let paths: Vec<String> = self.sessions().iter().map(|s| s.path.display().to_string()).collect();
+        let paths: Vec<String> = self.sessions().iter().map(|s| s.path.clone()).collect();
         if paths.is_empty() {
-            let dirs = self.cfg.session_dirs();
-            self.status = if dirs.is_empty() {
-                glyph_session_dirs::describe(&dirs)
-            } else {
-                format!("No transcripts in: {}", glyph_session_dirs::describe(&dirs))
-            };
+            self.status = format!("No sessions listed: {}", self.session_list_report);
             return;
         }
         let n = paths.len() as i32;
@@ -505,8 +514,12 @@ impl Launcher {
         self.session_path = paths[i as usize].clone();
     }
 
-    pub fn session_dirs_report(&self) -> String {
-        glyph_session_dirs::describe(&self.cfg.session_dirs())
+    /// Where the session list comes from (the command), or why it failed.
+    pub fn session_list_report(&self) -> &str {
+        match self.sessions {
+            None => "not listed yet (◄/► on the session field lists them)",
+            Some(_) => &self.session_list_report,
+        }
     }
 
     /// The config a launch writes: the options as edited, plus the chosen
@@ -540,7 +553,7 @@ impl Launcher {
         match self.target {
             Target::Repo => cfg.load_repo = Some(abs(&self.repo_path, ".")),
             Target::File => cfg.render_file = Some(abs(&self.file_path, &crate::cli::default_text_file().display().to_string())),
-            Target::Agent => cfg.agent_session = Some(abs(&self.session_path, "transcript.jsonl")),
+            Target::Agent => cfg.agent_session = Some(session_arg(&self.session_path, cwd)),
             Target::Demo => cfg.demo = Some(true),
         }
         if self.target != Target::Repo {
@@ -599,4 +612,20 @@ fn dial(v: f64, dir: i32, step: f64, lo: f64, hi: f64) -> f64 {
     let stepped = ((v / step).round() + dir as f64) * step;
     // Two decimals: 0.15 + 0.05 is 0.2, not 0.20000000000000001.
     ((stepped.clamp(lo, hi)) * 100.0).round() / 100.0
+}
+
+/// What a launch passes as `agent_session`: a path that names a file
+/// (relative to `cwd`) made absolute, as the other scene paths are; anything
+/// else (a session id, an agent's name) as typed, for gomuxai to resolve.
+/// With no `cwd` (a save into the user's own file), as typed.
+fn session_arg(typed: &str, cwd: Option<&Path>) -> String {
+    let typed = typed.trim();
+    let Some(cwd) = cwd else { return typed.to_string() };
+    let p = crate::launch_config::expand_home(Path::new(typed));
+    let full = if p.is_absolute() { p } else { cwd.join(p) };
+    if !typed.is_empty() && full.is_file() {
+        full.display().to_string()
+    } else {
+        typed.to_string()
+    }
 }

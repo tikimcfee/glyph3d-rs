@@ -159,9 +159,10 @@ impl Cli {
         let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
         let choice = if self.demo {
             SceneChoice::Demo
-        } else if let Some(session_path) = &self.agent_session {
+        } else if let Some(session) = &self.agent_session {
             SceneChoice::AgentSession {
-                session_path: session_path.clone(),
+                session: session.clone(),
+                agent: self.agent.clone(),
                 emoji_sheet,
                 layout_options: crate::spatial_scene::CarrelLayoutOptions {
                     deck_window_limit: self.deck_window_limit,

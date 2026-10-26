@@ -421,7 +421,7 @@ impl GlyphScene {
                     let total = ctrl
                         .session
                         .as_ref()
-                        .map(|s| s.linearize_events(ctrl.revision_engine.as_ref()).len().max(s.turn_count()))
+                        .map(|s| s.events.len())
                         .unwrap_or(0);
                     if total > 0 {
                         if let Some(msg) = ctrl.carrel_set_beat(total - 1) {

@@ -118,7 +118,7 @@ impl SpatialScene {
             .spawn((
                 Transform::IDENTITY,
                 ChildOf(parent),
-                Name::new(format!("agent_carrel:{}", session.session_id)),
+                Name::new(format!("agent_carrel:{}", session.session_id())),
             ))
             .id();
 
@@ -140,7 +140,7 @@ impl SpatialScene {
 
         // Spawn 2-page Agent Turn Cards using sliding window
         // The newest item is always first in the stack (position 0 / slot 0)
-        let total_items = if total_events > 0 { total_events } else { turn_count };
+        let total_items = total_events;
         let mut slot_to_beat = Vec::new();
 
         let limit = options.deck_window_limit.max(1);
@@ -158,31 +158,17 @@ impl SpatialScene {
         // Spawn ONLY active window card entities as children of deck_entity
         let mut card_entities = Vec::with_capacity(slot_to_beat.len());
         for (slot, &chrono_idx) in slot_to_beat.iter().enumerate() {
-            let card_e = if !events.is_empty() {
-                let event = &events[chrono_idx];
-                self.spawn_agent_turn_card(
-                    deck_entity,
-                    slot,
-                    event.index,
-                    event.turn_index,
-                    [55.0, 40.0],
-                    4.0,
-                    event.summary(),
-                    Some(event.banner_colors()),
-                )
-            } else {
-                let turn = &session.turns[chrono_idx];
-                self.spawn_agent_turn_card(
-                    deck_entity,
-                    slot,
-                    turn.turn_index,
-                    turn.turn_index,
-                    [55.0, 40.0],
-                    4.0,
-                    turn.summary(),
-                    None,
-                )
-            };
+            let event = &events[chrono_idx];
+            let card_e = self.spawn_agent_turn_card(
+                deck_entity,
+                slot,
+                event.index,
+                event.turn_index,
+                [55.0, 40.0],
+                4.0,
+                event.summary(),
+                Some(event.banner_colors()),
+            );
 
             card_entities.push(card_e);
         }
@@ -199,7 +185,7 @@ impl SpatialScene {
 
         let workdesk_entity = self.spawn_workdesk(
             workdesk_parent,
-            format!("desk:{}", session.session_id),
+            format!("desk:{}", session.session_id()),
             [60.0, 45.0],
             15.0,
         );
@@ -250,14 +236,10 @@ impl SpatialScene {
             .active_beat
             .filter(|&b| slot_to_beat.contains(&b))
             .unwrap_or_else(|| slot_to_beat.first().copied().unwrap_or(0));
-        let initial_turn = if !events.is_empty() {
-            events.get(initial_beat).map(|e| e.turn_index).unwrap_or(0)
-        } else {
-            initial_beat
-        };
+        let initial_turn = events.get(initial_beat).map(|e| e.turn_index).unwrap_or(0);
 
         self.world.entity_mut(carrel_entity).insert(AgentCarrel {
-            session_id: session.session_id.clone(),
+            session_id: session.session_id().to_string(),
             deck_entity,
             workdesk_entity,
             card_entities,
@@ -272,8 +254,6 @@ impl SpatialScene {
         // Initialize active beat/turn state
         if total_events > 0 {
             self.carrel_set_beat(carrel_entity, initial_beat, session, revision_engine);
-        } else {
-            self.carrel_set_turn(carrel_entity, initial_turn, session, revision_engine);
         }
 
         carrel_entity
@@ -325,7 +305,7 @@ impl SpatialScene {
             let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
                 return 0;
             };
-            let total = carrel.beat_count.max(carrel.turn_count);
+            let total = carrel.beat_count;
             (
                 carrel.deck_entity,
                 total,
@@ -407,7 +387,7 @@ impl SpatialScene {
             let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
                 return 0;
             };
-            let total = carrel.beat_count.max(carrel.turn_count);
+            let total = carrel.beat_count;
             (
                 carrel.deck_entity,
                 total,
@@ -504,7 +484,7 @@ impl SpatialScene {
             let Some(carrel) = self.world.get::<AgentCarrel>(carrel_entity) else {
                 return;
             };
-            let total = carrel.beat_count.max(carrel.turn_count);
+            let total = carrel.beat_count;
             (
                 carrel.deck_entity,
                 total,
@@ -650,44 +630,14 @@ impl SpatialScene {
         revision_engine: &RevisionEngine,
     ) {
         let events = session.linearize_events(Some(revision_engine));
-        if !events.is_empty() {
-            if let Some(beat_idx) = events
-                .iter()
-                .rposition(|e| e.turn_index == turn_index && e.file_path().is_some())
-                .or_else(|| events.iter().position(|e| e.turn_index == turn_index))
-            {
-                self.carrel_set_beat_sliding(carrel_entity, beat_idx, session, revision_engine);
-                return;
-            }
-        }
-
-        self.carrel_set_beat_sliding(carrel_entity, turn_index, session, revision_engine);
-
-        // Find file revisions produced or observed in this turn
-        let workdesk_e = if let Some(mut carrel) = self.world.get_mut::<AgentCarrel>(carrel_entity) {
-            carrel.active_turn = turn_index;
-            carrel.workdesk_entity
-        } else {
-            return;
-        };
-
-        if let Some(turn) = session.turns.get(turn_index) {
-            let desk_comp = match self.world.get::<Workdesk>(workdesk_e) {
-                Some(d) => d.clone(),
-                None => return,
-            };
-
-            for action in &turn.file_actions {
-                if let Some(&stack_e) = desk_comp.file_stacks.get(&action.file_path) {
-                    if let Some(history) = revision_engine.history(&action.file_path) {
-                        if let Some(rev) = history.revision_for_turn(turn_index) {
-                            if let Some(mut stack) = self.world.get_mut::<FileRevisionStack>(stack_e) {
-                                stack.active_revision = rev.revision_index;
-                            }
-                        }
-                    }
-                }
-            }
+        // The turn's last file beat (so the desk shows what the turn did),
+        // else its first beat.
+        if let Some(beat_idx) = events
+            .iter()
+            .rposition(|e| e.turn_index == turn_index && e.file_path().is_some())
+            .or_else(|| events.iter().position(|e| e.turn_index == turn_index))
+        {
+            self.carrel_set_beat_sliding(carrel_entity, beat_idx, session, revision_engine);
         }
     }
 }

@@ -160,6 +160,15 @@ fn scene_keys_become_the_target_and_only_it_is_written() {
     l.adopt(LaunchConfig::from_toml_str("demo = true\nagent_session = \"/s.jsonl\"\n").unwrap());
     assert_eq!(l.target, Target::Demo);
     assert_eq!(l.session_path, "/s.jsonl");
+
+    // A session is a path, made absolute when it names a file, or anything
+    // gomuxai resolves (an id, a prefix, an agent's name), passed as typed.
+    l.target = Target::Agent;
+    l.session_path = "3f34adff".into();
+    assert_eq!(l.launch_config(Path::new("/cwd")).agent_session.as_deref(), Some("3f34adff"));
+    l.session_path = "Cargo.toml".into();
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(l.launch_config(&here).agent_session, Some(here.join("Cargo.toml").display().to_string()));
 }
 
 /// The launch carries the whole loaded file, not just the keys the
