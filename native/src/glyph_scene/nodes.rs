@@ -1,18 +1,31 @@
 //! The scene's group rows as nodes of the transform tree (2026-10-10;
-//! step 1 of `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md`, transitional
-//! form). `crates/glyph-scene-graph` holds the tables and the resolve pass;
-//! this module maps the renderer's group rows onto it. Everything here is
-//! keyed by GROUP ROW (`gid`), never by view: which group row a view draws
-//! with is the view registry's answer (`crate::views`).
+//! step 1 of `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md`).
+//! `crates/glyph-scene-graph` holds the tables and the resolve; this module
+//! maps the renderer's group rows onto it and keeps the GPU's group table
+//! current. Everything here is keyed by GROUP ROW (`gid`), never by view:
+//! which group row a view draws with is the view registry's answer
+//! (`crate::views`).
 //!
 //! **Every group row is a node** whose parent is one identity root, and
 //! each node routes its resolved world transform and appearance into its
 //! own row of the group table (`set_group_row`), in the columns the draw
-//! shaders already read (cols 0-3; clip and background stay the host's). The
-//! draw path, the slot formats and the row layout are untouched. Composition
-//! under an identity parent is exact (every product with 1, every sum with
-//! 0, returns its operand), so the resolve rewrites each row with the bits it
-//! had and every golden frame stays byte-equal.
+//! shaders already read (cols 0-3; column 0's w, clip and background are
+//! the row's as it was allocated). The draw path, the slot formats and the
+//! row layout are untouched. Composition under an identity parent is exact
+//! (every product with 1, every sum with 0, returns its operand), so the
+//! resolve rebuilds each row with the bits it had and every golden frame
+//! stays byte-equal.
+//!
+//! **The frame** (`flush`, first thing in the frame): the tables resolve
+//! the moved subtrees on the CPU (`NodeTables::resolve_frame`), each
+//! resolved node with a group row has its row rebuilt in the host's image
+//! of the GPU table (`image`), and only the rows whose bytes changed go up,
+//! coalesced into runs (`upload_rows`). A settled frame resolves nothing
+//! and uploads nothing. The resolved ranges are handed on: the library's
+//! page faces and regions rebuild from the same nodes (`faces.rs`,
+//! `regions.rs`). Until 2026-10-26 the dirty input rows went up instead and
+//! a compute pass resolved them into the table; the renderer's default path
+//! now dispatches no compute, the shape a draw-only port (makepad) can run.
 //!
 //! **Writers.** A group verb writes ONE table: `move-group` and the `g` drag
 //! a local row (the world delta converted into the parent's frame, which is
@@ -20,7 +33,7 @@
 //! (uniform when the result is, else the per-axis post scale), `tint-group`
 //! / `tint-cycle` the appearance tint, `hide-group` / `show-group` its alpha.
 //! The CPU mirror (`groups_cpu`, which pick, cull and the HUD read) is then
-//! rewritten from the tables (`mirror`) — the same arithmetic the GPU runs.
+//! rewritten from the tables (`mirror`) — the arithmetic the flush runs.
 //!
 //! **External writers** — the bevy-backed layout controller (carrel zones,
 //! decks, the library's animation) still flatten their own hierarchy into
@@ -32,12 +45,50 @@
 //! edit — the library probe's E4 — while a carrel that hides a card still
 //! hides it. The library's own hierarchy moves onto these nodes next.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::time::Instant;
 
-use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, SceneGraphGpu, Similarity};
+use glyph_scene_graph::upload::{plan_upload, UploadPlan};
+use glyph_scene_graph::{Appearance, FramePlan, NodeHandle, NodeTables, Similarity};
 
 use super::GroupRow;
 use crate::gpu::GpuContext;
+
+/// What one host table's upload did and cost (the instruments:
+/// `GLYPH_LIBRARY_TIMING`, the profiler's CPU scopes).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UploadCost {
+    /// Rows whose bytes changed.
+    pub rows: usize,
+    /// Bytes written to the queue (whole runs: a run may carry clean rows).
+    pub bytes: usize,
+    /// Host time: rebuilding the rows and queueing the writes.
+    pub ms: f64,
+}
+
+/// Write `rows` (ascending, unique) of a host table `data` (`row_bytes` a
+/// row, `len` rows) into `buffer` by `plan_upload`'s choice; returns the
+/// bytes queued.
+pub(super) fn upload_rows(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8], row_bytes: usize, rows: &[u32]) -> usize {
+    let len = (data.len() / row_bytes) as u32;
+    match plan_upload(rows, len) {
+        UploadPlan::None => 0,
+        UploadPlan::Full => {
+            queue.write_buffer(buffer, 0, data);
+            data.len()
+        }
+        UploadPlan::Runs(runs) => {
+            let mut bytes = 0;
+            for (first, n) in runs {
+                let (a, b) = (first as usize * row_bytes, (first + n) as usize * row_bytes);
+                queue.write_buffer(buffer, a as u64, &data[a..b]);
+                bytes += b - a;
+            }
+            bytes
+        }
+    }
+}
+
 
 /// A row's columns as (local, post scale, appearance). A uniform scale (all
 /// three bit-equal) is the inherited uniform scale with post 1; anything
@@ -62,15 +113,20 @@ fn ext_appearance(row: &GroupRow) -> [u32; 5] {
 pub(crate) struct GroupNodes {
     /// Interior mutability for the flush, which runs from `render(&self)`.
     tables: RefCell<NodeTables>,
-    /// None only in the device-less unit tests.
-    gpu: Option<RefCell<SceneGraphGpu>>,
+    /// The GPU group table; None only in the device-less unit tests.
+    buffer: Option<wgpu::Buffer>,
+    /// Row by row, what the GPU group table holds (rows `0..len()`).
+    image: RefCell<Vec<GroupRow>>,
+    /// Rows allocated since the last flush: not on the GPU yet.
+    unsent: RefCell<Vec<u32>>,
     root: NodeHandle,
     /// Group id → node.
     nodes: Vec<NodeHandle>,
     /// Group id → the appearance the external writer last wrote.
     ext: Vec<[u32; 5]>,
-    /// The last flush's (bytes, resolved, dispatched), for the instruments.
-    last_flush: std::cell::Cell<(u64, u32, bool)>,
+    /// The last flush's group-row upload and nodes resolved, for the
+    /// instruments.
+    last_flush: Cell<(UploadCost, u32)>,
     /// Moved subtree roots whose group rows the CPU mirror has not taken
     /// yet (`defer_mirror`; each slot once, `pending_mark`).
     pending: Vec<NodeHandle>,
@@ -79,11 +135,12 @@ pub(crate) struct GroupNodes {
 
 impl GroupNodes {
     /// One node per row of `groups`, under an identity root, each writing
-    /// its row of `group_buf` (`max_rows` rows of 96 B).
-    pub(crate) fn new(device: &wgpu::Device, group_buf: &wgpu::Buffer, max_rows: u32, groups: &[GroupRow]) -> Self {
-        let mut gpu = SceneGraphGpu::new(device);
-        gpu.set_group_output(device, group_buf, max_rows);
-        Self { gpu: Some(RefCell::new(gpu)), ..Self::cpu_only(groups) }
+    /// its row of `group_buf`, which already holds `groups` (rows of 96 B;
+    /// the caller sizes it for every row a verb may allocate).
+    pub(crate) fn new(group_buf: &wgpu::Buffer, groups: &[GroupRow]) -> Self {
+        let this = Self { buffer: Some(group_buf.clone()), ..Self::cpu_only(groups) };
+        this.unsent.borrow_mut().clear();
+        this
     }
 
     fn cpu_only(groups: &[GroupRow]) -> Self {
@@ -91,11 +148,13 @@ impl GroupNodes {
         let root = tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).expect("a fresh pool accepts a root");
         let mut this = Self {
             tables: RefCell::new(tables),
-            gpu: None,
+            buffer: None,
+            image: RefCell::new(Vec::with_capacity(groups.len())),
+            unsent: RefCell::new(Vec::new()),
             root,
             nodes: Vec::with_capacity(groups.len()),
             ext: Vec::with_capacity(groups.len()),
-            last_flush: std::cell::Cell::new((0, 0, false)),
+            last_flush: Cell::new((UploadCost::default(), 0)),
             pending: Vec::new(),
             pending_mark: Vec::new(),
         };
@@ -106,9 +165,12 @@ impl GroupNodes {
     }
 
     /// A node for the next group id (a load's rows, or one the glyph verbs
-    /// allocated).
+    /// allocated). The whole row goes up at the next flush: its clip and
+    /// background are the row's own, never the tree's.
     pub(crate) fn push_row(&mut self, row: &GroupRow) {
         let gid = self.nodes.len() as u32;
+        self.image.get_mut().push(*row);
+        self.unsent.get_mut().push(gid);
         let (local, post, app) = decompose(row);
         let t = &mut self.tables.get_mut();
         let h = t.insert(Some(self.root), local, app).expect("the root is live");
@@ -191,8 +253,8 @@ impl GroupNodes {
         self.mirror(gid, row);
     }
 
-    /// Rewrite `row`'s columns 0-3 from the tables, in the resolve pass's
-    /// arithmetic (column 0's w, and columns 4-5, are left as they are).
+    /// Rewrite `row`'s columns 0-3 from the tables, as the flush builds them
+    /// (column 0's w, and columns 4-5, are left as they are).
     pub(crate) fn mirror(&self, gid: u32, row: &mut GroupRow) {
         let Some(&h) = self.nodes.get(gid as usize) else { return };
         let t = self.tables.borrow();
@@ -202,31 +264,46 @@ impl GroupNodes {
         write_row(row, &w, alpha, p, &a);
     }
 
-    /// Upload the frame's node edits and resolve the moved subtrees into the
-    /// group table — first thing in the frame's encoder, before any pass
-    /// reads a group row. A settled scene dispatches nothing. Returns what
-    /// the flush did (None without a device); the last one is also kept
-    /// for the instruments (`last_flush`).
-    pub(crate) fn flush(&self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder) -> Option<glyph_scene_graph::FlushStats> {
-        let gpu = self.gpu.as_ref()?;
-        let stats = gpu.borrow_mut().flush(&ctx.device, &ctx.queue, encoder, &mut self.tables.borrow_mut());
-        if stats.dispatched && ctx.profiler.is_some() {
-            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", (stats.cpu_plan_us + stats.cpu_encode_us) / 1e3);
+    /// Resolve the frame's node edits and upload the group rows they
+    /// changed — first thing in the frame, before any pass reads a group
+    /// row (the writes land at the frame's submit, ahead of its passes). A
+    /// settled scene resolves and uploads nothing. Returns what resolved
+    /// (None without a device), which the faces and regions rebuild from;
+    /// the rows' cost is kept for the instruments (`last_flush`).
+    pub(crate) fn flush(&self, ctx: &GpuContext) -> Option<FramePlan> {
+        let buffer = self.buffer.as_ref()?;
+        let t0 = Instant::now();
+        let mut t = self.tables.borrow_mut();
+        let plan = t.resolve_frame();
+        let mut image = self.image.borrow_mut();
+        let mut changed = std::mem::take(&mut *self.unsent.borrow_mut());
+        let (post, app) = (t.post_rows(), t.appearance_rows());
+        for slot in plan.slots(&t) {
+            let Some(gid) = t.slot_group_row(slot) else { continue };
+            let Some(old) = image.get_mut(gid as usize) else { continue };
+            let (w, alpha) = t.resolved_world(slot);
+            let mut row = *old;
+            write_row(&mut row, w, *alpha, post[slot as usize].xyz, &app[slot as usize]);
+            if bytemuck::bytes_of(&row) != bytemuck::bytes_of(old) {
+                *old = row;
+                changed.push(gid);
+            }
         }
-        self.last_flush.set((stats.bytes, stats.resolved, stats.dispatched));
-        Some(stats)
+        changed.sort_unstable();
+        changed.dedup();
+        let bytes = upload_rows(&ctx.queue, buffer, bytemuck::cast_slice(&image), std::mem::size_of::<GroupRow>(), &changed);
+        let rows = UploadCost { rows: changed.len(), bytes, ms: t0.elapsed().as_secs_f64() * 1e3 };
+        if (!plan.is_empty() || bytes > 0) && ctx.profiler.is_some() {
+            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", rows.ms);
+        }
+        self.last_flush.set((rows, plan.resolved));
+        Some(plan)
     }
 
-    /// The last flush's (bytes queued, nodes resolved, dispatched) — the
-    /// previous frame's, when read from `animate`.
-    pub(crate) fn last_flush(&self) -> (u64, u32, bool) {
+    /// The last flush's group-row upload and nodes resolved — the previous
+    /// frame's, when read from `animate`.
+    pub(crate) fn last_flush(&self) -> (UploadCost, u32) {
         self.last_flush.get()
-    }
-
-    /// The resolve pass's world table (one 32 B `Similarity` per pool slot;
-    /// replaced whenever the pool outgrows it — `FlushStats::grew`).
-    pub(crate) fn world_buffer(&self) -> Option<wgpu::Buffer> {
-        Some(self.gpu.as_ref()?.borrow().world_buffer().clone())
     }
 
     pub(crate) fn tables_mut(&mut self) -> &mut NodeTables {
@@ -250,7 +327,7 @@ impl GroupNodes {
     /// Note moved nodes whose subtrees' group rows the CPU mirror will take
     /// when a reader asks (`sync_mirror`) — O(1) a node, nothing per row: a
     /// directory drag no longer rewrites a row per file it carries every
-    /// frame (2026-10-10). The GPU resolve draws the move regardless.
+    /// frame (2026-10-10). The frame's flush draws the move regardless.
     pub(crate) fn defer_mirror(&mut self, moved: &[NodeHandle]) {
         for &h in moved {
             let i = h.index() as usize;
@@ -314,13 +391,35 @@ impl GroupNodes {
 }
 
 /// Columns 0-3 of a group row from a node's world, inherited alpha, post
-/// scale and appearance — the resolve pass's output, on the CPU (column 0's
-/// w, and columns 4-5, are left as they are).
+/// scale and appearance — what the flush uploads and the mirror holds
+/// (column 0's w, and columns 4-5, are left as they are).
 fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Appearance) {
     row.cols[0] = [w.translation[0], w.translation[1], w.translation[2], row.cols[0][3]];
     row.cols[1] = w.rotation;
     row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];
     row.cols[3] = [p[0] * w.scale, p[1] * w.scale, p[2] * w.scale, a.blend];
+}
+
+/// Block on a readback of `bytes` of `src` (tests only, never the frame
+/// path).
+#[cfg(test)]
+pub(crate) fn read_buffer(ctx: &GpuContext, src: &wgpu::Buffer, bytes: u64) -> Vec<u8> {
+    let size = bytes.div_ceil(4) * 4;
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test readback"),
+        size: size.max(4),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test readback") });
+    encoder.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+    ctx.queue.submit([encoder.finish()]);
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("test readback: map"));
+    ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("test readback: poll");
+    let out = slice.get_mapped_range().expect("test readback: range")[..bytes as usize].to_vec();
+    staging.unmap();
+    out
 }
 
 #[cfg(test)]
@@ -339,11 +438,11 @@ mod tests {
         ]
     }
 
-    /// The CPU half of the identity-root claim (the GPU half is
-    /// glyph-scene-graph's `group_rows_under_an_identity_root_...`): every
-    /// row mirrored back from its node is the same bits, uniform or per-axis
-    /// scale alike — and each verb through the node path lands exactly
-    /// where the old in-place edit of the row did.
+    /// The identity-root claim: every row mirrored back from its node is the
+    /// same bits, uniform or per-axis scale alike — and each verb through
+    /// the node path lands exactly where the old in-place edit of the row
+    /// did. (`flush_uploads_exactly_the_rows_that_changed` holds the GPU
+    /// table to these rows.)
     #[test]
     fn rows_through_their_nodes_come_back_bit_for_bit_and_verbs_match_the_old_edits() {
         let rows = rows();
@@ -374,6 +473,55 @@ mod tests {
             assert_eq!(bytemuck::bytes_of(&got), bytemuck::bytes_of(want), "row {gid} after the verbs");
         }
         assert!(!n.translate(9, [1.0; 3]), "an unknown group is refused");
+    }
+
+    /// What reaches the GPU's group table (2026-10-26, the CPU resolve as
+    /// the path): a load's rows resolve to their own bits and upload
+    /// nothing; a verb uploads exactly the rows it changed (as one run when
+    /// they sit close); an allocated row goes up whole, clip and background
+    /// included; and the table read back is the mirror, bit for bit. (Forty
+    /// rows, so a few changed ones stay under the whole-table share.)
+    #[test]
+    fn flush_uploads_exactly_the_rows_that_changed() {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let rows: Vec<GroupRow> = (0..40)
+            .map(|k| {
+                let mut r = rows()[k % 3];
+                r.cols[0][0] += k as f32 * 7.25;
+                r
+            })
+            .collect();
+        let buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test group table"),
+            size: 48 * 96,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&rows));
+        let mut n = GroupNodes::new(&buf, &rows);
+        let flush = |n: &GroupNodes| {
+            let plan = n.flush(&ctx).expect("a device-backed table");
+            (plan.resolved, n.last_flush().0)
+        };
+        let (resolved, up) = flush(&n);
+        assert_eq!((resolved, up.rows, up.bytes), (41, 0, 0), "the root and every row resolve to the bits they had");
+        n.translate(10, [1.5, -2.0, 0.25]);
+        n.set_tint(12, [0.25, 0.5, 0.75]);
+        let (_, up) = flush(&n);
+        assert_eq!((up.rows, up.bytes), (2, 3 * 96), "rows 10 and 12, one run across row 11");
+        let mut extra = GroupRow::identity([4.0, 5.0, 6.0]);
+        extra.cols[5] = [0.9, 0.1, 0.2, 1.0];
+        n.push_row(&extra);
+        let (_, up) = flush(&n);
+        assert_eq!((up.rows, up.bytes), (1, 96), "an allocated row goes up whole");
+        assert_eq!(flush(&n).1.bytes, 0, "a settled frame uploads nothing");
+        let back: Vec<GroupRow> = bytemuck::cast_slice(&read_buffer(&ctx, &buf, 41 * 96)).to_vec();
+        for (gid, row) in rows.iter().chain([&extra]).enumerate() {
+            let mut want = *row;
+            n.mirror(gid as u32, &mut want);
+            assert_eq!(bytemuck::bytes_of(&back[gid]), bytemuck::bytes_of(&want), "row {gid} on the GPU");
+        }
+        assert_eq!(back[40].cols[5], extra.cols[5], "the background is the row's own");
     }
 
     /// E4: an external writer that moves a group carries its transform in,

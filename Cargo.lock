@@ -1782,9 +1782,6 @@ name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "naga",
- "pollster",
- "wgpu",
 ]
 
 [[package]]

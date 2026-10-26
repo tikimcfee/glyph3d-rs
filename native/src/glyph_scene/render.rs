@@ -28,16 +28,18 @@ pub(super) fn render_scene(
         width,
         height,
     } = *target;
-    // The transform tree first: the frame's group edits go up and the moved
-    // subtrees resolve into the group table before any pass reads a row
-    // (the Visible field's cull below, the glyph pass). Nothing moved,
-    // nothing dispatched.
-    let flush = scene.nodes.flush(ctx, encoder);
-    // The library's page faces follow their sheets' resolved worlds: one
-    // GPU pass after any resolve, nothing from the host (faces.rs).
-    if let (Some(faces), Some(st), Some(world)) = (&scene.library_faces, &flush, scene.nodes.world_buffer()) {
-        if st.dispatched {
-            faces.encode(&ctx.device, encoder, &world, st.grew);
+    // The transform tree first: the moved subtrees resolve on the CPU and
+    // the group rows they changed go up before any pass reads a row (the
+    // Visible field's cull below, the glyph pass). Nothing moved, nothing
+    // uploaded.
+    let flush = scene.nodes.flush(ctx);
+    // The library's page faces follow their sheets' resolved worlds: the
+    // faces of the sheets the resolve reached, rebuilt and uploaded where
+    // they changed (faces.rs).
+    if let (Some(faces), Some(plan)) = (&scene.library_faces, &flush) {
+        let cost = faces.update(&ctx.queue, &scene.nodes.tables(), plan);
+        if cost.rows > 0 && ctx.profiler.is_some() {
+            crate::gpu::record_cpu_scope(ctx, "library faces (CPU)", cost.ms);
         }
     }
     let aspect = width as f32 / height.max(1) as f32;
@@ -297,18 +299,19 @@ pub(super) fn render_scene(
         }
     };
 
-    // The library's regions: the cull's refits re-pad their boxes (only
-    // the refit ones are uploaded), and a GPU pass composes them with their
-    // directories' worlds when anything resolved or was uploaded.
-    if let (Some(regions), Some(tree), Some(world)) =
-        (&scene.library_regions, scene.cull.as_ref().and_then(|c| c.tree.as_ref()), scene.nodes.world_buffer())
-    {
-        let cost = regions.prepare(&ctx.device, &ctx.queue, encoder, &mut tree.borrow_mut(), &world, flush.as_ref());
+    // The library's regions: the cull's refits re-pad their boxes, and the
+    // regions whose box changed or whose directory resolved are composed
+    // with their directories' worlds and uploaded where they changed.
+    if let (Some(regions), Some(tree)) = (&scene.library_regions, scene.cull.as_ref().and_then(|c| c.tree.as_ref())) {
+        let cost = regions.prepare(&ctx.queue, &mut tree.borrow_mut(), &scene.nodes.tables(), flush.as_ref());
+        if cost.composed > 0 && ctx.profiler.is_some() {
+            crate::gpu::record_cpu_scope(ctx, "library regions (CPU)", cost.ms);
+        }
         // GLYPH_LIBRARY_TIMING: one line per frame the regions did anything
-        // (a settled library prints nothing): refits taken, rows uploaded,
-        // whether the compose pass ran, and the CPU time of it all.
-        if (cost.refits > 0 || cost.composed) && std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
-            println!("REGIONTIME refits={} uploaded={} upload_bytes={} composed={} prepare_ms={:.4}", cost.refits, cost.uploaded, cost.bytes, cost.composed, cost.ms);
+        // (a settled library prints nothing): refits taken, instances
+        // composed, instances and bytes uploaded, and the CPU time of it all.
+        if (cost.refits > 0 || cost.composed > 0) && std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
+            println!("REGIONTIME refits={} composed={} uploaded={} upload_bytes={} prepare_ms={:.4}", cost.refits, cost.composed, cost.uploaded, cost.bytes, cost.ms);
         }
     }
 
