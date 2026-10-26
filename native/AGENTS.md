@@ -309,26 +309,31 @@ its staging text predates C22). Key touchpoints:
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
   moved (dir and sheet local rows written), the CPU stages (`ease_ms`, the
   easing loop with its local-row writes; `note_ms`, noting the moved nodes
-  for the deferred CPU mirror and the tree cull), `local_bytes` (the local
-  rows written, 32 B each), the PREVIOUS frame's flush (`last_flush_bytes`:
-  every byte the scene graph queued — rows, order span, uniforms;
-  `last_flush_resolved`: nodes the GPU resolved) and the previous frame's
+  for their deferred group rows and the tree cull), `local_bytes` (the local
+  rows written, 32 B each), the PREVIOUS frame's flush
+  (`last_flush_resolved`: nodes the CPU resolve reached;
+  `last_flush_rows` / `last_flush_bytes`: group rows that changed and the
+  bytes queued for them, whole runs; `last_flush_ms`: resolve, row rebuild
+  and queueing), the last face update that did anything (`last_faces`,
+  `last_faces_bytes`, `last_faces_ms`: the same for the page faces of the
+  resolved sheets, `glyph_scene/faces.rs`) and the previous frame's
   tree cull (`last_cull_ms`, refit included; `last_cull_visited`: nodes
   walked; `last_cull_candidates`: segments handed to the exact test).
-  Since the library moved onto the transform tree (2026-10-10) a move does
-  no per-file CPU work: no bevy propagation, no face upload (faces are
-  written on the GPU, `glyph_scene/faces.rs`), no per-file row mirror (it
-  is deferred until pick, a verb or the windowed HUD reads `groups_cpu`)
-  and no `sync_segment` (the library culls top-down from the tree,
+  Since 2026-10-26 the resolve, the faces and the regions are the host's
+  (no compute pass): a move costs CPU and upload in proportion to the
+  subtrees it moved, and nothing outside them. The move itself is still
+  O(moved nodes): no bevy propagation, no per-file row rebuild (it waits
+  for the flush, or for pick or a verb reading the group table first) and
+  no `sync_segment` (the library culls top-down from the tree,
   `glyph_scene/tree_cull.rs`). Animations run on the
   offscreen 1/60 s clock (`SceneLike::animate`), so `--verb page-next
   --frames 120` is a deterministic page turn. With `[library] regions` on
   (E20, `glyph_scene/regions.rs`) a `REGIONTIME` line follows every frame
   whose regions did anything: `refits` (tree-cull slots refit, any library
-  node), `uploaded` / `upload_bytes` (region rows changed and the bytes
-  written — the whole 48 B-per-region table once more than a quarter
-  changed), `composed` (the compose pass ran) and `prepare_ms`. A settled
-  library prints nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
+  node), `composed` (instances recomposed: a refit box or a resolved
+  directory), `uploaded` / `upload_bytes` (64 B instances whose bytes
+  changed, and the bytes queued — whole runs, or the table past 15 %) and
+  `prepare_ms`. A settled library prints nothing: it does no work. `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md` has
   the measured figures.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
@@ -404,8 +409,9 @@ its staging text predates C22). Key touchpoints:
   transform write; for a bevy-backed controller — the carrel — plus
   `update_transforms`, split into bevy propagation and scene-mesh
   re-extraction, both 0 for a library, whose files and zones are tree
-  nodes), `sync_ms` (the CPU mirror), `upload_ms` (0 for a tree move: the
-  frame's flush uploads its one local row), `seg_ms`. Bevy propagation is
+  nodes), `sync_ms` (the controller's rows into the group table, adopted;
+  for a tree move, noting it), `upload_ms` (0 for a tree move: the frame's
+  flush resolves and uploads), `seg_ms`. Bevy propagation is
   O(every entity): 0.39 ms for one moved card on a 9,241-file library
   before the library left bevy (2026-10-10).
 - `GLYPH_FRAME_SCRIPT="FRAME:STEP[;FRAME:STEP...]"` — offscreen (C32,

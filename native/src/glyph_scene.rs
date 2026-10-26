@@ -27,8 +27,8 @@
 //!   - instance fields (color/pos/advance/height): queue.write_buffer into
 //!     the affected arena chunk at slot granularity (32 B RenderSlot stride,
 //!     4-aligned);
-//!   - group TRS/color/alpha: one node-table row per edit (since 2026-10-10
-//!     the GPU resolve writes the 96 B GroupRow; `glyph_scene/nodes.rs`), plus a CPU
+//!   - group TRS/color/alpha: one node-table row per edit, resolved and
+//!     uploaded as the 96 B GroupRow at the next flush (`glyph_scene/nodes.rs`), plus a CPU
 //!     segment-table sync (AABB follows the group; backdrop tint follows the
 //!     group color; hidden groups are skipped by the cull entirely).
 //!
@@ -172,15 +172,15 @@ pub struct GlyphScene {
     /// the legacy per-chunk draws.
     pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
-    /// Group table buffer (96 B rows): columns 0-3 written by the group
-    /// nodes' resolve pass, whole rows by the load and the glyph verbs.
+    /// Group table buffer (96 B rows): written by the load, then by the
+    /// group nodes' flush (each row whose bytes changed, a verb's new row
+    /// whole).
     pub(crate) group_buf: wgpu::Buffer,
-    /// CPU mirror of the group table — the pick path reads the LIVE TRS from
-    /// here and every group verb writes it back (then uploads just that row).
-    pub(crate) groups_cpu: Vec<GroupRow>,
     /// Every group row as a node of the transform tree (2026-10-10,
-    /// `nodes.rs`): the group verbs write its tables, and its resolve pass
-    /// writes the rows' transform and appearance columns on the GPU.
+    /// `nodes.rs`), and the group table itself (`GroupNodes::rows`, the one
+    /// host copy: pick, cull and the HUD read the live TRS there): the group
+    /// verbs write its tables, and its flush resolves them into the rows'
+    /// transform and appearance columns and uploads the rows that changed.
     pub(crate) nodes: nodes::GroupNodes,
     /// The view registry (`crate::views`): per view — the unit picked,
     /// culled and edited, whose index is its item row — its group row,
@@ -249,8 +249,9 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) params: Cell<Params>,
     pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
     pub(crate) mesh_frame_bg: wgpu::BindGroup,
-    /// A library load's page faces, written on the GPU from the sheets'
-    /// resolved worlds (`faces.rs`); None in every other scene.
+    /// A library load's page faces, built on the host from the sheets'
+    /// resolved worlds and uploaded where they changed (`faces.rs`); None
+    /// in every other scene.
     pub(crate) library_faces: Option<faces::LibraryFaces>,
     /// A library load's bounding regions, one box per directory below the
     /// root (`regions.rs`, `[library] regions`); None in every other scene
@@ -362,9 +363,9 @@ impl GlyphScene {
 
     // ── Stage G: picking & live manipulation ───────────────────────────────
 
-    /// Group TRS from the CPU mirror: (offset, scale, rgb, alpha).
+    /// Group TRS from the group table: (offset, scale, rgb, alpha).
     pub(crate) fn group_trs(&self, gid: u32) -> Option<(Vec3, Vec3, [f32; 3], f32)> {
-        let g = self.groups_cpu.get(gid as usize)?;
+        let g = self.nodes.row(gid)?;
         Some((
             Vec3::new(g.cols[0][0], g.cols[0][1], g.cols[0][2]),
             Vec3::new(g.cols[3][0], g.cols[3][1], g.cols[3][2]),
@@ -373,9 +374,9 @@ impl GlyphScene {
         ))
     }
 
-    /// Group Affine3A transform from the CPU mirror.
+    /// Group Affine3A transform from the group table.
     pub(crate) fn group_affine(&self, gid: u32) -> Option<glam::Affine3A> {
-        let g = self.groups_cpu.get(gid as usize)?;
+        let g = self.nodes.row(gid)?;
         let t = Vec3::new(g.cols[0][0], g.cols[0][1], g.cols[0][2]);
         let q = glam::Quat::from_xyzw(g.cols[1][0], g.cols[1][1], g.cols[1][2], g.cols[1][3]);
         let q = if q.length_squared() > 1e-4 { q.normalize() } else { glam::Quat::IDENTITY };

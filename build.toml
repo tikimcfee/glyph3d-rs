@@ -26,7 +26,11 @@
 # Ratchet, NOT an equality: tests are added constantly, so an exact pin would
 # redden on the most common good action in the repo. A green run whose real
 # count exceeds the floor prints a NOTE naming the value to raise it to.
-test_floor = 376
+# Lowered 376 -> 374 on purpose (2026-10-26): the scene graph's GPU resolve
+# was deleted with its five tests (GPU against CPU, its WGSL pins, the range
+# coalescing) and three took their place (the frame resolve against the chain
+# walk; the group table read back).
+test_floor = 374
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1286,21 +1290,21 @@ expect = "a_stale_handle_is_refused_and_never_aliases_a_reused_slot"
 [[mutation]]
 name = "resolve-compose-order-swapped"
 gate = "cargo-test"
-why = "the GPU resolve composing child-then-parent (local[child] ∘ acc) instead of parent-then-child as it walks the chain down from the root: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the GPU test on a random 5,000-node tree, held to the CPU reference, can. CONSUMED BY: resolve.wgsl's top-down chain composition (2026-10-10; it was bottom-up until the library moved onto the tree), every node of every flush; reddens the_resolve_matches_the_cpu_reference_through_every_upload_path"
-file = "crates/glyph-scene-graph/shaders/resolve.wgsl"
+why = "the resolve composing child-then-parent (local[child] ∘ parent world) instead of parent-then-child as it walks a range down the depth-first order: a nested node's translation is no longer carried through its parent's rotation and scale. Every golden group is a child of an identity root, where the two orders agree bit for bit, so pixel-ab cannot see this; the random 5,000-node tree, held to the chain walk, can. CONSUMED BY: NodeTables::resolve_range, every node of every frame's resolve and of every between-frame mirror (resolve_subtrees). Re-aimed 2026-10-26 from resolve.wgsl's chain composition, when the CPU resolve replaced the GPU pass; reddens tables::tests::resolving_subtrees_on_the_cpu_matches_world_node_for_node (the crate's lib binary fails first, so cargo test never reaches tests/resolve.rs's the_frame_resolve_matches_the_chain_walk_through_every_kind_of_edit, which reddens too when run alone)"
+file = "crates/glyph-scene-graph/src/tables.rs"
 op = "replace"
-find = "        acc = compose(acc, locals[chain[k - 1u]]);"
-with = "        acc = compose(locals[chain[k - 1u]], acc);"
-expect = "the_resolve_matches_the_cpu_reference_through_every_upload_path"
+find = "                (Similarity::compose(&pw, &self.local[i]), pa * self.appearance[i].tint[3])"
+with = "                (Similarity::compose(&self.local[i], &pw), pa * self.appearance[i].tint[3])"
+expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"
 
 [[mutation]]
 name = "resolve-group-tint-halved"
 gate = "pixel-ab"
-why = "the transitional resolve writing a wrong appearance column into the group table: the proof that the draw path reads what the resolve pass writes (2026-10-10: every group row is a node, and the first frame's resolve rewrites columns 0-3 of every row). A resolve that wrote nothing, or wrote to the wrong buffer, would leave every golden byte-equal for the wrong reason. CONSUMED BY: resolve.wgsl's group-row output, every group of every scene on its first frame; text.png is the first framed view with a group"
-file = "crates/glyph-scene-graph/shaders/resolve.wgsl"
+why = "the flush writing a wrong appearance column into the group table: the proof that the draw path reads what the flush uploads (every group row is a node, and the first frame's resolve rebuilds columns 0-3 of every row; a row whose bytes changed goes up). A flush that wrote nothing, or wrote to the wrong buffer, would leave every golden byte-equal for the wrong reason. CONSUMED BY: nodes.rs write_row, behind every row GroupNodes::flush uploads (and the CPU mirror), every group of every scene on its first frame; text.png is the first framed view with a group. Re-aimed 2026-10-26 from resolve.wgsl's group-row output, when the CPU resolve replaced the GPU pass"
+file = "native/src/glyph_scene/nodes.rs"
 op = "replace"
-find = "        groups[g + 2u] = vec4<f32>(app.tint.xyz, alpha);"
-with = "        groups[g + 2u] = vec4<f32>(app.tint.xyz * 0.5, alpha);"
+find = "    row.cols[2] = [a.tint[0], a.tint[1], a.tint[2], alpha];"
+with = "    row.cols[2] = [a.tint[0] * 0.5, a.tint[1] * 0.5, a.tint[2] * 0.5, alpha];"
 expect = "text.png diverges from baseline"
 
 [[mutation]]
@@ -1326,12 +1330,12 @@ expect = "the_tree_resolves_the_rows_bevy_composed"
 [[mutation]]
 name = "library-face-offset-dropped"
 gate = "cargo-test"
-why = "the page-face pass placing each face ON its sheet instead of page_face_gap behind it (2026-10-10: faces are written on the GPU from the sheets' resolved worlds, no longer extracted from bevy). The face writes depth and the content's front sits on the page plane, so a face on the plane z-fights the text it backs. No golden view renders the library; the GPU test reads the face pass back against its CPU twin, which the bevy test holds to bevy's extraction. CONSUMED BY: library_faces.wgsl, every face on every frame whose flush resolved anything; reddens glyph_scene::faces::tests::the_gpu_resolves_the_library_rows_and_faces_the_cpu_does"
-file = "native/src/shaders/library_faces.wgsl"
+why = "each page face placed ON its sheet instead of page_face_gap behind it (2026-10-10: faces are built from the sheets' resolved worlds, no longer extracted from bevy). The face writes depth and the content's front sits on the page plane, so a face on the plane z-fights the text it backs. No golden view renders the library; the bevy test holds face_instance to bevy's extraction. CONSUMED BY: faces.rs face_instance, behind every face LibraryFaces::update rebuilds (every sheet the frame's resolve reaches). Re-aimed 2026-10-26 from library_faces.wgsl, when the host took the faces over from the compute pass; reddens library::tests::the_tree_resolves_the_rows_bevy_composed"
+file = "native/src/glyph_scene/faces.rs"
 op = "replace"
-find = "    let t = w.t_s.xyz + rotate(q, params.offset.xyz * s);"
-with = "    let t = w.t_s.xyz;"
-expect = "the_gpu_resolves_the_library_rows_and_faces_the_cpu_does"
+find = "    let t = [sheet.translation[0] + r[0], sheet.translation[1] + r[1], sheet.translation[2] + r[2]];"
+with = "    let t = { let _ = r; sheet.translation };"
+expect = "the_tree_resolves_the_rows_bevy_composed"
 
 [[mutation]]
 name = "tree-cull-refit-stops-at-the-moved-node"
@@ -1374,14 +1378,14 @@ with = "        let _ = dl;"
 expect = "a_dragged_directory_keeps_its_place_through_every_replan"
 
 [[mutation]]
-name = "group-mirror-deferred-forever"
+name = "group-rows-deferred-past-their-reader"
 gate = "cargo-test"
-why = "the deferred CPU mirror of a tree move never written back (2026-10-10: a library move notes its subtree instead of rewriting a group row per file every frame): pick, the verbs and the HUD read every moved file where it was at load, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_mirror, which apply_pick, apply_verb and the windowed HUD call before reading groups_cpu; reddens glyph_scene::nodes::tests::a_deferred_mirror_syncs_to_the_eager_rows"
+why = "a tree move's group rows never rebuilt for a reader before the flush (2026-10-10: a library move notes its subtree instead of rewriting a row per file; since 2026-10-26 the one group table is rebuilt by the flush, and sync_rows serves a reader in between): a pick or a verb in the frame of a move reads every moved file where the previous frame left it, so a click lands on the wrong file and a verb copies a stale row. No golden view moves a nested group. CONSUMED BY: GroupNodes::sync_rows, which apply_pick and apply_verb call before reading the table. Renamed from group-mirror-deferred-forever when the scene's second copy (groups_cpu) became the one table; reddens glyph_scene::nodes::tests::deferred_rows_sync_to_the_eager_rows"
 file = "native/src/glyph_scene/nodes.rs"
 op = "replace"
-find = "        self.mirror_subtrees(&pending, groups).len()"
+find = "        self.rebuild_subtrees(&pending).len()"
 with = "        0"
-expect = "a_deferred_mirror_syncs_to_the_eager_rows"
+expect = "deferred_rows_sync_to_the_eager_rows"
 
 [[mutation]]
 name = "region-refit-unlogged"
@@ -1436,12 +1440,42 @@ expect = "a_region_drag_moves_its_subtree_and_sticks"
 [[mutation]]
 name = "region-compose-drops-translation"
 gate = "cargo-test"
-why = "the region compose pass placing each box by its offset alone, without its directory's world translation (2026-10-10, library_regions.wgsl): every region draws near the world origin instead of around its pages, and none follows a drag, an ease or a page turn. CONSUMED BY: write_regions, every region on every frame whose flush resolved anything or uploaded a box; reddens glyph_scene::regions::tests::the_gpu_composes_the_regions_the_cpu_does"
-file = "native/src/shaders/library_regions.wgsl"
+why = "each region instance composed by its offset alone, without its directory's world translation (2026-10-10): every region draws near the world origin instead of around its pages, and none follows a drag, an ease or a page turn. CONSUMED BY: regions.rs region_instance, behind every instance LibraryRegions::prepare recomposes. Re-aimed 2026-10-26 from library_regions.wgsl's write_regions, when the host took the compose over; reddens glyph_scene::regions::tests::the_gpu_draws_the_regions_the_tree_composes (its f64 corner check: the read-back instance against the box carried through the world, not against region_instance)"
+file = "native/src/glyph_scene/regions.rs"
 op = "replace"
-find = "    let at = w.t_s.xyz + rotate(q, centre * s);"
-with = "    let at = rotate(q, centre * s);"
-expect = "the_gpu_composes_the_regions_the_cpu_does"
+find = "    let at = [0, 1, 2].map(|k| w.translation[k] + r[k]);"
+with = "    let at = r;"
+expect = "the_gpu_draws_the_regions_the_tree_composes"
+
+[[mutation]]
+name = "group-flush-drops-changed-row"
+gate = "cargo-test"
+why = "the flush rebuilding a moved group row in its image of the GPU table but not uploading it (2026-10-26, the CPU resolve as the path): the GPU keeps the row's old transform while pick, cull and the HUD read the new one. No golden view moves a group after its first frame. CONSUMED BY: GroupNodes::flush, every resolved node with a group row; reddens glyph_scene::nodes::tests::flush_uploads_exactly_the_rows_that_changed (the table read back against the mirror)"
+file = "native/src/glyph_scene/nodes.rs"
+op = "replace"
+find = "                changed.push(gid);"
+with = "                let _ = gid;"
+expect = "flush_uploads_exactly_the_rows_that_changed"
+
+[[mutation]]
+name = "faces-update-drops-changed-face"
+gate = "cargo-test"
+why = "a page face rebuilt from its sheet's new world but not uploaded (2026-10-26, the host writes the faces): the face stays where its sheet was while the page's text moves on. No golden view renders the library. CONSUMED BY: LibraryFaces::update, every sheet the frame's resolve reaches; reddens glyph_scene::faces::tests::the_gpu_tables_hold_the_rows_and_faces_the_tree_composes"
+file = "native/src/glyph_scene/faces.rs"
+op = "replace"
+find = "                changed.push(k);"
+with = "                let _ = k;"
+expect = "the_gpu_tables_hold_the_rows_and_faces_the_tree_composes"
+
+[[mutation]]
+name = "regions-ignore-the-resolve"
+gate = "cargo-test"
+why = "regions recomposed only when a refit changes their box, not when their directory moves (2026-10-26, the host composes the regions): a dragged directory's own box is unchanged in its own frame, so its region stays where it was dragged from. No golden view renders the library. CONSUMED BY: LibraryRegions::prepare's resolved-directory arm, every frame the resolve reaches a region's directory; reddens glyph_scene::regions::tests::the_gpu_draws_the_regions_the_tree_composes"
+file = "native/src/glyph_scene/regions.rs"
+op = "replace"
+find = "            dirty.extend(plan.slots(t).filter_map(|s| table.region_of_slot.get(s as usize).copied().filter(|&r| r != NONE)));"
+with = "            let _ = plan;"
+expect = "the_gpu_draws_the_regions_the_tree_composes"
 
 [[mutation]]
 name = "region-draw-dropped"
@@ -1452,16 +1486,6 @@ op = "replace"
 find = "                    regions.draw(&mut pass);"
 with = "                    let _ = regions;"
 expect = "regions_pick_after_content_and_draw_only_where_they_are"
-
-[[mutation]]
-name = "scene-graph-cpu-mirror-compose-swapped"
-gate = "cargo-test"
-why = "the CPU subtree resolve (the mirror of a move: the rows pick, the HUD and the CPU cull read) composing local ∘ parent-world instead of parent-world ∘ local. The GPU draws the right frame and the CPU readers see another: a pick or a cull box off wherever a nested node moves. No golden view nests a group. CONSUMED BY: NodeTables::resolve_subtrees, run by GroupNodes::mirror_subtrees for every library move (ease, zone drag, file drag); reddens tables::tests::resolving_subtrees_on_the_cpu_matches_world_node_for_node"
-file = "crates/glyph-scene-graph/src/tables.rs"
-op = "replace"
-find = "                    (Similarity::compose(&pw, &self.local[n]), pa * self.appearance[n].tint[3])"
-with = "                    (Similarity::compose(&self.local[n], &pw), pa * self.appearance[n].tint[3])"
-expect = "resolving_subtrees_on_the_cpu_matches_world_node_for_node"
 
 [[mutation]]
 name = "view-registry-node-is-the-index"

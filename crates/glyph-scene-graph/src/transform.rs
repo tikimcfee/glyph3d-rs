@@ -10,19 +10,19 @@
 //! scale under a rotation is a shear, and a shear does not compose into a
 //! similarity.
 //!
-//! The arithmetic here is written in the SAME order as `shaders/resolve.wgsl`
-//! (the rotation is the cross-product sandwich `glyph_field.wgsl` already
-//! uses), so the CPU reference and the GPU pass differ only by whatever the
-//! GPU fuses into an fma. Under an identity parent both are exact: every
-//! product with 1 and every sum with 0 returns its operand, so the transitional
-//! group rows (every group a child of an identity root) come out bit for bit
-//! as the rows they were (the one exception is the sign of a zero, `-0 + 0 =
-//! +0`, which no golden frame can see).
+//! The arithmetic is the one rule the resolve composes with (the rotation
+//! is the cross-product sandwich the draw shaders use, so the resolve and
+//! the draw agree on what a quaternion means). Under an identity parent it
+//! is exact: every product with 1 and every sum with 0 returns its operand,
+//! so a group row under the identity root comes out bit for bit as the row
+//! it was (the one exception is the sign of a zero, `-0 + 0 = +0`, which no
+//! golden frame can see). Until 2026-10-26 a GPU pass composed the same
+//! terms and this was its reference.
 
 use bytemuck::{Pod, Zeroable};
 
-/// Translation, uniform scale and rotation: 32 B, `struct Similarity
-/// { t_s: vec4<f32>, q: vec4<f32> }` in WGSL (scale rides in `t_s.w`).
+/// Translation, uniform scale and rotation: 32 B (the scale rides as the
+/// translation's fourth lane).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Similarity {
@@ -89,9 +89,8 @@ impl Default for PostScale {
 /// How a node looks, written by verbs and styling, never by a transform
 /// writer: 32 B. `tint.w` is the node's alpha; alpha MULTIPLIES down the
 /// tree (a hidden directory hides what is inside it), tint and blend are the
-/// node's own. In WGSL `struct Appearance { tint: vec4<f32>, blend: f32,
-/// flags: u32, _p0: u32, _p1: u32 }`. Kept in f32 rather than RGBA8 so the
-/// transitional group rows (f32 columns) round-trip exactly.
+/// node's own. Kept in f32 rather than RGBA8 so the renderer's group rows
+/// (f32 columns) round-trip exactly.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Appearance {
@@ -127,7 +126,7 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
-/// `v + 2·q.xyz × (q.xyz × v + q.w·v)`: the form `glyph_field.wgsl` rotates
+/// `v + 2·q.xyz × (q.xyz × v + q.w·v)`: the form the draw shaders rotate
 /// with, so the resolve and the draw agree on what a quaternion means.
 pub fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     let u = [q[0], q[1], q[2]];
@@ -137,7 +136,7 @@ pub fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     [v[0] + 2.0 * c2[0], v[1] + 2.0 * c2[1], v[2] + 2.0 * c2[2]]
 }
 
-/// Hamilton product `a·b` (apply b, then a), WGSL's term order.
+/// Hamilton product `a·b` (apply b, then a).
 pub fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     let (av, bv) = ([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
     let c = cross(av, bv);
