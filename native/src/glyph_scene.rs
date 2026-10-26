@@ -274,6 +274,11 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) scene_min_y: f32,
     /// The ground/sky pass; off unless asked for (records nothing when off).
     pub(in crate::glyph_scene) environment: environment::Environment,
+    /// The item table, one row per view (`Views::item_table`), as the
+    /// Derived field's shader reads it: kept for a host renderer that
+    /// uploads it itself (`FrameData::item_table`). Fixed for the scene's
+    /// life; a relayout builds a new scene.
+    pub(in crate::glyph_scene) item_table: Vec<glyph_field::ItemParamsGpu>,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
