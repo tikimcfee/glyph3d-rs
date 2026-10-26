@@ -488,6 +488,7 @@ impl GlyphScene {
             picked_region: None,
             scene_min_y: staged.bounds_min[1],
             environment: super::environment::Environment::new(device, depth_format),
+            item_table,
         }
     }
 
