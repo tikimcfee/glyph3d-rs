@@ -119,11 +119,25 @@ pub(crate) enum Scope {
     Corpus,
 }
 
+/// When a gate runs: after each change, or only in the full run before
+/// landing. Declared per gate (2026-10-26), never decided at run time.
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Tier {
+    /// `glyph test --inner`, and every full run.
+    Inner,
+    /// Only a full `glyph test`: the compiler's diagnostics.
+    Merge,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Gate {
     pub(crate) name: String,
     pub(crate) scope: Scope,
+    pub(crate) tier: Tier,
+    /// Opens the GPU: runs one at a time with the other GPU gates.
+    pub(crate) gpu: bool,
     pub(crate) kind: Kind,
     #[serde(default)]
     pub(crate) needs: Vec<String>,
@@ -164,7 +178,7 @@ pub(crate) fn load() -> Result<Manifest, String> {
 /// `kind` rather than declared: a `provides` field would be one more thing that
 /// can be written and never read, which is the defect this validation exists
 /// to remove.
-fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
+pub(crate) fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
     let of = |c: Class| {
         m.artifact.iter().filter(|(_, a)| a.class == c).map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     };

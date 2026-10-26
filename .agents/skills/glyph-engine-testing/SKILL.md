@@ -16,6 +16,7 @@ false).
 | Intent | Command | What it does |
 | :--- | :--- | :--- |
 | Iterate | `cargo glyph test <scope>` | Brings the renderer up to date, then runs the gates for a scope: `rust` (build, no-UI check, clippy, doc, orphan modules, tests: no pixels), `render` (anything that moves a pixel: pixel-ab, picks, layout oracles), `corpus` (fixtures, generators, vendored inputs). The verdict line says how many gates ran. |
+| After each change | `cargo glyph test --inner` | Every gate but the merge tier (warnings, clippy, rustdoc, no-default-features builds), which it names as skipped. Under a minute after a one-line edit on the Linux host. Not a landing run. |
 | Land | `cargo glyph test` | All gates. Red on any warning, failed test, test count under `test_floor`, or golden mismatch. |
 | Validate a commit | `cargo glyph test --frozen` | Asserts the renderer is already current instead of building it; staleness IS the finding. |
 | One check | `cargo glyph gate <name>` | A single gate by name (`cargo glyph gates` lists them, with what each cannot see). |
