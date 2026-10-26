@@ -8,6 +8,7 @@ pub mod bake;
 pub mod cli;
 pub mod config;
 pub mod fixture;
+pub mod float_tables;
 pub mod fold;
 pub mod glyph_scene;
 pub mod glyph_trie;
