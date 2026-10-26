@@ -7,8 +7,8 @@ Recorded because a vendored file with no recorded origin is indistinguishable
 from a local invention six months later.
 
   upstream repo    viz-web/glyph3d-js
-  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-10-10)
-  regenerated      2026-10-10  (tools/vendor-manifest.py)
+  upstream commit  2ef79b7e762a07ebbf72713f97527a6831b7a839  (recorded; web repo not present at regeneration on 2026-10-26)
+  regenerated      2026-10-26  (tools/vendor-manifest.py)
 
 ## The fixture oracle is pinned PER FILE
 
@@ -107,6 +107,35 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
 - `tools/vendor/third-party/unicode-ucd/GraphemeBreakProperty.txt` — Grapheme_Cluster_Break classes for the cluster-mode segmentation rule — the source tools/gen_cluster_table.py reads
 - `tools/vendor/third-party/unicode-ucd/emoji-data.txt` — Extended_Pictographic / Emoji_Modifier / keycap classes for the same generator — cluster head/trailer candidacy
 - `tools/vendor/third-party/unicode-ucd/license.txt` — the licence travels with the data
+
+## gomuxai's event-stream corpus
+
+The streams gomuxai's `agent transcript` must print for each conformance case
+(and the corpus README that explains them), copied verbatim from
+`tikimcfee/gomuxai` at commit `a33c68b9772b9a465fc329b283607fa9a1edb175`, under
+`tools/vendor/gomuxai/internal/transcript/testdata/corpus` (gomuxai's own layout). The renderer reads agent sessions
+only through gomuxai's `agent` CLI; `native/src/agent_transcript/tests.rs`
+holds its reader to these. The last column says whether the file is gomuxai's
+at that commit (checked against a gomuxai checkout named by `GLYPH_GOMUXAI`;
+kept as recorded when there is none). A newer corpus is a refresh: re-copy at
+the new commit, update `GOMUXAI_COMMIT`, regenerate.
+
+| local path | bytes | sha256 | matches the pinned commit |
+|---|---:|---|:--:|
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/README.md` | 28465 | `dddc64277f67fc0e…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/agy/conversation.events.jsonl` | 10262 | `2d8bea16227f4ef3…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/basic-turn.events.jsonl` | 4185 | `fa0ba18eedc98d43…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/derived-turns.events.jsonl` | 5176 | `b79160cd3af00cec…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/held-delivery.events.jsonl` | 4185 | `51e7e3a88e737038…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/mid-turn-queued.events.jsonl` | 5916 | `35d615c276d89b5d…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/notification-and-commands.events.jsonl` | 5644 | `bf4d6597e2c0eeb0…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/requests.events.jsonl` | 2527 | `a847952c383caf42…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/session-meta.events.jsonl` | 1541 | `c845cdd33add893c…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/subagent.events.jsonl` | 5623 | `36a457c6761799fc…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/subagent/subagents/agent-a3f9c2e17b4d5e608.events.jsonl` | 3597 | `1932e34b9349999f…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/system-records.events.jsonl` | 4794 | `606af86352a9a482…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/claude/tool-results.events.jsonl` | 11159 | `bfd57a5f8b207197…` | yes |
+| `tools/vendor/gomuxai/internal/transcript/testdata/corpus/kimi/interleaved.events.jsonl` | 3181 | `556758b4cc8c2bb0…` | yes |
 
 ## Notes
 

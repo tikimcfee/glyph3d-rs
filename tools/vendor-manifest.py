@@ -32,6 +32,14 @@ commit the tag resolves to, and are hashed like everything else. There is no
 "upstream matches" column for them: a release tag does not move, and if it
 ever did, the hash is the finding.
 
+A FOURTH kind (2026-10-26): gomuxai's event-stream conformance corpus, the
+streams `agent transcript` promises for each case, which the renderer's
+agent-session reader is tested against. Copied verbatim at one gomuxai commit
+(`git show <commit>:<path>`) into a mirror of gomuxai's layout under
+tools/vendor/gomuxai/. With GLYPH_GOMUXAI pointing at a gomuxai checkout,
+regeneration re-reads each file AT THE PINNED COMMIT and says whether it still
+matches; without one, the recorded verdicts are kept.
+
 Run:  python3 tools/vendor-manifest.py            regenerate both files
       python3 tools/vendor-manifest.py --check    verify local hashes only, exit 1 on drift
 
@@ -53,6 +61,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = Path(os.environ["GLYPH_WEB"]) if os.environ.get("GLYPH_WEB") else None  # only needed to REFRESH
+GOMUXAI_CHECKOUT = Path(os.environ["GLYPH_GOMUXAI"]) if os.environ.get("GLYPH_GOMUXAI") else None
 BUILD_TOML = ROOT / "build.toml"
 
 # local path in this repo -> path it came from in the web repo
@@ -186,6 +195,32 @@ THIRD_PARTY = {
     },
 }
 
+# GOMUXAI — the event-stream conformance corpus of tikimcfee/gomuxai (the one
+# reader of agent transcripts), at one commit. Each `.events.jsonl` is the
+# exact stream `agent transcript` must print for a case; README.md is the
+# corpus's own account of the cases and the decisions they encode. Read by
+# native/src/agent_transcript/tests.rs (include_str!), which pins the count.
+GOMUXAI_REPO = "tikimcfee/gomuxai"
+GOMUXAI_COMMIT = "a33c68b9772b9a465fc329b283607fa9a1edb175"
+GOMUXAI_UPSTREAM_DIR = "internal/transcript/testdata/corpus"
+GOMUXAI_LOCAL_DIR = "tools/vendor/gomuxai/" + GOMUXAI_UPSTREAM_DIR
+GOMUXAI = [f"{GOMUXAI_LOCAL_DIR}/{rel}" for rel in [
+    "README.md",
+    "agy/conversation.events.jsonl",
+    "claude/basic-turn.events.jsonl",
+    "claude/derived-turns.events.jsonl",
+    "claude/held-delivery.events.jsonl",
+    "claude/mid-turn-queued.events.jsonl",
+    "claude/notification-and-commands.events.jsonl",
+    "claude/requests.events.jsonl",
+    "claude/session-meta.events.jsonl",
+    "claude/subagent.events.jsonl",
+    "claude/subagent/subagents/agent-a3f9c2e17b4d5e608.events.jsonl",
+    "claude/system-records.events.jsonl",
+    "claude/tool-results.events.jsonl",
+    "kimi/interleaved.events.jsonl",
+]]
+
 # THE FIXTURE ORACLE IS PINNED PER FILE, NOT TO ONE UPSTREAM HEAD.
 #
 # `engine/fixtures/{gen,gen-bake}.mjs` reproduce the committed fixtures
@@ -254,7 +289,7 @@ def check() -> int:
         if line.strip():
             h, _, path = line.partition("  ")
             want[path] = h
-    tracked = set(VENDORED) | set(DERIVED) | set(THIRD_PARTY)
+    tracked = set(VENDORED) | set(DERIVED) | set(THIRD_PARTY) | set(GOMUXAI)
     missing = sorted(tracked - set(want))
     extra = sorted(set(want) - tracked)
     bad = []
@@ -313,6 +348,30 @@ def recorded_upstream() -> tuple[str, dict[str, str]]:
     return commit, verdicts
 
 
+def gomuxai_verdicts() -> dict[str, str]:
+    """Whether each corpus file is gomuxai's file at the pinned commit: read
+    from the GLYPH_GOMUXAI checkout's history, else as PROVENANCE.md recorded."""
+    if GOMUXAI_CHECKOUT is None or not (GOMUXAI_CHECKOUT / ".git").exists():
+        kept = {}
+        if PROV.exists():
+            for line in PROV.read_text().splitlines():
+                cells = [c.strip() for c in line.split("|")]
+                # | `local` | bytes | `hash…` | verdict |
+                if len(cells) == 6 and cells[1].startswith("`" + GOMUXAI_LOCAL_DIR):
+                    kept[cells[1].strip("`")] = cells[4]
+        return {local: kept.get(local, "n/a") for local in GOMUXAI}
+    verdicts = {}
+    for local in GOMUXAI:
+        upstream = local.removeprefix("tools/vendor/gomuxai/")
+        got = subprocess.run(["git", "-C", str(GOMUXAI_CHECKOUT), "show", f"{GOMUXAI_COMMIT}:{upstream}"],
+                             capture_output=True)
+        if got.returncode != 0:
+            verdicts[local] = "MISSING at pin"
+        else:
+            verdicts[local] = "yes" if got.stdout == (ROOT / local).read_bytes() else "MISMATCH"
+    return verdicts
+
+
 def regenerate() -> int:
     pipe, bake = fixture_counts()  # fail BEFORE writing anything
     web_present = WEB is not None and (WEB / ".git").exists()
@@ -356,6 +415,13 @@ def regenerate() -> int:
         drows.append((local, spec["source"], spec["how"], spec["why"], ls,
                       lp.stat().st_size, holds))
         sum_pairs.append((local, ls))
+    gverdicts = gomuxai_verdicts()
+    grows = []
+    for local in GOMUXAI:
+        lp = ROOT / local
+        ls = sha(lp)
+        grows.append((local, lp.stat().st_size, ls, gverdicts[local]))
+        sum_pairs.append((local, ls))
     sum_pairs.sort()
     SUMS.write_text("".join(f"{h}  {p}\n" for p, h in sum_pairs))
 
@@ -368,6 +434,7 @@ def regenerate() -> int:
         f"| `{l}` | {spec['project']} | `{spec['tag']}` | `{spec['commit'][:12]}` | {sz} | "
         f"`{spec['sha256'][:16]}…` | {spec['license']} |\n"
         for l, spec, sz in trows)
+    gbody = "".join(f"| `{l}` | {sz} | `{ls[:16]}…` | {v} |\n" for l, sz, ls, v in grows)
     twhy = "".join(f"- `{l}` — {spec['why']}\n" for l, spec, _ in trows)
     dbody = "".join(
         f"| `{l}` | `{s}` | {how} | {sz} | `{ls[:16]}…` | "
@@ -445,6 +512,21 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
 |---|---|---|---|---:|---|---|
 {tbody}
 {twhy}
+## gomuxai's event-stream corpus
+
+The streams gomuxai's `agent transcript` must print for each conformance case
+(and the corpus README that explains them), copied verbatim from
+`{GOMUXAI_REPO}` at commit `{GOMUXAI_COMMIT}`, under
+`{GOMUXAI_LOCAL_DIR}` (gomuxai's own layout). The renderer reads agent sessions
+only through gomuxai's `agent` CLI; `native/src/agent_transcript/tests.rs`
+holds its reader to these. The last column says whether the file is gomuxai's
+at that commit (checked against a gomuxai checkout named by `GLYPH_GOMUXAI`;
+kept as recorded when there is none). A newer corpus is a refresh: re-copy at
+the new commit, update `GOMUXAI_COMMIT`, regenerate.
+
+| local path | bytes | sha256 | matches the pinned commit |
+|---|---:|---|:--:|
+{gbody}
 ## Notes
 
 - `tools/vendor/ref/**` mirrors the web repo's LAYOUT exactly so every file stays
@@ -464,7 +546,10 @@ hash recorded in `THIRD_PARTY`, so a re-vendor that forgot the record is caught.
   a DIFFERENT corpus and redden that gate.
 - `schema/glyph-identity.json` is the source of truth for `tools/gen_schema.py`.
 """)
-    print(f"[done] {len(rows) + len(drows) + len(trows)} files -> {SUMS.name} + {PROV.name}")
+    print(f"[done] {len(rows) + len(drows) + len(trows) + len(grows)} files -> {SUMS.name} + {PROV.name}")
+    gbad = [l for l, sz, ls, v in grows if v not in ("yes", "n/a")]
+    if gbad:
+        print("WARNING  gomuxai corpus differs from the pinned commit:", ", ".join(gbad))
     mism = [l for l, u, ls, verdict, sz in rows if verdict == "MISMATCH"]
     print("upstream mismatches:", ", ".join(mism) if mism else "none",
           "" if web_present else "(as recorded; web repo not present)")
