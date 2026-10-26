@@ -3,8 +3,8 @@
 //! `HyperLayout` (`layout_hyper*`) is the production layout engine: every
 //! `--load-repo` runs it, whatever `--repo-engine` says. Before this
 //! instrument nothing compared it to the JS oracle. The
-//! `--fixture-*` instruments hold `fold.rs`, `scan.rs`, `bake.rs` and
-//! `text.rs` to the oracle's recorded answers; `--repo-verify` holds
+//! `--fixture-*` instruments hold `fold.rs`, the trie and `text.rs` to
+//! the oracle's recorded answers; `--repo-verify` holds
 //! HyperLayout to HyperLayout. A defect HyperLayout carries alone was
 //! therefore visible only through pixels — and the goldens were re-adopted
 //! after HyperLayout landed, so they pin whatever it does.

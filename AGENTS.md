@@ -76,7 +76,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `agy_brain_dir` and `kimi_sessions_dir`, passed to it as its app config
   (`launch_config.example.toml`).
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
-  (26 `.pipe.bin` + 8 `.bake.bin`, their generators and vendored inputs), and
+  (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
 - `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
@@ -348,10 +348,10 @@ sweep. Blind to every codepoint and sequence outside the pins.
 
 The same gate rebuilds the **fixture corpus** in a **scratch copy** of
 `engine/fixtures` (generators + vendored inputs + the `../glyph_schema.mjs`
-edge) and byte-compares against the committed 34 — an older form deleted the
+edge) and byte-compares against the committed 26 — an older form deleted the
 committed fixtures in place and restored them with `git checkout`, which
-needed the restore to be exactly right. The expected counts (26 pipe + 8 bake)
-are **declared in build.toml**, never derived from the tree under test: the
+needed the restore to be exactly right. The expected count (26 pipe)
+is **declared in build.toml**, never derived from the tree under test: the
 old gate `ls`-counted the tree it was checking, so a deleted fixture lowered
 both sides of the comparison and stayed green (measured 2026-09-06: eleven of
 twelve gates green on a shrunken corpus; only the fixture.rs pin caught it).
@@ -440,7 +440,7 @@ in the lib, so cargo-modules reports every one of them as an orphan of the bin.
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
 `ItemParams` validation, the layout-seam suites, the fixture loader and its
-refusals, the fold/scan/bake unit suites (monoid domain, wrap and paginate
+refusals, the fold unit suites (wrap, paginate and tab-stop
 rules), `text::reference_layout` bit-exact against every in-domain fixture's
 recorded answers, the agent event reader against gomuxai's vendored
 conformance corpus (`tools/vendor/gomuxai/`), the launcher, and the runner's own
@@ -462,9 +462,9 @@ the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. The realistic loss was never deletion — it
 is a dropped `mod` declaration or an `#[ignore]` that outlives its reason,
 neither of which rustc says a word about. **This matters more than it looks**,
-because the pins that keep the fixture corpus from silently shrinking
-(`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake — both worded
-"update deliberately") live inside this check.
+because the pin that keeps the fixture corpus from silently shrinking
+(`native/src/fixture.rs`, 26 pipe, worded "update deliberately") lives inside
+this check.
 
 **pick-oracle** (`tools/check-pick-oracle.sh`). Scripted picks and pixel-ray
 round trips from the native binary against an independent Python fold oracle.
@@ -480,20 +480,19 @@ reports FAIL, but every check after the abort point silently did not run.
 Blind to pick paths outside the scripted set.
 
 **reference-port** (`tools/check-fixture-parity.sh`; re-gated 2026-10-09).
-The Rust layout forms against the JS oracle's recorded answers, five halves,
+The Rust layout forms against the JS oracle's recorded answers, three halves,
 with the volumes they clear — quote these when you change it, because a count
 that quietly drops is how this check would go vacuous without going red:
 `--fixture-trie` (26 fixtures, 23,552 trie entries rebuilt from bytes),
 `--fixture-fold` (the serial fold, 155,222 leaders, 1,874,328 per-byte lanes
-bit-exact), `--fixture-scan` (208 cases across 8 tunings; 1,188,024
-leader-lanes bit-exact, 53,752 within 1e-4), `--fixture-bake` (8 fixtures,
-27,315 leaders, 167 checkpoints, 530 seed-protocol queries) and
-`--fixture-reference` (text.rs over its domain: 4 fixtures, 5,332 records).
-The script declares the corpus size (26 + 8) and refuses any other; the bake
-fails if no query ran, the reference if nothing was in domain. Red on any lane
-that leaves its tier. `phantom-row` and `advance-zeroed` prove it reddens
+bit-exact) and `--fixture-reference` (text.rs over its domain: 4 fixtures,
+5,332 records). The script declares the corpus size (26) and refuses any
+other; the reference fails if nothing was in domain. Red on any lane that
+differs. (The scan form and the bake, `scan.rs`/`bake.rs`, held here until
+2026-10-26, were deleted: nothing shipped them; the scan was the retired GPU
+compute layout's dispatch structure.) `phantom-row` and `advance-zeroed` prove it reddens
 through the fold, `fixture-deleted` that a shrunken corpus is refused. Blind
-to the engines that SHIP — these are `fold.rs`/`scan.rs`/`bake.rs`/`text.rs`,
+to the engines that SHIP — these are `fold.rs`/`text.rs` and the trie,
 not HyperLayout — to the atlas trie (each fixture carries its own
 synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
 parse is checked only through the lanes computed from it: the second loader
@@ -688,7 +687,7 @@ actually picked (`metal-apple`, `vulkan-nvidia`), resolved by the runner from
 the `{gpu}` token in build.toml. The first Linux run showed why: against the
 Metal set, NVIDIA's Vulkan rasterizer differs by ~1 level over 1-4% of pixels
 plus a few dozen ISOLATED single-pixel coverage flips at quad edges, while every
-numeric check — fold, scan, bake, picks — is bit-exact. Pixels
+numeric check — fold, picks — is bit-exact. Pixels
 are a property of the rasterizer; the layout is not. Making vendors agree is
 not a goal and nothing here tries. The key is deliberately coarser than the
 hardware (a 5090 and a 4090 share a set until a diff proves otherwise); each set
@@ -852,9 +851,8 @@ the oracle — arrived with them, red. In those nine days HyperLayout became the
 only engine, and nothing compared it to anything but itself.
 
 The lessons these gates taught stay true and are the pattern for any new one:
-**a check must refuse to pass having compared nothing** (the bake fails if no
-query ran, the reference fails if nothing was in domain, repo-verify refuses
-zero items, STRICT refuses an unexercised bucket, the parity script refuses a
+**a check must refuse to pass having compared nothing** (the reference fails
+if nothing was in domain, repo-verify refuses zero items, STRICT refuses an unexercised bucket, the parity script refuses a
 corpus of the wrong size), and a count that quietly drops is how a check goes
 vacuous without going red — quote the volumes. And a gate that compares an
 engine to itself is a determinism check: say so in its `blind_to`.
@@ -1010,7 +1008,8 @@ single most common way to misread the repo, so:
   substance ("since the layout seam", "since the carrier split") over the letter.
 - **`Stage 0`–`4` is ambiguous and binds to two different lists.** The live one is
   the reference port: 0 = fixture parity, 1 = trie, 2 = fold, 3 = scan,
-  4 = bake — the `--fixture-*` instruments carry those names, and the
+  4 = bake (3 and 4 deleted 2026-10-26) — the `--fixture-*` instruments carry
+  those names, and the
   `port: stage N` commits record them. The dead one numbered the layout-seam
   work. Some source comments still reference the dead scheme unqualified.
   Name the thing, not the number.

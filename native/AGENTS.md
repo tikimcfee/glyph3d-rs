@@ -180,8 +180,7 @@ caller; the short version:
   measures its tabs from the chunk's start, so `aggregate_chunk_prepasses`
   walks a newline-free chunk that holds a tab again from the true state
   (`walk_line_state`); the line-table replays and `measure_continued_lines`
-  take the true seed already. The scan form refuses a width past one cell
-  (it has no stops; the oracle has none). `--render-file` is a one-item repo
+  take the true seed already. `--render-file` is a one-item repo
   load (2026-10-11) with its own default, `[layout]
   render_file_tab_width_cells` (4, the stops its retired CPU stager had;
   `--tab-width` overrides it there too), resolved by

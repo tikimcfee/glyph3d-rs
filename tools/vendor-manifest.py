@@ -82,8 +82,6 @@ VENDORED = {
     "engine/fixtures/inputs/foldGeometry.js": "packages/glyph3d-core/src/core/foldGeometry.js",
     "engine/fixtures/inputs/glyphPipelineKernels.js": "packages/glyph3d-core/src/compute/glyphPipelineKernels.js",
     "engine/fixtures/inputs/glyphPipelineReference.js": "packages/glyph3d-core/src/compute/glyphPipelineReference.js",
-    "engine/fixtures/inputs/glyphPipelineScan.js": "packages/glyph3d-core/src/compute/glyphPipelineScan.js",
-    "engine/fixtures/inputs/glyphBake.js": "packages/glyph3d-core/src/compute/glyphBake.js",
     "engine/fixtures/inputs/GlyphTrie.js": "packages/glyph3d-core/src/compute/GlyphTrie.js",
     "schema/glyph-identity.json": "schema/glyph-identity.json",
 }
@@ -223,7 +221,7 @@ GOMUXAI = [f"{GOMUXAI_LOCAL_DIR}/{rel}" for rel in [
 
 # THE FIXTURE ORACLE IS PINNED PER FILE, NOT TO ONE UPSTREAM HEAD.
 #
-# `engine/fixtures/{gen,gen-bake}.mjs` reproduce the committed fixtures
+# `engine/fixtures/gen.mjs` reproduces the committed fixtures
 # BYTE-FOR-BYTE from these files, and only from these REVISIONS of them. The
 # corpus size is NOT restated here: it is declared in build.toml
 # (`[artifact.fixtures] counts`) and regenerate() reads it from there —
@@ -241,8 +239,6 @@ GOMUXAI = [f"{GOMUXAI_LOCAL_DIR}/{rel}" for rel in [
 # the corpus came from. Byte-identical regeneration is the check that can fail.
 FIXTURE_ORACLE_PINS = {
     "engine/fixtures/inputs/glyphPipelineReference.js": "70ce30e",
-    "engine/fixtures/inputs/glyphPipelineScan.js": "70ce30e",
-    "engine/fixtures/inputs/glyphBake.js": "70ce30e",
     "engine/fixtures/inputs/GlyphTrie.js": "70ce30e",
     "engine/fixtures/inputs/foldGeometry.js": "70ce30e",
     "engine/fixtures/inputs/glyphPipelineKernels.js": "59a2a44",
@@ -256,7 +252,7 @@ def sha(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def fixture_counts() -> tuple[int, int]:
+def fixture_count() -> int:
     """The declared corpus size, from build.toml [artifact.fixtures] counts.
 
     DERIVED, never hand-written: the template below used to say "all 22
@@ -267,16 +263,16 @@ def fixture_counts() -> tuple[int, int]:
     try:
         data = tomllib.loads(BUILD_TOML.read_text())
         counts = data["artifact"]["fixtures"]["counts"]
-        pipe, bake = int(counts["pipe"]), int(counts["bake"])
-        if pipe <= 0 or bake <= 0:
-            raise ValueError(f"non-positive counts: pipe={pipe}, bake={bake}")
+        pipe = int(counts["pipe"])
+        if pipe <= 0:
+            raise ValueError(f"non-positive count: pipe={pipe}")
     except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError) as e:
         raise SystemExit(
             f"ERROR  cannot read fixture counts from {BUILD_TOML.name} "
-            f'(expected [artifact.fixtures] counts = {{ "pipe" = N, "bake" = M }}): {e}\n'
+            f'(expected [artifact.fixtures] counts = {{ "pipe" = N }}): {e}\n'
             "       refusing to write PROVENANCE.md with an unverifiable corpus size"
         )
-    return pipe, bake
+    return pipe
 
 
 def check() -> int:
@@ -373,7 +369,7 @@ def gomuxai_verdicts() -> dict[str, str]:
 
 
 def regenerate() -> int:
-    pipe, bake = fixture_counts()  # fail BEFORE writing anything
+    pipe = fixture_count()  # fail BEFORE writing anything
     web_present = WEB is not None and (WEB / ".git").exists()
     if web_present:
         upstream = subprocess.run(["git", "-C", str(WEB), "rev-parse", "HEAD"],
@@ -454,9 +450,8 @@ from a local invention six months later.
 
 ## The fixture oracle is pinned PER FILE
 
-`engine/fixtures/{{gen,gen-bake}}.mjs` reproduce all {pipe + bake} committed
-fixtures ({pipe} `.pipe.bin` + {bake} `.bake.bin`; counts read from
-`build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
+`engine/fixtures/gen.mjs` reproduces all {pipe} committed `.pipe.bin`
+fixtures (the count read from `build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
 repo present — but only from these
 revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
 exporting `FLOAT_LANES` at 3da6542 and the generators do not even load.

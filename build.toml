@@ -30,8 +30,9 @@
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
-# test and float_tables' eight.
-test_floor = 383
+# test and float_tables' eight. Lowered 383 -> 371 on purpose (2026-10-26):
+# scan.rs and bake.rs were deleted with their twelve tests.
+test_floor = 371
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -118,15 +119,15 @@ note = "No generator-native check mode; the runner rebuilds to scratch and cmps.
 
 [artifact.fixtures]
 class = "committed"
-outputs = ["engine/fixtures/*.pipe.bin", "engine/fixtures/*.bake.bin"]
-inputs = ["engine/fixtures/gen.mjs", "engine/fixtures/gen-bake.mjs", "engine/fixtures/inputs/**/*", "engine/glyph_schema.mjs"]
-build = "cd engine/fixtures && node gen.mjs && node gen-bake.mjs"
+outputs = ["engine/fixtures/*.pipe.bin"]
+inputs = ["engine/fixtures/gen.mjs", "engine/fixtures/inputs/**/*", "engine/glyph_schema.mjs"]
+build = "cd engine/fixtures && node gen.mjs"
 # Verified in a scratch COPY of engine/fixtures (+ ../glyph_schema.mjs, which
 # gen.mjs imports) so the committed corpus is never deleted mid-check — the
 # old gate deleted all 25 fixtures in place and restored them with git
 # checkout. Counts are DECLARED, not ls-derived from the tree under test.
-counts = { "pipe" = 26, "bake" = 8 }
-note = "The Rust-side corpus pins (fixture.rs / bake.rs, 'update deliberately') stay; they and these declared counts are two independent witnesses, not duplicates."
+counts = { "pipe" = 26 }
+note = "The Rust-side corpus pin (fixture.rs, 'update deliberately') stays; it and this declared count are two independent witnesses, not duplicates."
 
 [artifact.glyph-schema]
 class = "committed"
@@ -397,7 +398,7 @@ blind_to = "pick paths outside the scripted set"
 # nothing. Each refuses to pass having compared nothing.
 
 # The Rust layout forms against the JS oracle's recorded answers. The volumes
-# the five halves clear today are quoted in `compare` — a count that quietly
+# the three halves clear today are quoted in `compare` — a count that quietly
 # drops is how this would go vacuous without going red.
 [[gate]]
 name = "reference-port"
@@ -406,8 +407,8 @@ kind = "cmd"
 cmd = "bash tools/check-fixture-parity.sh"
 pass_line = "ALL PASS"
 needs = ["renderer", "fixtures"]
-compare = "five Rust forms vs the JS oracle's recorded answers over engine/fixtures (26 pipe + 8 bake, counts declared in the script): trie rebuilt from bytes (23,552 entries); serial fold, every lane of every byte (155,222 leaders, 1,874,328 lanes bit-exact); scan form across 8 tunings (208 cases, 1,188,024 leader-lanes bit-exact, 53,752 within 1e-4); bake + seed protocol (27,315 leaders, 167 checkpoints, 530 queries); text.rs's independent fold over its domain (4 fixtures, 5,332 records)"
-blind_to = "HyperLayout entirely — these are fold.rs/scan.rs/bake.rs/text.rs, not the engines that ship (hyper-oracle holds HyperLayout to fold.rs); the atlas trie (fixtures carry their own synthetic tries); any fixture outside text.rs's domain, silently (22 of 26 today); the parse, except through the lanes computed from it (its second loader, Mojo, is retired)"
+compare = "three Rust forms vs the JS oracle's recorded answers over engine/fixtures (26 pipe fixtures, the count declared in the script): trie rebuilt from bytes (23,552 entries); serial fold, every lane of every byte (155,222 leaders, 1,874,328 lanes bit-exact); text.rs's independent fold over its domain (4 fixtures, 5,332 records)"
+blind_to = "HyperLayout entirely — these are fold.rs/text.rs and the trie, not the engines that ship (hyper-oracle holds HyperLayout to fold.rs); the atlas trie (fixtures carry their own synthetic tries); any fixture outside text.rs's domain, silently (22 of 26 today); the parse, except through the lanes computed from it (its second loader, Mojo, is retired)"
 
 # HyperLayout — the production engine — against the oracle-backed fold.
 # Red from 2026-10-09 (C10, C13, C14 in out/MAINTENANCE-NOTES-2026-10-08.md)
@@ -766,7 +767,7 @@ expect = "PICK ORACLE CHECK: FAILURES"
 [[mutation]]
 name = "advance-zeroed"
 gate = "reference-port"
-why = "every glyph x-position derives from the per-byte advance; zeroing the accessor must break the fold's agreement with the oracle's recorded lanes. cargo-mutants once measured this exact mutant MISSED by the whole unit suite. CONSUMED BY: fold.rs layout_item's advance sums (and scan.rs's, and the fixture differ's ADVANCE lane) — every fixture"
+why = "every glyph x-position derives from the per-byte advance; zeroing the accessor must break the fold's agreement with the oracle's recorded lanes. cargo-mutants once measured this exact mutant MISSED by the whole unit suite. CONSUMED BY: fold.rs layout_item's advance sums (and the fixture differ's ADVANCE lane) — every fixture"
 file = "native/src/fold.rs"
 op = "replace"
 find = """    pub fn advance(&self, id: usize) -> f32 {
