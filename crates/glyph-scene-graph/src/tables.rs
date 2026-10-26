@@ -467,7 +467,9 @@ impl NodeTables {
             .map(|h| (self.pos[h.index as usize], self.pos[h.index as usize] + self.size[h.index as usize]))
             .collect();
         for (s, n) in merge(spans) {
-            self.resolve_range(s, n);
+            // Between frames a node above the span may be marked and not
+            // yet resolved, so the span's head walks its chain.
+            self.resolve_range(s, n, false);
             for p in s..s + n {
                 let i = self.order[p as usize] as usize;
                 let row = self.group_row[i];
@@ -479,14 +481,18 @@ impl NodeTables {
 
     /// Resolve depth-first positions `s .. s + n` into the world table, at
     /// O(1) a node: a node's world is its parent's composed with its local
-    /// row, and pre-order visits the parent first. The range's first node,
-    /// and any whose parent lies before the range, walks its chain once
-    /// (`world`), so the bits are `world`'s for every node.
-    fn resolve_range(&mut self, s: u32, n: u32) {
+    /// row, and pre-order visits the parent first, so the bits are `world`'s
+    /// for every node. A node whose parent lies before the range (its head)
+    /// reads the parent's world row when `parent_current` (in a frame
+    /// resolve the head's parent is outside every marked subtree, so its row
+    /// is as current as its chain), else walks its chain once (`world`).
+    fn resolve_range(&mut self, s: u32, n: u32, parent_current: bool) {
         for p in s..s + n {
             let i = self.order[p as usize] as usize;
             let parent = self.parent[i];
-            self.world[i] = if p == s || parent == NONE || self.pos[parent as usize] < s {
+            self.world[i] = if parent == NONE {
+                (self.local[i], self.appearance[i].tint[3])
+            } else if !parent_current && self.pos[parent as usize] < s {
                 self.world(NodeHandle { index: i as u32, generation: self.generation[i] }).expect("an ordered node is live")
             } else {
                 let (pw, pa) = self.world[parent as usize];
@@ -607,7 +613,7 @@ impl NodeTables {
         self.ensure_order();
         let ranges = self.dirty_ranges();
         for &(s, n) in &ranges {
-            self.resolve_range(s, n);
+            self.resolve_range(s, n, true);
         }
         self.dirty.clear();
         let resolved = ranges.iter().map(|r| r.1).sum();
