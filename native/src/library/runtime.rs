@@ -2,8 +2,8 @@
 //! 2026-10-10 — before, a bevy_transform hierarchy flattened on the CPU):
 //! library root → directory → volume → sheet → mount (the contain-fit
 //! scale) → file. The file node IS the file's group node: it routes its
-//! resolved world into its group row, so the GPU resolve writes the row the
-//! draw shaders read, and a move writes only the LOCAL rows of the nodes
+//! resolved world into its group row, so the frame's resolve rebuilds the
+//! row the draw shaders read, and a move writes only the LOCAL rows of the nodes
 //! that moved — a page turn its sheets, a directory drag one row — never a
 //! row per descendant. Paging, form, stack and sort are RETARGETS: the plan
 //! is recomputed, every node's easing starts from where its local row

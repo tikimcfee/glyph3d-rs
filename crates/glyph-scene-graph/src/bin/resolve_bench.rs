@@ -1,10 +1,12 @@
-//! resolve-bench: what the scene graph's per-frame flush costs on this GPU.
+//! resolve-bench: what the scene graph's per-frame resolve costs on this CPU.
 //!
 //! Builds a tree once, then for each case dirties it the same way a few
-//! times and reports the flush: GPU time of the pass (scatter + resolve,
-//! timestamps at the pass boundaries, when the adapter has TIMESTAMP_QUERY),
-//! host time to close the plan and encode, bytes queued, nodes resolved, and
-//! how each table went up. A ballpark instrument, not a gate: run by hand.
+//! times and reports the frame resolve (`NodeTables::resolve_frame`): host
+//! time, nodes resolved, and — with `--group-rows`, every leaf routed to a
+//! 96 B row of a group table as the renderer routes its files — the rows the
+//! renderer would then rebuild and how they would go up (`plan_upload`). A
+//! ballpark instrument, not a gate: run by hand. (Until 2026-10-26 it timed
+//! the GPU compute resolve this replaced.)
 //!
 //! Trees:
 //! - `synthetic`: a binary directory tree 10 levels deep with 96 leaves under
@@ -19,13 +21,12 @@
 //! cargo run --release -p glyph-scene-graph --bin resolve-bench -- \
 //!     [--tree <checkout>] [--subtree drivers] [--iters 5] [--group-rows]
 //! ```
-//! `--group-rows` gives every leaf an output row in a 96 B group table, the
-//! transitional form the renderer runs.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use glyph_scene_graph::{Appearance, FlushStats, NodeHandle, SceneGraph, Similarity};
+use glyph_scene_graph::upload::plan_upload;
+use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
 struct Tree {
     name: String,
@@ -41,15 +42,15 @@ struct Tree {
     max_depth: u32,
 }
 
-fn synthetic(g: &mut SceneGraph) -> Tree {
-    let root = g.tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
+fn synthetic(t: &mut NodeTables) -> Tree {
+    let root = t.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
     let mut nodes = vec![root];
     let mut level = vec![root];
     for _ in 0..10 {
         let mut next = Vec::with_capacity(level.len() * 2);
         for &p in &level {
             for _ in 0..2 {
-                let h = g.tables.insert(Some(p), Similarity::from_translation([1.0, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
+                let h = t.insert(Some(p), Similarity::from_translation([1.0, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
                 next.push(h);
                 nodes.push(h);
             }
@@ -59,12 +60,12 @@ fn synthetic(g: &mut SceneGraph) -> Tree {
     let mut leaves = 0;
     for &p in &level {
         for _ in 0..96 {
-            nodes.push(g.tables.insert(Some(p), Similarity::from_translation([0.0, 1.0, 0.0]), Appearance::IDENTITY).unwrap());
+            nodes.push(t.insert(Some(p), Similarity::from_translation([0.0, 1.0, 0.0]), Appearance::IDENTITY).unwrap());
             leaves += 1;
         }
     }
-    let subtree = g.tables.children(root).unwrap()[0];
-    let other_dir = g.tables.children(g.tables.children(root).unwrap()[1]).unwrap()[0];
+    let subtree = t.children(root).unwrap()[0];
+    let other_dir = t.children(t.children(root).unwrap()[1]).unwrap()[0];
     Tree {
         other_dir,
         name: "synthetic".into(),
@@ -78,8 +79,8 @@ fn synthetic(g: &mut SceneGraph) -> Tree {
     }
 }
 
-fn walk(g: &mut SceneGraph, path: &Path, subtree_name: &str) -> Tree {
-    let root = g.tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
+fn walk(t: &mut NodeTables, path: &Path, subtree_name: &str) -> Tree {
+    let root = t.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).unwrap();
     let mut nodes = vec![root];
     let mut leaves = 0u32;
     let mut max_depth = 0u32;
@@ -98,14 +99,14 @@ fn walk(g: &mut SceneGraph, path: &Path, subtree_name: &str) -> Tree {
                 if e.file_name() == ".git" {
                     continue;
                 }
-                let h = g.tables.insert(Some(node), Similarity::from_translation([1.0, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
+                let h = t.insert(Some(node), Similarity::from_translation([1.0, 0.0, 0.0]), Appearance::IDENTITY).unwrap();
                 nodes.push(h);
                 if depth == 0 && e.file_name() == subtree_name {
                     subtree = Some(h);
                 }
                 stack.push((e.path(), h, depth + 1));
             } else if ft.is_file() {
-                leaf = g.tables.insert(Some(node), Similarity::from_translation([0.0, 1.0, 0.0]), Appearance::IDENTITY).unwrap();
+                leaf = t.insert(Some(node), Similarity::from_translation([0.0, 1.0, 0.0]), Appearance::IDENTITY).unwrap();
                 nodes.push(leaf);
                 leaves += 1;
                 max_depth = max_depth.max(depth + 1);
@@ -114,35 +115,20 @@ fn walk(g: &mut SceneGraph, path: &Path, subtree_name: &str) -> Tree {
     }
     let (subtree, subtree_label) = match subtree {
         Some(h) => (h, format!("{subtree_name}/")),
-        None => (g.tables.children(root).unwrap()[0], "first top-level dir".to_string()),
+        None => (t.children(root).unwrap()[0], "first top-level dir".to_string()),
     };
-    let other_dir = *g.tables.children(root).unwrap().iter().find(|&&h| h != subtree && !g.tables.children(h).unwrap().is_empty()).expect("a second directory");
+    let other_dir = *t.children(root).unwrap().iter().find(|&&h| h != subtree && !t.children(h).unwrap().is_empty()).expect("a second directory");
     Tree { other_dir, name: path.file_name().map_or("tree".into(), |n| n.to_string_lossy().into_owned()), root, subtree, subtree_label, leaf, nodes, leaves, max_depth }
 }
 
-fn flush(g: &mut SceneGraph, device: &wgpu::Device, queue: &wgpu::Queue) -> (FlushStats, Option<f64>) {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench flush") });
-    let stats = g.flush(device, queue, &mut encoder);
-    queue.submit([encoder.finish()]);
-    let gpu = g.gpu.read_gpu_ms(device);
-    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("bench: poll");
-    (stats, gpu)
-}
-
-/// A timing over an empty or wrong dispatch would read just as well: hold
-/// every world row to the CPU reference.
-fn verify(tree: &Tree, g: &SceneGraph, device: &wgpu::Device, queue: &wgpu::Queue, case: &str) -> f32 {
-    let worlds = g.gpu.read_worlds(device, queue, g.tables.slot_count());
-    let mut worst = 0.0f32;
+/// A timing over an empty or wrong resolve would read just as well: hold
+/// every resolved world row to the chain walk, bit for bit.
+fn verify(tree: &Tree, t: &NodeTables, case: &str) {
     for &h in &tree.nodes {
-        let (cpu, _) = g.tables.world(h).unwrap();
-        let gpu = worlds[h.index() as usize];
-        for k in 0..3 {
-            worst = worst.max((gpu.translation[k] - cpu.translation[k]).abs() / cpu.translation[k].abs().max(1.0));
-        }
+        let walked: [u32; 8] = bytemuck::cast(t.world(h).unwrap().0);
+        let resolved: [u32; 8] = bytemuck::cast(t.resolved_world(h.index()).0);
+        assert_eq!(walked, resolved, "resolve-bench: after {case:?} node {} resolved off its chain", h.index());
     }
-    assert!(worst < 1e-4, "resolve-bench: after {case:?} the GPU world rows disagree with the CPU reference ({worst:e})");
-    worst
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -153,8 +139,8 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn run(tree: &Tree, g: &mut SceneGraph, device: &wgpu::Device, queue: &wgpu::Queue, iters: usize) {
-    let (sub_start, sub_len) = g.tables.subtree_range(tree.subtree).unwrap();
+fn run(tree: &Tree, t: &mut NodeTables, iters: usize, group_rows: u32) {
+    let (_, sub_len) = t.subtree_range(tree.subtree).unwrap();
     println!(
         "\n== {}: {} nodes ({} leaves, {} inner), leaf depth <= {}; {} = {} nodes",
         tree.name,
@@ -165,75 +151,66 @@ fn run(tree: &Tree, g: &mut SceneGraph, device: &wgpu::Device, queue: &wgpu::Que
         tree.subtree_label,
         sub_len
     );
-    let _ = sub_start;
-    let t = Instant::now();
-    let (s, gpu) = flush(g, device, queue);
-    println!(
-        "initial upload + resolve: gpu {} ms, host {:.0} us, {} B, resolved {}",
-        gpu.map_or("n/a".into(), |m| format!("{m:.3}")),
-        t.elapsed().as_secs_f64() * 1e6,
-        s.bytes,
-        s.resolved
-    );
-    println!("{:<22} {:>9} {:>9} {:>9} {:>11} {:>9}  uploads (local/post/appearance/topo)", "case", "gpu ms", "plan us", "enc us", "bytes", "resolved");
-    type Dirty<'a> = Box<dyn Fn(&mut SceneGraph, f32) + 'a>;
+    let t0 = Instant::now();
+    let p = t.resolve_frame();
+    println!("initial resolve: {:.0} us, resolved {}", t0.elapsed().as_secs_f64() * 1e6, p.resolved);
+    println!("{:<22} {:>11} {:>9} {:>9} {:>11}  upload", "case", "resolve us", "resolved", "rows", "bytes");
+    type Dirty<'a> = Box<dyn Fn(&mut NodeTables, f32) + 'a>;
     let mv = |h: NodeHandle| -> Dirty<'_> {
-        Box::new(move |g: &mut SceneGraph, k: f32| {
-            let l = g.tables.local(h).unwrap();
-            g.tables.set_local(h, Similarity { translation: [l.translation[0] + k, l.translation[1], l.translation[2]], ..l }).unwrap();
+        Box::new(move |t: &mut NodeTables, k: f32| {
+            let l = t.local(h).unwrap();
+            t.set_local(h, Similarity { translation: [l.translation[0] + k, l.translation[1], l.translation[2]], ..l }).unwrap();
         })
     };
     let cases: Vec<(&str, Dirty<'_>)> = vec![
-        ("nothing dirty", Box::new(|_: &mut SceneGraph, _| {})),
+        ("nothing dirty", Box::new(|_: &mut NodeTables, _| {})),
         ("one leaf moved", mv(tree.leaf)),
         ("subtree moved", mv(tree.subtree)),
         ("root moved", mv(tree.root)),
         (
-            // A structural edit: the order is rebuilt (plan us) and the
-            // changed span of it re-uploaded.
+            // A structural edit: the order is rebuilt inside the resolve.
             "subtree reparented",
-            Box::new(|g: &mut SceneGraph, k: f32| {
+            Box::new(|t: &mut NodeTables, k: f32| {
                 let to = if (k as i32) % 2 == 0 { tree.root } else { tree.other_dir };
-                g.tables.reparent(tree.subtree, Some(to)).unwrap();
+                t.reparent(tree.subtree, Some(to)).unwrap();
             }),
         ),
         (
             "everything moved",
-            Box::new(|g: &mut SceneGraph, k: f32| {
+            Box::new(|t: &mut NodeTables, k: f32| {
                 for &h in &tree.nodes {
-                    let l = g.tables.local(h).unwrap();
-                    g.tables.set_local(h, Similarity { translation: [l.translation[0] + k * 1e-3, l.translation[1], l.translation[2]], ..l }).unwrap();
+                    let l = t.local(h).unwrap();
+                    t.set_local(h, Similarity { translation: [l.translation[0] + k * 1e-3, l.translation[1], l.translation[2]], ..l }).unwrap();
                 }
             }),
         ),
     ];
-    let mut worst_all = 0.0f32;
     for (name, dirty) in &cases {
-        let (mut gpu, mut plan, mut enc) = (Vec::new(), Vec::new(), Vec::new());
-        let mut last = FlushStats::default();
+        let mut us = Vec::new();
+        let mut last = Default::default();
         for i in 0..iters {
-            dirty(g, 0.25 + i as f32);
-            let (s, ms) = flush(g, device, queue);
-            gpu.extend(ms);
-            plan.push(s.cpu_plan_us);
-            enc.push(s.cpu_encode_us);
-            last = s;
+            dirty(t, 0.25 + i as f32);
+            let t0 = Instant::now();
+            last = t.resolve_frame();
+            us.push(t0.elapsed().as_secs_f64() * 1e6);
         }
-        let ups: Vec<String> = last.uploads.iter().map(|u| format!("{}:{}", u.1, u.2)).collect();
+        // The group rows the renderer would rebuild from the resolved nodes.
+        let mut rows: Vec<u32> = last.slots(t).filter_map(|s| t.slot_group_row(s)).collect();
+        rows.sort_unstable();
+        let up = plan_upload(&rows, group_rows);
         let label = if *name == "subtree moved" { format!("{} moved", tree.subtree_label) } else { name.to_string() };
         println!(
-            "{:<22} {:>9} {:>9.0} {:>9.0} {:>11} {:>9}  {}",
+            "{:<22} {:>11.0} {:>9} {:>9} {:>11}  {}",
             label,
-            if gpu.is_empty() { "-".into() } else { format!("{:.3}", median(gpu)) },
-            median(plan),
-            median(enc),
-            last.bytes,
+            median(us),
             last.resolved,
-            ups.join(" ")
+            rows.len(),
+            up.rows(group_rows) * 96,
+            up.label()
         );
-        worst_all = worst_all.max(verify(tree, g, device, queue, &label));
+        verify(tree, t, &label);
     }
-    println!("verify: every case's world rows held to the CPU reference after its last flush (worst relative translation error {:.2e})", worst_all);
+    println!("verify: every case's world rows held to the chain walk, bit for bit, after its last resolve");
 }
 
 fn main() {
@@ -251,63 +228,30 @@ fn main() {
             other => panic!("resolve-bench: unknown argument {other:?} (see the module header)"),
         }
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))
-    .expect("resolve-bench: no adapter");
-    let mut features = wgpu::Features::empty();
-    if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-        features |= wgpu::Features::TIMESTAMP_QUERY;
-    }
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("resolve-bench"),
-        required_features: features,
-        required_limits: adapter.limits(),
-        experimental_features: Default::default(),
-        memory_hints: Default::default(),
-        trace: wgpu::Trace::Off,
-    }))
-    .expect("resolve-bench: device");
-    let info = adapter.get_info();
-    println!("adapter: {} ({:?}, {}), iters {iters}, group rows {group_rows}", info.name, info.backend, info.driver);
+    println!("iters {iters}, group rows {group_rows}");
 
-    let mut trees: Vec<(Tree, SceneGraph)> = Vec::new();
-    let mut g = SceneGraph::new(&device);
-    let t = synthetic(&mut g);
-    trees.push((t, g));
+    let mut trees: Vec<(Tree, NodeTables)> = Vec::new();
+    let mut t = NodeTables::default();
+    let tree = synthetic(&mut t);
+    trees.push((tree, t));
     if let Some(p) = &tree_path {
-        let mut g = SceneGraph::new(&device);
+        let mut t = NodeTables::default();
         let t0 = Instant::now();
-        let t = walk(&mut g, p, &subtree);
-        println!("walked {} in {:.0} ms", t.name, t0.elapsed().as_secs_f64() * 1e3);
-        trees.push((t, g));
+        let tree = walk(&mut t, p, &subtree);
+        println!("walked {} in {:.0} ms", tree.name, t0.elapsed().as_secs_f64() * 1e3);
+        trees.push((tree, t));
     } else {
         println!("(no --tree / GLYPH_BENCH_TREE: synthetic tree only)");
     }
-    for (tree, g) in &mut trees {
-        if !g.gpu.enable_timing(&device, &queue) {
-            println!("(no TIMESTAMP_QUERY on this adapter: gpu ms not reported)");
-        }
+    for (tree, t) in &mut trees {
+        let mut rows = 0u32;
         if group_rows {
-            let leaves: Vec<NodeHandle> = tree.nodes.iter().copied().filter(|&h| g.tables.children(h).unwrap().is_empty()).collect();
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("bench group table"),
-                size: (leaves.len().max(1) * 96) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let leaves: Vec<NodeHandle> = tree.nodes.iter().copied().filter(|&h| t.children(h).unwrap().is_empty()).collect();
             for (i, &h) in leaves.iter().enumerate() {
-                g.tables.set_group_row(h, Some(i as u32)).unwrap();
+                t.set_group_row(h, Some(i as u32)).unwrap();
             }
-            g.gpu.set_group_output(&device, &buf, leaves.len() as u32);
+            rows = leaves.len() as u32;
         }
-        run(tree, g, &device, &queue, iters);
+        run(tree, t, iters, rows);
     }
 }
