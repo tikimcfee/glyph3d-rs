@@ -109,21 +109,12 @@ pub struct G3LodState {
     pub text_detail_px: f32,
     /// "Show glyphs", 0.25..=16 (log): rows this tall become glyphs.
     pub show_glyphs_px: f32,
-    /// The visible field's "File rectangle", 0.05..=4 (log); None outside
-    /// visible mode (hide the slider).
-    pub file_rectangle_px: Option<f32>,
-    /// Whether "Show glyphs" says "a line is a wash" (visible mode) or "a
-    /// file is its rectangle".
-    pub visible_mode: bool,
     /// Greeking on, and pure (hard cut) rather than smooth.
     pub greeking: bool,
     pub greek_pure: bool,
     pub file_backgrounds: bool,
     /// Unmultiplied RGBA, 0..1.
     pub file_bg_color: [f32; 4],
-    /// The visible field's debug tint (`off`, `by LOD tier`, `by cull
-    /// state`); empty outside visible mode. Emits `SetDebugTint(i)`.
-    pub debug_tints: Vec<G3Choice>,
     /// `cull: N draw ranges, N instances | N backdrops`.
     pub cull_line: String,
 }
@@ -266,12 +257,10 @@ pub enum G3UiAction {
     // ── live LOD/cull controls, applied next frame ──
     SetTextDetailPx(f32),
     SetShowGlyphsPx(f32),
-    SetFileRectanglePx(f32),
     SetGreeking(bool),
     SetGreekPure(bool),
     SetFileBackgrounds(bool),
     SetFileBgColor([f32; 4]),
-    SetDebugTint(usize),
     // ── layout: each one rebuilds the scene (pick/selection reset) ──
     SetZWrapSpacing(f64),
     SetStrategy(usize),

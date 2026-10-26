@@ -205,14 +205,6 @@ script_mod! {
                     }
                     show_glyphs := Slider{text: "Show glyphs" min: 0.25 max: 16.0 precision: 2 default: 1.0 unit: "px" taper: Log}
                     show_glyphs_note := G3Line{text: ""}
-                    file_rect_section := View{
-                        width: Fill
-                        height: Fit
-                        flow: Down
-                        padding: Inset{left: 12}
-                        file_rectangle := Slider{text: "File rectangle (visible mode)" min: 0.05 max: 4.0 precision: 2 default: 0.25 unit: "px" taper: Log}
-                        G3Line{text: "rows this tall get line washes; below, the whole file is one rectangle"}
-                    }
                     file_backgrounds := CheckBox{text: "File card backgrounds"}
                     View{
                         width: Fill
@@ -232,14 +224,6 @@ script_mod! {
                         }
                     }
                     cull_text := G3Line{text: ""}
-                    tint_section := View{
-                        width: Fill
-                        height: Fit
-                        flow: Down
-                        spacing: 4
-                        G3Caption{text: "DEBUG TINT"}
-                        debug_tints := G3Choices{}
-                    }
 
                     z_section := View{
                         width: Fill
@@ -698,10 +682,9 @@ pub struct G3DebugPanel {
     reported: Option<Vec<usize>>,
 }
 
-const LOD_SLIDERS: [LiveId; 7] = [
+const LOD_SLIDERS: [LiveId; 6] = [
     live_id!(text_detail),
     live_id!(show_glyphs),
-    live_id!(file_rectangle),
     live_id!(bg_r),
     live_id!(bg_g),
     live_id!(bg_b),
@@ -766,37 +749,17 @@ impl G3DebugPanel {
 
             let l = &d.lod;
             let [r, g, b, a] = l.file_bg_color;
-            let values = [
-                Some(l.text_detail_px),
-                Some(l.show_glyphs_px),
-                l.file_rectangle_px,
-                Some(r),
-                Some(g),
-                Some(b),
-                Some(a),
-            ];
+            let values = [l.text_detail_px, l.show_glyphs_px, r, g, b, a];
             for (id, value) in LOD_SLIDERS.iter().zip(values) {
-                if let Some(value) = value {
-                    sync_slider(cx, v, *id, &self.held, value as f64);
-                }
+                sync_slider(cx, v, *id, &self.held, value as f64);
             }
-            v.widget(cx, ids!(file_rect_section)).set_visible(cx, l.file_rectangle_px.is_some());
-            v.label(cx, ids!(show_glyphs_note)).set_text(
-                cx,
-                if l.visible_mode {
-                    "rows this tall become glyphs; below, a line is a wash"
-                } else {
-                    "rows this tall become glyphs; below, a file is its rectangle"
-                },
-            );
+            v.label(cx, ids!(show_glyphs_note)).set_text(cx, "rows this tall become glyphs; below, a file is its rectangle");
             sync_check(cx, v, ids!(greeking), l.greeking);
             sync_check(cx, v, ids!(file_backgrounds), l.file_backgrounds);
             v.button(cx, ids!(greek_smooth)).set_text(cx, &choice_text("smooth", !l.greek_pure));
             v.button(cx, ids!(greek_pure)).set_text(cx, &choice_text("pure (hard cut, max FPS)", l.greek_pure));
             set_bg_color(cx, &v.widget(cx, ids!(bg_swatch)), vec4(r, g, b, 1.0));
             v.label(cx, ids!(cull_text)).set_text(cx, &l.cull_line);
-            v.widget(cx, ids!(tint_section)).set_visible(cx, !l.debug_tints.is_empty());
-            sync_choices(cx, &v.widget(cx, ids!(debug_tints)), l.debug_tints.iter().map(|c| (c.label.as_str(), c.selected)));
 
             v.widget(cx, ids!(z_section)).set_visible(cx, d.z_wrap_spacing.is_some());
             if let Some(z) = d.z_wrap_spacing {
@@ -909,7 +872,6 @@ impl WidgetMatchEvent for G3DebugPanel {
             let action = match id {
                 id if id == live_id!(text_detail) => G3UiAction::SetTextDetailPx(value),
                 id if id == live_id!(show_glyphs) => G3UiAction::SetShowGlyphsPx(value),
-                id if id == live_id!(file_rectangle) => G3UiAction::SetFileRectanglePx(value),
                 id => {
                     let lane = [live_id!(bg_r), live_id!(bg_g), live_id!(bg_b), live_id!(bg_a)]
                         .iter()
@@ -930,11 +892,6 @@ impl WidgetMatchEvent for G3DebugPanel {
         for (id, pure) in [(ids!(greek_smooth), false), (ids!(greek_pure), true)] {
             if v.button(cx, id).clicked(actions) && d.lod.greek_pure != pure {
                 emit(cx, G3UiAction::SetGreekPure(pure));
-            }
-        }
-        if let Some(i) = clicked_choice(cx, &v.widget(cx, ids!(debug_tints)), actions) {
-            if d.lod.debug_tints.get(i).is_some_and(|c| !c.selected) {
-                emit(cx, G3UiAction::SetDebugTint(i));
             }
         }
 
