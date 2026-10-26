@@ -17,8 +17,9 @@ members = ["native", "glyph", "crates/glyph-field", "crates/glyph-field-instance
 # (experiments/Cargo.toml) where native's deps and Zed's graph unify in one
 # lock seeded from Zed's. `exclude` keeps directory-walking from claiming
 # them (and their Zed-path deps) for THIS workspace — the gated build never
-# sees Zed. See zed_integration_experiments/docs/seam.md.
-exclude = ["experiments"]
+# sees Zed. See zed_integration_experiments/docs/seam.md. `makepad` is the
+# makepad host, its own workspace too (makepad/Cargo.toml says why).
+exclude = ["experiments", "makepad"]
 
 # The one place lint levels are set (2026-10-11); every member opts in with
 # `[lints] workspace = true`. cargo-build and cargo-clippy are zero-warning
