@@ -1,0 +1,13 @@
+# Differential float harness: the same kernels compiled by rustc (release)
+# and by makepad's relax JIT, compared bit for bit. Its own workspace, outside
+# every gate; see README.md.
+[package]
+name = "relax-fidelity"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+debug = false
