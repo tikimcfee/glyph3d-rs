@@ -18,6 +18,12 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
+  The window (`native/src/windowed/`, winit) is the `windowed` cargo feature
+  (2026-10-26), which `egui-ui` and `launcher` imply; all three are default.
+  `--no-default-features` is the engine alone, no winit or egui in its tree,
+  for a host that brings its own window (the makepad port): it drives a
+  scene through `SceneLike` with `scene::SceneKey` for keys, and rebuilds
+  one for a layout change with `relayout::rebuild_for_relayout`.
 - `glyph/` — the build/verify tool: gate runner, mutation prover. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
@@ -50,12 +56,17 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
   Derived and Visible mode.
   `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
-  behind generation handles, CPU depth-first topology, per-table dirty sets,
-  and one compute pass resolving world transforms over the dirty ranges;
-  every group row is a node of it (`native/src/glyph_scene/nodes.rs`), and
-  the pass writes the group table's transform and appearance columns.
-  `resolve-bench` (in the crate, run by hand) times it;
-  `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built".
+  behind generation handles, CPU depth-first topology, dirty marks, and a
+  CPU resolve of world transforms over the dirty depth-first ranges; every
+  group row is a node of it (`native/src/glyph_scene/nodes.rs`), whose
+  flush rebuilds the resolved nodes' group rows and uploads the ones that
+  changed (the library's page faces and regions follow the same way). The
+  default (Derived) frame dispatches no compute since 2026-10-26: the
+  resolve, the face pass and the region compose were GPU passes until then
+  (the makepad port draws with no compute dispatch; Visible mode keeps its
+  own). `resolve-bench` (in the crate, run by hand) times the resolve;
+  `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built" has
+  the GPU form's figures.
   Agent sessions come from gomuxai's `agent` CLI, the one reader of agent
   transcripts: `agent sessions --json` lists them (the F7 browser and the
   launcher), `agent transcript <session>` prints one session's events, and
@@ -377,12 +388,18 @@ anything silenced with `#[expect(..., reason)]` (an expectation that stops
 being met is itself a warning, so a silence cannot outlive its cause).
 
 **cargo-check-no-ui** (2026-10-09). `cargo check` of the renderer with
-`--no-default-features` (no egui overlay), all targets, zero warnings, in its
-own `target/no-ui` so the changed feature set never invalidates the main build.
-It exists because that build is supported and nothing compiled it: an `egui`
-use outside the `egui-ui` gate broke it unnoticed (C24, found by the GPU
-research agent). `egui-use-ungated` proves it. Blind to whether the no-UI build
-RUNS correctly — it is checked, not executed.
+`--no-default-features`, all targets, zero warnings, twice, in its own
+`target/no-ui` so the changed feature sets never invalidate the main build:
+with `--features windowed` (the window without the egui overlay) and bare
+(since 2026-10-26: the engine with no window, what a host that owns its
+window and event loop links). The bare build's `cargo tree` must hold the
+renderer and no `winit` or `egui` crate. It exists because these builds are
+supported and nothing compiled the first: an `egui` use outside the `egui-ui`
+gate broke it unnoticed (C24, found by the GPU research agent).
+`egui-use-ungated` proves the windowed half, `windowed-module-ungated` the bare
+compile and `winit-unconditional` the tree. Blind to whether either build
+RUNS correctly — they are checked, not executed — and to a windowing crate in
+the bare tree whose name starts with neither.
 
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
@@ -851,7 +868,7 @@ and the union is not:
 - **The atlas trie's VALUES.** Every oracle comparison runs on the fixtures'
   synthetic tries; hyper-oracle runs both sides on the atlas trie, so a wrong
   advance in `codepoints.bin` moves both sides together.
-- **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its world rows to the CPU reference after each case.
+- **Nothing executes the benches.** `tools/bench_hyper.py` and `resolve-bench` (crates/glyph-scene-graph) are run by hand; the latter at least holds its resolved world rows to the chain walk after each case.
 - **`tools/preview_glyphs.py` and `repro_pick_oblique.py`** are manual tools,
   run by **zero** checks, so the oblique-pick repro is exercised by nothing in
   the battery. (`tools/verify_atlas.py` was on this list until 2026-10-11; it
@@ -864,7 +881,8 @@ and the union is not:
   the group rows are seen by nothing. Candidate frames and the commands
   that made them are in `out/LIBRARY-LAYOUT-FINDINGS-2026-10-10.md`. Its
   bounding regions (E20, `glyph_scene/regions.rs`) are held to the tree
-  cull's boxes, a brute-force pick and their CPU twin by `regions::tests`,
+  cull's boxes, a brute-force pick and (read back from the device) their
+  boxes carried through their directories' worlds by `regions::tests`,
   and seen in pixels only by `tests/library_regions.rs`'s one-region
   on/off comparison on `g-pick-repo`; their depth order against the glyph
   pass is seen by nothing.

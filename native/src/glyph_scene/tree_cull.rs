@@ -26,7 +26,7 @@
 //! with its stored (staged) world box, as before; a file under a node that
 //! moved since load — or whose segment a verb synced — gets the box
 //! `sync_segment` would have written (local × scale + offset, term for
-//! term, from the same world the mirror holds), its em scale and blocks the
+//! term, from the same world the group row holds), its em scale and blocks the
 //! same way, and the backdrop tint `sync_segment` computes at its colour.
 //! The library tests hold this cull to the flat one over synced boxes
 //! (`tree_cull::tests`).

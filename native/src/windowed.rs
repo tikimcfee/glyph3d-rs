@@ -50,7 +50,8 @@
 //! Layout dial (repo scenes): the Debug panel's z_wrap_spacing slider
 //! applies on drag RELEASE by rebuilding the scene — re-running
 //! repo::load_repo with the new pitch and swapping the GlyphScene in place
-//! (the pending_relayout arm in window_event). Layout is not a per-frame
+//! (the pending_relayout arm in window_event, through the engine's
+//! `relayout::rebuild_for_relayout`). Layout is not a per-frame
 //! input like K4's LOD threshold, and the JS system's `grid.layout` was
 //! likewise a discrete refold command, not a live drag. The camera pose
 //! survives the swap (restored from the old probe); pick/selection/grab

@@ -6,17 +6,18 @@
 //! anything moved, ~88 % of a drag or page-turn frame, findings E16). A
 //! move writes the LOCAL rows of the nodes that moved: a page turn its
 //! sheets, a `c` drag its directory, a `g` drag its file. The frame's flush
-//! uploads those rows and the GPU resolve composes the moved subtrees into
-//! the group rows the draw shaders read; the page faces follow on the GPU
-//! (`faces.rs`). Nothing on the CPU is per moved FILE either: the move is
-//! noted on the tree cull (`tree_cull.rs`, which refits its bounds along
-//! the moved nodes' ancestors and computes moved files' boxes as it walks)
-//! and deferred for the CPU mirror of the group rows, which a reader (pick,
-//! a verb, the windowed HUD) brings up to date when it asks
-//! (`GroupNodes::defer_mirror` / `sync_group_mirror`).
+//! resolves the moved subtrees on the CPU and uploads the group rows they
+//! changed; the page faces and regions of the resolved sheets and
+//! directories follow the same way (`faces.rs`, `regions.rs`). Nothing in
+//! the move itself is per moved FILE: it is noted on the tree cull
+//! (`tree_cull.rs`, which refits its bounds along the moved nodes'
+//! ancestors and computes moved files' boxes as it walks) and its group rows
+//! deferred until the flush rebuilds them, or a reader (pick, a verb, the
+//! windowed HUD) asks first (`GroupNodes::defer_rows` / `sync_group_rows`).
 //!
 //! `GLYPH_LIBRARY_TIMING=1` prints one `LIBTIME` line per animated frame:
-//! what moved, what each stage cost, and the bytes the last flush queued.
+//! what moved, what each stage cost, and what the last flush and face
+//! update resolved, uploaded and cost.
 
 use std::time::Instant;
 
@@ -29,7 +30,7 @@ use crate::library::LibraryVerb;
 pub(super) struct MoveCost {
     /// Moved nodes noted (their subtrees are what moved).
     pub(super) nodes: usize,
-    /// Deferring the mirror and marking the tree cull.
+    /// Deferring the group rows and marking the tree cull.
     pub(super) note_ms: f64,
 }
 
@@ -63,12 +64,12 @@ impl GlyphScene {
         self.controller.as_ref()?.library.as_ref()
     }
 
-    /// Note a tree move: the moved nodes' subtrees are deferred for the CPU
-    /// mirror and marked on the tree cull (when the scene culls from the
-    /// tree). O(moved nodes), never O(the files they carry).
+    /// Note a tree move: the moved nodes' subtrees' group rows are deferred
+    /// (`defer_rows`) and the nodes marked on the tree cull (when the scene
+    /// culls from the tree). O(moved nodes), never O(the files they carry).
     pub(super) fn note_tree_move(&mut self, moved: &[glyph_scene_graph::NodeHandle]) -> MoveCost {
         let t0 = Instant::now();
-        self.nodes.defer_mirror(moved);
+        self.nodes.defer_rows(moved);
         if let Some(tree) = self.cull.as_ref().and_then(|c| c.tree.as_ref()) {
             let mut tree = tree.borrow_mut();
             for h in moved {
@@ -78,11 +79,11 @@ impl GlyphScene {
         MoveCost { nodes: moved.len(), note_ms: t0.elapsed().as_secs_f64() * 1e3 }
     }
 
-    /// Bring the CPU mirror of the group rows (`groups_cpu`: pick, the
-    /// verbs, the HUD) up to date with every deferred move. Returns the rows
-    /// written (0 when nothing waited).
-    pub(super) fn sync_group_mirror(&mut self) -> usize {
-        self.nodes.sync_mirror(&mut self.groups_cpu)
+    /// Bring the group table (pick, the verbs, the HUD read it) up to date
+    /// with every move deferred since the last flush. Returns the rows
+    /// rebuilt (0 when nothing waited).
+    pub(super) fn sync_group_rows(&mut self) -> usize {
+        self.nodes.sync_rows()
     }
 
     /// A library zone's (`dir:<path>`) world translation, from the tree.
@@ -92,8 +93,8 @@ impl GlyphScene {
     }
 
     /// Move a library zone by a WORLD delta: its directory node's local row
-    /// takes the delta in its parent's frame (one row; the GPU carries the
-    /// subtree), and the library keeps it through every later re-plan
+    /// takes the delta in its parent's frame (one row; the resolve carries
+    /// the subtree), and the library keeps it through every later re-plan
     /// (`Library::move_zone`). Returns the move's cost, or None for no such
     /// zone.
     pub(super) fn library_move_zone(&mut self, zone_id: &str, d: [f32; 3]) -> Option<(f64, MoveCost)> {
@@ -129,17 +130,24 @@ impl GlyphScene {
             crate::gpu::record_cpu_scope(ctx, "library move notes (CPU)", cost.note_ms);
         }
         if std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
-            let (flush_bytes, flush_resolved, _) = self.nodes.last_flush();
+            let (rows, resolved) = self.nodes.last_flush();
+            let faces = self.library_faces.as_ref().map(|f| f.last_update()).unwrap_or_default();
             let (cull_ms, visited, cands) = self.last_tree_cull();
             println!(
-                "LIBTIME nodes_moved={} ease_ms={:.4} note_ms={:.4} local_bytes={} last_flush_bytes={} last_flush_resolved={} \
+                "LIBTIME nodes_moved={} ease_ms={:.4} note_ms={:.4} local_bytes={} last_flush_resolved={} last_flush_rows={} \
+                 last_flush_bytes={} last_flush_ms={:.4} last_faces={} last_faces_bytes={} last_faces_ms={:.4} \
                  last_cull_ms={:.4} last_cull_visited={} last_cull_candidates={} animating={}",
                 tick.nodes_moved,
                 tick.ease_ms,
                 cost.note_ms,
                 tick.nodes_moved * std::mem::size_of::<glyph_scene_graph::Similarity>(),
-                flush_bytes,
-                flush_resolved,
+                resolved,
+                rows.rows,
+                rows.bytes,
+                rows.ms,
+                faces.rows,
+                faces.bytes,
+                faces.ms,
                 cull_ms,
                 visited,
                 cands,
