@@ -14,6 +14,13 @@ pub(crate) fn native() -> PathBuf {
 pub(crate) fn stamps() -> PathBuf {
     root().join("target/.glyph-stamps")
 }
+/// Throwaway rebuilds and renders, per checkout. Not the system temp dir:
+/// its paths were shared by every worktree, and a gate that `rm -rf`s its
+/// scratch first ate another worktree's mid-run (2026-10-26, when gates
+/// started running in parallel across helpers).
+pub(crate) fn scratch() -> PathBuf {
+    root().join("target/glyph-scratch")
+}
 pub(crate) fn sweep() -> PathBuf {
     root().join("out/tooling-ab/sweep")
 }
