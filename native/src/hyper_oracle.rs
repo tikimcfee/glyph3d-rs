@@ -1136,11 +1136,6 @@ mod tests {
             let tab_width = fold::TabWidth::new(width).expect("a width");
             let mut off_stop_cuts = 0usize;
             for cluster in [ClusterMode::Cluster, ClusterMode::Leader] {
-                // The two 135 KB texts run at the pairings the hyper-oracle
-                // gate's tab runs use (width 4 in cluster mode, 8 in leader),
-                // the small one at all four (2026-10-26: the full product was
-                // 9.5 s, the slowest test in the lib binary).
-                let long = (width == 4) == (cluster == ClusterMode::Cluster);
                 for (wrap, mode, rows, cols, wide) in shapes {
                     let params = ItemParams {
                         origin_x: 0.5,
@@ -1167,7 +1162,6 @@ mod tests {
                         items: texts
                             .iter()
                             .enumerate()
-                            .take(if long { texts.len() } else { 1 })
                             .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
                             .collect(),
                     };
@@ -1185,7 +1179,7 @@ mod tests {
                     compared += d.instances;
                     // The cut text's chunks, read off the reference: a chunk
                     // holding a tab whose line is off a stop where it starts.
-                    if long && wrap == 0 && cols == 0 {
+                    if wrap == 0 && cols == 0 {
                         let r = reference_item(cut.as_bytes(), &params, &trie);
                         let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
                         moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
