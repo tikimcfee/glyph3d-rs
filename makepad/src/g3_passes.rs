@@ -49,6 +49,8 @@ use glyph3d_native::float_tables::{FloatTexture, TexelRect, GROUP_TABLE_WIDTH, T
 use glyph3d_native::glyph_scene::mesh::MeshInstance;
 use glyph3d_native::glyph_scene::{BackdropInst, EnvUniform, Params, RegionInstance, RegionParams};
 use std::ops::Range;
+
+use crate::residency::{BlockResidency, G3Residency};
 use std::sync::Arc;
 
 script_mod! {
@@ -1694,13 +1696,11 @@ impl G3PhaseList {
 /// glyph3d's phase order and composites it into a rect.
 ///
 /// RESIDENCY (2026-10-26): a block is published only while the cull draws
-/// it (or the selection covers it), within the host's envelope
-/// ([`G3Residency`]). Each frame the blocks the frame needs and does not
-/// hold are published, in arena order, up to the per-frame upload budget
-/// (the native frame builder uploads a new retained publication in the
-/// frame that first draws it, with no budget of its own); to make room, the
-/// held blocks the frame does not need are evicted, least recently drawn
-/// first. A needed block not yet published draws nothing until it is. A
+/// it (or the selection covers it), within the host's envelope; which
+/// blocks are published and evicted each frame is
+/// [`crate::residency::BlockResidency`]'s decision. A needed block not yet
+/// published draws nothing until it is. Evicting a block drops its lists,
+/// which makepad retires with their buffers. A
 /// tree past the device (1.29B slots, 24 GiB, against a 7 GiB envelope) is
 /// drawn from the host blocks a view at a time. Selecting glyphs costs one
 /// more upload per selected block (its mask copy, in the block's own mask
@@ -1722,33 +1722,13 @@ pub struct G3Renderer {
     tables: Option<G3Tables>,
     /// Per block index, the block while it is resident.
     blocks: Vec<Option<G3ResidentBlock>>,
-    residency: G3Residency,
-    /// Bytes of the resident blocks.
-    resident_bytes: usize,
-    /// Frames synced, for least-recently-drawn eviction.
-    frame: u64,
+    residency: BlockResidency,
     /// The last frame's needed blocks that did not fit the envelope, logged
     /// when it changes.
     unfit: usize,
     meshes: Option<G3MeshPublications>,
     scratch: Vec<f32>,
     seen: G3Seen,
-}
-
-/// What the host lets the glyph blocks hold of the device: `envelope`
-/// bytes resident at once, `upload_per_frame` bytes published a frame.
-#[derive(Clone, Copy, Debug)]
-pub struct G3Residency {
-    pub envelope: usize,
-    pub upload_per_frame: usize,
-}
-
-impl Default for G3Residency {
-    /// No envelope: every block the frame needs is published, at most
-    /// 256 MiB of them a frame.
-    fn default() -> Self {
-        Self { envelope: usize::MAX, upload_per_frame: 256 << 20 }
-    }
 }
 
 /// A resident block: its publication, drawn at index 0 of a list of its
@@ -1758,9 +1738,6 @@ struct G3ResidentBlock {
     block: G3GlyphBlock,
     list: G3PhaseList,
     mask: Option<G3PhaseList>,
-    bytes: usize,
-    /// The last frame that needed it.
-    needed: u64,
 }
 
 fn g3_set_pass_camera(cx: &mut Cx, pass: &DrawPass, view_proj: &[f32; 16]) {
@@ -1797,9 +1774,7 @@ impl G3Renderer {
             geoms: G3MeshGeometries::new(cx),
             tables: None,
             blocks: Vec::new(),
-            residency: G3Residency::default(),
-            resident_bytes: 0,
-            frame: 0,
+            residency: BlockResidency::default(),
             unfit: 0,
             meshes: None,
             scratch: Vec::new(),
@@ -1813,12 +1788,7 @@ impl G3Renderer {
     }
 
     pub fn set_residency(&mut self, residency: G3Residency) {
-        self.residency = residency;
-    }
-
-    /// Resident blocks and their bytes.
-    pub fn resident(&self) -> (usize, usize) {
-        (self.blocks.iter().flatten().count(), self.resident_bytes)
+        self.residency.residency = residency;
     }
 
     fn sync(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
@@ -1851,75 +1821,35 @@ impl G3Renderer {
     /// or evicted any, so an edit's upload is visible: it should name one
     /// block, not all.
     fn sync_blocks(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
-        self.frame += 1;
-        let frame = self.frame;
-        for gone in self.blocks.drain(inputs.blocks.len().min(self.blocks.len())..).flatten() {
-            self.resident_bytes -= gone.bytes;
-        }
-        self.blocks.resize_with(inputs.blocks.len(), || None);
         let selected = |k: usize| inputs.selection.and_then(|s| s.chunk_ranges.get(k)).is_some_and(|r| !r.is_empty());
         let needed: Vec<usize> = (0..inputs.blocks.len())
             .filter(|&k| inputs.chunk_ranges.get(k).is_some_and(|r| !r.is_empty()) || selected(k))
             .collect();
+        let plan = self.residency.plan(inputs.blocks.len(), |k| inputs.blocks[k].len() * 4, &needed);
+        for &k in &plan.evict {
+            self.blocks[k] = None;
+        }
+        self.blocks.resize_with(inputs.blocks.len(), || None);
         let mut republished = Vec::new();
-        let mut published = Vec::new();
-        let mut evicted = 0usize;
-        let mut uploaded = 0usize;
-        let mut unfit = 0usize;
-        // The held blocks first: all of them are this frame's before any
-        // eviction looks for one that is not.
-        let mut missing = Vec::new();
         for &k in &needed {
-            let words = &inputs.blocks[k];
-            match &mut self.blocks[k] {
-                Some(held) => {
-                    held.needed = frame;
-                    if !held.block.is(words) {
-                        held.block = G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot");
-                        republished.push(k);
-                    }
+            if let Some(held) = &mut self.blocks[k] {
+                if !held.block.is(&inputs.blocks[k]) {
+                    held.block = G3GlyphBlock::new(&inputs.blocks[k]).expect("a DerivedSlot block is 5 words a slot");
+                    republished.push(k);
                 }
-                None => missing.push(k),
             }
         }
-        for k in missing {
-            let words = &inputs.blocks[k];
-            let bytes = words.len() * 4;
-            if uploaded > 0 && uploaded + bytes > self.residency.upload_per_frame {
-                continue;
-            }
-            // Room: evict the held blocks this frame does not need, least
-            // recently needed first.
-            while self.resident_bytes + bytes > self.residency.envelope {
-                let victim = self
-                    .blocks
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(j, b)| b.as_ref().filter(|b| b.needed != frame).map(|b| (b.needed, j)))
-                    .min();
-                let Some((_, j)) = victim else { break };
-                let gone = self.blocks[j].take().expect("the victim is resident");
-                self.resident_bytes -= gone.bytes;
-                evicted += 1;
-            }
-            if self.resident_bytes + bytes > self.residency.envelope {
-                unfit += 1;
-                continue;
-            }
+        for &k in &plan.publish {
             self.blocks[k] = Some(G3ResidentBlock {
-                block: G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot"),
+                block: G3GlyphBlock::new(&inputs.blocks[k]).expect("a DerivedSlot block is 5 words a slot"),
                 list: G3PhaseList::new(cx),
                 mask: None,
-                bytes,
-                needed: frame,
             });
-            self.resident_bytes += bytes;
-            uploaded += bytes;
-            published.push(k);
         }
+        let (published, evicted, unfit) = (&plan.publish, plan.evict.len(), plan.unfit);
         if !(republished.is_empty() && published.is_empty() && evicted == 0) {
-            let shown: Vec<usize> = republished.iter().chain(&published).copied().take(8).collect();
-            let (resident, bytes) = self.resident();
+            let shown: Vec<usize> = republished.iter().chain(published).copied().take(8).collect();
+            let (resident, bytes) = self.residency.resident();
             log!(
                 "g3: republished {} and published {} glyph blocks {:?}{}, evicted {}; {} of {} resident ({} MiB), {} needed",
                 republished.len(),
@@ -1939,7 +1869,7 @@ impl G3Renderer {
                     "g3: the view needs {} glyph blocks, {} past the {} MiB envelope: they draw nothing",
                     needed.len(),
                     unfit,
-                    self.residency.envelope >> 20
+                    self.residency.residency.envelope >> 20
                 );
             }
             self.unfit = unfit;

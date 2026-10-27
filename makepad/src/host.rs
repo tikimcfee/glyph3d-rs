@@ -22,7 +22,7 @@ use glyph3d_native::relayout::{rebuild_for_relayout, RelayoutRequest};
 use glyph3d_native::scene::{SceneKey, SceneLike};
 use glyph3d_native::{SceneChoice, SceneCullOptions};
 
-use crate::g3_passes::G3Residency;
+use crate::residency::G3Residency;
 use crate::sessions::SessionBrowser;
 
 /// The format the engine's wgpu pipelines are built for (the scene builds
