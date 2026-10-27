@@ -52,6 +52,10 @@ pub(crate) const SLOT_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_DST)
     .union(wgpu::BufferUsages::COPY_SRC);
 
+/// The host-block upload's batch: the staging wgpu holds for an upload
+/// in flight is at most two of these (`SlotStorage::from_host_slots`).
+pub(crate) const UPLOAD_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
 const PARALLEL_TRANSCODE_THRESHOLD: usize = 16384;
 const CHUNK_SIZE: usize = 65536;
 

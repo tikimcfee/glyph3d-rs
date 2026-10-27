@@ -10,7 +10,7 @@ use std::cell::{Ref, RefCell};
 
 use wgpu::util::DeviceExt;
 
-use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels, SLOT_USAGE};
+use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels, SLOT_USAGE, UPLOAD_BATCH_BYTES};
 use crate::{split_at_chunks, HostSlots, SlotChunk, SlotSource};
 
 /// A mode's per-glyph record, as the shared storage and upload see it.
@@ -69,7 +69,15 @@ impl<S: SlotRecord> SlotStorage<S> {
     }
 
     /// One buffer per host block, uploaded from it; the blocks are kept.
-    pub fn from_host_slots(device: &wgpu::Device, slots: HostSlots, labels: &UploadLabels) -> Self {
+    ///
+    /// In batches of 256 MiB (`UPLOAD_BATCH_BYTES`), at most two in flight
+    /// (2026-10-26): a buffer created with its contents is filled through a
+    /// staging buffer wgpu keeps until a submission carrying its copy
+    /// completes, so an unbatched upload held a staging copy of every block
+    /// at once, a second full copy of the slots. On an RTX 5090 that copy
+    /// lands in device memory: 8.7 GiB of slots peaked 15.9 GB above idle
+    /// unbatched and 9.1 GB batched, for 0.12 s more of field build.
+    pub fn from_host_slots(device: &wgpu::Device, queue: &wgpu::Queue, slots: HostSlots, labels: &UploadLabels) -> Self {
         assert_eq!(
             slots.slot_words() * 4,
             std::mem::size_of::<S>(),
@@ -79,14 +87,17 @@ impl<S: SlotRecord> SlotStorage<S> {
         );
         use rayon::prelude::*;
         let n = slots.blocks().len();
-        // In parallel: one block's create-and-fill is a memcpy into a
-        // mapped buffer, and one thread left them serial (measured on a
-        // 71.6M-slot tree, 274 blocks: 198 ms of the scene's build).
-        let chunks = slots
-            .blocks()
-            .par_iter()
-            .enumerate()
-            .map(|(k, block)| {
+        let block_bytes = slots.block_slots() * slots.slot_words() * 4;
+        let per_batch = (UPLOAD_BATCH_BYTES / block_bytes).max(1);
+        let mut chunks = Vec::with_capacity(n);
+        let mut in_flight: Option<wgpu::SubmissionIndex> = None;
+        for (b, batch) in slots.blocks().chunks(per_batch).enumerate() {
+            // In parallel within a batch: one block's create-and-fill is a
+            // memcpy into a mapped buffer, and one thread left them serial
+            // (measured on a 71.6M-slot tree, 274 blocks: 198 ms of the
+            // scene's build).
+            chunks.par_extend(batch.par_iter().enumerate().map(|(i, block)| {
+                let k = b * per_batch + i;
                 let label = if n == 1 { labels.buffers.to_string() } else { format!("{} {k}/{n}", labels.buffers) };
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&label),
@@ -94,8 +105,16 @@ impl<S: SlotRecord> SlotStorage<S> {
                     usage: SLOT_USAGE,
                 });
                 SlotChunk { buffer, offset: 0, slots: slots.block_len(k) as u32 }
-            })
-            .collect();
+            }));
+            // An empty submit carries the batch's staging copies; waiting on
+            // the one before frees that batch's staging buffers.
+            let submitted = queue.submit([]);
+            if let Some(previous) = in_flight.replace(submitted) {
+                device
+                    .poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None })
+                    .expect("the host-block upload's previous batch completes");
+            }
+        }
         let mut storage = Self::new(chunks, slots.block_slots(), slots.len(), None);
         storage.host = Some(RefCell::new(slots));
         storage
@@ -115,7 +134,7 @@ impl<S: SlotRecord> SlotStorage<S> {
             SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
                 Self::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
             }
-            SlotSource::Blocks(slots) => Self::from_host_slots(device, slots, labels),
+            SlotSource::Blocks(slots) => Self::from_host_slots(device, queue, slots, labels),
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {
                 let HostUpload { chunk_capacity, chunk_counts, buffers } =
                     upload_host_slots(device, queue, &slices, glyph_count, direct_host_upload, transcode, labels);
