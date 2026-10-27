@@ -3,7 +3,7 @@
 use crate::artifacts::verify_committed;
 use crate::golden::verify_golden;
 use crate::manifest::{Class, Gate, Kind, Manifest};
-use crate::paths::{expand, native, resolve_gpu, root, sh};
+use crate::paths::{expand, keep, native, resolve_gpu, root, sh};
 use crate::test_build::test_build;
 use std::process::Command;
 
@@ -48,6 +48,7 @@ fn gate_cargo(g: &Gate) -> bool {
     let (good, out) = sh(cmd, &root());
     if !good {
         println!("{}", out.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        println!("      cargo's output kept: {}", keep(&g.name, &out));
         println!("FAIL  {} errored", g.name);
         return false;
     }
@@ -59,6 +60,7 @@ fn gate_cargo(g: &Gate) -> bool {
         for l in out.lines().filter(|l| l.starts_with("warning")) {
             println!("      {l}");
         }
+        println!("      cargo's output kept: {}", keep(&g.name, &out));
         println!("FAIL  {} — {w} warnings", g.name);
         false
     }
@@ -112,6 +114,7 @@ fn gate_cargo_test(m: &Manifest) -> bool {
             for l in rendered.lines().filter(|l| l.starts_with("error")).take(20) {
                 println!("      {l}");
             }
+            println!("      the build's output kept: {}", keep("cargo-test-build", &rendered));
             println!("FAIL  cargo test — the test build errored");
             return false;
         }
@@ -158,6 +161,7 @@ fn gate_cargo_test(m: &Manifest) -> bool {
                 }
             }
             println!("      ^ {label}{}", if summaries.is_empty() { " reported no result" } else { "" });
+            println!("        its whole output kept: {}", keep(&format!("cargo-test {label}"), out));
         }
     }
     if !good {
@@ -279,6 +283,7 @@ fn gate_repo_verify(g: &Gate) -> bool {
                 for l in out.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
                     println!("      {l}");
                 }
+                println!("      output kept: {}", keep(&format!("{} {mode}", g.name), &out));
                 println!("FAIL  --wrap-mode {mode}");
                 ok = false;
             }
@@ -332,6 +337,7 @@ fn gate_cmd(g: &Gate) -> bool {
         for l in out.lines().rev().take(tail).collect::<Vec<_>>().into_iter().rev() {
             println!("      {l}");
         }
+        println!("      output kept: {}", keep(&g.name, &out));
         println!("FAIL  {}", g.name);
     }
     passed
