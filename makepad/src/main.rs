@@ -20,6 +20,7 @@ mod g3_passes;
 mod g3_ui;
 mod host;
 mod input;
+mod residency;
 mod sessions;
 mod ui_adapter;
 mod ui_model;
