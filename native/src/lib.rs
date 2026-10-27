@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod agent_transcript;
 pub mod atlas;
+pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod fixture;

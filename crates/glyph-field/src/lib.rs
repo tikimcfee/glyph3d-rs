@@ -56,6 +56,6 @@ pub use resources::{
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
 pub use storage::{SlotRecord, SlotStorage};
-pub use upload::{transcode_host_slots, upload_host_slots, HostUpload, Transcode, UploadLabels};
+pub use upload::{transcode_host_slots, upload_host_slots, HostUpload, Transcode, UploadLabels, UPLOAD_BATCH_BYTES};
 #[cfg(target_os = "macos")]
 pub use upload::create_mapped_slot_buffer;

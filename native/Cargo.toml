@@ -85,6 +85,11 @@ crossterm = { version = "0.28", optional = true }
 # comments kept. The version toml 1.1 already resolves.
 toml_edit = { version = "0.25", optional = true }
 
+
+# The device's memory budget (`budget.rs`, 2026-10-26): VK_EXT_memory_budget,
+# read through wgpu-hal's Vulkan adapter. The version wgpu-hal itself links.
+[target.'cfg(not(any(target_vendor = "apple", target_family = "wasm")))'.dependencies]
+ash = "0.38"
 [features]
 default = ["windowed", "egui-ui", "launcher"]
 # The window: `windowed/` and winit (2026-10-26). Off, the library is the
