@@ -161,7 +161,6 @@ pub fn rebuild_for_relayout(
                 greek_pure: p.greek_pure,
                 greek_onset_px: Some(p.greek_onset_px),
                 field_mode: cull_opts.field_mode,
-                debug_tint: p.debug_tint,
                 environment: p.environment,
                 ground_y: cull_opts.ground_y,
             },

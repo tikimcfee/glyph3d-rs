@@ -421,7 +421,7 @@ pub fn prefetch_repo(
         .collect();
 
     let hyper_data = if strategy == Strategy::Hyper {
-        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params, params.field_mode))
+        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params))
     } else {
         None
     };
@@ -491,8 +491,7 @@ pub fn load_repo_from_prefetched(
 /// `--render-file FILE [--copies N]` as a repo load of that one file
 /// (2026-10-11; step 2 of the Instanced retirement): one buffer, `copies`
 /// views over it, laid out, painted and fielded by the same HyperLayout,
-/// colourisers and fields as `--load-repo` — so the Visible field serves it
-/// for real, and the glyph verbs and picks work on it. The views are tiled
+/// colourisers and fields as `--load-repo` — so the glyph verbs and picks work on it. The views are tiled
 /// (`tile_views`) rather than shelved, each its own group row so the
 /// copies sit side by side. It paints flat like every load (the syntax
 /// heuristic it painted until then was retired the same day).
@@ -608,9 +607,8 @@ fn load_views(
             crate::gpu::SharedDevice::from_ctx(ctx),
             params.field_mode,
         ),
-        // Without a device the mode still matters for Visible (no slot is
-        // ever emitted, so it needs none); the other modes run as before.
-        None => crate::layout::LayoutEngine::hyper_with_mode(params.field_mode),
+        // Without a device: host records, whatever the mode.
+        None => crate::layout::LayoutEngine::hyper(),
     };
     if let Some(hd) = hyper_data {
         // The prefetch ran Pass 1 over the walked FILES; it stands for the
@@ -784,20 +782,13 @@ fn load_views(
     drop(sp_views);
     stage_dur += t.elapsed();
 
-    // The visible form keeps the bytes: the walk's own Vecs move into the
-    // staging — one allocation per file, no copy of the corpus, however many
-    // views read it. Everything the walk still had to say (counts, times, a
-    // tiled block's last row) is read before the move.
+    // What the walk still has to say (counts, times, a tiled block's last
+    // row), read once.
     let files_len = walk.files.len();
     let (walk_total_bytes, walk_skipped_large, walk_skipped_non_utf8, walk_dirs_visited) =
         (walk.total_bytes, walk.skipped_large, walk.skipped_non_utf8, walk.dirs_visited);
     let ends_in_newline: Vec<bool> =
         plan.buffer_of_view.iter().map(|&buffer| walk.files[buffer as usize].bytes.last() == Some(&b'\n')).collect();
-    if let Some(staging) = arena.visible_staging_mut() {
-        assert_eq!(staging.seeds.len(), view_count, "one visible seed per view");
-        staging.buffer_bytes = walk.files.into_iter().map(|f| f.bytes).collect();
-        staging.item_buffers = plan.buffer_of_view.clone();
-    }
 
     let t = Instant::now();
     let sp_grid = tracing::info_span!("repo.layout").entered();
@@ -868,7 +859,7 @@ impl RepoLoad {
         );
         // One view per file (`crate::views`), view i being file i — the
         // item row of every per-item table here (the layout's placements,
-        // tints and blocks, the item table, the Visible items, the pick
+        // tints and blocks, the item table, the pick
         // records) — and drawn with the file's group row, `v.group_id`.
         // Stage F: one cull segment per file — world AABB (group offset
         // applied, small margins for glyph overhang) + arena slot range +
@@ -895,11 +886,7 @@ impl RepoLoad {
         } else {
             Vec::new()
         };
-        // The visible form has no slots to fold a tint from: its backdrop
-        // takes the flat form's extension tint, and no sub-file blocks — the
-        // field culls its own lines.
-        let visible = self.arena.is_visible();
-        let is_flat = self.painted_flat || visible;
+        let is_flat = self.painted_flat;
         let file_tints = self.arena.device_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.device_slots().map(|d| &d.file_blocks);
         let emoji_tint_pairs = self.arena.device_slots().map(|d| &d.emoji_tint_pairs);
@@ -962,9 +949,7 @@ impl RepoLoad {
                 }
             };
             let fast_blocks = file_blocks.and_then(|fb| fb.get(view));
-            let blocks = if visible {
-                Vec::new()
-            } else if let Some(fbs) = fast_blocks {
+            let blocks = if let Some(fbs) = fast_blocks {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
@@ -1073,24 +1058,7 @@ impl RepoLoad {
                 })
                 .collect(),
         );
-        // The visible field's items: the seam's seeds finished with what only
-        // the layout knows — the group row, in the item table's group lane —
-        // and the LOCAL box the field's item cull carries through that row
-        // every frame: the segment's box before the group's T·R·S (`offset +
-        // local * s` is the segment). Local since 2026-10-10, so no group
-        // edit re-uploads it.
-        let mut arena = self.arena;
-        if let Some(staging) = arena.visible_staging_mut() {
-            assert_eq!(staging.item_buffers.len(), views.len(), "the loader named every view's buffer");
-            let item_table = views.item_table();
-            let items: Vec<glyph_field_visible::VisibleItem> = (0..views.len())
-                .map(|view| {
-                    let (min, max) = views.local_extent(view as u32);
-                    staging.item(view, item_table[view], min, max)
-                })
-                .collect();
-            staging.items = items;
-        }
+        let arena = self.arena;
         StagedText {
             glyphs_emitted: arena.len(),
             codepoints_decoded: self.stats.records,
@@ -1300,8 +1268,7 @@ impl GroupRows {
 
 /// A file's cull box in its own frame: the `SegCull` box `into_staged`
 /// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
-/// so `offset + local * scale` is that segment. The Visible field's items
-/// carry it (their cull applies the live group row).
+/// so `offset + local * scale` is that segment.
 fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
     use crate::glyph_scene::{SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN};
     (

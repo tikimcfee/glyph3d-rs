@@ -35,8 +35,8 @@ file_bg_color = [0.10, 0.10, 0.13, 0.85]
 # two sliders move them live and keep text_detail_px >= show_glyphs_px.
 #
 # "Show glyphs" (default: 1.0): rows at least this tall are drawn as glyphs;
-# below it a distant file collapses into its backdrop rectangle (in visible
-# mode a line becomes a wash). Was `lod_min_px`; the old key still parses.
+# below it a distant file collapses into its backdrop rectangle. Was
+# `lod_min_px`; the old key still parses.
 show_glyphs_px = 1.0
 
 # "Text detail" (default: 10.0): rows at least this tall get full curve
@@ -64,10 +64,8 @@ cluster_mode = "cluster"
 repo_engine = "hyper"
 
 # Glyph field render mode: "derived" (compact 20B slots, zero-copy; the CLI
-# default since 2026-10-11), "instanced" (32B slots; being retired), or
-# "visible" (no slot per glyph: the lines in view are laid out per frame on
-# the GPU — out/VISIBLE-MODE.md; switchable live
-# from the Debug panel, F8 shows its HUD).
+# default since 2026-10-11) or "instanced" (32B slots; being retired).
+# Switchable live from the Debug panel.
 field_mode = "derived"
 
 # Debug flags

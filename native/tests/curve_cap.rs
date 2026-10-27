@@ -16,8 +16,7 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The glyph field shaders that run the curve loop (Visible draws through
-/// the Derived one).
+/// The glyph field shaders that run the curve loop.
 const SHADERS: [&str; 2] = [
     "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl",
     "crates/glyph-field-instanced/shaders/glyph_field.wgsl",

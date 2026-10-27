@@ -102,19 +102,12 @@ pub(super) struct WindowState {
     #[cfg(feature = "egui-ui")]
     pub(super) cluster_selftest: u8,
     /// Dev-only verification hook state (GLYPH_FIELDMODE_SELFTEST=1): at
-    /// t≈3 s cycles the field mode Instanced → Derived → Visible through the
+    /// t≈3 s cycles the field mode Instanced → Derived through the
     /// same pending_relayout arm the panel's selector fires, printing the
     /// HUD line after each rebuild. 0 = off/done; odd states fire, even
     /// states are the quiet frame after a rebuild (see `render`).
     #[cfg(feature = "egui-ui")]
     pub(super) fieldmode_selftest: u8,
-    /// Dev-only verification hook state (GLYPH_VISIBLE_VERB_SELFTEST=1, M3):
-    /// at t≈3 s picks a glyph through `apply_pick` (the CLI/click entry) and
-    /// applies recolor-glyph, nudge-glyph, set-glyph-background, hide-group
-    /// and show-group one every few frames, printing each verb's reply and
-    /// the HUD line after it. 0 = off/done; 1 = armed; 2.. = the step to run.
-    #[cfg(feature = "egui-ui")]
-    pub(super) visible_verb_selftest: u8,
     /// Dev-only verification hook state (GLYPH_GRAB_SELFTEST=file[:dx:dy],
     /// C29): the windowed GRAB path — `g` on a picked file, cursor drags
     /// through `SceneLike::on_cursor`, `g` again — printing the HUD line
@@ -149,31 +142,8 @@ fn hud_line(snap: &crate::glyph_scene::UiProbeState, fps: f32) -> String {
         "field {mode} | engine {strategy} | segments {} ({} hidden) | backdrops {} | cull {:.2} ms | fps {fps:.1}",
         snap.segments, snap.hidden_segments, snap.cull_backdrops, snap.cull_cpu_ms
     );
-    match &snap.visible_stats {
-        Some(s) => {
-            line += &format!(
-                " | items {}/{} visible, {} backdrop | lines {} candidate: {} glyph, {} wash ({} dropped) | segments {} | slots {} ({} dropped) | gpu cull {:.2} layout {:.2} draw {:.2} ms",
-                s.items_visible,
-                s.items_total,
-                s.items_backdrop,
-                s.lines_candidate,
-                s.lines_glyph,
-                s.lines_wash,
-                s.wash_dropped,
-                s.segments,
-                s.slots,
-                s.slots_dropped,
-                s.cull_ms,
-                s.layout_ms,
-                s.draw_ms,
-            );
-        }
-        None => {
-            line += &format!(" | instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges);
-        }
-    }
-    // What is selected and what the verbs address, in the field's own key
-    // (M3: `item:start..end` and `file byte N` for the Visible field).
+    line += &format!(" | instances {} in {} draw ranges", snap.cull_instances, snap.cull_ranges);
+    // What is selected and what the verbs address, in the field's own key.
     if let Some(sel) = &snap.selection {
         line += &format!(" | selection {sel}");
     }
@@ -468,23 +438,20 @@ impl WindowState {
             _ => {}
         }
         // Dev-only verification hook (GLYPH_FIELDMODE_SELFTEST=1): cycle the
-        // field mode Instanced → Derived → Visible through the SAME
-        // pending_relayout arm the panel's selector fires, printing the HUD
-        // line after each rebuild. Odd states fire a request (consumed after
-        // this render), even states are the quiet frame whose render fills
-        // the new probe; the print reads that. Until the Visible field's
-        // bodies land, the third step panics at `VisibleField::new` — which
-        // is the point of running it: the mode reaches the call.
+        // field mode Instanced → Derived through the SAME pending_relayout
+        // arm the panel's selector fires, printing the HUD line after each
+        // rebuild. Odd states fire a request (consumed after this render),
+        // even states are the quiet frame whose render fills the new probe;
+        // the print reads that.
         #[cfg(feature = "egui-ui")]
         {
             let step_mode = |s: u8| match s {
                 1 => Some(glyph_field::GlyphFieldMode::Instanced),
                 3 => Some(glyph_field::GlyphFieldMode::Derived),
-                5 => Some(glyph_field::GlyphFieldMode::Visible),
                 _ => None,
             };
             match self.fieldmode_selftest {
-                s @ (1 | 3 | 5) if s > 1 || self.time() > 3.0 => {
+                s @ (1 | 3) if s > 1 || self.time() > 3.0 => {
                     let has_mode = self.ui_probe.as_ref().and_then(|p| p.borrow().field_mode);
                     match (has_mode, step_mode(s)) {
                         (Some(_), Some(mode)) => {
@@ -503,55 +470,14 @@ impl WindowState {
                         }
                     }
                 }
-                s @ (2 | 4 | 6) => {
+                s @ (2 | 4) => {
                     if let Some(probe) = &self.ui_probe {
                         println!("FIELDMODE-SELFTEST after step {}:  {}", s / 2, hud_line(&probe.borrow(), self.ui_fps));
                     }
-                    self.fieldmode_selftest = if s == 6 { 0 } else { s + 1 };
+                    self.fieldmode_selftest = if s == 4 { 0 } else { s + 1 };
                 }
                 _ => {}
             }
-        }
-        // Dev-only verification hook (GLYPH_VISIBLE_VERB_SELFTEST=1, M3): the
-        // verbs through the SAME entry points the CLI op stream and the panel
-        // use (`apply_pick`, `apply_verb` with `parse_verb`'s literals), one
-        // step every fourth frame from t≈3 s so the HUD line printed after
-        // each step reads a frame that saw the edit (the Visible field's
-        // counters lag a frame or two). The value is the pick:
-        // `1` = the first file's row 0 col 0; `file[:row[:col]]` otherwise.
-        // Meant for `--field-mode visible` (the replies name item:byte); in a
-        // stored mode the same steps run through the slot paths.
-        #[cfg(feature = "egui-ui")]
-        if self.visible_verb_selftest != 0 && self.time() > 3.0 && self.frames_total.is_multiple_of(4) {
-            let step = self.visible_verb_selftest;
-            let hud = |state: &Self| state.ui_probe.as_ref().map(|p| hud_line(&p.borrow(), state.ui_fps)).unwrap_or_default();
-            if step > 1 {
-                println!("VISIBLE-VERB-SELFTEST hud after step {}: {}", step - 1, hud(self));
-            }
-            let verb_step = |state: &mut Self, spec: &str| {
-                let verb = crate::parse_verb(spec).expect("selftest verb literal must parse like the CLI");
-                let line = state.scene.apply_verb(ctx, &verb).unwrap_or_else(|| "scene does not support verbs".to_string());
-                println!("VISIBLE-VERB-SELFTEST step {step} ({spec}): {line}");
-            };
-            match step {
-                1 => {
-                    let spec = std::env::var("GLYPH_VISIBLE_VERB_SELFTEST").unwrap_or_default();
-                    let mut parts = spec.split(':');
-                    let file = parts.next().filter(|f| *f != "1").unwrap_or("").to_string();
-                    let row = parts.next().and_then(|r| r.parse().ok()).unwrap_or(0);
-                    let col = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
-                    let cmd = crate::glyph_scene::PickCommand::RowCol { file, row, col };
-                    let line = self.scene.apply_pick(ctx, &cmd).unwrap_or_else(|| "scene does not support picks".to_string());
-                    println!("VISIBLE-VERB-SELFTEST step 1 (pick {cmd:?}): {line}");
-                }
-                2 => verb_step(self, "recolor-glyph"),
-                3 => verb_step(self, "nudge-glyph 0.5 0 0"),
-                4 => verb_step(self, "set-glyph-background 2050c0"),
-                5 => verb_step(self, "hide-group"),
-                6 => verb_step(self, "show-group"),
-                _ => {}
-            }
-            self.visible_verb_selftest = if step >= 7 { 0 } else { step + 1 };
         }
         // Dev-only verification hook (GLYPH_GRAB_SELFTEST=file[:dx:dy], C29,
         // 2026-10-10): the windowed GRAB path, through the SAME entry points
@@ -559,10 +485,9 @@ impl WindowState {
         // cursor at the centre, `on_key(G)` to grab, ten `on_cursor` steps
         // along (dx, dy) px (default 0, 400: straight down), `on_key(G)` to
         // release — one step every fourth frame from t≈3 s, the HUD line
-        // (items and lines per tier) printed after each, and the group's
-        // offset at the end (`move-group 0 0 0`). Meant for `--field-mode
-        // visible` with a `--cam-pose` that puts the drag where you want:
-        // an item still in view after the drag must stay counted visible.
+        // printed after each, and the group's offset at the end
+        // (`move-group 0 0 0`). Pair it with a `--cam-pose` that puts the
+        // drag where you want.
         #[cfg(feature = "egui-ui")]
         if self.grab_selftest != 0 && self.time() > 3.0 && self.frames_total.is_multiple_of(4) {
             let step = self.grab_selftest;
@@ -717,38 +642,10 @@ impl WindowState {
                                         "segments {} ({} hidden) | backdrops {} | cull {:.2} ms CPU",
                                         snap.segments, snap.hidden_segments, snap.cull_backdrops, snap.cull_cpu_ms
                                     ));
-                                    match &snap.visible_stats {
-                                        Some(s) => {
-                                            ui.monospace(format!(
-                                                "items {}/{} visible, {} backdrop",
-                                                s.items_visible, s.items_total, s.items_backdrop
-                                            ));
-                                            ui.monospace(format!(
-                                                "lines {} candidate: {} glyph | {} wash ({} dropped)",
-                                                s.lines_candidate, s.lines_glyph, s.lines_wash, s.wash_dropped
-                                            ));
-                                            ui.monospace(format!(
-                                                "segments {} | slots {} ({} dropped)",
-                                                s.segments, s.slots, s.slots_dropped
-                                            ));
-                                            ui.monospace(format!(
-                                                "gpu: cull {:.2} | layout {:.2} | draw {:.2} ms",
-                                                s.cull_ms, s.layout_ms, s.draw_ms
-                                            ));
-                                        }
-                                        None => {
-                                            ui.monospace(format!(
-                                                "instances {} in {} draw ranges",
-                                                snap.cull_instances, snap.cull_ranges
-                                            ));
-                                        }
-                                    }
-                                    if snap.debug_tint != 0 {
-                                        ui.monospace(format!(
-                                            "debug tint: {}",
-                                            if snap.debug_tint == 1 { "by LOD tier" } else { "by cull state" }
-                                        ));
-                                    }
+                                    ui.monospace(format!(
+                                        "instances {} in {} draw ranges",
+                                        snap.cull_instances, snap.cull_ranges
+                                    ));
                                     // The selection and the pick in the
                                     // field's own key (M3): what a verb
                                     // would address right now.
@@ -894,15 +791,13 @@ impl WindowState {
                         // sliders in plain words. Every threshold is "px per
                         // text row" — how many on-screen pixels tall a row
                         // appears — fixed, never camera-adapted. The panel
-                        // keeps Text detail >= Show glyphs (>= File rectangle
-                        // in visible mode): the handle that moved wins and
-                        // the others yield (`UiProbeState::keep_lod_order`),
+                        // keeps Text detail >= Show glyphs: the handle that
+                        // moved wins and the other yields (`UiProbeState::keep_lod_order`),
                         // so glyphs appear fuzzed first and sharpen on
                         // approach. CLI/config values are applied as given.
                         if let (Some(snap), Some(cell)) = (&probe_snap, &self.ui_probe) {
                             ui.separator();
                             ui.label("LOD — live, windowed only (offscreen keeps the [lod] settings); px = on-screen pixels per text row:");
-                            let visible = snap.field_mode == Some(glyph_field::GlyphFieldMode::Visible);
                             let mut p = cell.borrow_mut();
                             let detail = ui.add(
                                 egui::Slider::new(&mut p.greek_onset_px, 2.0..=32.0)
@@ -924,31 +819,12 @@ impl WindowState {
                                 egui::Slider::new(&mut p.lod_min_px, 0.25..=16.0)
                                     .logarithmic(true)
                                     .suffix(" px")
-                                    .text(if visible {
-                                        "Show glyphs — rows this tall become glyphs; below, a line is a wash"
-                                    } else {
-                                        "Show glyphs — rows this tall become glyphs; below, a file is its rectangle"
-                                    }),
+                                    .text("Show glyphs — rows this tall become glyphs; below, a file is its rectangle"),
                             );
-                            // The visible field's second handle, under Show
-                            // glyphs: the file-rectangle-vs-line-wash tier.
-                            let rect = visible.then(|| {
-                                ui.indent("lod_file_rectangle", |ui| {
-                                    ui.add(
-                                        egui::Slider::new(&mut p.lod_backdrop_px, 0.05..=4.0)
-                                            .logarithmic(true)
-                                            .suffix(" px")
-                                            .text("File rectangle (visible mode) — rows this tall get line washes; below, the whole file is one rectangle"),
-                                    )
-                                })
-                                .inner
-                            });
                             if detail.changed() {
                                 p.keep_lod_order(crate::glyph_scene::LodHandle::TextDetail);
                             } else if show.changed() {
                                 p.keep_lod_order(crate::glyph_scene::LodHandle::ShowGlyphs);
-                            } else if rect.is_some_and(|r| r.changed()) {
-                                p.keep_lod_order(crate::glyph_scene::LodHandle::FileRectangle);
                             }
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut p.file_backgrounds, "File card backgrounds");
@@ -958,19 +834,6 @@ impl WindowState {
                                 "cull: {} draw ranges, {} instances | {} backdrops",
                                 snap.cull_ranges, snap.cull_instances, snap.cull_backdrops
                             ));
-                            // The visible field's debug tint: a diagnostic
-                            // the stored modes' shaders never read.
-                            if visible {
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("debug tint:");
-                                    for (mode, label) in [(0u32, "off"), (1, "by LOD tier"), (2, "by cull state")] {
-                                        if ui.selectable_label(p.debug_tint == mode, label).clicked() {
-                                            p.debug_tint = mode;
-                                        }
-                                    }
-                                });
-                            }
                         }
                         // The layout dial (repo scenes only): the wrap
                         // staircase's pitch. Unlike K4's cull input this IS
@@ -1055,8 +918,7 @@ impl WindowState {
                             }
                         }
 
-                        // Glyph field mode selection: the two stored formats
-                        // and the Visible field (no slots; experimental, M2).
+                        // Glyph field mode selection: the two stored formats.
                         // The highlighted label is the mode actually BUILT
                         // (the probe reads `field.mode()`), so a lane-limit
                         // fallback shows as Instanced here.
@@ -1064,13 +926,12 @@ impl WindowState {
                             if let Some(current_mode) = snap.field_mode {
                                 ui.separator();
                                 ui.label(
-                                    "glyph field mode — click switches the field & rebuilds (visible: experimental, lays out per frame):",
+                                    "glyph field mode — click switches the field & rebuilds:",
                                 );
                                 ui.horizontal(|ui| {
                                     for (mode, label) in [
                                         (glyph_field::GlyphFieldMode::Derived, "Derived (20B)"),
                                         (glyph_field::GlyphFieldMode::Instanced, "Instanced (32B)"),
-                                        (glyph_field::GlyphFieldMode::Visible, "Visible (no slots)"),
                                     ] {
                                         if ui.selectable_label(current_mode == mode, label).clicked()
                                             && current_mode != mode

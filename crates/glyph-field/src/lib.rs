@@ -9,10 +9,6 @@
 //!   vertex stage reads it as-is.
 //! - [`GlyphFieldMode::Derived`] stores a compact record (20 B) and derives
 //!   Y/Z in the vertex stage from per-item tables.
-//! - [`GlyphFieldMode::Visible`] stores no record per glyph: the source bytes
-//!   and a line table are resident, and the lines in view are laid out per
-//!   frame on the GPU into a transient Derived-format buffer
-//!   (`glyph-field-visible`).
 //!
 //! Each mode is its own crate with its own slot record, transcode, WGSL and
 //! pipelines — no shader branches on the mode, and the modes' load flows never
@@ -34,9 +30,7 @@
 //!
 //! The one invariant every mode must keep: **each glyph is individually
 //! addressable** — its color and its placement can be edited without
-//! touching any other glyph. The stored modes address it by slot; Visible,
-//! whose slots are transient, by (item, byte) (M3, 2026-10-10), with the
-//! edit applied by its layout kernel every frame.
+//! touching any other glyph. Both modes address it by slot.
 
 mod copy;
 mod field;
@@ -53,7 +47,7 @@ pub use field_core::{FieldCore, FieldShape};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 pub use resources::{
-    shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, FramePrepare, SlotChunk,
+    shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, SlotChunk,
     SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
 pub use storage::{SlotRecord, SlotStorage};

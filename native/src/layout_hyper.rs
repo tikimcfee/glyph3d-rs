@@ -38,8 +38,6 @@ use pass2_device::{DerivedEmit, RenderEmit};
 mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
-pub mod visible;
-pub use visible::{VisibleItemSeed, VisibleStaging};
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
@@ -70,18 +68,6 @@ impl HyperLayout {
         Self {
             trie: None,
             device: Some(device),
-            field_mode,
-            prefetched_data: None,
-        }
-    }
-
-    /// No device, but a mode: Visible needs none (it emits no slot), so a
-    /// device-less load can still stage it; the other modes behave as
-    /// [`Self::new`] (host records).
-    pub(crate) fn with_field_mode(field_mode: GlyphFieldMode) -> Self {
-        Self {
-            trie: None,
-            device: None,
             field_mode,
             prefetched_data: None,
         }
@@ -139,12 +125,8 @@ impl HyperLayout {
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
-        // The visible field wants Pass 1's line table and no Pass 2; the
-        // prefetch collected one only if it was told the same mode.
-        let wants_lines = allow_device && self.field_mode == GlyphFieldMode::Visible;
-
         // --- PASS 1 (Parallel): Prepass per chunk to find counts and max_row_extent ---
-        let (chunks, item_chunk_ranges, mut agg) = if let Some(pre) = self.prefetched_data.take() {
+        let (chunks, item_chunk_ranges, agg) = if let Some(pre) = self.prefetched_data.take() {
             let chunks: Vec<chunk::LayoutChunk<'_>> = pre
                 .chunk_defs
                 .iter()
@@ -158,53 +140,18 @@ impl HyperLayout {
         } else {
             let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
             let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-            let agg = if wants_lines {
-                let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
-                let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-                pass1_over_chunks_with_lines(
-                    &chunks,
-                    &item_chunk_ranges,
-                    &item_bytes,
-                    &file_params,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                    Some(SEGMENT_BYTES),
-                )
-            } else {
-                pass1_prepass_chunks(
-                    &chunks,
-                    &item_chunk_ranges,
-                    items,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                )
-            };
-            drop(sp_pass1);
-            (chunks, item_chunk_ranges, agg)
-        };
-        // A prefetch run for another mode carries no table: Pass 1 once more,
-        // with lines (the only cost of switching to Visible from the panel on
-        // a load whose prefetch predates the choice).
-        if wants_lines && agg.line_table.is_none() {
-            let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
-            let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-            log::info!("visible: the prefetched Pass 1 carried no line table — running Pass 1 again with lines");
-            agg = pass1_over_chunks_with_lines(
+            let agg = pass1_prepass_chunks(
                 &chunks,
                 &item_chunk_ranges,
-                &item_bytes,
-                &file_params,
+                items,
                 &trie,
                 bitmap_adv,
                 em_height_fu,
-                Some(SEGMENT_BYTES),
             );
-        }
-        let line_table = agg.line_table.take();
-
-        // The Derived lanes (which the Visible field reuses) are release-time
+            drop(sp_pass1);
+            (chunks, item_chunk_ranges, agg)
+        };
+        // The Derived lanes are release-time
         // limits: past them a slot would pack a wrong lane and misplace
         // glyphs, so the load falls back to Instanced, once, loudly.
         let field_mode = if allow_device {
@@ -234,53 +181,6 @@ impl HyperLayout {
 
         let derived = field_mode == GlyphFieldMode::Derived;
         let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
-
-        if field_mode == GlyphFieldMode::Visible && allow_device {
-            // No Pass 2: the field lays the visible lines out per frame from
-            // the bytes and the table. The placements come from the serial
-            // single-item measure (held to the device Pass 2 by
-            // `visible::tests`), in parallel over the items.
-            let sp = tracing::info_span!("hyper.visible_placements").entered();
-            let placements: Vec<ItemPlacement> = items
-                .par_iter()
-                .zip(prepasses.par_iter())
-                .zip(slot_bases.par_iter())
-                .map(|((item, pre), &slot_base)| {
-                    compute_single_item_placement(
-                        &item.params,
-                        item.bytes,
-                        slot_base,
-                        pre.max_row_extent,
-                        &trie,
-                        bitmap_adv,
-                        em_height_fu,
-                    )
-                    .0
-                })
-                .collect();
-            drop(sp);
-            let seeds = items
-                .iter()
-                .zip(prepasses.iter())
-                .zip(placements.iter())
-                .map(|((item, pre), placed)| VisibleItemSeed {
-                    params: item.params,
-                    group_id: item.group_id,
-                    max_row_extent: pre.max_row_extent,
-                    slot_count: placed.slot_count,
-                    byte_len: u32::try_from(item.bytes.len()).expect("an item's bytes exceed u32"),
-                })
-                .collect();
-            *arena = GlyphArena::from_visible(VisibleStaging {
-                buffer_bytes: Vec::new(),
-                item_buffers: Vec::new(),
-                line_table: line_table.expect("Pass 1 ran with lines for the visible field"),
-                seeds,
-                glyph_count: total_survivors as u64,
-                items: Vec::new(),
-            });
-            return Ok(placements);
-        }
 
         if can_use_device {
             let dev = self.device.as_ref().unwrap();
@@ -371,8 +271,7 @@ impl HyperLayout {
 /// Pass 1's aggregate, before any slot is emitted or any field built: the
 /// item count against `ITEM_MAX`, each item's `row_count` against `ROW_MAX`,
 /// and each column-paged item's widest column page (`max_line_cols /
-/// page_cols`) against `X_PAGE_MAX`. The Visible field reuses the lanes, so
-/// it is held to the same limits. `Err` names the first item and limit.
+/// page_cols`) against `X_PAGE_MAX`. `Err` names the first item and limit.
 pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Result<(), String> {
     use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
     if prepasses.len() as u64 > u64::from(ITEM_MAX) + 1 {
@@ -405,7 +304,7 @@ pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::I
 }
 
 /// The field mode a load builds, given the one asked for and the lane
-/// check: a Derived or Visible request past the lanes becomes Instanced,
+/// check: a Derived request past the lanes becomes Instanced,
 /// with the warning to print. Instanced has no lanes to exceed.
 pub fn effective_field_mode(requested: GlyphFieldMode, limits: &Result<(), String>) -> (GlyphFieldMode, Option<String>) {
     match (requested, limits) {
@@ -428,8 +327,7 @@ pub struct PrepassAggregate {
     pub chunk_initial_seg_advs: Vec<f32>,
     pub chunk_initial_line_advs: Vec<f64>,
     pub total_survivors: usize,
-    /// The line table (`line_table.rs`), when Pass 1 was asked for it: the
-    /// visible-set field's resident index. `None` for every other mode.
+    /// The line table (`line_table.rs`), when Pass 1 was asked for it.
     pub line_table: Option<LineTable>,
 }
 
@@ -1358,12 +1256,9 @@ fn measure_continued_lines(
 }
 
 /// Computes Pass 1 chunk prepasses ahead of time during repository prefetching.
-/// For the Visible field the walk also collects the line table, so the
-/// background Pass 1 is the whole of the load's layout work.
 pub fn prefetch_hyper(
     files: &[crate::repo::RepoFile],
     file_params: &[crate::layout::ItemParams],
-    field_mode: GlyphFieldMode,
 ) -> PrefetchedHyperData {
     let trie = crate::default_trie();
     let em_height_fu = trie.metrics.em_height_fu;
@@ -1380,7 +1275,7 @@ pub fn prefetch_hyper(
         })
         .collect();
 
-    let aggregate = pass1_over_chunks_with_lines(
+    let aggregate = pass1_over_chunks(
         &chunks,
         &item_chunk_ranges,
         &byte_slices,
@@ -1388,7 +1283,6 @@ pub fn prefetch_hyper(
         &trie,
         bitmap_adv,
         em_height_fu,
-        (field_mode == GlyphFieldMode::Visible).then_some(SEGMENT_BYTES),
     );
 
     PrefetchedHyperData {
@@ -2156,19 +2050,18 @@ mod tests {
         assert_eq!(derived_lane_limits(&many[..ITEM_MAX as usize + 1], &params[..ITEM_MAX as usize + 1]), Ok(()));
     }
 
-    /// The fallback decision: Derived and Visible past the lanes become
-    /// Instanced with a warning that names the reason; within them, or for
-    /// Instanced itself, the request stands and nothing is said.
+    /// The fallback decision: Derived past the lanes becomes Instanced with
+    /// a warning that names the reason; within them, or for Instanced
+    /// itself, the request stands and nothing is said.
     #[test]
     fn effective_field_mode_falls_back_to_instanced_past_the_lanes() {
         let refused: Result<(), String> = Err("item 7: too many rows".into());
-        for mode in [GlyphFieldMode::Derived, GlyphFieldMode::Visible] {
-            let (got, note) = effective_field_mode(mode, &refused);
-            assert_eq!(got, GlyphFieldMode::Instanced);
-            let note = note.expect("a fallback is announced");
-            assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
-            assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
-        }
+        let mode = GlyphFieldMode::Derived;
+        let (got, note) = effective_field_mode(mode, &refused);
+        assert_eq!(got, GlyphFieldMode::Instanced);
+        let note = note.expect("a fallback is announced");
+        assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
+        assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
         assert_eq!(effective_field_mode(GlyphFieldMode::Instanced, &refused), (GlyphFieldMode::Instanced, None));
     }
 

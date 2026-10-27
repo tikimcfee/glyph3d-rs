@@ -71,7 +71,6 @@ pub enum Control {
     RepoEngine,
     ClusterMode,
     FieldMode,
-    DebugTint,
     TextDetail,
     ShowGlyphs,
     Greeking,
@@ -94,7 +93,6 @@ impl Control {
         Control::RepoEngine,
         Control::ClusterMode,
         Control::FieldMode,
-        Control::DebugTint,
         Control::TextDetail,
         Control::ShowGlyphs,
         Control::Greeking,
@@ -109,7 +107,7 @@ impl Control {
         match self {
             Target | RepoPath | FocusFile | FilePath | SessionPath => Section::Target,
             LayoutMode | WrapMode | ZWrapSpacing | RepoEngine | ClusterMode => Section::Layout,
-            FieldMode | DebugTint | TextDetail | ShowGlyphs | Greeking | FileBackgrounds | Cull | UiOverlay
+            FieldMode | TextDetail | ShowGlyphs | Greeking | FileBackgrounds | Cull | UiOverlay
             | PresentMode => Section::Graphics,
         }
     }
@@ -128,7 +126,6 @@ impl Control {
             RepoEngine => "Engine",
             ClusterMode => "Cluster",
             FieldMode => "Field mode",
-            DebugTint => "Debug tint",
             TextDetail => "Text detail",
             ShowGlyphs => "Show glyphs",
             Greeking => "Greeking",
@@ -375,7 +372,6 @@ impl Launcher {
             Control::RepoEngine => View::Choice(options(&cfg.repo_engine.unwrap_or(d.repo_engine))),
             Control::ClusterMode => View::Choice(options(&cfg.cluster_mode.unwrap_or(d.cluster_mode))),
             Control::FieldMode => View::Choice(options(&cfg.field_mode.unwrap_or(d.field_mode))),
-            Control::DebugTint => View::Choice(options(&cfg.debug_tint.unwrap_or(d.debug_tint))),
             Control::TextDetail => View::Dial {
                 value: cfg.text_detail_px.map(f64::from),
                 default: self.lod_defaults.0,
@@ -424,7 +420,6 @@ impl Launcher {
             Control::RepoEngine => cfg.repo_engine = Some(step_enum(&cfg.repo_engine.unwrap_or(d.repo_engine), dir)),
             Control::ClusterMode => cfg.cluster_mode = Some(step_enum(&cfg.cluster_mode.unwrap_or(d.cluster_mode), dir)),
             Control::FieldMode => cfg.field_mode = Some(step_enum(&cfg.field_mode.unwrap_or(d.field_mode), dir)),
-            Control::DebugTint => cfg.debug_tint = Some(step_enum(&cfg.debug_tint.unwrap_or(d.debug_tint), dir)),
             Control::PresentMode => {
                 cfg.present_mode = Some(step_enum(&cfg.present_mode.unwrap_or(d.present_mode), dir))
             }

@@ -215,7 +215,7 @@ fn the_retired_color_mode_flag_is_refused() {
 fn field_mode_parses_and_refuses_unknown() {
     assert_eq!(parse(&["--field-mode", "derived"]).field_mode, glyph_field::GlyphFieldMode::Derived);
     assert_eq!(parse(&["--field-mode", "instanced"]).field_mode, glyph_field::GlyphFieldMode::Instanced);
-    assert_eq!(parse(&["--field-mode", "visible"]).field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert!(try_parse(&["--field-mode", "visible"]).is_err(), "the Visible field was deleted on 2026-10-26");
     assert_eq!(parse(&[]).field_mode, glyph_field::GlyphFieldMode::Derived, "the default is derived (2026-10-11)");
     assert_eq!(parse(&[]).field_mode, glyph_field::GlyphFieldMode::default(), "clap's default is the enum's");
     let text = match try_parse(&["--field-mode", "vertexy"]) {
@@ -223,18 +223,12 @@ fn field_mode_parses_and_refuses_unknown() {
         Err(e) => e.to_string(),
     };
     assert!(text.contains("vertexy"), "the error must name the bad value: {text}");
-    // The visible mode reaches the scene options as itself, and its debug
-    // tint rides beside it: off by default (the uniform lane stays 0, so the
-    // stored modes' Params bytes are what they were), a named tier otherwise.
-    let plan = match parse(&["--load-repo", ".", "--field-mode", "visible"]).action() {
+    // The mode reaches the scene options as itself.
+    let plan = match parse(&["--load-repo", ".", "--field-mode", "instanced"]).action() {
         CliCommand::Render(plan) => plan,
         _ => panic!("a repo load renders"),
     };
-    assert_eq!(plan.cull_opts.field_mode, glyph_field::GlyphFieldMode::Visible);
-    assert_eq!(plan.cull_opts.debug_tint, 0);
-    assert_eq!(parse(&["--debug-tint", "lod"]).debug_tint.as_u32(), 1);
-    assert_eq!(parse(&["--debug-tint", "cull"]).debug_tint.as_u32(), 2);
-    assert!(try_parse(&["--debug-tint", "rainbow"]).is_err(), "clap must refuse an unknown tint");
+    assert_eq!(plan.cull_opts.field_mode, glyph_field::GlyphFieldMode::Instanced);
 }
 
 /// Out-of-domain spacing is REFUSED at the boundary with the flag and the
@@ -768,7 +762,7 @@ fn check_runs_never_discover_launch_config() {
 #[test]
 fn launch_config_scene_yields_to_a_typed_scene() {
     let tmp = std::env::temp_dir().join(format!("test_launch_cfg_scene_{}.toml", std::process::id()));
-    std::fs::write(&tmp, "load_repo = \"/cfg/repo\"\nfocus_file = \"alpha\"\nfield_mode = \"visible\"\n")
+    std::fs::write(&tmp, "load_repo = \"/cfg/repo\"\nfocus_file = \"alpha\"\nfield_mode = \"instanced\"\n")
         .expect("write temp config");
     let cfg = tmp.to_str().unwrap();
 
@@ -781,6 +775,6 @@ fn launch_config_scene_yields_to_a_typed_scene() {
     assert_eq!(typed.load_repo, None, "the file's repo must not outrank a typed --render-file");
     assert_eq!(typed.render_file, Some(PathBuf::from("x.rs")));
     // Non-scene keys still apply.
-    assert_eq!(typed.field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert_eq!(typed.field_mode, glyph_field::GlyphFieldMode::Instanced);
 }
 
