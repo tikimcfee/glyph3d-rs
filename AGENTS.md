@@ -197,8 +197,9 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   it `needs`; the gates that open the GPU (`gpu = true`) run one at a time;
   cargo's lock orders the cargo gates sharing `target/`. The run ends with a
   TIME line: wall, products, gate seconds summed, the slowest. Measured on
-  the 32-core Linux host under sibling load: a full run after a one-line
-  edit in `native/src` 63 s (111 s serially), with nothing changed 38 s
+  the 32-core Linux host under sibling load, at the end of the branch that
+  brought it (`out/GATETIME-2026-10-26.md`): a full run after a one-line
+  edit in `native/src` 53 s (111 s serially), with nothing changed 27-41 s
   (95 s).
 - **A red gate keeps its evidence** (2026-10-26) under
   `target/glyph-scratch/kept/`, named by time, process and what, and
@@ -207,8 +208,10 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
   read afterwards; one was lost before this existed.
 - **Two tiers, declared per gate.** `tier = "inner"` gates are what
-  `--inner` runs after each change (56 s after a one-line edit, measured
-  as above); `tier = "merge"` gates — the compiler's diagnostics: warnings,
+  `--inner` runs after each change (53 s after a one-line edit, 30 s with
+  nothing changed, measured as above: on an idle 32-core host the merge
+  gates fit beside the GPU gates' chain, so what `--inner` saves there is
+  their CPU, which siblings share); `tier = "merge"` gates — the compiler's diagnostics: warnings,
   clippy, rustdoc, the no-default-features builds — run only in a full
   `glyph test`, and `--inner` names each one it skipped. They judge the
   code's form, not what it computes, and each recompiles the renderer in its
