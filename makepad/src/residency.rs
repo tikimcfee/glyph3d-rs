@@ -3,27 +3,16 @@
 //!
 //! Each frame names the blocks it needs (the cull draws them, or the
 //! selection covers them). The held ones stay; the missing ones are
-//! published in arena order, at most `upload_per_frame` bytes a frame (the
-//! native frame builder uploads a new publication in the frame that first
-//! draws it, with no budget of its own); room under the envelope is made by
-//! evicting held blocks the frame does not need, least recently needed
-//! first. A needed block that finds no room is left out and counted.
+//! published in arena order, at most `upload_per_frame` bytes a frame; room
+//! under the envelope (makepad's, `PublicationAccounting::envelope`, which
+//! leaves keeping under it to the producer) is made by evicting held blocks
+//! the frame does not need, least recently needed first. A needed block
+//! that finds no room is left out and counted.
 
-/// What the host lets the glyph blocks hold of the device: `envelope`
-/// bytes resident at once, `upload_per_frame` bytes published a frame.
-#[derive(Clone, Copy, Debug)]
-pub struct G3Residency {
-    pub envelope: usize,
-    pub upload_per_frame: usize,
-}
-
-impl Default for G3Residency {
-    /// No envelope: every block the frame needs is published, at most
-    /// 256 MiB of them a frame.
-    fn default() -> Self {
-        Self { envelope: usize::MAX, upload_per_frame: 256 << 20 }
-    }
-}
+/// Bytes a frame's publications may total: the native frame builder
+/// uploads a new publication in the frame that first draws it, with no
+/// budget of its own.
+pub const UPLOAD_PER_FRAME: usize = 256 << 20;
 
 /// One frame's decision: the blocks to evict (in order) and then to
 /// publish, and how many needed blocks found no room.
@@ -36,24 +25,35 @@ pub struct ResidencyPlan {
 
 /// The resident set: per block index, its bytes and the last frame that
 /// needed it, while it is resident.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BlockResidency {
-    pub residency: G3Residency,
+    upload_per_frame: usize,
     held: Vec<Option<(usize, u64)>>,
     bytes: usize,
     frame: u64,
 }
 
 impl BlockResidency {
+    pub fn new(upload_per_frame: usize) -> Self {
+        Self { upload_per_frame, held: Vec::new(), bytes: 0, frame: 0 }
+    }
+
     /// Resident blocks and their bytes.
     pub fn resident(&self) -> (usize, usize) {
         (self.held.iter().flatten().count(), self.bytes)
     }
 
     /// Plan a frame over `block_count` blocks of `block_bytes(k)` bytes
-    /// that needs `needed` (ascending), and take the plan as done. Blocks
-    /// past `block_count` (the scene shrank) are evicted first.
-    pub fn plan(&mut self, block_count: usize, block_bytes: impl Fn(usize) -> usize, needed: &[usize]) -> ResidencyPlan {
+    /// that needs `needed` (ascending), within `envelope` bytes resident,
+    /// and take the plan as done. Blocks past `block_count` (the scene
+    /// shrank) are evicted first.
+    pub fn plan(
+        &mut self,
+        envelope: usize,
+        block_count: usize,
+        block_bytes: impl Fn(usize) -> usize,
+        needed: &[usize],
+    ) -> ResidencyPlan {
         self.frame += 1;
         let frame = self.frame;
         let mut plan = ResidencyPlan::default();
@@ -76,10 +76,10 @@ impl BlockResidency {
         let mut uploaded = 0;
         for k in missing {
             let bytes = block_bytes(k);
-            if uploaded > 0 && uploaded + bytes > self.residency.upload_per_frame {
+            if uploaded > 0 && uploaded + bytes > self.upload_per_frame {
                 continue;
             }
-            while self.bytes + bytes > self.residency.envelope {
+            while self.bytes + bytes > envelope {
                 let victim = self
                     .held
                     .iter()
@@ -91,7 +91,7 @@ impl BlockResidency {
                 self.bytes -= gone;
                 plan.evict.push(j);
             }
-            if self.bytes + bytes > self.residency.envelope {
+            if self.bytes + bytes > envelope {
                 plan.unfit += 1;
                 continue;
             }
@@ -110,11 +110,22 @@ mod tests {
 
     const BLOCK: usize = 100;
 
-    fn residency(envelope_blocks: usize, per_frame_blocks: usize) -> BlockResidency {
-        BlockResidency {
-            residency: G3Residency { envelope: envelope_blocks * BLOCK, upload_per_frame: per_frame_blocks * BLOCK },
-            ..BlockResidency::default()
+    /// A residency of `per_frame_blocks` a frame, planned within
+    /// `envelope_blocks`.
+    struct Fixture(BlockResidency, usize);
+
+    impl Fixture {
+        fn plan(&mut self, block_count: usize, block_bytes: impl Fn(usize) -> usize, needed: &[usize]) -> ResidencyPlan {
+            self.0.plan(self.1 * BLOCK, block_count, block_bytes, needed)
         }
+
+        fn resident(&self) -> (usize, usize) {
+            self.0.resident()
+        }
+    }
+
+    fn residency(envelope_blocks: usize, per_frame_blocks: usize) -> Fixture {
+        Fixture(BlockResidency::new(per_frame_blocks * BLOCK), envelope_blocks)
     }
 
     #[test]
@@ -144,7 +155,7 @@ mod tests {
         // comes after the missing ones in arena order.
         let plan = r.plan(10, |_| BLOCK, &[3, 6]);
         assert_eq!((plan.evict, plan.publish), (vec![0], vec![3]));
-        let resident: Vec<usize> = (0..10).filter(|&k| r.held[k].is_some()).collect();
+        let resident: Vec<usize> = (0..10).filter(|&k| r.0.held[k].is_some()).collect();
         assert_eq!(resident, [3, 5, 6]);
     }
 

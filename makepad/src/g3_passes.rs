@@ -50,7 +50,7 @@ use glyph3d_native::glyph_scene::mesh::MeshInstance;
 use glyph3d_native::glyph_scene::{BackdropInst, EnvUniform, Params, RegionInstance, RegionParams};
 use std::ops::Range;
 
-use crate::residency::{BlockResidency, G3Residency};
+use crate::residency::{BlockResidency, UPLOAD_PER_FRAME};
 use std::sync::Arc;
 
 script_mod! {
@@ -1698,7 +1698,7 @@ impl G3PhaseList {
 /// glyph3d's phase order and composites it into a rect.
 ///
 /// RESIDENCY (2026-10-26): a block is published only while the cull draws
-/// it (or the selection covers it), within the host's envelope; which
+/// it (or the selection covers it), within makepad's publication envelope; which
 /// blocks are published and evicted each frame is
 /// [`crate::residency::BlockResidency`]'s decision. A needed block not yet
 /// published draws nothing until it is. Evicting a block drops its lists,
@@ -1725,6 +1725,8 @@ pub struct G3Renderer {
     /// Per block index, the block while it is resident.
     blocks: Vec<Option<G3ResidentBlock>>,
     residency: BlockResidency,
+    /// Makepad's envelope as last read, logged when it changes.
+    envelope: Option<usize>,
     /// The last frame's needed blocks that did not fit the envelope, logged
     /// when it changes.
     unfit: usize,
@@ -1776,7 +1778,8 @@ impl G3Renderer {
             geoms: G3MeshGeometries::new(cx),
             tables: None,
             blocks: Vec::new(),
-            residency: BlockResidency::default(),
+            residency: BlockResidency::new(UPLOAD_PER_FRAME),
+            envelope: None,
             unfit: 0,
             meshes: None,
             scratch: Vec::new(),
@@ -1787,10 +1790,6 @@ impl G3Renderer {
     /// The generations consumed so far.
     pub fn seen(&self) -> G3Seen {
         self.seen
-    }
-
-    pub fn set_residency(&mut self, residency: G3Residency) {
-        self.residency.residency = residency;
     }
 
     fn sync(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
@@ -1827,7 +1826,18 @@ impl G3Renderer {
         let needed: Vec<usize> = (0..inputs.blocks.len())
             .filter(|&k| inputs.chunk_ranges.get(k).is_some_and(|r| !r.is_empty()) || selected(k))
             .collect();
-        let plan = self.residency.plan(inputs.blocks.len(), |k| inputs.blocks[k].len() * 4, &needed);
+        // Makepad's envelope (set from the device's memory budget when its
+        // HAL session starts); it leaves keeping under it to the producer.
+        let envelope = cx.publication_accounting().envelope;
+        assert!(
+            envelope != 0,
+            "makepad set no publication envelope (its backend reported no working set): the glyph blocks would have no bound on the device"
+        );
+        if self.envelope != Some(envelope) {
+            log!("g3: glyph block envelope {} MiB (makepad's), {} MiB published a frame", envelope >> 20, UPLOAD_PER_FRAME >> 20);
+            self.envelope = Some(envelope);
+        }
+        let plan = self.residency.plan(envelope, inputs.blocks.len(), |k| inputs.blocks[k].len() * 4, &needed);
         for &k in &plan.evict {
             self.blocks[k] = None;
         }
@@ -1871,7 +1881,7 @@ impl G3Renderer {
                     "g3: the view needs {} glyph blocks, {} past the {} MiB envelope: they draw nothing",
                     needed.len(),
                     unfit,
-                    self.residency.residency.envelope >> 20
+                    envelope >> 20
                 );
             }
             self.unfit = unfit;
