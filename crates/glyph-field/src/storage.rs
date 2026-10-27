@@ -8,8 +8,6 @@
 
 use std::cell::{Ref, RefCell};
 
-use wgpu::util::DeviceExt;
-
 use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels, SLOT_USAGE, UPLOAD_BATCH_BYTES};
 use crate::{split_at_chunks, HostSlots, SlotChunk, SlotSource};
 
@@ -21,6 +19,17 @@ pub trait SlotRecord: bytemuck::Pod + Send + Sync {
     /// Byte offset of the record's packed RGBA8 `u32` colour.
     const COLOR_OFFSET: u64;
 }
+
+/// A queued write's staging range, handed to the rayon worker that fills
+/// it. wgpu-types 30 makes `WriteOnly<T>` `Send` for a sized `T` only, so a
+/// range of bytes is not, though it is exclusive access to them as a
+/// `&mut [u8]` is.
+struct StagingRange<'a>(wgpu::WriteOnly<'a, [u8]>);
+
+// SAFETY: the range is the only access to its bytes for `'a` (its view is
+// borrowed mutably for as long), and bytes are `Send`: moving it to another
+// thread is moving a `&mut [u8]`.
+unsafe impl Send for StagingRange<'_> {}
 
 /// Where a field's slots live: one buffer range per chunk.
 ///
@@ -71,12 +80,23 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// One buffer per host block, uploaded from it; the blocks are kept.
     ///
     /// In batches of 256 MiB (`UPLOAD_BATCH_BYTES`), at most two in flight
-    /// (2026-10-26): a buffer created with its contents is filled through a
-    /// staging buffer wgpu keeps until a submission carrying its copy
-    /// completes, so an unbatched upload held a staging copy of every block
-    /// at once, a second full copy of the slots. On an RTX 5090 that copy
-    /// lands in device memory: 8.7 GiB of slots peaked 15.9 GB above idle
-    /// unbatched and 9.1 GB batched, for 0.12 s more of field build.
+    /// (2026-10-26): a block is written through a staging buffer wgpu keeps
+    /// until a submission carrying its copy completes, so an unbatched
+    /// upload held a staging copy of every block at once, a second full
+    /// copy of the slots. On an RTX 5090 that copy lands in device memory:
+    /// 8.7 GiB of slots peaked 15.9 GB above idle unbatched and 9.1 GB
+    /// batched, for 0.12 s more of field build.
+    ///
+    /// A batch's buffers and its queued writes' staging are made on this
+    /// thread, then the blocks are copied into the staging in parallel (one
+    /// thread left them serial: 198 ms of a 71.6M-slot tree's build, 274
+    /// blocks). Only the staging ranges and the blocks cross threads, never
+    /// the device (2026-10-27): proving `&wgpu::Device: Send` inside a rayon
+    /// job overflows the trait solver's recursion limit under relax. The
+    /// staging is a queued write's (`write_buffer_with`), not a buffer
+    /// created mapped: wgpu zero-fills the latter's on the creating thread,
+    /// which made this thread's share 0.21 s of drivers/net's 535 blocks
+    /// (field build 0.23 s before, 0.34 s mapped, 0.17 s queued).
     pub fn from_host_slots(device: &wgpu::Device, queue: &wgpu::Queue, slots: HostSlots, labels: &UploadLabels) -> Self {
         assert_eq!(
             slots.slot_words() * 4,
@@ -92,20 +112,37 @@ impl<S: SlotRecord> SlotStorage<S> {
         let mut chunks = Vec::with_capacity(n);
         let mut in_flight: Option<wgpu::SubmissionIndex> = None;
         for (b, batch) in slots.blocks().chunks(per_batch).enumerate() {
-            // In parallel within a batch: one block's create-and-fill is a
-            // memcpy into a mapped buffer, and one thread left them serial
-            // (measured on a 71.6M-slot tree, 274 blocks: 198 ms of the
-            // scene's build).
-            chunks.par_extend(batch.par_iter().enumerate().map(|(i, block)| {
-                let k = b * per_batch + i;
-                let label = if n == 1 { labels.buffers.to_string() } else { format!("{} {k}/{n}", labels.buffers) };
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&label),
-                    contents: bytemuck::cast_slice(block),
-                    usage: SLOT_USAGE,
-                });
-                SlotChunk { buffer, offset: 0, slots: slots.block_len(k) as u32 }
-            }));
+            let buffers: Vec<wgpu::Buffer> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, block)| {
+                    let k = b * per_batch + i;
+                    let label = if n == 1 { labels.buffers.to_string() } else { format!("{} {k}/{n}", labels.buffers) };
+                    let bytes = std::mem::size_of_val::<[u32]>(block) as wgpu::BufferAddress;
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&label),
+                        size: bytes,
+                        usage: SLOT_USAGE,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect();
+            let mut views: Vec<wgpu::QueueWriteBufferView> = buffers
+                .iter()
+                .map(|buffer| {
+                    let size = wgpu::BufferSize::new(buffer.size()).expect("a host block holds at least one slot");
+                    queue.write_buffer_with(buffer, 0, size).expect("a slot buffer takes a write of its whole size")
+                })
+                .collect();
+            let ranges: Vec<StagingRange<'_>> = views.iter_mut().map(|view| StagingRange(view.slice(..))).collect();
+            ranges.into_par_iter().zip(batch.par_iter()).for_each(|(StagingRange(mut range), block)| {
+                range.copy_from_slice(bytemuck::cast_slice(block));
+            });
+            // A view queues its copy into its buffer when it drops.
+            drop(views);
+            for (i, buffer) in buffers.into_iter().enumerate() {
+                chunks.push(SlotChunk { buffer, offset: 0, slots: slots.block_len(b * per_batch + i) as u32 });
+            }
             // An empty submit carries the batch's staging copies; waiting on
             // the one before frees that batch's staging buffers.
             let submitted = queue.submit([]);
