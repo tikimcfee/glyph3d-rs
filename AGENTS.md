@@ -406,13 +406,24 @@ one lint per commit with all of its fixes. Blind to anything silenced with
 
 **cargo-doc.** `cargo doc --workspace --release --no-deps`, zero warnings (every
 workspace crate since 2026-10-11; before that the renderer alone, so a dead
-link in `crates/` or `glyph/` was read by nothing: `dead-doc-link-crate`
-measured 0 warnings under the old command and 2 under the new one). Red when a doc comment names
+link in `crates/` or `glyph/` was read by nothing: a planted one measured
+0 warnings under the old command and 2 under the new one). Red when a doc comment names
 a symbol that no longer exists, or leaves an HTML tag open. It exists because
 renames are constant here and this was the one class the battery could not see:
 two links to `Engine::records` survived its rename to `read_back` through a full
 green run. Blind to whether the prose is TRUE — it checks that the symbols named
 still exist, not that the sentence around them is current.
+
+**What proves cargo-build, cargo-clippy and cargo-doc** (2026-10-26). Their
+value is the runner counting each tool's warnings and running rustdoc over
+the workspace, so the runner's own unit tests hold that
+(`warn_count_counts_each_tools_warnings_once`,
+`the_doc_gate_documents_the_workspace`, added on mp-gatetime in f99d8e0)
+rather than mutations. The four mutations that did it (`unused-binding`,
+`clippy-lint`, `dead-doc-link`, `dead-doc-link-crate`) were anchored in
+engine files, so `prove --since` re-proved the warning counter on every
+branch that touched the fold. `cargo glyph prove` lists these three gates
+as uncovered: their proof is a unit test, not a mutation.
 
 **orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
 declaration reaches is not compiled at all, and rustc says nothing about it.
