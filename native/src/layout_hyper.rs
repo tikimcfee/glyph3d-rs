@@ -203,7 +203,7 @@ impl HyperLayout {
                     staging: 0,
                 }
             };
-            match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter)) {
+            match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter, dev.is_unified())) {
                 Ok(line) => println!("slots: {line}"),
                 Err(why) => {
                     return Err(LayoutError { backend: "hyper", status: crate::layout::LAYOUT_PAST_BUDGET, what: why });
