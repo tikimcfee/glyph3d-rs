@@ -189,6 +189,7 @@ impl GlyphScene {
             item_params: &item_table,
             item_of_group: &item_of_group,
             block_slots: crate::config::settings().glyph_scene.derived_block_slots as usize,
+            slots_on_device: !ctx.host_draws_glyphs,
         };
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let targets = FieldTargets {
@@ -252,8 +253,9 @@ impl GlyphScene {
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
         log::info!(
-            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
+            "glyph field ({}{}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             field.mode(),
+            if field.slots_on_device() { "" } else { ", host blocks only: the host draws them" },
             instances_len,
             (instances_len * field.slot_bytes() as usize) >> 20,
             field.chunk_count(),
@@ -505,39 +507,46 @@ mod tests {
     use crate::scene::SceneLike;
     use glyph_field::GlyphFieldMode;
 
-    /// The Derived field keeps its slots in host blocks (2026-10-26), and a
-    /// renderer that draws from them (makepad) sees only them: every write
-    /// must land in the block as it lands in the buffer. A load of
-    /// g-pick-repo (two blocks at the default 262144 slots) is held as a
-    /// renderer holds it, edited by the verbs that write slots (a glyph's
-    /// colour, x and group, a line, a whole file through the highlight
-    /// sidecar), then every block is compared with its buffer read back.
-    /// Only the edited block may change identity: an untouched one
-    /// republished would re-upload for nothing.
-    #[test]
-    fn derived_host_blocks_follow_every_slot_write() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+    /// g-pick-repo loaded as a Derived scene on `ctx`, edited by the verbs
+    /// that write slots (a glyph's colour, x and group, a line, a whole file
+    /// through the highlight sidecar), with the host blocks as they were
+    /// before the edits.
+    fn edited_derived_scene(ctx: &crate::gpu::GpuContext) -> (GlyphScene, Vec<Arc<[u32]>>) {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/g-pick-repo");
         let params = RepoParams { field_mode: GlyphFieldMode::Derived, ..Default::default() };
         let prefetched = repo::prefetch_repo(&dir, params, Strategy::Hyper);
-        let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, Some(&ctx), crate::layout::GlyphArena::new(), None);
+        let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, Some(ctx), crate::layout::GlyphArena::new(), None);
         let atlas = crate::atlas::Atlas::load_device(&ctx.device, &ctx.queue, &crate::default_emoji_sheet());
         let staged = load.into_staged(None, &atlas.slot_ink);
-        let mut scene = GlyphScene::new(&ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
+        let mut scene = GlyphScene::new(ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
         scene.set_viewport(crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
 
         let held: Vec<Arc<[u32]>> = scene.field.host_slots().expect("a Derived field keeps host blocks").blocks().to_vec();
         assert!(held.len() >= 2, "g-pick-repo spans more than one block");
 
-        let pick = SceneLike::apply_pick(&mut scene, &ctx, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
+        let pick = SceneLike::apply_pick(&mut scene, ctx, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
         assert!(pick.is_some_and(|l| l.contains("alpha.rs")), "the pick resolves in alpha.rs");
         for verb in ["recolor-glyph ff0000", "nudge-glyph 0.5 0", "set-glyph-transform 1 2 0", "recolor-line 00ff00", "reset-glyph-group"] {
             let verb = crate::parse_verb(verb).expect("a verb literal parses");
-            SceneLike::apply_verb(&mut scene, &ctx, &verb).expect("the scene applies the verb");
+            SceneLike::apply_verb(&mut scene, ctx, &verb).expect("the scene applies the verb");
         }
         let sidecar = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/highlight-alpha.tsv");
-        SceneLike::apply_highlight_sidecar(&scene, &ctx, &sidecar).expect("the sidecar applies");
+        SceneLike::apply_highlight_sidecar(&scene, ctx, &sidecar).expect("the sidecar applies");
+        (scene, held)
+    }
 
+    /// The Derived field keeps its slots in host blocks (2026-10-26), and a
+    /// renderer that draws from them (makepad) sees only them: every write
+    /// must land in the block as it lands in the buffer. A load of
+    /// g-pick-repo (two blocks at the default 262144 slots) is held as a
+    /// renderer holds it, edited ([`edited_derived_scene`]), then every
+    /// block is compared with its buffer read back.
+    /// Only the edited block may change identity: an untouched one
+    /// republished would re-upload for nothing.
+    #[test]
+    fn derived_host_blocks_follow_every_slot_write() {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let (scene, held) = edited_derived_scene(&ctx);
         let host = scene.field.host_slots().expect("a Derived field keeps host blocks");
         let mut changed = 0;
         for (k, block) in host.blocks().iter().enumerate() {
@@ -550,5 +559,24 @@ mod tests {
             }
         }
         assert_eq!(changed, 1, "the edits are all in alpha.rs, one block: only it is a fresh allocation");
+    }
+
+    /// A field built for a host renderer (`GpuContext::host_draws_glyphs`)
+    /// holds no device copy of its slots, and the same edits leave its
+    /// blocks exactly where the device field's are.
+    #[test]
+    fn a_host_drawn_field_keeps_blocks_alone_and_edits_them_alike() {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let (device_scene, _) = edited_derived_scene(&ctx);
+        let mut host_ctx = pollster::block_on(crate::gpu::init(None));
+        host_ctx.host_draws_glyphs = true;
+        let (host_scene, _) = edited_derived_scene(&host_ctx);
+        assert!(device_scene.field.slots_on_device(), "this crate's renderer draws from the device");
+        assert!(!host_scene.field.slots_on_device(), "a host-drawn field gives the device no copy");
+        let (device, host) = (device_scene.field.host_slots().unwrap(), host_scene.field.host_slots().unwrap());
+        assert_eq!(device.blocks().len(), host.blocks().len());
+        for (k, (d, h)) in device.blocks().iter().zip(host.blocks()).enumerate() {
+            assert!(d[..] == h[..], "block {k}: the host-drawn field's edits differ from the device field's");
+        }
     }
 }

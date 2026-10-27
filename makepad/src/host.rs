@@ -132,14 +132,21 @@ pub struct EngineHost {
     last_tick: Instant,
     fps_window: (Instant, u32),
     pub fps: f32,
+    /// The bytes makepad lets its publications hold on the device (its
+    /// publication envelope, read once at startup, never 0): the glyph
+    /// blocks are resident within it.
+    pub glyph_envelope: usize,
 }
 
 impl EngineHost {
     /// Build the scene the command line asked for, with its probe, and run
     /// its startup ops (`--pick`, `--verb`, `--cam-pose`, `--highlight`)
     /// through the same entry points the panels use.
-    pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op]) -> Self {
-        let ctx = pollster::block_on(gpu::init(None));
+    pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op], glyph_envelope: usize) -> Self {
+        let mut ctx = pollster::block_on(gpu::init(None));
+        // The makepad passes draw the glyphs from the field's host blocks:
+        // the engine's device gets no copy of them.
+        ctx.host_draws_glyphs = true;
         let (mut scene, probe) =
             glyph3d_native::build_scene_probed(&ctx, COLOR_FORMAT, &choice, CameraMode::Fly, cull_opts);
         // The options follow the mode the scene BUILT (a load past the
@@ -181,6 +188,7 @@ impl EngineHost {
             last_tick: Instant::now(),
             fps_window: (Instant::now(), 0),
             fps: 0.0,
+            glyph_envelope,
         }
     }
 

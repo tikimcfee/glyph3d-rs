@@ -643,10 +643,10 @@ impl WidgetMatchEvent for G3CarrelPanel {
             if let Some(value) = slider.end_slide(actions) {
                 let value = value.round().max(0.0) as usize;
                 match id {
-                    id if id == live_id!(deck_window_limit) => opts.deck_window_limit = value,
-                    id if id == live_id!(deck_scroll_offset) => opts.deck_scroll_offset = value,
-                    id if id == live_id!(desk_revision_limit) => opts.desk_revision_limit = value,
-                    id if id == live_id!(desk_scroll_offset) => opts.desk_scroll_offset = value,
+                    live_id!(deck_window_limit) => opts.deck_window_limit = value,
+                    live_id!(deck_scroll_offset) => opts.deck_scroll_offset = value,
+                    live_id!(desk_revision_limit) => opts.desk_revision_limit = value,
+                    live_id!(desk_scroll_offset) => opts.desk_scroll_offset = value,
                     _ => opts.max_file_stacks = value,
                 }
             }
@@ -870,8 +870,8 @@ impl WidgetMatchEvent for G3DebugPanel {
             let value = value as f32;
             let mut color = d.lod.file_bg_color;
             let action = match id {
-                id if id == live_id!(text_detail) => G3UiAction::SetTextDetailPx(value),
-                id if id == live_id!(show_glyphs) => G3UiAction::SetShowGlyphsPx(value),
+                live_id!(text_detail) => G3UiAction::SetTextDetailPx(value),
+                live_id!(show_glyphs) => G3UiAction::SetShowGlyphsPx(value),
                 id => {
                     let lane = [live_id!(bg_r), live_id!(bg_g), live_id!(bg_b), live_id!(bg_a)]
                         .iter()
