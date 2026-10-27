@@ -43,7 +43,8 @@
 # buffers after every slot write). 346 -> 348 (2026-10-26): budget.rs's
 # two (a load past the device or the host refused with its numbers).
 # 348 -> 349: a host-drawn field keeps its blocks alone and edits them alike.
-test_floor = 349
+# 349 -> 350: on unified memory the host blocks and device copy are one demand.
+test_floor = 350
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

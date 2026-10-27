@@ -12,7 +12,10 @@
 //! this process may allocate there now, other processes' use already
 //! subtracted; the usage is this process's). No other backend reports a
 //! budget through wgpu, and there the device side goes unchecked, which the
-//! demand line says. The host's number is `MemAvailable` (Linux).
+//! demand line says. The host's number is `MemAvailable` (Linux). On a
+//! unified-memory device (an integrated GPU, Apple silicon) the device's
+//! memory is the host's: the host blocks and the device copy are one
+//! demand on one pool, held to the smaller of the two numbers.
 
 /// A device's local memory as its driver reports it, summed over its
 /// device-local heaps.
@@ -96,17 +99,23 @@ impl SlotDemand {
 }
 
 /// The machine's side: the host's available memory and the device's, where
-/// known.
+/// known, and whether they are one memory (`unified`).
 #[derive(Clone, Debug)]
 pub struct Machine {
     pub host_available: Option<u64>,
     pub device_name: String,
     pub device: Option<DeviceMemory>,
+    pub unified: bool,
 }
 
 impl Machine {
-    pub fn of(adapter: &wgpu::Adapter) -> Self {
-        Self { host_available: host_available_bytes(), device_name: adapter.get_info().name, device: device_memory(adapter) }
+    pub fn of(adapter: &wgpu::Adapter, unified: bool) -> Self {
+        Self {
+            host_available: host_available_bytes(),
+            device_name: adapter.get_info().name,
+            device: device_memory(adapter),
+            unified,
+        }
     }
 }
 
@@ -167,6 +176,24 @@ pub fn check(demand: &SlotDemand, machine: &Machine) -> Result<String, String> {
             None => line += &format!("; device ({}): no budget reported, not checked", machine.device_name),
         }
     }
+    if machine.unified && demand.host_blocks && demand.device {
+        // One memory: the separate checks above each see half the demand.
+        let need = total + total + demand.staging;
+        let pool = [machine.host_available, machine.device.map(|d| d.free_bytes())].into_iter().flatten().min();
+        match pool {
+            Some(pool) => {
+                line += &format!("; unified memory: host blocks and device copy {} of one pool, {} free", gib(need), gib(pool));
+                if need > pool {
+                    past.push(format!(
+                        "on unified memory the host blocks and the device copy need {} together, {} more than the pool has free",
+                        gib(need),
+                        gib(need - pool)
+                    ));
+                }
+            }
+            None => line += "; unified memory: pool unknown, not checked",
+        }
+    }
     if past.is_empty() {
         Ok(line)
     } else {
@@ -189,6 +216,7 @@ mod tests {
             host_available: Some(host),
             device_name: "a 32 GB card".into(),
             device: Some(DeviceMemory { heap_bytes: 32 * GIB, budget_bytes: budget, usage_bytes: usage }),
+            unified: false,
         }
     }
 
@@ -209,8 +237,26 @@ mod tests {
         assert!(err.contains("Refused: the host blocks need 23.75 GiB, 3.75 GiB more than the host has available"), "{err}");
         let host_only = SlotDemand { device: false, ..linux_tree() };
         assert!(check(&host_only, &machine(48 * GIB, GIB, 0)).is_ok(), "a host-drawn field asks nothing of the device");
-        let unknown = Machine { host_available: None, device_name: "a card".into(), device: None };
+        let unknown = Machine { host_available: None, device_name: "a card".into(), device: None, unified: false };
         let line = check(&linux_tree(), &unknown).unwrap();
         assert!(line.contains("host: available memory unknown, not checked") && line.contains("no budget reported, not checked"), "{line}");
+    }
+
+    /// The review's case (2026-10-26): a 32 GB APU with 24 GiB available
+    /// and a 20 GiB device budget, and a 15 GiB Derived load. Each side
+    /// alone fits; together, from the one memory, they do not.
+    #[test]
+    fn on_unified_memory_the_host_blocks_and_device_copy_are_one_demand() {
+        let load = SlotDemand { slots: 15 * GIB / 20, slot_bytes: 20, block_slots: 262_144, host_blocks: true, device: true, staging: GIB / 2 };
+        let discrete = machine(24 * GIB, 20 * GIB, 0);
+        assert!(check(&load, &discrete).is_ok(), "on a discrete card the two pools are separate");
+        let apu = Machine { unified: true, ..discrete };
+        let err = check(&load, &apu).unwrap_err();
+        assert!(
+            err.contains("Refused: on unified memory the host blocks and the device copy need 30.50 GiB together, 10.50 GiB more than the pool has free"),
+            "{err}"
+        );
+        let host_drawn = SlotDemand { device: false, ..load };
+        assert!(check(&host_drawn, &apu).is_ok(), "a host-drawn field has no device copy to add");
     }
 }
