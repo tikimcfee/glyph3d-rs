@@ -50,10 +50,12 @@
 //! test that spawns the renderer (`CARGO_BIN_EXE_*`), the suite — would
 //! compile the mutant again in each, so it runs on its own copy-on-write
 //! clone of the clean cache (`MAKEPAD_RUN_CACHE_DIR`, `clone_dir`),
-//! deleted with the mutant. The clone has
-//! a cost of its own: its first process re-collects 334 crates where the
-//! shared cache re-collects 31 (measured on the renderer: 20 s against 11 s;
-//! the run dir's own path is in some crate records), then 1.1 s a process.
+//! deleted with the mutant. Only `cache/` is cloned: since makepad
+//! a5299abd2 a redirected run dir keeps its build outputs at the
+//! workspace's. Before then a clone's first process re-collected 334 crates
+//! (20 s on the renderer); now it re-collects the 31 the shared cache does
+//! (8.3 s against 6.0 s read-only on the shared one, then 1.2 s a process;
+//! measured 2026-10-26).
 //! A mutation whose mutant relax's cache would serve stale declares
 //! `relax_cache = "off"` (a constant aggregate over another crate's
 //! `include_str!` constant keeps its cached value, measured 2026-10-26;
@@ -529,7 +531,10 @@ fn scratch_env(mu: &Mutation, r: &Route, dir: &Path) -> Result<Vec<(&'static str
         env.push(("MAKEPAD_RUN_CACHE", "off".into()));
     } else if spawns_relax(r) {
         let cache = dir.join("run-dir");
-        clone_dir(&relax_run_dir(), &cache).map_err(|e| format!("the relax cache did not clone: {e}"))?;
+        // Only the code cache: relax keeps a redirected run dir's build
+        // outputs (build/, build-scripts/, native/) at the workspace's own
+        // (makepad a5299abd2), so the clone shares them.
+        clone_dir(&relax_run_dir().join("cache"), &cache.join("cache")).map_err(|e| format!("the relax cache did not clone: {e}"))?;
         env.push(("MAKEPAD_RUN_CACHE_DIR", cache.into()));
         env.push(("GLYPH_SWEEP", dir.join("sweep").into()));
         if let Some(view) = expect_view(&mu.expect) {
