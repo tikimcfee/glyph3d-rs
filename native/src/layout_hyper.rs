@@ -24,9 +24,6 @@ pub(crate) mod chunk;
 pub(crate) mod char_resolve;
 pub(crate) mod tab_stop;
 use tab_stop::TabStops;
-pub mod line_table;
-pub use line_table::{LineEntry, LineTable, SegmentSeed, SEGMENT_BYTES};
-use line_table::{cells_of, ChunkLine, ChunkLines, ChunkSeed, CutPlan};
 use char_resolve::{resolve_byte_char_cluster, ResolveCtx};
 
 mod device_alloc;
@@ -37,8 +34,6 @@ use pass2_device::{DerivedEmit, RenderEmit};
 mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
-pub mod visible;
-pub use visible::{VisibleItemSeed, VisibleStaging};
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
@@ -69,18 +64,6 @@ impl HyperLayout {
         Self {
             trie: None,
             device: Some(device),
-            field_mode,
-            prefetched_data: None,
-        }
-    }
-
-    /// No device, but a mode: Visible needs none (it emits no slot), so a
-    /// device-less load can still stage it; the other modes behave as
-    /// [`Self::new`] (host records).
-    pub(crate) fn with_field_mode(field_mode: GlyphFieldMode) -> Self {
-        Self {
-            trie: None,
-            device: None,
             field_mode,
             prefetched_data: None,
         }
@@ -138,12 +121,8 @@ impl HyperLayout {
         let em_height_fu = trie.metrics.em_height_fu;
         let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
 
-        // The visible field wants Pass 1's line table and no Pass 2; the
-        // prefetch collected one only if it was told the same mode.
-        let wants_lines = allow_device && self.field_mode == GlyphFieldMode::Visible;
-
         // --- PASS 1 (Parallel): Prepass per chunk to find counts and max_row_extent ---
-        let (chunks, item_chunk_ranges, mut agg) = if let Some(pre) = self.prefetched_data.take() {
+        let (chunks, item_chunk_ranges, agg) = if let Some(pre) = self.prefetched_data.take() {
             let chunks: Vec<chunk::LayoutChunk<'_>> = pre
                 .chunk_defs
                 .iter()
@@ -157,53 +136,18 @@ impl HyperLayout {
         } else {
             let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
             let sp_pass1 = tracing::info_span!("hyper.pass1").entered();
-            let agg = if wants_lines {
-                let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
-                let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-                pass1_over_chunks_with_lines(
-                    &chunks,
-                    &item_chunk_ranges,
-                    &item_bytes,
-                    &file_params,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                    Some(SEGMENT_BYTES),
-                )
-            } else {
-                pass1_prepass_chunks(
-                    &chunks,
-                    &item_chunk_ranges,
-                    items,
-                    &trie,
-                    bitmap_adv,
-                    em_height_fu,
-                )
-            };
-            drop(sp_pass1);
-            (chunks, item_chunk_ranges, agg)
-        };
-        // A prefetch run for another mode carries no table: Pass 1 once more,
-        // with lines (the only cost of switching to Visible from the panel on
-        // a load whose prefetch predates the choice).
-        if wants_lines && agg.line_table.is_none() {
-            let item_bytes: Vec<&[u8]> = items.iter().map(|it| it.bytes).collect();
-            let file_params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-            log::info!("visible: the prefetched Pass 1 carried no line table — running Pass 1 again with lines");
-            agg = pass1_over_chunks_with_lines(
+            let agg = pass1_prepass_chunks(
                 &chunks,
                 &item_chunk_ranges,
-                &item_bytes,
-                &file_params,
+                items,
                 &trie,
                 bitmap_adv,
                 em_height_fu,
-                Some(SEGMENT_BYTES),
             );
-        }
-        let line_table = agg.line_table.take();
-
-        // The Derived lanes (which the Visible field reuses) are release-time
+            drop(sp_pass1);
+            (chunks, item_chunk_ranges, agg)
+        };
+        // The Derived lanes are release-time
         // limits: past them a slot would pack a wrong lane and misplace
         // glyphs, so the load falls back to Instanced, once, loudly.
         let field_mode = if allow_device {
@@ -233,53 +177,6 @@ impl HyperLayout {
 
         let derived = field_mode == GlyphFieldMode::Derived;
         let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
-
-        if field_mode == GlyphFieldMode::Visible && allow_device {
-            // No Pass 2: the field lays the visible lines out per frame from
-            // the bytes and the table. The placements come from the serial
-            // single-item measure (held to the device Pass 2 by
-            // `visible::tests`), in parallel over the items.
-            let sp = tracing::info_span!("hyper.visible_placements").entered();
-            let placements: Vec<ItemPlacement> = items
-                .par_iter()
-                .zip(prepasses.par_iter())
-                .zip(slot_bases.par_iter())
-                .map(|((item, pre), &slot_base)| {
-                    compute_single_item_placement(
-                        &item.params,
-                        item.bytes,
-                        slot_base,
-                        pre.max_row_extent,
-                        &trie,
-                        bitmap_adv,
-                        em_height_fu,
-                    )
-                    .0
-                })
-                .collect();
-            drop(sp);
-            let seeds = items
-                .iter()
-                .zip(prepasses.iter())
-                .zip(placements.iter())
-                .map(|((item, pre), placed)| VisibleItemSeed {
-                    params: item.params,
-                    group_id: item.group_id,
-                    max_row_extent: pre.max_row_extent,
-                    slot_count: placed.slot_count,
-                    byte_len: u32::try_from(item.bytes.len()).expect("an item's bytes exceed u32"),
-                })
-                .collect();
-            *arena = GlyphArena::from_visible(VisibleStaging {
-                buffer_bytes: Vec::new(),
-                item_buffers: Vec::new(),
-                line_table: line_table.expect("Pass 1 ran with lines for the visible field"),
-                seeds,
-                glyph_count: total_survivors as u64,
-                items: Vec::new(),
-            });
-            return Ok(placements);
-        }
 
         if can_use_device {
             let dev = self.device.as_ref().unwrap();
@@ -365,8 +262,7 @@ impl HyperLayout {
 /// Pass 1's aggregate, before any slot is emitted or any field built: the
 /// item count against `ITEM_MAX`, each item's `row_count` against `ROW_MAX`,
 /// and each column-paged item's widest column page (`max_line_cols /
-/// page_cols`) against `X_PAGE_MAX`. The Visible field reuses the lanes, so
-/// it is held to the same limits. `Err` names the first item and limit.
+/// page_cols`) against `X_PAGE_MAX`. `Err` names the first item and limit.
 pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Result<(), String> {
     use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
     if prepasses.len() as u64 > u64::from(ITEM_MAX) + 1 {
@@ -399,7 +295,7 @@ pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::I
 }
 
 /// The field mode a load builds, given the one asked for and the lane
-/// check: a Derived or Visible request past the lanes becomes Instanced,
+/// check: a Derived request past the lanes becomes Instanced,
 /// with the warning to print. Instanced has no lanes to exceed.
 pub fn effective_field_mode(requested: GlyphFieldMode, limits: &Result<(), String>) -> (GlyphFieldMode, Option<String>) {
     match (requested, limits) {
@@ -422,9 +318,6 @@ pub struct PrepassAggregate {
     pub chunk_initial_seg_advs: Vec<f32>,
     pub chunk_initial_line_advs: Vec<f64>,
     pub total_survivors: usize,
-    /// The line table (`line_table.rs`), when Pass 1 was asked for it: the
-    /// visible-set field's resident index. `None` for every other mode.
-    pub line_table: Option<LineTable>,
 }
 
 /// Precomputed chunks and Pass 1 metadata from background prefetch.
@@ -471,11 +364,11 @@ fn ascii_line_max_x(l: usize, terminated: bool, fu: usize, seg_adv_table: &[f32]
 /// portion contributes nothing to `max_row_extent` here; the aggregation
 /// measures it with the true seed where the stride can reach an output
 /// (`measure_continued_lines`).
-///
-/// `lines`: when `Some`, the chunk's lines and long-line cuts are collected
-/// for the line table (`line_table.rs`), cuts planned every `segment_bytes`;
-/// the layout counts are the same either way.
-#[expect(clippy::too_many_arguments, reason = "one chunk's bytes plus the per-load constants Pass 1 reads (trie, metrics, segment-advance table), passed apart; not yet bundled")]
+// `inline(never)`: the walk kept as its own function, the shape it had as
+// the non-collecting instantiation beside the retired line table's (which
+// the M2 measured faster than one walk inlined into a dispatcher,
+// 2026-10-10).
+#[inline(never)]
 pub(crate) fn pass1_prepass_chunk_bytes(
     bytes: &[u8],
     p: &crate::layout::ItemParams,
@@ -484,38 +377,6 @@ pub(crate) fn pass1_prepass_chunk_bytes(
     em_height_fu: u32,
     global_seg_adv_table: &[f32],
     continues_line: bool,
-    lines: Option<&mut ChunkLines>,
-    segment_bytes: usize,
-) -> ChunkPrepass {
-    // Two monomorphizations, so a load that wants no line table runs the
-    // walk with none of the collection in it — not even a predictable
-    // branch per byte (measured 2026-10-10: a runtime flag cost ~0.5 ms of
-    // a 4 ms Pass 1 on the 93 MB tree).
-    match lines {
-        Some(out) => pass1_prepass_chunk_walk::<true>(bytes, p, trie, bitmap_adv, em_height_fu, global_seg_adv_table, continues_line, out, segment_bytes),
-        None => {
-            let mut none = ChunkLines::default();
-            pass1_prepass_chunk_walk::<false>(bytes, p, trie, bitmap_adv, em_height_fu, global_seg_adv_table, continues_line, &mut none, segment_bytes)
-        }
-    }
-}
-
-// `inline(never)`: with both instantiations inlined into the dispatching
-// wrapper, LLVM kept COLLECT as a runtime branch inside one 14 KB function
-// instead of two specialised walks (the M2 measured it: +0.7 ms of an 11 ms
-// Pass 1, 2026-10-10). As separate functions the `false` walk is the old one.
-#[inline(never)]
-#[expect(clippy::too_many_arguments, reason = "the monomorphized body of pass1_prepass_chunk_bytes, with its parameters")]
-fn pass1_prepass_chunk_walk<const COLLECT: bool>(
-    bytes: &[u8],
-    p: &crate::layout::ItemParams,
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-    global_seg_adv_table: &[f32],
-    continues_line: bool,
-    out: &mut ChunkLines,
-    segment_bytes: usize,
 ) -> ChunkPrepass {
     let fold_unit = if p.wrap_width > 0 {
         p.wrap_width as i64
@@ -553,12 +414,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         let mut col = 0i64;
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
-        let mut cells = 0u32;
-        // The line's widest fold unit so far and the cells in the current
-        // one (`LineEntry::width_cells`, C28; COLLECT only).
-        let mut unit_cells = 0u32;
-        let mut width_cells = 0u32;
-        let mut plan = CutPlan::new(segment_bytes);
 
         let is_pure_ascii = crate::text::is_pure_printable_ascii(bytes);
         if is_pure_ascii {
@@ -570,35 +425,14 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
             if fold_unit > 0 {
                 seg_adv = seg_adv_table[l % fu];
             }
-            if COLLECT {
-                // Every byte is one cell: a full unit, or the whole line.
-                width_cells = if fold_unit > 0 { l.min(fu) as u32 } else { l as u32 };
-            }
             // No newline: the widest x is the last glyph's own (see
             // `ascii_line_max_x`).
             let widest = ascii_line_max_x(l, false, fu, seg_adv_table, ascii_adv);
             if widest > max_row_extent {
                 max_row_extent = widest;
             }
-            if COLLECT {
-                // Every byte is a cell: the cuts land on the targets.
-                let mut off = segment_bytes;
-                while off < l {
-                    out.seeds.push(ChunkSeed {
-                        line: 0,
-                        byte_offset: off as u32,
-                        col: off as u32,
-                        seg_adv: if fold_unit > 0 { seg_adv_table[off % fu] } else { 0.0 },
-                        cells: off as u32,
-                    });
-                    off += segment_bytes;
-                }
-            }
         } else {
             for i in 0..bytes.len() {
-                if COLLECT && plan.cut_here(i, bytes[i]) {
-                    out.seeds.push(ChunkSeed { line: 0, byte_offset: i as u32, col: col as u32, seg_adv, cells });
-                }
                 let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
@@ -617,15 +451,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 let (advance, line_advance_addend) = tabs.advance(bytes[i], r.advance, line_adv);
                 col += 1;
                 line_adv += line_advance_addend;
-                if COLLECT {
-                    let k = cells_of(advance, ascii_adv);
-                    cells += k;
-                    unit_cells += k;
-                    if fold_unit > 0 && col % fold_unit == 0 {
-                        width_cells = width_cells.max(unit_cells);
-                        unit_cells = 0;
-                    }
-                }
                 if fold_unit > 0 {
                     if col % fold_unit == 0 {
                         seg_adv = 0.0;
@@ -635,11 +460,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 }
             }
         }
-        // An empty item is one empty chunk, and has no line.
-        if COLLECT && !bytes.is_empty() {
-            out.lines.push(ChunkLine { start: 0, glyphs: survivor_count, col: col as u32, width_cells: width_cells.max(unit_cells), terminated: false });
-        }
-
         return ChunkPrepass {
             survivor_count,
             leader_count,
@@ -681,12 +501,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         let mut line_col = 0i64;
         let mut line_adv = 0.0f64;
         let mut seg_adv = 0.0f32;
-        let mut cells = 0u32;
-        // The line's widest fold unit so far and the cells in the current
-        // one (`LineEntry::width_cells`, C28; COLLECT only).
-        let mut unit_cells = 0u32;
-        let mut width_cells = 0u32;
-        let mut plan = CutPlan::new(segment_bytes);
         // The first line of a continuing chunk is measured with its true
         // seed by the aggregation, not here (see the doc above).
         let widest_before_line = max_row_extent;
@@ -701,37 +515,12 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
             if fold_unit > 0 {
                 seg_adv = seg_adv_table[l % fu];
             }
-            if COLLECT {
-                width_cells = if fold_unit > 0 { l.min(fu) as u32 } else { l as u32 };
-            }
             let widest = ascii_line_max_x(l, nl_pos < bytes.len(), fu, seg_adv_table, ascii_adv);
             if widest > max_row_extent {
                 max_row_extent = widest;
             }
-            if COLLECT {
-                let mut off = segment_bytes;
-                while off < l {
-                    out.seeds.push(ChunkSeed {
-                        line: line_index as u32,
-                        byte_offset: (pos + off) as u32,
-                        col: off as u32,
-                        seg_adv: if fold_unit > 0 { seg_adv_table[off % fu] } else { 0.0 },
-                        cells: off as u32,
-                    });
-                    off += segment_bytes;
-                }
-            }
         } else {
             for i in pos..nl_pos {
-                if COLLECT && plan.cut_here(i - pos, bytes[i]) {
-                    out.seeds.push(ChunkSeed {
-                        line: line_index as u32,
-                        byte_offset: i as u32,
-                        col: line_col as u32,
-                        seg_adv,
-                        cells,
-                    });
-                }
                 let r = match resolve_byte_char_cluster(bytes, i, rctx, &mut trailer_until, &mut has_cluster) {
                     Some(r) => r,
                     None => continue,
@@ -748,15 +537,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
                 let (advance, line_advance_addend) = tabs.advance(bytes[i], r.advance, line_adv);
                 line_col += 1;
                 line_adv += line_advance_addend;
-                if COLLECT {
-                    let k = cells_of(advance, ascii_adv);
-                    cells += k;
-                    unit_cells += k;
-                    if fold_unit > 0 && line_col % fold_unit == 0 {
-                        width_cells = width_cells.max(unit_cells);
-                        unit_cells = 0;
-                    }
-                }
                 if fold_unit > 0 {
                     if line_col % fold_unit == 0 {
                         seg_adv = 0.0;
@@ -781,15 +561,6 @@ fn pass1_prepass_chunk_walk<const COLLECT: bool>(
         // Once per line, outside the per-byte loop (the lane-limit check).
         if line_col as u32 > max_line_cols {
             max_line_cols = line_col as u32;
-        }
-        if COLLECT {
-            out.lines.push(ChunkLine {
-                start: pos as u32,
-                glyphs: line_survivors,
-                col: line_col as u32,
-                width_cells: width_cells.max(unit_cells),
-                terminated: nl_pos < bytes.len(),
-            });
         }
 
         if nl_pos < bytes.len() {
@@ -845,19 +616,6 @@ pub(crate) fn pass1_prepass_chunks(
     pass1_over_chunks(chunks, item_chunk_ranges, &item_bytes, &file_params, trie, bitmap_adv, em_height_fu)
 }
 
-/// [`pass1_over_chunks`] without a line table.
-fn pass1_over_chunks(
-    chunks: &[chunk::LayoutChunk<'_>],
-    item_chunk_ranges: &[std::ops::Range<usize>],
-    item_bytes: &[&[u8]],
-    file_params: &[crate::layout::ItemParams],
-    trie: &TrieTable,
-    bitmap_adv: f32,
-    em_height_fu: u32,
-) -> PrepassAggregate {
-    pass1_over_chunks_with_lines(chunks, item_chunk_ranges, item_bytes, file_params, trie, bitmap_adv, em_height_fu, None)
-}
-
 /// Whether a chunk starts mid-line: an intra-line cut (`chunk.rs`).
 #[inline]
 fn chunk_continues_line(item_bytes: &[u8], byte_offset: usize) -> bool {
@@ -867,10 +625,7 @@ fn chunk_continues_line(item_bytes: &[u8], byte_offset: usize) -> bool {
 /// Pass 1 proper, shared by the inline path ([`pass1_prepass_chunks`]) and
 /// the background prefetch ([`prefetch_hyper`]): the per-chunk walk in
 /// parallel, the serial aggregation, then the continued lines measured.
-/// With `line_segment_bytes` the walk also collects the line table
-/// (`line_table.rs`), cuts planned at that spacing.
-#[expect(clippy::too_many_arguments, reason = "the chunk list plus the per-load constants Pass 1 reads, passed apart; not yet bundled")]
-pub(crate) fn pass1_over_chunks_with_lines(
+pub(crate) fn pass1_over_chunks(
     chunks: &[chunk::LayoutChunk<'_>],
     item_chunk_ranges: &[std::ops::Range<usize>],
     item_bytes: &[&[u8]],
@@ -878,7 +633,6 @@ pub(crate) fn pass1_over_chunks_with_lines(
     trie: &TrieTable,
     bitmap_adv: f32,
     em_height_fu: u32,
-    line_segment_bytes: Option<usize>,
 ) -> PrepassAggregate {
     let max_fold_unit = file_params
         .iter()
@@ -904,50 +658,20 @@ pub(crate) fn pass1_over_chunks_with_lines(
         }
     }
 
-    let segment_bytes = line_segment_bytes.unwrap_or(SEGMENT_BYTES).max(1);
-    // Two collects, not one with a tuple: a load that wants no table keeps
-    // the indexed single-allocation collect it always had (an `unzip` over
-    // the parallel iterator folds through a list and cost the M2 a measurable
-    // slice of an 11 ms Pass 1, 2026-10-10).
-    let (chunk_prepasses, chunk_lines): (Vec<ChunkPrepass>, Vec<ChunkLines>) = if line_segment_bytes.is_none() {
-        let cps: Vec<ChunkPrepass> = chunks
-            .par_iter()
-            .map(|chunk| {
-                pass1_prepass_chunk_bytes(
-                    chunk.bytes,
-                    &file_params[chunk.item_index],
-                    trie,
-                    bitmap_adv,
-                    em_height_fu,
-                    &global_seg_adv_table,
-                    chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
-                    None,
-                    segment_bytes,
-                )
-            })
-            .collect();
-        (cps, Vec::new())
-    } else {
-        let both: Vec<(ChunkPrepass, ChunkLines)> = chunks
-            .par_iter()
-            .map(|chunk| {
-                let mut lines = ChunkLines::default();
-                let cp = pass1_prepass_chunk_bytes(
-                    chunk.bytes,
-                    &file_params[chunk.item_index],
-                    trie,
-                    bitmap_adv,
-                    em_height_fu,
-                    &global_seg_adv_table,
-                    chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
-                    Some(&mut lines),
-                    segment_bytes,
-                );
-                (cp, lines)
-            })
-            .collect();
-        both.into_iter().unzip()
-    };
+    let chunk_prepasses: Vec<ChunkPrepass> = chunks
+        .par_iter()
+        .map(|chunk| {
+            pass1_prepass_chunk_bytes(
+                chunk.bytes,
+                &file_params[chunk.item_index],
+                trie,
+                bitmap_adv,
+                em_height_fu,
+                &global_seg_adv_table,
+                chunk_continues_line(item_bytes[chunk.item_index], chunk.byte_offset),
+            )
+        })
+        .collect();
 
     let mut agg = aggregate_chunk_prepasses(
         &chunk_prepasses,
@@ -959,49 +683,6 @@ pub(crate) fn pass1_over_chunks_with_lines(
         em_height_fu,
     );
     measure_continued_lines(&mut agg, chunks, item_bytes, file_params, trie, bitmap_adv, em_height_fu);
-    if line_segment_bytes.is_some() {
-        let chunk_continues: Vec<bool> = chunks
-            .iter()
-            .map(|c| chunk_continues_line(item_bytes[c.item_index], c.byte_offset))
-            .collect();
-        let mut table = line_table::assemble(
-            &chunk_lines,
-            item_chunk_ranges,
-            chunks,
-            &chunk_continues,
-            &agg.chunk_initial_cols,
-            &agg.chunk_initial_seg_advs,
-            &agg.chunk_initial_line_advs,
-            file_params,
-            ascii_adv,
-            segment_bytes,
-        );
-        line_table::seed_continued_lines(
-            &mut table,
-            chunks,
-            &chunk_continues,
-            &agg.chunk_initial_cols,
-            &agg.chunk_initial_seg_advs,
-            &agg.chunk_initial_line_advs,
-            file_params,
-            trie,
-            bitmap_adv,
-            em_height_fu,
-        );
-        line_table::measure_continued_line_widths(
-            &mut table,
-            chunks,
-            &chunk_continues,
-            &agg.chunk_initial_cols,
-            &agg.chunk_initial_seg_advs,
-            &agg.chunk_initial_line_advs,
-            file_params,
-            trie,
-            bitmap_adv,
-            em_height_fu,
-        );
-        agg.line_table = Some(table);
-    }
     agg
 }
 
@@ -1248,7 +929,6 @@ pub(crate) fn aggregate_chunk_prepasses(
         chunk_initial_seg_advs,
         chunk_initial_line_advs,
         total_survivors,
-        line_table: None,
     }
 }
 
@@ -1352,12 +1032,9 @@ fn measure_continued_lines(
 }
 
 /// Computes Pass 1 chunk prepasses ahead of time during repository prefetching.
-/// For the Visible field the walk also collects the line table, so the
-/// background Pass 1 is the whole of the load's layout work.
 pub fn prefetch_hyper(
     files: &[crate::repo::RepoFile],
     file_params: &[crate::layout::ItemParams],
-    field_mode: GlyphFieldMode,
 ) -> PrefetchedHyperData {
     let trie = crate::default_trie();
     let em_height_fu = trie.metrics.em_height_fu;
@@ -1374,7 +1051,7 @@ pub fn prefetch_hyper(
         })
         .collect();
 
-    let aggregate = pass1_over_chunks_with_lines(
+    let aggregate = pass1_over_chunks(
         &chunks,
         &item_chunk_ranges,
         &byte_slices,
@@ -1382,7 +1059,6 @@ pub fn prefetch_hyper(
         &trie,
         bitmap_adv,
         em_height_fu,
-        (field_mode == GlyphFieldMode::Visible).then_some(SEGMENT_BYTES),
     );
 
     PrefetchedHyperData {
@@ -1402,8 +1078,8 @@ pub fn prefetch_hyper(
 /// survivors, built from the same Pass 1 calls `layout_items_internal` makes.
 /// This hands it a host `Vec`. What it does not reach is what happens to the
 /// bytes afterwards (the staging copy into VRAM, chunking across buffers)
-/// and the background prefetch of Pass 1 (`prefetch_hyper`, which
-/// `repo-verify` holds to the inline Pass 1 used here).
+/// and the background prefetch of Pass 1 (`prefetch_hyper`, which runs the
+/// same Pass 1 driver, `pass1_over_chunks`, as the inline Pass 1 used here).
 fn device_pass2_on_host<E: pass2_device::SlotEmit>(
     items: &[LayoutItem<'_>],
     trie: &TrieTable,
@@ -2214,19 +1890,18 @@ mod tests {
         assert_eq!(derived_lane_limits(&many[..ITEM_MAX as usize + 1], &params[..ITEM_MAX as usize + 1]), Ok(()));
     }
 
-    /// The fallback decision: Derived and Visible past the lanes become
-    /// Instanced with a warning that names the reason; within them, or for
-    /// Instanced itself, the request stands and nothing is said.
+    /// The fallback decision: Derived past the lanes becomes Instanced with
+    /// a warning that names the reason; within them, or for Instanced
+    /// itself, the request stands and nothing is said.
     #[test]
     fn effective_field_mode_falls_back_to_instanced_past_the_lanes() {
         let refused: Result<(), String> = Err("item 7: too many rows".into());
-        for mode in [GlyphFieldMode::Derived, GlyphFieldMode::Visible] {
-            let (got, note) = effective_field_mode(mode, &refused);
-            assert_eq!(got, GlyphFieldMode::Instanced);
-            let note = note.expect("a fallback is announced");
-            assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
-            assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
-        }
+        let mode = GlyphFieldMode::Derived;
+        let (got, note) = effective_field_mode(mode, &refused);
+        assert_eq!(got, GlyphFieldMode::Instanced);
+        let note = note.expect("a fallback is announced");
+        assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
+        assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
         assert_eq!(effective_field_mode(GlyphFieldMode::Instanced, &refused), (GlyphFieldMode::Instanced, None));
     }
 

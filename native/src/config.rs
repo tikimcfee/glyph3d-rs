@@ -59,13 +59,13 @@ pub struct GlyphSceneSettings {
 /// Far-LOD substitution (`glyph_scene::cull`) and text detail (the glyph
 /// shaders' greeking). Every threshold is px per text row — how many
 /// on-screen pixels tall a row appears — fixed, never camera-adapted; the
-/// Debug panel keeps them ordered `text_detail_px >= show_glyphs_px >=
-/// visible_backdrop_px` (`UiProbeState::keep_lod_order`).
+/// Debug panel keeps them ordered `text_detail_px >= show_glyphs_px`
+/// (`UiProbeState::keep_lod_order`).
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LodSettings {
     /// "Show glyphs": at or above this a segment is drawn as glyphs; below
-    /// it, its backdrop rectangle (visible mode: a line wash). Default for
+    /// it, its backdrop rectangle. Default for
     /// `--show-glyphs-px`. Was `min_px` until 2026-10-10 (C26); the old key
     /// in a launch_config.toml `[lod]` section is renamed before the merge
     /// (`RENAMED_SETTINGS_KEYS`).
@@ -76,12 +76,6 @@ pub struct LodSettings {
     pub text_detail_px: f32,
     /// Backdrop coverage gain: backdrop alpha = ink fraction x gain.
     pub backdrop_gain: f32,
-    /// `--field-mode visible` only: below this a whole item collapses to
-    /// its backdrop rectangle. Between this and `show_glyphs_px` its lines
-    /// are WASHES (one quad per line); at or above `show_glyphs_px` they are
-    /// laid out as glyphs. The panel's "File rectangle" handle under "Show
-    /// glyphs". The other modes never read it.
-    pub visible_backdrop_px: f32,
 }
 
 /// The layout recipe's defaults for a repo load (`repo::RepoParams`, and
@@ -583,7 +577,6 @@ mod tests {
         // until C26 (2026-10-10).
         assert_eq!(s.lod.text_detail_px, 10.0f32);
         assert_eq!(s.lod.backdrop_gain, 0.7f32);
-        assert_eq!(s.lod.visible_backdrop_px, 0.25f32);
         // Not a migrated literal but the same standing: one cell is the tab
         // every golden view and fixture was taken under (2026-10-11).
         assert_eq!(s.layout.tab_width(), crate::fold::TabWidth::ONE_CELL);

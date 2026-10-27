@@ -7,7 +7,7 @@ byte) and the glyph-lookup trie stay resident on the GPU. Each frame a compute
 pass runs one serial fold per visible line (UTF-8 decode, emoji-sequence trie
 chain, wrap, paginate) and writes a transient `DerivedSlot` buffer that the
 Derived vertex shader draws. Lines too small to read become one quad each.
-Sources for the glyph3d side are the repo's own `out/VISIBLE-MODE.md` (M1/M2)
+Sources for the glyph3d side are the repo's own `out/history/VISIBLE-MODE.md` (M1/M2)
 and `out/GPU-DIRECTION-2026-10-09.md` §2 (a design argument that the line,
 not the byte, is the parallel unit, and that "Nobody ships this: Slug takes
 CPU-placed quads; Vello/Parley shape and wrap on the CPU; GPUI lays out on

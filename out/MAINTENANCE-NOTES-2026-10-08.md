@@ -223,7 +223,7 @@ byte-equal plain and under both equivalents (`--field-mode derived`;
 `--field-mode visible` with five syntax views exempt). Visible mode is the
 experiment that worked: Ivan loads near-whole repos on the M2 at a locked
 frame rate; C28-C30 found by his testing were fixed or fenced, and he
-confirmed C29's and C30's fixes by eye. (`out/VISIBLE-MODE.md` is its log.)
+confirmed C29's and C30's fixes by eye. (`out/history/VISIBLE-MODE.md` is its log.)
 
 **Ivan's decisions pending:**
 - ~~Adopt the five flat candidate goldens (`visible-flat/`)~~ — superseded

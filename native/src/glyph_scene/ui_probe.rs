@@ -12,38 +12,25 @@ pub enum LodHandle {
     TextDetail,
     /// "Show glyphs" (`lod_min_px`).
     ShowGlyphs,
-    /// "File rectangle", the Visible field's tier under Show glyphs
-    /// (`lod_backdrop_px`).
-    FileRectangle,
 }
 
-/// Keep the three LOD tiers ordered after `moved` changed: text detail >=
-/// show glyphs >= file rectangle (all px per text row). The handle that
+/// Keep the two LOD tiers ordered after `moved` changed: text detail >=
+/// show glyphs (both px per text row). The handle that
 /// moved keeps its value and the others yield — a clamp, never an error —
 /// so glyphs always appear fuzzed first and sharpen as the viewer
 /// approaches. Only the panel calls this, on a slider change: values that
 /// arrive from the CLI or a config file are applied as given.
-pub fn keep_lod_order(moved: LodHandle, text_detail: &mut f32, show_glyphs: &mut f32, file_rectangle: &mut f32) {
+pub fn keep_lod_order(moved: LodHandle, text_detail: &mut f32, show_glyphs: &mut f32) {
     match moved {
-        LodHandle::TextDetail => {
-            *show_glyphs = show_glyphs.min(*text_detail);
-            *file_rectangle = file_rectangle.min(*show_glyphs);
-        }
-        LodHandle::ShowGlyphs => {
-            *text_detail = text_detail.max(*show_glyphs);
-            *file_rectangle = file_rectangle.min(*show_glyphs);
-        }
-        LodHandle::FileRectangle => {
-            *show_glyphs = show_glyphs.max(*file_rectangle);
-            *text_detail = text_detail.max(*show_glyphs);
-        }
+        LodHandle::TextDetail => *show_glyphs = show_glyphs.min(*text_detail),
+        LodHandle::ShowGlyphs => *text_detail = text_detail.max(*show_glyphs),
     }
 }
 
 impl UiProbeState {
-    /// `keep_lod_order` over this state's three live thresholds.
+    /// `keep_lod_order` over this state's two live thresholds.
     pub fn keep_lod_order(&mut self, moved: LodHandle) {
-        keep_lod_order(moved, &mut self.greek_onset_px, &mut self.lod_min_px, &mut self.lod_backdrop_px);
+        keep_lod_order(moved, &mut self.greek_onset_px, &mut self.lod_min_px);
     }
 }
 
@@ -51,31 +38,25 @@ impl UiProbeState {
 mod lod_order_tests {
     use super::{keep_lod_order, LodHandle};
 
-    fn after(moved: LodHandle, detail: f32, show: f32, rect: f32) -> (f32, f32, f32) {
-        let (mut d, mut s, mut r) = (detail, show, rect);
-        keep_lod_order(moved, &mut d, &mut s, &mut r);
-        (d, s, r)
+    fn after(moved: LodHandle, detail: f32, show: f32) -> (f32, f32) {
+        let (mut d, mut s) = (detail, show);
+        keep_lod_order(moved, &mut d, &mut s);
+        (d, s)
     }
 
     #[test]
-    fn the_moved_handle_wins_and_the_others_yield() {
+    fn the_moved_handle_wins_and_the_other_yields() {
         // Show glyphs dragged above text detail: detail follows it up.
-        assert_eq!(after(LodHandle::ShowGlyphs, 10.0, 12.0, 0.25), (12.0, 12.0, 0.25));
-        // Text detail dragged below show glyphs: show glyphs follows it down,
-        // and the file rectangle under it too.
-        assert_eq!(after(LodHandle::TextDetail, 0.5, 1.0, 0.25), (0.5, 0.5, 0.25));
-        assert_eq!(after(LodHandle::TextDetail, 0.1, 1.0, 0.25), (0.1, 0.1, 0.1));
-        // File rectangle dragged above both: both follow it up.
-        assert_eq!(after(LodHandle::FileRectangle, 2.0, 1.0, 3.0), (3.0, 3.0, 3.0));
-        // Show glyphs dragged below the file rectangle: the rectangle follows.
-        assert_eq!(after(LodHandle::ShowGlyphs, 10.0, 0.1, 0.25), (10.0, 0.1, 0.1));
+        assert_eq!(after(LodHandle::ShowGlyphs, 10.0, 12.0), (12.0, 12.0));
+        // Text detail dragged below show glyphs: show glyphs follows it down.
+        assert_eq!(after(LodHandle::TextDetail, 0.5, 1.0), (0.5, 0.5));
     }
 
     #[test]
     fn an_ordered_set_is_untouched_whichever_handle_moved() {
-        for moved in [LodHandle::TextDetail, LodHandle::ShowGlyphs, LodHandle::FileRectangle] {
-            assert_eq!(after(moved, 10.0, 1.0, 0.25), (10.0, 1.0, 0.25), "{moved:?}");
-            assert_eq!(after(moved, 1.0, 1.0, 1.0), (1.0, 1.0, 1.0), "{moved:?} (equal is ordered)");
+        for moved in [LodHandle::TextDetail, LodHandle::ShowGlyphs] {
+            assert_eq!(after(moved, 10.0, 1.0), (10.0, 1.0), "{moved:?}");
+            assert_eq!(after(moved, 1.0, 1.0), (1.0, 1.0), "{moved:?} (equal is ordered)");
         }
     }
 }
@@ -105,11 +86,10 @@ pub struct UiProbeState {
     /// stdout pick log line.
     pub last_pick: Option<String>,
     /// The current selection in the field's own key (`Selection::describe`):
-    /// `item:start..end` for the Visible field, the slot or slot range for
-    /// the stored modes. None when nothing is selected.
+    /// the slot or slot range. None when nothing is selected.
     pub selection: Option<String>,
     /// The last pick's key, compact: `file byte N` for a glyph, `file (file)`
-    /// for a file-level pick — what the Visible field's verbs address.
+    /// for a file-level pick.
     pub pick_key: Option<String>,
     // ── K4: UI → scene controls. Written by the Debug-panel sliders;
     // applied by render() before culling. Seeded from the compile-time
@@ -117,16 +97,8 @@ pub struct UiProbeState {
     // rule there. ──
     /// Live "Show glyphs" threshold, px per text row (default: `[lod]
     /// show_glyphs_px`): at or above it a segment is glyphs, below it a
-    /// backdrop rectangle (visible mode: a line wash).
+    /// backdrop rectangle.
     pub lod_min_px: f32,
-    /// Live "File rectangle" threshold of the Visible field, px per text row
-    /// (default: `[lod] visible_backdrop_px`); lines between it and
-    /// `lod_min_px` are washes. Unread by the other modes.
-    pub lod_backdrop_px: f32,
-    /// Live debug tint of the Visible field (`--debug-tint`): 0 off, 1 by
-    /// LOD tier, 2 by cull state. Written to the Params uniform's spare
-    /// lane; the other modes' shaders never read it.
-    pub debug_tint: u32,
     /// Live file background cards toggle.
     pub file_backgrounds: bool,
     /// Live file background cards color.
@@ -150,8 +122,6 @@ pub struct UiProbeState {
     /// Cull segments (one per file) and how many are user-hidden.
     pub segments: usize,
     pub hidden_segments: usize,
-    /// The Visible field's own counters (None for the stored modes).
-    pub visible_stats: Option<glyph_field_visible::VisibleStats>,
     // ── Layout dial (repo scenes): the wrap staircase's pitch. Unlike the
     // K4 controls this is LAYOUT, not a per-frame cull input — applying it
     // re-runs load_repo and rebuilds the scene (windowed.rs's
@@ -316,23 +286,20 @@ impl GlyphScene {
         let layout_mode = self.probe_layout_mode;
         let strategy = self.probe_strategy;
         let field_mode = Some(self.field.mode());
-        let (file_backgrounds, file_bg_color, lod_min_px, lod_backdrop_px) = self
+        let (file_backgrounds, file_bg_color, lod_min_px) = self
             .cull
             .as_ref()
-            .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get(), c.lod_backdrop_px.get()))
+            .map(|c| (c.file_backgrounds.get(), c.file_bg_color.get(), c.lod_min_px.get()))
             .unwrap_or_else(|| {
                 let s = crate::config::settings();
-                (false, s.glyph_scene.file_bg_color, s.lod.show_glyphs_px, s.lod.visible_backdrop_px)
+                (false, s.glyph_scene.file_bg_color, s.lod.show_glyphs_px)
             });
         let mode = self.params.get().greek_mode;
         let greeking = mode != 0;
         let greek_pure = mode == 2;
         let greek_onset_px = self.params.get().greek_onset_px;
-        let debug_tint = self.params.get().debug_tint;
         let probe = UiProbe::new(std::cell::RefCell::new(UiProbeState {
             lod_min_px,
-            lod_backdrop_px,
-            debug_tint,
             file_backgrounds,
             file_bg_color,
             greeking,

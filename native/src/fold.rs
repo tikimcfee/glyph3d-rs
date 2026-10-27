@@ -76,13 +76,6 @@ pub const TRIE_FLAG_MISSING: u32 = 1;
 /// (each segment starts at x = 0), and the wrap SEGMENT index still exists in both
 /// modes — under `Back` it feeds z and no longer feeds row. Picking by (row, col)
 /// still resolves uniquely because col differs between segments.
-///
-/// WHY IT IS ITEM-LEVEL AND MUST STAY THAT WAY: `scan::scan_combine`'s junction term
-/// evaluates `rows_for_line` with `b`'s parameters, so it is not associative across a
-/// change of them. Mode joins wrap in that term, which makes the non-associative
-/// surface WIDER, not narrower. What keeps the scan form safe is structural and
-/// unchanged: an item boundary emits a resetting leaf, so no interval without a reset
-/// spans two items. See `scan::tests::mixed_mode_is_outside_the_monoid_s_domain`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum WrapMode {
@@ -209,11 +202,10 @@ impl ClusterMode {
 ///
 /// WHY DISPLAY CELLS FROM THE LOGICAL LINE, measured against the other two
 /// choices. It is EXACT: every atlas advance is a whole number of cells
-/// (`line_table::tests::every_trie_advance_is_whole_cells`), so a line's
+/// (`tab_stop::tests::every_trie_advance_is_whole_cells`), so a line's
 /// cell count is an integer, and every engine already carries it or recovers
-/// it exactly — the f64 line advance is exactly `cells × cell`, and the
-/// Visible field's segment seeds carry `cells`. It is CHEAP: the count never
-/// resets at a fold boundary, so a chunk or segment seeded mid-line needs no
+/// it exactly — the f64 line advance is exactly `cells × cell`. It is CHEAP:
+/// the count never resets at a fold boundary, so a chunk seeded mid-line needs no
 /// state it did not already have, and nothing but a tab reads it. Leader
 /// columns are wrong as soon as a line holds two tabs (the second would be
 /// measured from a column the first did not advance) or a double-width glyph;
@@ -223,8 +215,8 @@ impl ClusterMode {
 /// THE MEASURES of a tab that spans `k` cells: its ADVANCE lane, and the f32
 /// segment carrier's addend, is `f32(k) × cell` — one correctly rounded
 /// product (WGSL's `*` is correctly rounded too); the f64 line advance takes
-/// `k × cell` exactly, so it stays `cells × cell` and the foldless x and the
-/// Visible seeds stay exact. Its COLUMN is still one leader: wrap, rows,
+/// `k × cell` exactly, so it stays `cells × cell` and the foldless x stays
+/// exact. Its COLUMN is still one leader: wrap, rows,
 /// pages and pick are untouched, as they are by a double-width glyph.
 ///
 /// NO ORACLE past one cell: the JS oracle and the fixture corpus know only
@@ -240,7 +232,7 @@ impl TabWidth {
     pub const ONE_CELL: TabWidth = TabWidth(1);
     /// The widest stop accepted — a bound on input, not on the arithmetic
     /// (`f32(k)` is exact far past it): a stop wider than any editor offers
-    /// is a typo, and the Visible kernel's u32 cell counts stay small.
+    /// is a typo.
     pub const MAX_CELLS: u32 = 64;
 
     /// A width of `cells` cells, refused outside `1..=MAX_CELLS` (a stop
@@ -413,23 +405,11 @@ impl Slots {
     pub fn base_x(&self, id: usize) -> f32 {
         self.lm[id * 4 + 3]
     }
-    /// The scan form writes these from `resolve_x`, a separate dispatch from
-    /// the one that assigns row/col — hence setters the serial fold does not
-    /// need, since it computes a position and its lanes in the same breath.
-    #[inline]
-    pub(crate) fn set_position(&mut self, id: usize, x: f32, y: f32, z: f32) {
-        self.lm[id * 4] = x;
-        self.lm[id * 4 + 1] = y;
-        self.lm[id * 4 + 2] = z;
-    }
+    /// A test's way to plant a base x (the fold computes it with the position).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn set_base_x(&mut self, id: usize, v: f32) {
         self.lm[id * 4 + 3] = v;
-    }
-    #[inline]
-    pub(crate) fn zero_positional(&mut self, id: usize) {
-        self.lm[id * 4..id * 4 + 4].fill(0.0);
-        self.lc[id * 2..id * 2 + 2].fill(0);
     }
 
     #[inline]

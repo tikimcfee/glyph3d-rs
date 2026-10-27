@@ -46,32 +46,6 @@ impl std::str::FromStr for PresentMode {
     }
 }
 
-/// The Visible field's debug tint (`--debug-tint`): colour each glyph by the
-/// LOD tier its line landed in, or by its item's cull state. A diagnostic
-/// lane in the Params uniform; the Instanced and Derived shaders never read
-/// it, so it moves no pixel there.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum DebugTint {
-    #[default]
-    Off,
-    /// Colour by LOD tier (glyph / wash / backdrop).
-    Lod,
-    /// Colour by cull state (visible / culled by frustum / culled by LOD).
-    Cull,
-}
-
-impl DebugTint {
-    /// The uniform's encoding (`FramePrepare::debug_tint`).
-    pub fn as_u32(self) -> u32 {
-        match self {
-            DebugTint::Off => 0,
-            DebugTint::Lod => 1,
-            DebugTint::Cull => 2,
-        }
-    }
-}
-
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
@@ -89,8 +63,8 @@ VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
   move-group dx dy dz | scale-group s
   tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden
   set-glyph-background rrggbb[aa] | set-glyph-transform tx ty tz [s] | reset-glyph-group
-  (--field-mode visible keys the glyph verbs by item:byte; nudge is x-only
-  and scale-glyph is not representable there, as in derived)
+  (in --field-mode derived, nudge is x-only and scale-glyph is not
+  representable)
 
 WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
@@ -161,15 +135,6 @@ pub struct Cli {
     /// EVERY lane of EVERY byte plus boxes and the batch union, then exit.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub fixture_fold: Vec<PathBuf>,
-    /// Scan form: run the ported scan form over each .pipe.bin at a SWEEP of
-    /// chunk/group/shard tunings and compare under the tiered contract, then
-    /// exit. Invariance across the tunings is associativity in situ.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub fixture_scan: Vec<PathBuf>,
-    /// Bake: replay each .bake.bin through the ported bake and diff the
-    /// record AND every seed-protocol query bit-exact, then exit.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub fixture_bake: Vec<PathBuf>,
     /// HyperLayout against the oracle-backed fold: lay each input out with the
     /// production engine and with `fold.rs` (held to the JS oracle by
     /// `--fixture-fold`), diff records, instances and placements bit-exact,
@@ -178,29 +143,15 @@ pub struct Cli {
     /// or single text files.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub hyper_oracle_check: Vec<PathBuf>,
-    /// Build the visible-set line table (Pass 1's per-line index and the
-    /// long-line segment seeds, `layout_hyper/line_table.rs`) over the given
-    /// inputs and print what it holds — lines, seeds, bytes — then exit. The
-    /// same inputs `--hyper-oracle-check` takes.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub line_table_stats: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     pub load_repo: Option<PathBuf>,
     /// Which layout engine a repo load uses. `hyper` (the DEFAULT) is the
     /// parallel CPU HyperLayout, writing render instances straight into the
     /// arena with its inputs prefetched in the background. `direct`,
-    /// `batch` and `naive` run the same HyperLayout without the prefetch;
-    /// under `--repo-verify`, `direct` records no 32 B wire records
-    /// (placements and instances are diffed, records are not) while `batch`
-    /// and `naive` do.
+    /// `batch` and `naive` run the same HyperLayout without the prefetch.
     #[arg(long, value_name = "MODE", default_value = "hyper")]
     pub repo_engine: crate::repo::Strategy,
-    /// Diff the chosen strategy against a counterpart, bit-exact over the
-    /// whole repo: placements and instances always, wire records when both
-    /// paths have them (`direct` has none, and the PASS line says so).
-    #[arg(long)]
-    pub repo_verify: bool,
     /// How a wrap is spent on a repo load: `back` (the default, and what the
     /// `repo-wide`/`repo-zoom` byte-equal screenshot baselines are taken
     /// under; `repo-down` covers the other) keeps the row and steps the
@@ -253,18 +204,12 @@ pub struct Cli {
     /// Glyph field render mode: `derived` (default since 2026-10-11: compact
     /// 20 B record per glyph, x stored, Y/Z derived in the vertex stage from
     /// the item table), `instanced` (one full 32 B placement record per
-    /// glyph, read as-is by the vertex stage; being retired), or `visible`
-    /// (no slot per glyph — the source bytes and a line table are resident
-    /// and the lines in view are laid out per frame on the GPU;
-    /// `out/VISIBLE-MODE.md`). Switchable live from the Debug panel's
+    /// glyph, read as-is by the vertex stage; being retired). Switchable
+    /// live from the Debug panel's
     /// selector (the scene rebuilds); a load past the Derived slot lanes
     /// falls back to `instanced` and says so.
     #[arg(long, value_name = "MODE", default_value = "derived")]
     pub field_mode: glyph_field::GlyphFieldMode,
-    /// Visible field only: tint glyphs by `lod` tier or `cull` state (`off`
-    /// by default). The other modes ignore it; the F8 HUD names the active one.
-    #[arg(long, value_name = "MODE", default_value = "off")]
-    pub debug_tint: DebugTint,
     /// Ground/sky environment behind the glyph scene: `off` or `ground`
     /// (default: `[environment] mode` in config, itself `off`). Windowed:
     /// the B key toggles it live.
@@ -307,7 +252,7 @@ pub struct Cli {
     #[arg(long, value_name = "R,G,B,A", value_parser = parse_rgba)]
     pub file_bg_color: Option<[f32; 4]>,
     /// "Show glyphs": px per text row at or above which a file is drawn as
-    /// glyphs; below it, a backdrop rectangle (visible mode: a line wash).
+    /// glyphs; below it, a backdrop rectangle.
     /// Default: the config's lod.show_glyphs_px (1.0). Was --lod-min-px, still accepted
     #[arg(long, alias = "lod-min-px", value_name = "F")]
     pub show_glyphs_px: Option<f32>,
@@ -385,27 +330,22 @@ pub struct RawOps {
 
 /// Whether this run looks for a personal `launch_config.toml` on its own.
 /// Only an interactive run does. Screenshot runs never do, and neither does
-/// any run that checks or measures (`--repo-verify`, `--repo-scan-only`, the
-/// `--fixture-*` and `--hyper-oracle-check` instruments, `--line-table-stats`,
+/// any run that checks or measures (`--repo-scan-only`, the
+/// `--fixture-*` and `--hyper-oracle-check` instruments,
 /// `--gpu-key` / `--gpu-profile`, `--generate`): every gate launches the
 /// binary as one of these, and a personal override (a color, a wrap mode, a
 /// field mode) must not reach what a gate compares. Until 2026-10-10 only
-/// `--screenshot` was excluded, and a launcher-saved `field_mode = "visible"`
-/// in the checkout's `launch_config.toml` turned repo-verify-direct red
-/// (`direct` lays out no instances in visible mode).
+/// `--screenshot` was excluded, and a launcher-saved field mode in the
+/// checkout's `launch_config.toml` turned a gate red.
 pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
-    let checks = cli.repo_verify
-        || cli.repo_scan_only
+    let checks = cli.repo_scan_only
         || cli.gpu_key
         || cli.gpu_profile
         || cli.generate.is_some()
         || !cli.fixture_reference.is_empty()
         || !cli.fixture_trie.is_empty()
         || !cli.fixture_fold.is_empty()
-        || !cli.fixture_scan.is_empty()
-        || !cli.fixture_bake.is_empty()
-        || !cli.hyper_oracle_check.is_empty()
-        || !cli.line_table_stats.is_empty();
+        || !cli.hyper_oracle_check.is_empty();
     cli.screenshot.is_none() && !checks
 }
 
@@ -495,7 +435,6 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(layout_mode);
     under!(repo_engine);
     under!(field_mode);
-    under!(debug_tint);
     under!(present_mode);
     under!(Some frames);
     let scene_typed = ["demo", "agent_session", "load_repo", "render_file"]

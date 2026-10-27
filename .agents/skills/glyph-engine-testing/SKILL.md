@@ -16,6 +16,7 @@ false).
 | Intent | Command | What it does |
 | :--- | :--- | :--- |
 | Iterate | `cargo glyph test <scope>` | Brings the renderer up to date, then runs the gates for a scope: `rust` (build, no-UI check, clippy, doc, orphan modules, tests: no pixels), `render` (anything that moves a pixel: pixel-ab, picks, layout oracles), `corpus` (fixtures, generators, vendored inputs). The verdict line says how many gates ran. |
+| After each change | `cargo glyph test --inner` | Every gate but the merge tier (warnings, clippy, rustdoc, no-default-features builds), which it names as skipped. Under a minute after a one-line edit on the Linux host. Not a landing run. |
 | Land | `cargo glyph test` | All gates. Red on any warning, failed test, test count under `test_floor`, or golden mismatch. |
 | Validate a commit | `cargo glyph test --frozen` | Asserts the renderer is already current instead of building it; staleness IS the finding. |
 | One check | `cargo glyph gate <name>` | A single gate by name (`cargo glyph gates` lists them, with what each cannot see). |
@@ -38,12 +39,10 @@ tool; re-baselining is a human act (root `AGENTS.md` § pixel-ab).
   `long.md`, `text.rs`, `emoji-view.txt`).
 - `hyper-oracle`: HyperLayout, the production engine, held to the
   oracle-backed fold bit-for-bit (records, host and device Pass 2 in both
-  slot formats, paint, and the visible kernel against Pass 2) over the
+  slot formats) over the
   fixture corpus, `g-pick-repo`, `g-cluster-repo` and the chunk-cut fixtures.
 - `pixel-ab`: the golden views byte-compared per rasterizer key, plain and
-  under each `golden_equivalents` entry (`--field-mode instanced`,
-  `--field-mode visible`; five syntax views are exempt from the visible one,
-  by name, and their distance is still printed).
+  under each `golden_equivalents` entry (`--field-mode instanced`).
 
 ## 3. Performance
 
@@ -56,8 +55,7 @@ python3 tools/bench_hyper.py --repo "$GLYPH_FLAGSHIP_REPO" -n 5 --field-mode der
 It reports walk, Pass 1, Pass 2, backend total (MB/s) and visual init. For
 one run with the stats line, `cargo glyph run --load-repo <dir> --frames 1`.
 Report interleaved A/B runs with machine load noted; the M2 is fanless and
-needs cool-downs. Visible mode's GPU timings: `GLYPH_VISIBLE_TIMING=1` (per
-frame, offscreen) or the F8 HUD.
+needs cool-downs.
 
 ## 4. Launcher vs in-app UI
 

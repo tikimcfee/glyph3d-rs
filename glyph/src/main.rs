@@ -31,14 +31,18 @@ mod manifest;
 mod paths;
 mod products;
 mod prove;
+mod schedule;
+mod test_build;
+mod prove_relax;
 
 use clap::{Parser, Subcommand};
 use std::process::{Command, ExitCode};
 
 use crate::artifacts::verify_committed;
 use crate::gates::run_gate;
+use crate::schedule::{run_gates, time_line};
 use crate::golden::cmd_drift;
-use crate::manifest::{Gate, load, Manifest, Scope, validate};
+use crate::manifest::{Gate, load, Manifest, Scope, Tier, validate};
 use crate::paths::{resolve_gpu, root, step};
 use crate::products::ensure_products;
 use crate::prove::{cmd_prove, self_exe};
@@ -64,6 +68,11 @@ enum Cmd {
         /// Use this to validate a commit: if something is stale, that IS the finding.
         #[arg(long)]
         frozen: bool,
+        /// Only the `inner` tier: what to run after each change. The `merge`
+        /// gates (the compiler's diagnostics) are skipped, and named; a run
+        /// without this flag runs every tier, and is the one to land on.
+        #[arg(long)]
+        inner: bool,
     },
     /// Bring the renderer up to date, then launch it. Arguments are passed
     /// through; none at all opens its launcher.
@@ -72,7 +81,10 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Prove the checks can fail: apply each declared mutation, require its
-    /// gate to redden for its stated reason, restore.
+    /// gate to redden for its stated reason, restore. A gate that declares
+    /// `relax` has its mutations proven under makepad's relax JIT, in
+    /// parallel and without writing the tree (`GLYPH_RELAX` names the binary;
+    /// prove_relax.rs); the rest on cargo.
     Prove {
         /// Only mutations targeting this gate.
         #[arg(long)]
@@ -96,9 +108,19 @@ enum Cmd {
         /// run would prove, before paying for it. Builds and mutates nothing.
         #[arg(long)]
         list: bool,
+        /// How many relax mutants (and clean-tree runs) go at once. A relax
+        /// process peaks near 3 GB; size it to RAM.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
     },
     /// Run a single check by name. Used by `prove`, and useful on its own.
-    Gate { name: String },
+    Gate {
+        name: String,
+        /// As `glyph test --inner` runs it: a gate's own merge-tier parts
+        /// (pixel-ab's `golden_equivalents_merge`) are skipped, and named.
+        #[arg(long)]
+        inner: bool,
+    },
     /// Check build.toml is internally consistent.
     Validate,
     /// What each check compares, and what it cannot see.
@@ -139,15 +161,25 @@ fn cmd_run(m: &Manifest, args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
+fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool, inner: bool) -> bool {
+    let t_run = std::time::Instant::now();
     step(if frozen { "products: asserting currency (--frozen)" } else { "products" });
     let mut ok = ensure_products(m, frozen);
+    let products = t_run.elapsed().as_secs_f64();
     if !ok && frozen {
         // Everything below would test an artifact we just said is wrong.
         println!("\nCHECK: FAILURES — see above");
         return false;
     }
-    let selected: Vec<&Gate> = m.gate.iter().filter(|g| scope.is_none_or(|s| g.scope == s)).collect();
+    let in_scope: Vec<&Gate> = m.gate.iter().filter(|g| scope.is_none_or(|s| g.scope == s)).collect();
+    let (selected, skipped): (Vec<&Gate>, Vec<&Gate>) =
+        in_scope.into_iter().partition(|g| !inner || g.tier == Tier::Inner);
+    if !skipped.is_empty() {
+        step("skipped: the merge tier (--inner)");
+        for g in &skipped {
+            println!("SKIP  {} — tier merge: runs in a full `glyph test`, not after each change", g.name);
+        }
+    }
     if selected.is_empty() {
         // Say WHY nothing ran, so whoever reads this can tell a wrong scope
         // from a manifest that lost its gates.
@@ -158,12 +190,11 @@ fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool) -> bool {
             println!("        {:<7} {}", scope_name(s), if names.is_empty() { "(none)".to_string() } else { names.join(", ") });
         }
     }
-    for g in &selected {
-        step(&format!("{} — {}", g.name, g.compare.as_deref().unwrap_or("")));
-        ok &= run_gate(g, m);
-    }
-    let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, ok);
+    let ran = run_gates(m, &selected, inner);
+    ok &= ran.iter().all(|r| r.ok);
+    let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, inner, ok);
     println!();
+    println!("{}", time_line(&selected, &ran, products, t_run.elapsed().as_secs_f64()));
     println!("{verdict}");
     ok
 }
@@ -179,11 +210,14 @@ fn scope_name(s: Scope) -> String {
 /// fail shape AGENTS.md warns about. Every verdict also says how many gates
 /// ran, so a reader (or an agent) can see an unexpected count even when the
 /// run is green.
-fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, ok: bool) -> (bool, String) {
-    let which = match scope {
-        Some(s) => format!("{selected} of {total} gates ran, scope {}", scope_name(s)),
-        None => format!("{selected} of {total} gates ran"),
-    };
+fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, inner: bool, ok: bool) -> (bool, String) {
+    let mut which = format!("{selected} of {total} gates ran");
+    if let Some(s) = scope {
+        which.push_str(&format!(", scope {}", scope_name(s)));
+    }
+    if inner {
+        which.push_str(", tier inner — not a landing run");
+    }
     if selected == 0 {
         return (false, format!("CHECK-ALL: NOTHING RAN — {which}; a run that checks nothing is not a pass"));
     }
@@ -233,16 +267,16 @@ fn main() -> ExitCode {
             ok &= verify_committed(&m);
             ok
         }
-        Cmd::Test { scope, frozen } => cmd_test(&m, scope, frozen),
+        Cmd::Test { scope, frozen, inner } => cmd_test(&m, scope, frozen, inner),
         Cmd::Run { args } => cmd_run(&m, &args),
-        Cmd::Prove { gate, mutations, changed, since, list } => {
+        Cmd::Prove { gate, mutations, changed, since, list, jobs } => {
             let since = if changed { Some("HEAD") } else { since.as_deref() };
-            cmd_prove(&m, gate.as_deref(), &mutations, since, list)
+            cmd_prove(&m, gate.as_deref(), &mutations, since, list, jobs)
         }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),
-        Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
-            Some(g) => run_gate(g, &m),
+        Cmd::Gate { name, inner } => match m.gate.iter().find(|g| g.name == name) {
+            Some(g) => run_gate(g, &m, inner),
             None => {
                 println!("FAIL  no gate named {name}");
                 false
@@ -269,7 +303,10 @@ fn main() -> ExitCode {
         }
         Cmd::Gates => {
             for g in &m.gate {
-                println!("  {}  [{:?}]", g.name, g.scope);
+                println!("  {}  [{:?}, tier {:?}]", g.name, g.scope, g.tier);
+                if !g.apart_from.is_empty() {
+                    println!("    apart from : {}", g.apart_from.join(", "));
+                }
                 if let Some(c) = &g.compare {
                     println!("    compares : {c}");
                 }
@@ -282,6 +319,9 @@ fn main() -> ExitCode {
                 if g.kind == manifest::Kind::GoldenVerify {
                     if !m.settings.golden_equivalents.is_empty() {
                         println!("    equivalents : {}", m.settings.golden_equivalents.join("; "));
+                    }
+                    if !m.settings.golden_equivalents_merge.is_empty() {
+                        println!("    merge tier  : {}", m.settings.golden_equivalents_merge.join("; "));
                     }
                     for v in &m.golden_view {
                         for e in &v.exempt {
@@ -331,7 +371,7 @@ mod tests {
 
     #[test]
     fn empty_gate_selection_is_refused() {
-        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), true);
+        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), false, true);
         assert!(!ok, "a run that selected no gate must not pass");
         assert!(line.starts_with("CHECK-ALL: NOTHING RAN"), "{line}");
         assert!(line.contains("0 of 9 gates ran, scope corpus"), "{line}");
@@ -340,11 +380,15 @@ mod tests {
     #[test]
     fn verdict_reports_how_many_gates_ran() {
         assert_eq!(
-            test_verdict(4, 9, Some(Scope::Rust), true),
+            test_verdict(4, 9, Some(Scope::Rust), false, true),
             (true, "CHECK-ALL: ALL GATES GREEN — 4 of 9 gates ran, scope rust".to_string())
         );
         assert_eq!(
-            test_verdict(9, 9, None, false),
+            test_verdict(12, 17, None, true, true),
+            (true, "CHECK-ALL: ALL GATES GREEN — 12 of 17 gates ran, tier inner — not a landing run".to_string())
+        );
+        assert_eq!(
+            test_verdict(9, 9, None, false, false),
             (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
         );
     }

@@ -3,10 +3,8 @@
 //! Walks a repository (source-extension whitelist; VCS/build/dependency dirs
 //! skipped), lays every file out through the layout seam (`HyperLayout`,
 //! whatever `--repo-engine` says), and fills ONE
-//! glyph arena. The backend writes instances straight into the arena; only a
-//! `--repo-verify` run asks it for the 32 B wire records as well.
-//! `--repo-engine` selects; `--repo-verify` diffs against a recording
-//! `HyperLayout` reference. Each file is one VIEW (`crate::views`: its
+//! glyph arena. The backend writes instances straight into the arena.
+//! Each file is one VIEW (`crate::views`: its
 //! item row is the file's index) drawn with its own GROUP row, placed on a
 //! 2D grid of code pages; files are views {slot range, engine params} into
 //! the shared arena — the web's MegaGlyphField architecture (one arena,
@@ -25,10 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::glyph_scene::{GlyphInstance, GroupRow};
-use crate::layout::{
-    diff_backends, BackendOutput, GlyphArena, ItemParams, LayoutGlyphs,
-    LayoutItem, Paint, VerifyLayout,
-};
+use crate::layout::{GlyphArena, ItemParams, LayoutGlyphs, LayoutItem, Paint};
 use crate::text::{self, StagedText};
 
 pub use crate::layout_stack::{LayoutController, LayoutStack, LayoutZone, SpatialLayoutStrategy};
@@ -72,10 +67,6 @@ impl std::str::FromStr for Strategy {
 }
 
 impl Strategy {
-    pub fn can_record(&self) -> bool {
-        matches!(self, Strategy::Hyper | Strategy::Batched | Strategy::PerItem)
-    }
-
     pub fn materializes_records(&self) -> bool {
         matches!(self, Strategy::Batched | Strategy::PerItem)
     }
@@ -339,7 +330,6 @@ pub struct LoadStats {
     pub skipped_non_utf8: usize,
     pub dirs_visited: usize,
     pub strategy: Strategy,
-    pub verified: bool,
 }
 
 pub struct RepoLoad {
@@ -368,22 +358,17 @@ pub(crate) use shelf::{dir_tint, layout_shelf};
 /// Whole-repo load: walk → paint → the layout seam → grid layout.
 ///
 /// `strategy` selects how `HyperLayout` runs (`Hyper` alone gets the
-/// background prefetch) and whether a verify
-/// run records. `verify` lays the same items out again with a recording
-/// `HyperLayout` reference and diffs the two AT THE SEAM: placements,
-/// instances and, when both can produce them, records, all bit-exact.
+/// background prefetch).
 pub fn load_repo(
     root: &Path,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
 ) -> RepoLoad {
     load_repo_from_walk(
         root,
         walk_repo(root),
         params,
         strategy,
-        verify,
         None,
         GlyphArena::new(),
         None,
@@ -401,7 +386,6 @@ pub fn load_items(
     root: &Path,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
     load_repo_from_walk(
@@ -409,7 +393,6 @@ pub fn load_items(
         walk,
         params,
         strategy,
-        verify,
         None,
         GlyphArena::new(),
         folds,
@@ -438,7 +421,7 @@ pub fn prefetch_repo(
         .collect();
 
     let hyper_data = if strategy == Strategy::Hyper {
-        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params, params.field_mode))
+        Some(crate::layout_hyper::prefetch_hyper(&walk.files, &file_params))
     } else {
         None
     };
@@ -457,13 +440,11 @@ pub fn prefetch_repo(
 /// `gpu` is the renderer's device when one exists — HyperLayout emits
 /// straight into its buffers; `None` is the no-GPU door
 /// (`--repo-scan-only`), where layout fills a host arena.
-#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -485,20 +466,17 @@ pub fn load_repo_from_walk(
         prefetched,
         params,
         strategy,
-        verify,
         gpu,
         arena,
         folds,
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "a repo-load entry point: each parameter is a separate input its callers choose (walk, device, arena, folds)")]
 pub fn load_repo_from_prefetched(
     root: &Path,
     prefetched: PrefetchedRepo,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -507,14 +485,13 @@ pub fn load_repo_from_prefetched(
         buffer_of_view: (0..prefetched.walk.files.len() as u32).collect(),
         placement: Placement::Controller,
     };
-    load_views(root, prefetched, plan, params, strategy, verify, gpu, arena, folds)
+    load_views(root, prefetched, plan, params, strategy, gpu, arena, folds)
 }
 
 /// `--render-file FILE [--copies N]` as a repo load of that one file
 /// (2026-10-11; step 2 of the Instanced retirement): one buffer, `copies`
 /// views over it, laid out, painted and fielded by the same HyperLayout,
-/// colourisers and fields as `--load-repo` — so the Visible field serves it
-/// for real, and the glyph verbs and picks work on it. The views are tiled
+/// colourisers and fields as `--load-repo` — so the glyph verbs and picks work on it. The views are tiled
 /// (`tile_views`) rather than shelved, each its own group row so the
 /// copies sit side by side. It paints flat like every load (the syntax
 /// heuristic it painted until then was retired the same day).
@@ -547,7 +524,6 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&cra
         plan,
         params,
         Strategy::default(),
-        false,
         gpu,
         GlyphArena::new(),
         None,
@@ -580,7 +556,6 @@ fn load_views(
     plan: ViewPlan,
     params: &RepoParams,
     strategy: Strategy,
-    verify: bool,
     gpu: Option<&crate::gpu::GpuContext>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
@@ -597,7 +572,6 @@ fn load_views(
         files = walk.files.len(),
         bytes = walk.total_bytes,
         ?strategy,
-        verify,
     )
     .entered();
     let walk_dur = walk.walk_dur;
@@ -633,9 +607,8 @@ fn load_views(
             crate::gpu::SharedDevice::from_ctx(ctx),
             params.field_mode,
         ),
-        // Without a device the mode still matters for Visible (no slot is
-        // ever emitted, so it needs none); the other modes run as before.
-        None => crate::layout::LayoutEngine::hyper_with_mode(params.field_mode),
+        // Without a device: host records, whatever the mode.
+        None => crate::layout::LayoutEngine::hyper(),
     };
     if let Some(hd) = hyper_data {
         // The prefetch ran Pass 1 over the walked FILES; it stands for the
@@ -649,62 +622,11 @@ fn load_views(
     }
     let t = Instant::now();
     let sp_backend = tracing::info_span!("repo.backend").entered();
-    let (mut placements, records) = if verify && strategy.can_record() {
-        backend
-            .layout_items_recording(&items, &mut arena)
-            .expect("layout failed")
-    } else {
-        (
-            backend
-                .layout_items(&items, &mut arena)
-                .expect("layout failed"),
-            Vec::new(),
-        )
-    };
+    let mut placements = backend
+        .layout_items(&items, &mut arena)
+        .expect("layout failed");
     drop(sp_backend);
-    let mut backend_dur = t.elapsed();
-
-    let mut verified = false;
-    if verify {
-        let _sp_verify = tracing::info_span!("repo.verify").entered();
-        let t = Instant::now();
-        let mut alt = crate::layout_hyper::HyperLayout::new();
-        let mut alt_arena = GlyphArena::new();
-        let (alt_placements, alt_records) = alt
-            .layout_validated_items_recording(&items, &mut alt_arena)
-            .expect("layout failed");
-        let arena_flat = arena.instances_cow();
-        let alt_flat = alt_arena.instances_cow();
-        let report = diff_backends(
-            &BackendOutput {
-                name: backend.name(),
-                placements: &placements,
-                instances: &arena_flat,
-                records: &records,
-            },
-            &BackendOutput {
-                name: "hyper-ref",
-                placements: &alt_placements,
-                instances: &alt_flat,
-                records: &alt_records,
-            },
-        )
-        .unwrap_or_else(|why| panic!("repo-verify FAIL: {why}"));
-        if report.items == 0 || report.instances == 0 {
-            panic!(
-                "repo-verify FAIL: nothing to compare — {} items, {} instances.",
-                report.items, report.instances,
-            );
-        }
-        backend_dur += t.elapsed();
-        verified = true;
-        println!(
-            "repo-verify PASS: {} items, {} instances, {} records verified",
-            report.items,
-            report.instances,
-            report.records,
-        );
-    }
+    let backend_dur = t.elapsed();
 
     let t_fold_phase = Instant::now();
     // ── P2a: fold compaction ────────────────────────────────────────────
@@ -860,20 +782,13 @@ fn load_views(
     drop(sp_views);
     stage_dur += t.elapsed();
 
-    // The visible form keeps the bytes: the walk's own Vecs move into the
-    // staging — one allocation per file, no copy of the corpus, however many
-    // views read it. Everything the walk still had to say (counts, times, a
-    // tiled block's last row) is read before the move.
+    // What the walk still has to say (counts, times, a tiled block's last
+    // row), read once.
     let files_len = walk.files.len();
     let (walk_total_bytes, walk_skipped_large, walk_skipped_non_utf8, walk_dirs_visited) =
         (walk.total_bytes, walk.skipped_large, walk.skipped_non_utf8, walk.dirs_visited);
     let ends_in_newline: Vec<bool> =
         plan.buffer_of_view.iter().map(|&buffer| walk.files[buffer as usize].bytes.last() == Some(&b'\n')).collect();
-    if let Some(staging) = arena.visible_staging_mut() {
-        assert_eq!(staging.seeds.len(), view_count, "one visible seed per view");
-        staging.buffer_bytes = walk.files.into_iter().map(|f| f.bytes).collect();
-        staging.item_buffers = plan.buffer_of_view.clone();
-    }
 
     let t = Instant::now();
     let sp_grid = tracing::info_span!("repo.layout").entered();
@@ -908,7 +823,6 @@ fn load_views(
         skipped_non_utf8: walk_skipped_non_utf8,
         dirs_visited: walk_dirs_visited,
         strategy,
-        verified,
     };
     RepoLoad {
         arena,
@@ -945,7 +859,7 @@ impl RepoLoad {
         );
         // One view per file (`crate::views`), view i being file i — the
         // item row of every per-item table here (the layout's placements,
-        // tints and blocks, the item table, the Visible items, the pick
+        // tints and blocks, the item table, the pick
         // records) — and drawn with the file's group row, `v.group_id`.
         // Stage F: one cull segment per file — world AABB (group offset
         // applied, small margins for glyph overhang) + arena slot range +
@@ -972,11 +886,7 @@ impl RepoLoad {
         } else {
             Vec::new()
         };
-        // The visible form has no slots to fold a tint from: its backdrop
-        // takes the flat form's extension tint, and no sub-file blocks — the
-        // field culls its own lines.
-        let visible = self.arena.is_visible();
-        let is_flat = self.painted_flat || visible;
+        let is_flat = self.painted_flat;
         let file_tints = self.arena.emitted_slots().map(|d| &d.file_tints);
         let file_blocks = self.arena.emitted_slots().map(|d| &d.file_blocks);
         let emoji_tint_pairs = self.arena.emitted_slots().map(|d| &d.emoji_tint_pairs);
@@ -1039,9 +949,7 @@ impl RepoLoad {
                 }
             };
             let fast_blocks = file_blocks.and_then(|fb| fb.get(view));
-            let blocks = if visible {
-                Vec::new()
-            } else if let Some(fbs) = fast_blocks {
+            let blocks = if let Some(fbs) = fast_blocks {
                 fbs.iter()
                     .map(|lb| crate::glyph_scene::BlockCull {
                         min: [
@@ -1150,24 +1058,7 @@ impl RepoLoad {
                 })
                 .collect(),
         );
-        // The visible field's items: the seam's seeds finished with what only
-        // the layout knows — the group row, in the item table's group lane —
-        // and the LOCAL box the field's item cull carries through that row
-        // every frame: the segment's box before the group's T·R·S (`offset +
-        // local * s` is the segment). Local since 2026-10-10, so no group
-        // edit re-uploads it.
-        let mut arena = self.arena;
-        if let Some(staging) = arena.visible_staging_mut() {
-            assert_eq!(staging.item_buffers.len(), views.len(), "the loader named every view's buffer");
-            let item_table = views.item_table();
-            let items: Vec<glyph_field_visible::VisibleItem> = (0..views.len())
-                .map(|view| {
-                    let (min, max) = views.local_extent(view as u32);
-                    staging.item(view, item_table[view], min, max)
-                })
-                .collect();
-            staging.items = items;
-        }
+        let arena = self.arena;
         StagedText {
             glyphs_emitted: arena.len(),
             codepoints_decoded: self.stats.records,
@@ -1207,7 +1098,7 @@ impl RepoLoad {
         );
         println!(
             "repo: {} engine records -> {} glyph instances ({} blank/missing dropped) \
-             | backend: {}{}",
+             | backend: {}",
             s.records,
             s.instances,
             s.blanks,
@@ -1217,7 +1108,6 @@ impl RepoLoad {
                 Strategy::Direct => "hyper/direct",
                 Strategy::Hyper => "hyper-rust (parallel direct)",
             },
-            if s.verified { " (verified bit-exact vs the other strategy)" } else { "" },
         );
         println!(
             "phases: walk {:.3}s | backend {:.3}s ({:.1} MB/s, {}) \
@@ -1378,8 +1268,7 @@ impl GroupRows {
 
 /// A file's cull box in its own frame: the `SegCull` box `into_staged`
 /// builds (ink plus the segment pads, no z pad) before the group's T·R·S,
-/// so `offset + local * scale` is that segment. The Visible field's items
-/// carry it (their cull applies the live group row).
+/// so `offset + local * scale` is that segment.
 fn segment_local_box(v: &FileView) -> ([f32; 3], [f32; 3]) {
     use crate::glyph_scene::{SEG_CULL_PAD_MAX, SEG_CULL_PAD_MIN};
     (

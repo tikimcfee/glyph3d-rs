@@ -1,3 +1,5 @@
+> **History.** Moved to `out/history/` on 2026-10-26, when the Visible field was deleted (`crates/glyph-field-visible`, `--field-mode visible`, hyper-oracle's visible tier): the makepad port has no compute and targets Derived alone. A dated record, not current state. What is true now: `README.md`, root `AGENTS.md`.
+
 # Visible-set field mode — how to see it
 
 The third glyph field mode (`--field-mode visible`, beside `instanced` and

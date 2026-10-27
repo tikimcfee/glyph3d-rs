@@ -327,10 +327,10 @@ mod tests {
     fn focused_choice_shows_its_help_from_the_derive() {
         let mut l = Launcher::defaults();
         l.focus = Control::FieldMode;
-        l.cfg.field_mode = Some(glyph_field::GlyphFieldMode::Visible);
+        l.cfg.field_mode = Some(glyph_field::GlyphFieldMode::Instanced);
         let out = render(&l, Section::Graphics, 60);
-        assert!(out.contains("[visible]"), "{out}");
-        assert!(out.contains("No slot per glyph"), "the variant's doc comment is the help: {out}");
+        assert!(out.contains("[instanced]"), "{out}");
+        assert!(out.contains("One full 32 B placement record per glyph"), "the variant's doc comment is the help: {out}");
 
         l.cfg.field_mode = Some(glyph_field::GlyphFieldMode::Derived);
         let out = render(&l, Section::Graphics, 60);

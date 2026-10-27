@@ -30,6 +30,10 @@ pub(crate) struct Settings {
     /// covered without a second golden set to adopt and keep in step.
     #[serde(default)]
     pub(crate) golden_equivalents: Vec<String>,
+    /// The golden equivalents that run in the merge tier only: skipped,
+    /// and named, by `glyph test --inner` (test diet step 6, 2026-10-26).
+    #[serde(default)]
+    pub(crate) golden_equivalents_merge: Vec<String>,
 }
 
 /// How an artifact is verified is a property of its CLASS, not a per-artifact
@@ -97,8 +101,8 @@ pub(crate) enum Kind {
     Cmd,
     Cargo,
     CargoTest,
+    Orphans,
     GoldenVerify,
-    RepoVerify,
 }
 
 /// What you changed, and therefore what is worth running.
@@ -118,21 +122,50 @@ pub(crate) enum Scope {
     Corpus,
 }
 
+/// When a gate runs: after each change, or only in the full run before
+/// landing. Declared per gate (2026-10-26), never decided at run time.
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Tier {
+    /// `glyph test --inner`, and every full run.
+    Inner,
+    /// Only a full `glyph test`: the compiler's diagnostics.
+    Merge,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Gate {
     pub(crate) name: String,
     pub(crate) scope: Scope,
+    pub(crate) tier: Tier,
+    /// Gates this one never runs beside (`glyph test`'s scheduler), where
+    /// running together was measured to cost more than it saves.
+    #[serde(default)]
+    pub(crate) apart_from: Vec<String>,
     pub(crate) kind: Kind,
     #[serde(default)]
     pub(crate) needs: Vec<String>,
     pub(crate) cmd: Option<String>,
     pub(crate) pass_line: Option<String>,
-    /// repo-verify: the wrap modes `cmd`'s {mode} is substituted with.
-    #[serde(default)]
-    pub(crate) modes: Vec<String>,
     pub(crate) compare: Option<String>,
     pub(crate) blind_to: Option<String>,
+    /// How `prove` proves this gate's mutations: under makepad's relax JIT,
+    /// in parallel and through its source overlay (prove_relax.rs). Declared,
+    /// never inferred: a gate without one is proven on cargo.
+    pub(crate) relax: Option<Relax>,
+}
+
+/// How `prove` runs a gate's mutations under relax.
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Relax {
+    /// cargo-test: the test a mutation's `expect` names, under `relax test`;
+    /// the whole suite, judged as the gate judges it, when it names none.
+    Test,
+    /// a gate that runs the renderer: the gate itself, with the renderer
+    /// under `relax run` (`GLYPH_RENDERER`).
+    Renderer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,7 +196,7 @@ pub(crate) fn load() -> Result<Manifest, String> {
 /// `kind` rather than declared: a `provides` field would be one more thing that
 /// can be written and never read, which is the defect this validation exists
 /// to remove.
-fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
+pub(crate) fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
     let of = |c: Class| {
         m.artifact.iter().filter(|(_, a)| a.class == c).map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     };
@@ -258,12 +291,21 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
                 ));
             }
         }
-        if g.kind == Kind::RepoVerify && (g.cmd.is_none() || g.modes.is_empty()) {
-            p.push(format!(
-                "gate {} is kind=repo-verify but declares no cmd/modes; it would run \
-                 nothing and report success",
-                g.name
-            ));
+        for a in &g.apart_from {
+            if !gates.contains(a.as_str()) || *a == g.name {
+                p.push(format!("gate {} is apart_from '{a}', which is not another declared gate", g.name));
+            }
+        }
+        match g.relax {
+            Some(Relax::Test) if g.kind != Kind::CargoTest => {
+                p.push(format!("gate {} declares relax = \"test\" but is not kind=cargo-test", g.name));
+            }
+            Some(Relax::Renderer)
+                if !g.needs.iter().any(|n| m.artifact.get(n).is_some_and(|a| a.class == Class::Product)) =>
+            {
+                p.push(format!("gate {} declares relax = \"renderer\" but needs no product to run", g.name));
+            }
+            _ => {}
         }
         if g.kind == Kind::Cmd && g.cmd.is_none() {
             p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));
@@ -301,6 +343,14 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
             }
             if !tags.insert(equivalent_tag(e)) {
                 p.push(format!("golden equivalent '{e}' collides with another's file tag"));
+            }
+        }
+        for e in &m.settings.golden_equivalents_merge {
+            if !m.settings.golden_equivalents.contains(e) {
+                p.push(format!(
+                    "golden_equivalents_merge names '{e}', which is not a declared golden equivalent; \
+                     it would put nothing in the merge tier"
+                ));
             }
         }
         // An exemption names a declared equivalent, exactly, with a reason;

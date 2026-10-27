@@ -277,8 +277,7 @@ impl App<'_> {
                 discovered_sessions: None,
                 session_dirs_report: Ok(String::new()),
                 session_load_error: None,
-                // The field HUD starts open where it has the most to say.
-                hud_open: self.cull_opts.field_mode == glyph_field::GlyphFieldMode::Visible,
+                hud_open: false,
             })
         } else {
             None
@@ -376,8 +375,6 @@ impl App<'_> {
             cluster_selftest: u8::from(std::env::var_os("GLYPH_CLUSTER_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
             fieldmode_selftest: u8::from(std::env::var_os("GLYPH_FIELDMODE_SELFTEST").is_some()),
-            #[cfg(feature = "egui-ui")]
-            visible_verb_selftest: u8::from(std::env::var_os("GLYPH_VISIBLE_VERB_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
             grab_selftest: u8::from(std::env::var_os("GLYPH_GRAB_SELFTEST").is_some()),
         });
@@ -763,7 +760,6 @@ fn poll_live(
         std::path::Path::new("."),
         &src.params,
         crate::repo::Strategy::Hyper,
-        false,
         if folds.is_empty() { None } else { Some(&folds) },
     );
     let t_fold = t_all.elapsed();

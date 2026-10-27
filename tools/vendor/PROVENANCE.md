@@ -12,19 +12,16 @@ from a local invention six months later.
 
 ## The fixture oracle is pinned PER FILE
 
-`engine/fixtures/{gen,gen-bake}.mjs` reproduce all 34 committed
-fixtures (26 `.pipe.bin` + 8 `.bake.bin`; counts read from
-`build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
+`engine/fixtures/gen.mjs` reproduces all 26 committed `.pipe.bin`
+fixtures (the count read from `build.toml [artifact.fixtures]`) byte-for-byte, in this tree, with no web
 repo present — but only from these
 revisions. Today's upstream cannot: `glyphPipelineReference.js` stopped
 exporting `FLOAT_LANES` at 3da6542 and the generators do not even load.
 
   engine/fixtures/inputs/GlyphTrie.js                  70ce30e
   engine/fixtures/inputs/foldGeometry.js               70ce30e
-  engine/fixtures/inputs/glyphBake.js                  70ce30e
   engine/fixtures/inputs/glyphPipelineKernels.js       59a2a44
   engine/fixtures/inputs/glyphPipelineReference.js     70ce30e
-  engine/fixtures/inputs/glyphPipelineScan.js          70ce30e
 
 A single "upstream commit" is the wrong model for these files and hid a real
 defect: the `glyphPipelineKernels.js` vendored here until 2026-09-04 was
@@ -52,10 +49,8 @@ is that check.
 |---|---|---:|---|:--:|
 | `engine/fixtures/inputs/GlyphTrie.js` | `packages/glyph3d-core/src/compute/GlyphTrie.js` | 9498 | `288dcb3cdac888b7…` | MISMATCH |
 | `engine/fixtures/inputs/foldGeometry.js` | `packages/glyph3d-core/src/core/foldGeometry.js` | 14806 | `c925c6d2c8036f2b…` | yes |
-| `engine/fixtures/inputs/glyphBake.js` | `packages/glyph3d-core/src/compute/glyphBake.js` | 11761 | `5ba631bdbd6ed5e5…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineKernels.js` | `packages/glyph3d-core/src/compute/glyphPipelineKernels.js` | 90515 | `c785a572091d2f37…` | MISMATCH |
 | `engine/fixtures/inputs/glyphPipelineReference.js` | `packages/glyph3d-core/src/compute/glyphPipelineReference.js` | 51879 | `dd2bc84bfc3cd1be…` | MISMATCH |
-| `engine/fixtures/inputs/glyphPipelineScan.js` | `packages/glyph3d-core/src/compute/glyphPipelineScan.js` | 15254 | `4b83b7447b66695e…` | MISMATCH |
 | `schema/glyph-identity.json` | `schema/glyph-identity.json` | 19662 | `ac9e95ec2bfec524…` | MISMATCH |
 | `tools/vendor/ref/app/public/slug-core/slug-core.1tstke3lync.bin` | `app/public/slug-core/slug-core.1tstke3lync.bin` | 609569 | `647ccdaba087de1f…` | yes |
 | `tools/vendor/ref/packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | `packages/glyph3d-core/src/fonts/Cousine-Regular.ttf` | 300208 | `dcd526004fcfec4e…` | yes |

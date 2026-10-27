@@ -42,7 +42,7 @@ the checks themselves (what each gate runs and cannot see) live in the root
 - **Readability Across Agents & Humans**: Code is read far more often than it is written. Eliminating acronym mapping eliminates bugs.
 
 ## 8. GPU Float Determinism & Kernel Safety
-These bind the WGSL compute kernels (today the visible field's cull and layout, `crates/glyph-field-visible/shaders/`, held to Pass 2 by hyper-oracle's visible tier) and any CPU parallel pass.
+These bind any WGSL compute kernel (none ships since the Visible field's deletion, 2026-10-26; its cull and layout were the last) and any CPU parallel pass.
 - **Strict Float Addition Order**: Floating-point addition is non-associative: `(a + b) + c != a + (b + c)`. Any kernel that sums layout coordinates or advances MUST accumulate in strict left-to-right order from the segment head (or from a seed Pass 1 computed that way) to stay bit-exact with the CPU reference folds.
 - **Deterministic order**: a GPU pass whose output order reaches the screen (draw order, a capped prefix) must not take that order from atomics: reserve with a prefix scan in index order (C30, 2026-10-10: atomic slot order made visible frames differ run to run).
 - **Bounded Kernel Loops & Hang Prevention**: Because workgroups cover fixed spans while corpora end at arbitrary byte offsets, all backward and forward walks across shared or global memory MUST be strictly bounded (`global_byte_index < total_bytes`, `start_byte_index >= 0`). Never cast negative loop indices to `usize`.

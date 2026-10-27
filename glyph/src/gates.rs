@@ -3,14 +3,17 @@
 use crate::artifacts::verify_committed;
 use crate::golden::verify_golden;
 use crate::manifest::{Class, Gate, Kind, Manifest};
-use crate::paths::{expand, native, resolve_gpu, root, sh};
+use crate::paths::{expand, keep, resolve_gpu, root, sh};
+use crate::test_build::test_build;
+use std::process::Command;
 
 fn warn_count(out: &str) -> usize {
     out.lines().filter(|l| l.starts_with("warning") && !l.contains("generated")).count()
 }
 
-fn gate_cargo(g: &Gate) -> bool {
-    let cmd = match g.cmd.as_deref() {
+/// The command a `kind = "cargo"` gate's `cmd` names.
+fn cargo_cmd(name: Option<&str>) -> Option<&'static str> {
+    Some(match name {
         Some("build") => "cargo build --release",
         Some("clippy") => "cargo clippy --release --all-targets",
         // Doc links are the one rename hazard nothing else in this battery can
@@ -38,14 +41,19 @@ fn gate_cargo(g: &Gate) -> bool {
             " && grep -q '^glyph3d-native ' target/no-ui/tree.txt",
             " && ! grep -E '^(winit|egui)' target/no-ui/tree.txt",
         ),
-        other => {
-            println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
-            return false;
-        }
+        _ => return None,
+    })
+}
+
+fn gate_cargo(g: &Gate) -> bool {
+    let Some(cmd) = cargo_cmd(g.cmd.as_deref()) else {
+        println!("FAIL  {} has unknown cargo cmd {:?}", g.name, g.cmd);
+        return false;
     };
     let (good, out) = sh(cmd, &root());
     if !good {
         println!("{}", out.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        println!("      cargo's output kept: {}", keep(&g.name, &out));
         println!("FAIL  {} errored", g.name);
         return false;
     }
@@ -57,9 +65,40 @@ fn gate_cargo(g: &Gate) -> bool {
         for l in out.lines().filter(|l| l.starts_with("warning")) {
             println!("      {l}");
         }
+        println!("      cargo's output kept: {}", keep(&g.name, &out));
         println!("FAIL  {} — {w} warnings", g.name);
         false
     }
+}
+
+/// One test job: a harness binary the test build made, or the doctests.
+struct TestJob {
+    label: String,
+    cmd: Command,
+}
+
+/// Every job at once, each in its own thread; outputs back in job order.
+/// cargo test runs its binaries one after another, so the eight GPU
+/// integration binaries (1-4 s each) queued behind the renderer's unit
+/// tests: 29 s run serially, 22 s at once (measured 2026-10-26, under
+/// sibling load).
+fn run_test_jobs(jobs: Vec<TestJob>) -> Vec<(String, bool, String)> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|mut j| {
+                s.spawn(move || match j.cmd.output() {
+                    Ok(o) => {
+                        let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+                        out.push_str(&String::from_utf8_lossy(&o.stderr));
+                        (j.label, o.status.success(), out)
+                    }
+                    Err(e) => (j.label, false, format!("could not spawn: {e}")),
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a test job thread panicked")).collect()
+    })
 }
 
 /// The floor is a RATCHET, not an equality: tests are added constantly, so an
@@ -67,69 +106,208 @@ fn gate_cargo(g: &Gate) -> bool {
 /// because the previous form counted "test result: ok" LINES and required two —
 /// and there are exactly two test binaries, so it could not fail. A green run
 /// above the floor prints the value to raise it to, so it cannot quietly decay.
+///
+/// The runner runs the binaries, not `cargo test` (2026-10-26): the same
+/// binaries cargo test would run (its `--no-run` names them), each from its
+/// package's directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus
+/// `cargo test --doc` for the doctests, all at once. A failing binary no
+/// longer stops the ones after it, and every binary must report a result.
 fn gate_cargo_test(m: &Manifest) -> bool {
-    let (good, out) = sh("cargo test --release", &root());
-    for l in out.lines().filter(|l| l.contains("test result")) {
-        println!("{l}");
+    let units = match test_build() {
+        Ok(u) => u,
+        Err(rendered) => {
+            for l in rendered.lines().filter(|l| l.starts_with("error")).take(20) {
+                println!("      {l}");
+            }
+            println!("      the build's output kept: {}", keep("cargo-test-build", &rendered));
+            println!("FAIL  cargo test — the test build errored");
+            return false;
+        }
+    };
+    let mut jobs: Vec<TestJob> = units
+        .iter()
+        .filter(|u| u.harness)
+        .filter_map(|u| {
+            let mut cmd = Command::new(u.executable.as_ref()?);
+            cmd.current_dir(&u.package_dir).env("CARGO_MANIFEST_DIR", &u.package_dir);
+            Some(TestJob { label: u.label(), cmd })
+        })
+        .collect();
+    let mut doc = Command::new("cargo");
+    doc.args(["test", "--release", "--doc"]).current_dir(root());
+    jobs.push(TestJob { label: "doctests".into(), cmd: doc });
+    let results = run_test_jobs(jobs);
+
+    let mut good = true;
+    let mut binaries = 0;
+    let mut total: u32 = 0;
+    for (label, ok, out) in &results {
+        let summaries: Vec<&str> = out.lines().filter(|l| l.contains("test result")).collect();
+        for l in &summaries {
+            println!("{l}");
+        }
+        binaries += summaries.iter().filter(|l| l.contains("test result: ok")).count();
+        total += summaries
+            .iter()
+            .flat_map(|l| l.split_whitespace().collect::<Vec<_>>().windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>())
+            .filter(|(_, w)| w.starts_with("passed"))
+            .filter_map(|(n, _)| n.parse::<u32>().ok())
+            .sum::<u32>();
+        if !ok || summaries.is_empty() {
+            good = false;
+            // Name the failing tests: printing only the summary discards WHY it
+            // reddened, and a mutation's `expect` needs the reason in the text.
+            for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
+                println!("      {l}");
+            }
+            if summaries.is_empty() {
+                for l in out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                    println!("      {l}");
+                }
+            }
+            println!("      ^ {label}{}", if summaries.is_empty() { " reported no result" } else { "" });
+            println!("        its whole output kept: {}", keep(&format!("cargo-test {label}"), out));
+        }
     }
     if !good {
-        // Name the failing tests: printing only the summary discards WHY it
-        // reddened, and a mutation's `expect` needs the reason in the text.
-        for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
-            println!("      {l}");
-        }
         println!("FAIL  cargo test");
         return false;
     }
+    let (passed, verdict) = floor_verdict(m, binaries, total);
+    print!("{verdict}");
+    passed
+}
+
+/// The floor's verdict on a green run: at least two binaries reporting, and
+/// at least `test_floor` tests run.
+fn floor_verdict(m: &Manifest, binaries: usize, total: u32) -> (bool, String) {
+    let floor = m.settings.test_floor;
+    if binaries < 2 {
+        return (false, format!("FAIL  cargo test — only {binaries} test binary reported; one stopped running\n"));
+    }
+    if total < floor {
+        return (
+            false,
+            format!(
+                "FAIL  cargo test — {total} tests ran, floor is {floor}. Coverage DROPPED by {}.\n      \
+                 A deleted test, an #[ignore] that outlived its reason, or a module\n      \
+                 that stopped being compiled. Lower the floor only on purpose.\n",
+                floor - total
+            ),
+        );
+    }
+    let mut s = format!("PASS  cargo test — {total} tests over {binaries} binaries (floor {floor})\n");
+    if total > floor {
+        s.push_str(&format!("NOTE  the floor is behind: raise test_floor to {total} in build.toml\n"));
+    }
+    (true, s)
+}
+
+/// This gate's verdict on the suite as relax ran it (prove's suite route):
+/// every target green, then the floor, by the same rule as the gate's own
+/// run. `good` is whether every target exited green.
+pub(crate) fn judge_tests(m: &Manifest, good: bool, out: &str) -> (bool, String) {
+    let mut s = String::new();
+    for l in out.lines().filter(|l| l.contains("test result")) {
+        s.push_str(&format!("{l}\n"));
+    }
+    if !good {
+        for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
+            s.push_str(&format!("      {l}\n"));
+        }
+        s.push_str("FAIL  cargo test\n");
+        return (false, s);
+    }
     let binaries = out.lines().filter(|l| l.contains("test result: ok")).count();
-    let total: u32 = out
-        .split_whitespace()
+    let (passed, verdict) = floor_verdict(m, binaries, tests_ran(out));
+    s.push_str(&verdict);
+    (passed, s)
+}
+
+/// How many tests a run's libtest summaries say passed, summed.
+pub(crate) fn tests_ran(out: &str) -> u32 {
+    out.split_whitespace()
         .collect::<Vec<_>>()
         .windows(2)
         .filter(|w| w[1].starts_with("passed"))
         .filter_map(|w| w[0].parse::<u32>().ok())
-        .sum();
-    let floor = m.settings.test_floor;
-    if binaries < 2 {
-        println!("FAIL  cargo test — only {binaries} test binary reported; one stopped running");
-        return false;
-    }
-    if total < floor {
-        println!("FAIL  cargo test — {total} tests ran, floor is {floor}. Coverage DROPPED by {}.", floor - total);
-        println!("      A deleted test, an #[ignore] that outlived its reason, or a module");
-        println!("      that stopped being compiled. Lower the floor only on purpose.");
-        return false;
-    }
-    println!("PASS  cargo test — {total} tests over {binaries} binaries (floor {floor})");
-    if total > floor {
-        println!("NOTE  the floor is behind: raise test_floor to {total} in build.toml");
-    }
-    true
+        .sum()
 }
 
-fn gate_repo_verify(g: &Gate) -> bool {
-    let mut ok = true;
-    let template = g.cmd.as_deref().unwrap_or_default();
-    for mode in &g.modes {
-        let (good, out) = sh(
-            &format!(
-                "../target/release/glyph3d-native {}",
-                template.replace("{mode}", mode)
-            ),
-            &native(),
-        );
-        // The result line is not necessarily the last one: the renderer logs
-        // after it. Search, do not assume position.
-        match out.lines().find(|l| l.contains("repo-verify PASS")) {
-            Some(hit) if good => println!("PASS  --wrap-mode {mode} — {}", hit.trim()),
-            _ => {
-                for l in out.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-                    println!("      {l}");
-                }
-                println!("FAIL  --wrap-mode {mode}");
-                ok = false;
+/// The source files a dep-info file lists (make syntax: `target: dep dep`,
+/// spaces in a path escaped `\ `), resolved against the workspace root,
+/// where cargo runs rustc.
+fn dep_info_sources(text: &str) -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let Some((_, deps)) = line.split_once(": ").or_else(|| line.strip_suffix(':').map(|t| (t, ""))) else {
+            continue;
+        };
+        let mut cur = String::new();
+        let mut chars = deps.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&' ') => cur.push(chars.next().unwrap_or(' ')),
+                ' ' => v.push(std::mem::take(&mut cur)),
+                c => cur.push(c),
             }
         }
+        v.push(cur);
+    }
+    v.into_iter().filter(|p| !p.is_empty()).map(|p| root().join(p)).collect()
+}
+
+/// A `.rs` file under a package's `src/` that no unit of the test build
+/// read: no `mod` reaches it, so rustc never compiled it and said nothing.
+/// The reach is rustc's own (each unit's dep-info), over every unit cargo
+/// test builds — lib, its cfg(test) harness, bins and theirs — so this needs
+/// no second analysis of the workspace (cargo-modules, 24-48 s a run until
+/// 2026-10-26) and covers the renderer's bin, which cargo-modules could not.
+fn gate_orphans() -> bool {
+    let units = match test_build() {
+        Ok(u) => u,
+        Err(_) => {
+            println!("FAIL  orphans — the test build errored, so nothing says what was compiled");
+            return false;
+        }
+    };
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut packages: std::collections::BTreeMap<std::path::PathBuf, (Vec<String>, std::collections::BTreeSet<std::path::PathBuf>)> =
+        Default::default();
+    let mut ok = true;
+    for u in units.iter().filter(|u| u.package_dir.starts_with(root())) {
+        let entry = packages.entry(u.package_dir.clone()).or_default();
+        let Some(d) = u.dep_info() else {
+            println!("FAIL  orphans — {} left no dep-info; what it compiled is unknown", u.label());
+            ok = false;
+            continue;
+        };
+        entry.0.push(u.label());
+        let text = std::fs::read_to_string(&d).unwrap_or_default();
+        entry.1.extend(dep_info_sources(&text).iter().map(|p| canon(p)));
+    }
+    if packages.is_empty() {
+        println!("FAIL  orphans — the test build named no workspace unit; compared nothing");
+        return false;
+    }
+    let mut files_total = 0;
+    for (dir, (labels, reached)) in &packages {
+        let rel = dir.strip_prefix(root()).unwrap_or(dir).to_string_lossy().into_owned();
+        let files = expand(&format!("{rel}/src/**/*.rs"));
+        files_total += files.len();
+        let orphans: Vec<_> = files.iter().filter(|f| !reached.contains(&canon(f))).collect();
+        if orphans.is_empty() {
+            println!("PASS  orphans {rel} — {} files, every one read by its {} units", files.len(), labels.len());
+        } else {
+            ok = false;
+            println!("FAIL  orphans {rel} — {} file(s) no unit compiled:", orphans.len());
+            for f in orphans {
+                println!("      {}", f.strip_prefix(root()).unwrap_or(f).display());
+            }
+        }
+    }
+    if ok {
+        println!("ORPHANS OK — {} packages, {files_total} files, no unreachable module file", packages.len());
     }
     ok
 }
@@ -147,8 +325,18 @@ fn gate_cmd(g: &Gate) -> bool {
         // fixtures, 13568 trie entries, 1872012 lanes, 530 seed queries — and
         // those counts ARE the claim that the check is not vacuous. Collapsing
         // them to one line is the same loss a doc review caught earlier today.
-        let detail: Vec<&str> =
-            out.lines().filter(|l| l.starts_with("PASS ") || l.starts_with("FAIL ")).collect();
+        // A child whose summary is its declared pass_line (hyper-oracle's
+        // "hyper-oracle PASS: 6 corpora, ... records") surfaces those lines
+        // too: without them the summary was the LAST line, which for
+        // hyper-oracle is a wgpu WARN log, timestamp and all (2026-10-26).
+        let detail: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.starts_with("PASS ")
+                    || l.starts_with("FAIL ")
+                    || g.pass_line.as_deref().is_some_and(|p| l.starts_with(p))
+            })
+            .collect();
         if detail.is_empty() {
             println!("PASS  {} — {}", g.name, out.lines().last().unwrap_or("").trim());
         } else {
@@ -179,6 +367,7 @@ fn gate_cmd(g: &Gate) -> bool {
         for l in out.lines().rev().take(tail).collect::<Vec<_>>().into_iter().rev() {
             println!("      {l}");
         }
+        println!("      output kept: {}", keep(&g.name, &out));
         println!("FAIL  {}", g.name);
     }
     passed
@@ -219,7 +408,9 @@ fn needs_met(g: &Gate, m: &Manifest) -> bool {
     true
 }
 
-pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
+/// `inner`: the run is `glyph test --inner`, for a gate with merge-tier
+/// parts of its own (pixel-ab's merge-tier equivalents).
+pub(crate) fn run_gate(g: &Gate, m: &Manifest, inner: bool) -> bool {
     if !needs_met(g, m) {
         return false;
     }
@@ -228,7 +419,57 @@ pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
         Kind::Cmd => gate_cmd(g),
         Kind::Cargo => gate_cargo(g),
         Kind::CargoTest => gate_cargo_test(m),
-        Kind::GoldenVerify => verify_golden(m),
-        Kind::RepoVerify => gate_repo_verify(g),
+        Kind::Orphans => gate_orphans(),
+        Kind::GoldenVerify => verify_golden(m, inner),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the zero-warning gates count, over each tool's own output (test
+    /// diet step 2, 2026-10-26: this replaces four mutations that each paid
+    /// a renderer rebuild to show a warning reddens its gate). One warning
+    /// each from rustc, clippy and rustdoc, with the location lines and
+    /// cargo's summary line that follow it, counts once; a clean build
+    /// counts none; a warning from cargo itself counts, as every warning
+    /// does against a zero-warning gate.
+    #[test]
+    fn warn_count_counts_each_tools_warnings_once() {
+        let rustc = "warning: unused variable: `x`\n --> src/a.rs:1:5\n  |\n1 | let x = 1;\n  |     ^ help: prefix it\n\n\
+                     warning: `crate` (lib) generated 1 warning\n    Finished `release` profile";
+        let clippy = "warning: this `if` has identical blocks\n --> src/a.rs:3:9\n\
+                      warning: `crate` (lib) generated 1 warning (run `cargo clippy --fix` to apply 1 suggestion)";
+        let rustdoc = "warning: unresolved link to `Foo::bar`\n --> src/a.rs:2:7\n\
+                       warning: `crate` (lib doc) generated 1 warning\n   Generated target/doc/crate/index.html";
+        for (tool, out) in [("rustc", rustc), ("clippy", clippy), ("rustdoc", rustdoc)] {
+            assert_eq!(warn_count(out), 1, "{tool}: {out}");
+        }
+        assert_eq!(warn_count("   Compiling crate v0.1.0\n    Finished `release` profile [optimized] target(s) in 1.0s"), 0);
+        assert_eq!(warn_count("warning: unused manifest key: package.foo"), 1);
+    }
+
+    /// The doc gate documents every workspace crate, not the renderer alone:
+    /// until 2026-10-11 a dead link in crates/ or glyph/ was read by nothing
+    /// (the dead-doc-link-crate mutation measured it).
+    #[test]
+    fn the_doc_gate_documents_the_workspace() {
+        let doc = cargo_cmd(Some("doc")).expect("the doc gate's command");
+        assert!(doc.contains("--workspace"), "{doc}");
+        assert!(cargo_cmd(Some("nonsense")).is_none());
+    }
+
+    /// Dep-info's make syntax: the target before `: `, escaped spaces kept
+    /// inside a path, phony `path:` lines and `#` comments.
+    #[test]
+    fn dep_info_lists_every_source() {
+        let text = "/t/deps/x-1.d: native/src/lib.rs native/src/a\\ b.rs /abs/c.rs\n\nnative/src/lib.rs:\n# env-dep:X=1\n";
+        let got = dep_info_sources(text);
+        let want: Vec<_> = ["native/src/lib.rs", "native/src/a b.rs", "/abs/c.rs"]
+            .iter()
+            .map(|p| root().join(p))
+            .collect();
+        assert_eq!(got, want);
     }
 }

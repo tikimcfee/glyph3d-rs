@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::manifest::{Artifact, Class, Manifest};
-use crate::paths::{gpu_key, gpu_profile, native, resolve_gpu, root, sh, step, sweep};
+use crate::manifest::{Artifact, Class, GoldenView, Manifest};
+use crate::paths::{gpu_key, gpu_profile, keep, keep_file, native, resolve_gpu, root, sh, step, sweep};
 
 /// A golden equivalent's file-name tag: its arguments' alphanumerics, runs
 /// of anything else collapsed to one `-` (`--field-mode derived` →
@@ -32,22 +32,42 @@ fn shot_path(name: &str, equivalent: Option<&str>) -> PathBuf {
     }
 }
 
-/// Render every golden view into the sweep dir — and, with `equivalents`,
-/// again under each golden equivalent. Shared by the gate and by `drift`
-/// (which compares only the plain frames), so both read the same renders.
-fn render_views(m: &Manifest, equivalents: bool) -> bool {
+/// The views the gate renders and judges: every declared one, or the ones
+/// `GLYPH_GOLDEN_VIEWS` names (comma-separated). prove's relax route names the view
+/// a mutation's `expect` claims diverges, so a mutant renders that frame and
+/// not thirty. Err names a view that is not declared: a filter that selects
+/// nothing must not pass.
+fn views(m: &Manifest) -> Result<Vec<&GoldenView>, String> {
+    let Some(names) = std::env::var("GLYPH_GOLDEN_VIEWS").ok().filter(|n| !n.is_empty()) else {
+        return Ok(m.golden_view.iter().collect());
+    };
+    names
+        .split(',')
+        .map(|n| m.golden_view.iter().find(|v| v.name == n).ok_or_else(|| format!("GLYPH_GOLDEN_VIEWS names {n:?}, which is no golden_view")))
+        .collect()
+}
+
+/// Render every golden view into the sweep dir, and again under each of
+/// `equivalents`. Shared by the gate and by `drift` (which compares only the
+/// plain frames), so both read the same renders.
+fn render_views(m: &Manifest, equivalents: &[&str]) -> bool {
     let _ = std::fs::create_dir_all(sweep());
     let mut variants: Vec<Option<&str>> = vec![None];
-    if equivalents {
-        variants.extend(m.settings.golden_equivalents.iter().map(|e| Some(e.as_str())));
-    }
+    variants.extend(equivalents.iter().map(|e| Some(*e)));
     let mut ok = true;
-    for v in &m.golden_view {
+    let views = match views(m) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("FAIL  pixel-ab — {e}");
+            return false;
+        }
+    };
+    for v in views {
         for eq in &variants {
             let shot = shot_path(&v.name, *eq);
             let (good, out) = sh(
                 &format!(
-                    "../target/release/glyph3d-native {} {} --screenshot {}",
+                    "\"$GLYPH_RENDERER\" {} {} --screenshot {}",
                     v.cmd,
                     eq.unwrap_or(""),
                     shot.to_string_lossy()
@@ -57,6 +77,7 @@ fn render_views(m: &Manifest, equivalents: bool) -> bool {
             if !good {
                 let under = eq.map(|e| format!(" under {e}")).unwrap_or_default();
                 println!("FAIL  {}{under} render errored — {}", v.name, out.lines().last().unwrap_or(""));
+                println!("      output kept: {}", keep(&format!("{}{under}", v.name), &out));
                 ok = false;
             }
         }
@@ -94,19 +115,30 @@ fn adapter_note(key: &str, dir: &Path) {
     }
 }
 
-pub(crate) fn verify_golden(m: &Manifest) -> bool {
+/// `inner`: the run is `glyph test --inner`, so the equivalents declared
+/// merge tier (`golden_equivalents_merge`) are skipped, each named.
+pub(crate) fn verify_golden(m: &Manifest, inner: bool) -> bool {
     let a = m.artifact.values().find(|a| a.class == Class::Golden).unwrap();
     let Some(key) = gpu_key() else {
         println!("FAIL  pixel-ab — the renderer did not answer --gpu-key, so this host's golden set is unknown");
         return false;
     };
     let dir = golden_dir(a, key);
-    if !render_views(m, true) {
+    let (equivalents, skipped): (Vec<&str>, Vec<&str>) = m
+        .settings
+        .golden_equivalents
+        .iter()
+        .map(String::as_str)
+        .partition(|e| !inner || !m.settings.golden_equivalents_merge.iter().any(|x| x == e));
+    for e in &skipped {
+        println!("SKIP  every view under {e} — a merge-tier equivalent: runs in a full `glyph test`");
+    }
+    if !render_views(m, &equivalents) {
         return false;
     }
     let mut ok = true;
     let mut missing: Vec<&str> = Vec::new();
-    for v in &m.golden_view {
+    for v in views(m).unwrap_or_default() {
         let shot = sweep().join(format!("{}.png", v.name));
         let baseline = a
             .outputs
@@ -127,6 +159,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                 } else {
                     println!("FAIL  {}.png diverges from baseline — the renderer changed.", v.name);
                     println!("      If that was intended, re-baseline by hand and say so in the commit.");
+                    println!("      the frame kept: {}", keep_file(&v.name, &shot));
                     ok = false;
                 }
                 // The same baseline, under each equivalent: a divergence here
@@ -136,7 +169,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                 // rendered all the same and its distance reported, so the
                 // known difference stays in sight and a stale exemption
                 // shows as one.
-                for eq in &m.settings.golden_equivalents {
+                for eq in &equivalents {
                     let shot_eq = shot_path(&v.name, Some(eq));
                     let equal = golden == std::fs::read(&shot_eq).ok();
                     match (v.exemption(eq), equal) {
@@ -144,6 +177,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                         (None, false) => {
                             println!("FAIL  {}.png diverges from baseline under {eq} — that variant no longer", v.name);
                             println!("      renders what the plain view does.");
+                            println!("      the frame kept: {}", keep_file(&format!("{} {eq}", v.name), &shot_eq));
                             ok = false;
                         }
                         (Some(why), true) => {
@@ -279,7 +313,7 @@ pub(crate) fn cmd_drift(m: &Manifest) -> bool {
         return false;
     };
     step(&format!("drift: this host ({key}) against the other golden sets"));
-    if !render_views(m, false) {
+    if !render_views(m, &[]) {
         return false;
     }
     let base = golden_dir(a, key).parent().unwrap().to_path_buf();

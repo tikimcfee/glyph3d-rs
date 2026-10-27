@@ -5,7 +5,7 @@
 //! from the atlas table. So `nudge-glyph`'s y/z and `scale-glyph` have no
 //! lane to land in. Until 2026-10-11 the field dropped them silently while
 //! the reply claimed them applied; now the reply says "not representable",
-//! as the Visible field's does, and nothing is applied for those components.
+//! and nothing is applied for those components.
 //! Instanced (still a mode until its retirement) applies all of them.
 //!
 //! Witnessed through the release binary, offscreen, at `repo-zoom`'s camera
@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const REPO: &str = "fixtures/g-pick-repo";
-/// The `a` of `alpha` on `    let alpha = 1;` (row 3 col 8 of alpha.rs), as
-/// in `visible_verbs.rs`.
+/// The `a` of `alpha` on `    let alpha = 1;` (row 3 col 8 of alpha.rs).
 const PICK: [&str; 6] = ["--pick-file", "alpha.rs", "--pick-row", "3", "--pick-col", "8"];
 
 fn native_dir() -> PathBuf {

@@ -20,7 +20,6 @@ wgpu = "30"
 glyph-field = { path = "../crates/glyph-field", features = ["clap"] }
 glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
-glyph-field-visible = { path = "../crates/glyph-field-visible" }
 # The transform tree (2026-10-10): every group row a node, resolved on
 # the CPU into the group table, whose changed rows are uploaded
 # (glyph_scene/nodes.rs; a GPU compute pass until 2026-10-26).

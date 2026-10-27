@@ -6,7 +6,7 @@
 # the renderer's whole graph (about three minutes, cold); later ones reuse its cache.
 #
 #   tools/relax-fidelity/gates.sh            every instrument
-#   tools/relax-fidelity/gates.sh fold scan  the named ones (see `names` below)
+#   tools/relax-fidelity/gates.sh fold trie  the named ones (see `names` below)
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -17,7 +17,6 @@ mkdir -p "$OUT"
 cd "$root"
 shopt -s nullglob
 FIX=(engine/fixtures/*.pipe.bin)
-BAKE=(engine/fixtures/*.bake.bin)
 HO=(native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt)
 
 # name | working dir | env | arguments (the gate commands of build.toml)
@@ -26,18 +25,11 @@ add() { dir[$1]=$2; env[$1]=$3; args[$1]=$4; names+=("$1"); }
 names=()
 add trie      . "" "--fixture-trie ${FIX[*]}"
 add fold      . "" "--fixture-fold ${FIX[*]}"
-add scan      . "" "--fixture-scan ${FIX[*]}"
-add bake      . "" "--fixture-bake ${BAKE[*]}"
 add reference . "" "--fixture-reference ${FIX[*]}"
 add ho-leader . "" "--hyper-oracle-check ${HO[*]} --cluster-mode leader"
 add ho-strict . "GLYPH_HYPER_ORACLE_STRICT=1" "--hyper-oracle-check ${FIX[*]} ${HO[*]}"
 add ho-tab4   . "GLYPH_HYPER_ORACLE_STRICT=1" "--hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4"
 add ho-tab8   . "" "--hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
-for e in hyper direct; do
-  for m in down back; do
-    add "verify-$e-$m" native "" "--load-repo fixtures/g-pick-repo --wrap-mode $m --repo-engine $e --repo-verify --repo-scan-only"
-  done
-done
 
 pick=("$@")
 [ ${#pick[@]} -eq 0 ] && pick=("${names[@]}")

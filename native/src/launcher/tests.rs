@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::{CommandFactory, ValueEnum};
 
 use super::model::{Control, Launcher, Target, View};
-use crate::cli::{parse_cli_from, Cli, DebugTint, PresentMode};
+use crate::cli::{parse_cli_from, Cli, PresentMode};
 use crate::fold::{ClusterMode, WrapMode};
 use crate::launch_config::{value_name, LaunchConfig};
 use crate::repo::{RepoLayoutMode, Strategy};
@@ -31,9 +31,7 @@ fn every_value_enum_is_offered_whole() {
     assert_eq!(choice_names(&l, Control::RepoEngine), names::<Strategy>());
     assert_eq!(choice_names(&l, Control::ClusterMode), names::<ClusterMode>());
     assert_eq!(choice_names(&l, Control::FieldMode), names::<GlyphFieldMode>());
-    assert_eq!(choice_names(&l, Control::DebugTint), names::<DebugTint>());
     assert_eq!(choice_names(&l, Control::PresentMode), names::<PresentMode>());
-    assert!(choice_names(&l, Control::FieldMode).contains(&"visible".to_string()));
 }
 
 /// Untouched, a control shows what the renderer would run with no
@@ -89,11 +87,9 @@ fn choices_cycle_both_ways_and_dials_clamp() {
     let mut l = Launcher::defaults();
     l.focus = Control::FieldMode;
     l.step(1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Visible), "from the default, derived");
-    l.step(1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "wraps");
+    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "from the default, derived, it wraps");
     l.step(-1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Visible));
+    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Derived));
     l.toggle();
     assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "space steps a choice forward");
 
@@ -208,13 +204,13 @@ fn a_launch_saves_changes_and_remembers_the_repo() {
 
     l.target = Target::Repo;
     l.repo_path = "~/src/linux".into();
-    l.cfg.field_mode = Some(GlyphFieldMode::Visible);
+    l.cfg.field_mode = Some(GlyphFieldMode::Instanced);
     l.remember_repo();
     assert!(l.save().unwrap());
     let text = std::fs::read_to_string(&path).unwrap();
     let back = LaunchConfig::from_toml_str(&text).unwrap();
     assert!(text.starts_with("# mine\nwrap_mode = \"back\"\n"), "{text}");
-    assert_eq!(back.field_mode, Some(GlyphFieldMode::Visible));
+    assert_eq!(back.field_mode, Some(GlyphFieldMode::Instanced));
     assert_eq!(back.load_repo, Some(PathBuf::from("~/src/linux")), "saved as typed, not absolute");
     assert_eq!(back.agent_session, None, "the scene is the one launched");
     assert_eq!(
@@ -268,11 +264,10 @@ fn the_written_file_builds_the_plan_the_flags_build() {
     l.target = Target::Repo;
     l.repo_path = "/repo".into();
     l.cfg.focus_file = Some("alpha".into());
-    l.cfg.field_mode = Some(GlyphFieldMode::Visible);
+    l.cfg.field_mode = Some(GlyphFieldMode::Instanced);
     l.cfg.wrap_mode = Some(WrapMode::Down);
     l.cfg.layout_mode = Some(RepoLayoutMode::Carrel);
     l.cfg.repo_engine = Some(Strategy::Direct);
-    l.cfg.debug_tint = Some(DebugTint::Cull);
     l.cfg.present_mode = Some(PresentMode::Mailbox);
     l.cfg.text_detail_px = Some(12.0);
     l.cfg.no_cull = Some(true);
@@ -290,11 +285,10 @@ fn the_written_file_builds_the_plan_the_flags_build() {
         "glyph3d-native",
         "--load-repo", "/repo",
         "--focus-file", "alpha",
-        "--field-mode", "visible",
+        "--field-mode", "instanced",
         "--wrap-mode", "down",
         "--layout-mode", "carrel",
         "--repo-engine", "direct",
-        "--debug-tint", "cull",
         "--present-mode", "mailbox",
         "--text-detail-px", "12",
         "--no-cull",

@@ -2,7 +2,7 @@
 
 Researched 2026-10-10. Verification key: **[fetched]** means the page itself was read for this note. **[search]** means the claim comes from a search-result summary of the page, which was not opened. **[local]** means a file in this repo. Figures quoted from news coverage are labelled as claims.
 
-glyph3d reference points used for comparison (all [local], from `AGENTS.md`, `out/VISIBLE-MODE.md`, `out/GPU-DIRECTION-2026-10-09.md` in this worktree):
+glyph3d reference points used for comparison (all [local], from `AGENTS.md`, `out/history/VISIBLE-MODE.md`, `out/GPU-DIRECTION-2026-10-09.md` in this worktree):
 - Slug-style analytic coverage from prebaked quadratic outlines, in WGSL on wgpu 30.
 - 95.2 M glyph instances for a 97.0 MB repo (1,306 files), laid out in about 168 ms backend / about 177 ms to first visual (flat colour) on Apple Silicon. These are late-2026-09 figures, not re-measured since; AGENTS.md says "re-measure before quoting".
 - Three field modes (Instanced 32 B/slot, Derived 20 B/slot, Visible: GPU per-frame layout of in-view lines from resident bytes).
@@ -130,7 +130,7 @@ The *idea* is old and well established in 2D: Seesoft (1992) draws each line of 
 - **Arends' viewer** keeps "level-of-detail data" in a disk-backed cache; files read as "colored code blocks" from afar. — [techtroduce.com](https://www.techtroduce.com/rik-arends-3d-source-code-visualizer/) [fetched]; [LavX](https://news.lavx.hu/article/developer-builds-3d-source-code-visualizer-that-navigates-2-5-million-lines-at-120-fps) [fetched]
 - **code-map**: file boxes at overview, text only when zoomed. — [github.com/abyss464/code-map](https://github.com/abyss464/code-map) [fetched]
 - **Makepad code editor**: alt-click minimap zoom (author's page). — [ivanlugo.dev/prior-art/gpu-text](https://ivanlugo.dev/prior-art/gpu-text/) [fetched]
-- **glyph3d's wash tier**: a line under the glyph px threshold becomes one wash *box* (since C28, a box per line that recedes with back-wrapped depth). It is classified per frame by a GPU cull (`cull_lines` → glyph tier, wash tier, nothing) and costs about 0.005 ms layout for 137 k all-wash candidate lines on an RTX 5090. — `out/VISIBLE-MODE.md` lines 120–130, 382–411, 541–572 [local]
+- **glyph3d's wash tier**: a line under the glyph px threshold becomes one wash *box* (since C28, a box per line that recedes with back-wrapped depth). It is classified per frame by a GPU cull (`cull_lines` → glyph tier, wash tier, nothing) and costs about 0.005 ms layout for 137 k all-wash candidate lines on an RTX 5090. — `out/history/VISIBLE-MODE.md` lines 120–130, 382–411, 541–572 [local]
 
 ### Inferences
 - Seesoft and the minimap are the conceptual ancestors of the wash tier, and both belong in the prior-art lineage: they are 2D, offline or per-file, and CPU-drawn. glyph3d's contribution is doing it per line, per frame, by projected pixel size, in 3D perspective, with a GPU cull and depth-correct boxes.
