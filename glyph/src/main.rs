@@ -33,6 +33,7 @@ mod products;
 mod prove;
 mod schedule;
 mod test_build;
+mod prove_relax;
 
 use clap::{Parser, Subcommand};
 use std::process::{Command, ExitCode};
@@ -80,7 +81,10 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Prove the checks can fail: apply each declared mutation, require its
-    /// gate to redden for its stated reason, restore.
+    /// gate to redden for its stated reason, restore. A gate that declares
+    /// `relax` has its mutations proven under makepad's relax JIT, in
+    /// parallel and without writing the tree (`GLYPH_RELAX` names the binary;
+    /// prove_relax.rs); the rest on cargo.
     Prove {
         /// Only mutations targeting this gate.
         #[arg(long)]
@@ -104,6 +108,10 @@ enum Cmd {
         /// run would prove, before paying for it. Builds and mutates nothing.
         #[arg(long)]
         list: bool,
+        /// How many relax mutants (and clean-tree runs) go at once. A relax
+        /// process peaks near 3 GB; size it to RAM.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
     },
     /// Run a single check by name. Used by `prove`, and useful on its own.
     Gate {
@@ -261,9 +269,9 @@ fn main() -> ExitCode {
         }
         Cmd::Test { scope, frozen, inner } => cmd_test(&m, scope, frozen, inner),
         Cmd::Run { args } => cmd_run(&m, &args),
-        Cmd::Prove { gate, mutations, changed, since, list } => {
+        Cmd::Prove { gate, mutations, changed, since, list, jobs } => {
             let since = if changed { Some("HEAD") } else { since.as_deref() };
-            cmd_prove(&m, gate.as_deref(), &mutations, since, list)
+            cmd_prove(&m, gate.as_deref(), &mutations, since, list, jobs)
         }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),

@@ -173,22 +173,65 @@ fn gate_cargo_test(m: &Manifest) -> bool {
         println!("FAIL  cargo test");
         return false;
     }
+    let (passed, verdict) = floor_verdict(m, binaries, total);
+    print!("{verdict}");
+    passed
+}
+
+/// The floor's verdict on a green run: at least two binaries reporting, and
+/// at least `test_floor` tests run.
+fn floor_verdict(m: &Manifest, binaries: usize, total: u32) -> (bool, String) {
     let floor = m.settings.test_floor;
     if binaries < 2 {
-        println!("FAIL  cargo test — only {binaries} test binary reported; one stopped running");
-        return false;
+        return (false, format!("FAIL  cargo test — only {binaries} test binary reported; one stopped running\n"));
     }
     if total < floor {
-        println!("FAIL  cargo test — {total} tests ran, floor is {floor}. Coverage DROPPED by {}.", floor - total);
-        println!("      A deleted test, an #[ignore] that outlived its reason, or a module");
-        println!("      that stopped being compiled. Lower the floor only on purpose.");
-        return false;
+        return (
+            false,
+            format!(
+                "FAIL  cargo test — {total} tests ran, floor is {floor}. Coverage DROPPED by {}.\n      \
+                 A deleted test, an #[ignore] that outlived its reason, or a module\n      \
+                 that stopped being compiled. Lower the floor only on purpose.\n",
+                floor - total
+            ),
+        );
     }
-    println!("PASS  cargo test — {total} tests over {binaries} binaries (floor {floor})");
+    let mut s = format!("PASS  cargo test — {total} tests over {binaries} binaries (floor {floor})\n");
     if total > floor {
-        println!("NOTE  the floor is behind: raise test_floor to {total} in build.toml");
+        s.push_str(&format!("NOTE  the floor is behind: raise test_floor to {total} in build.toml\n"));
     }
-    true
+    (true, s)
+}
+
+/// This gate's verdict on the suite as relax ran it (prove's suite route):
+/// every target green, then the floor, by the same rule as the gate's own
+/// run. `good` is whether every target exited green.
+pub(crate) fn judge_tests(m: &Manifest, good: bool, out: &str) -> (bool, String) {
+    let mut s = String::new();
+    for l in out.lines().filter(|l| l.contains("test result")) {
+        s.push_str(&format!("{l}\n"));
+    }
+    if !good {
+        for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
+            s.push_str(&format!("      {l}\n"));
+        }
+        s.push_str("FAIL  cargo test\n");
+        return (false, s);
+    }
+    let binaries = out.lines().filter(|l| l.contains("test result: ok")).count();
+    let (passed, verdict) = floor_verdict(m, binaries, tests_ran(out));
+    s.push_str(&verdict);
+    (passed, s)
+}
+
+/// How many tests a run's libtest summaries say passed, summed.
+pub(crate) fn tests_ran(out: &str) -> u32 {
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[1].starts_with("passed"))
+        .filter_map(|w| w[0].parse::<u32>().ok())
+        .sum()
 }
 
 /// The source files a dep-info file lists (make syntax: `target: dep dep`,
@@ -282,8 +325,18 @@ fn gate_cmd(g: &Gate) -> bool {
         // fixtures, 13568 trie entries, 1872012 lanes, 530 seed queries — and
         // those counts ARE the claim that the check is not vacuous. Collapsing
         // them to one line is the same loss a doc review caught earlier today.
-        let detail: Vec<&str> =
-            out.lines().filter(|l| l.starts_with("PASS ") || l.starts_with("FAIL ")).collect();
+        // A child whose summary is its declared pass_line (hyper-oracle's
+        // "hyper-oracle PASS: 6 corpora, ... records") surfaces those lines
+        // too: without them the summary was the LAST line, which for
+        // hyper-oracle is a wgpu WARN log, timestamp and all (2026-10-26).
+        let detail: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.starts_with("PASS ")
+                    || l.starts_with("FAIL ")
+                    || g.pass_line.as_deref().is_some_and(|p| l.starts_with(p))
+            })
+            .collect();
         if detail.is_empty() {
             println!("PASS  {} — {}", g.name, out.lines().last().unwrap_or("").trim());
         } else {
