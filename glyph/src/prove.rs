@@ -578,7 +578,6 @@ mod tests {
             find: None,
             with_: None,
             rebuild: None,
-            relax_cache: None,
         };
         let set = |files: &[&str], mutations: &[&str], gates: &[&str]| ChangeSet {
             files: files.iter().map(|s| s.to_string()).collect(),
