@@ -1,7 +1,24 @@
 # Test diet: which checks to delete or merge, and what each one costs (2026-10-26)
 
-A plan only. Nothing is deleted on this branch. Branch `mp-test-diet` from
-`main` @ c56ae30.
+Branch `mp-test-diet` from `main` @ c56ae30. Written as a plan; Ivan then
+decided, and part of it is executed on this branch (below). Steps 1 and 6
+went to the provejit and gatetime siblings.
+
+**Executed on this branch (2026-10-26):**
+- `69861ce` scan.rs and bake.rs deleted (§ 4 step 3).
+- `030d1cf` repo-verify and repo-verify-direct deleted, with the
+  `--repo-verify` instrument (step 4).
+- `d0b997f` the Visible field deleted **now**, not at wgpu's retirement
+  (Ivan's decision; premise 1 below is superseded): the crate, the mode,
+  hyper-oracle's visible tier (which makes that gate CPU-only), the
+  visible golden equivalent and 14 mutations.
+- `0fbdf5e` the line table deleted: Visible was its only consumer.
+- Step 5, the tab-grid trim: done on mp-gatetime instead (`48ad388`, the 24
+  cases in parallel, 2.7 s); this branch's trim (`7894114`) is reverted in
+  `f0ebf90`. The Visible tier's removal alone took that test from 9.5 s to
+  4.9 s here.
+- Step 2, the warn_count unit test: proposed to gatetime (who owns
+  `glyph/src/gates.rs`); not done here yet.
 
 Ivan asked how much of the verification suite is repeated CPU work, and
 whether it can be replaced with something more useful. Across the day's six
