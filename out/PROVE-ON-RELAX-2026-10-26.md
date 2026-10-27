@@ -375,14 +375,17 @@ What changed from § 6:
   is applied on disk, last and one at a time, with its gate under relax.
   `curve_cap.rs` now reads the shaders the renderer embeds (each field crate's
   `include_str!` constant), so `derived-curve-cap-128` rides the overlay too.
-- **relax's cache serves one mutant stale.** A const aggregate over another
-  crate's `include_str!` constant keeps its cached value when the included
-  file changes: on disk and through the overlay, cache on or read-only. With
-  the cache off it is right. `curve_cap.rs`'s shader array is such an
+- **relax's cache served one mutant stale, until makepad 80ffba413.** A const
+  aggregate over another crate's `include_str!` constant kept its cached
+  value when the included file changed: on disk and through the overlay, with
+  the cache on or read-only. `curve_cap.rs`'s shader array is such an
   aggregate. The repro, 9 lines in two crates, went to relax's owners
-  (makepad's mail, `RELAX_STALE_CONST.md`). Until it is fixed,
-  `derived-curve-cap-128` declares `relax_cache = "off"` with its why, and
-  runs uncached (50 s). Every other WGSL mutant reddened with the cache on.
+  (makepad's mail, `RELAX_STALE_CONST.md`). The cause was relax's file digest,
+  which hashed an item only up to its authored semicolon and missed a macro
+  expansion inside an interface item. While it stood, `derived-curve-cap-128`
+  declared `relax_cache = "off"` and ran uncached (50 s). Since the fix the
+  repro reddens with the cache on and read-only, and so does the mutant
+  (5.6 s), so the declaration and its route are gone.
 - **Cloning the relax cache tolerated nothing.** `cp -r` failed when a clean
   run renamed a cache file mid-copy. `clone_dir` copies file by file and skips
   an entry that vanishes; each entry is content-keyed.
