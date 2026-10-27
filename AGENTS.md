@@ -148,6 +148,7 @@ or mutation survival.
 ```sh
 cargo glyph build          bring the renderer up to date
 cargo glyph test           run everything; nonzero if anything is wrong
+cargo glyph test --inner   after each change: every gate but the merge tier
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
 cargo glyph run --demo     build if stale, then launch the renderer; arguments
@@ -182,6 +183,37 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
   NOTHING RAN`, never green: a scope once outlived its last gate and printed
   ALL GATES GREEN over nothing until it was removed (2026-10-09).
+- **The gates run at once** (2026-10-26, `glyph/src/schedule.rs`), each a
+  child `glyph gate`, their output printed in `build.toml` order as each
+  finishes. A gate waits only for an earlier gate that provides an artifact
+  it `needs`, and never beside a gate either one declares `apart_from`:
+  pixel-ab, pick-oracle and hyper-oracle are apart from cargo-test, whose
+  GPU integration binaries were measured to slow a pixel-ab beside them
+  from 7 s to 21 s, so overlapping them saved nothing; the three run beside
+  each other (8-11 s together, 13 s in turn);
+  cargo's lock orders the cargo gates sharing `target/`. The run ends with a
+  TIME line: wall, products, gate seconds summed, the slowest. Measured on
+  the 32-core Linux host under sibling load, at the end of the branch that
+  brought it (`out/GATETIME-2026-10-26.md`): a full run after a one-line
+  edit in `native/src` 53 s (111 s serially), with nothing changed 27-41 s
+  (95 s).
+- **A red gate keeps its evidence** (2026-10-26) under
+  `target/glyph-scratch/kept/`, named by time, process and what, and
+  prints the path: the child gate's whole output, the whole output of the
+  command that failed under it (each failing test binary's, not just its
+  FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
+  read afterwards; one was lost before this existed.
+- **Two tiers, declared per gate.** `tier = "inner"` gates are what
+  `--inner` runs after each change; `tier = "merge"` gates run only in a
+  full `glyph test`, and `--inner` names each one it skipped. The merge
+  tier is the compiler's diagnostics — warnings, clippy, rustdoc, the
+  no-default-features builds, orphan modules: they judge the code's form,
+  not what it computes — and the corpus checks (committed artifacts, the
+  atlas, vendored hashes), whose inputs a renderer change does not touch.
+  Inside pixel-ab, `[settings] golden_equivalents_merge` puts the
+  `--field-mode instanced` equivalent in the merge tier too: a field the
+  makepad port does not have (test diet step 6, 2026-10-26). An `--inner`
+  verdict says "not a landing run"; land on a full one.
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
@@ -199,7 +231,14 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   branch touched" — and also selects every mutation of a gate whose own
   script changed, and every mutation whose `build.toml` declaration, or
   whose gate's, is new or edited, so a mutation proves itself on the branch
-  that adds it (`--changed` is `--since HEAD`). `--list` prints a
+  that adds it (`--changed` is `--since HEAD`). Since 2026-10-26 "edited"
+  means a field a gate run reads: prose (`compare`, `blind_to`, `why`) and
+  `glyph test`'s own `scope`, `tier` and `gpu` do not count (declaring
+  `tier` on every gate selected all 116). And a mutation is selected when
+  a changed file other than build.toml or prose holds its `expect`: its
+  witness changed (for a cargo-test mutation, the test that must catch it),
+  though its target did not. At the commit that brought both, 116 became
+  29. `--list` prints a
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
@@ -242,8 +281,9 @@ read by nothing at all.
 earlier agents' picks that no gate used). `pixi install` brings up what
 conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
 ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
-tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
-cargo-modules (the orphans gate's tool). Under `pixi run` both sets are on PATH. **Rust and
+tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga
+(cargo-modules, the orphans gate's tool until 2026-10-26, went when the gate
+began reading rustc's dep-info). Under `pixi run` both sets are on PATH. **Rust and
 rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
 (`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
 Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
@@ -292,7 +332,10 @@ is a *product*: nothing to compare against, it only has to be CURRENT.
 Currency is a content hash of the declared inputs — `native/src`, `crates/`,
 `native/Cargo.toml`, `glyph/Cargo.toml`, and the root `Cargo.toml`,
 `Cargo.lock` and `.cargo/config.toml` — stamped at build time, rebuilt only
-when that hash moved. It is built at WORKSPACE scope, the scope cargo-build
+when that hash moved. Its build makes the test binaries too
+(`cargo build --release --lib --bins --tests`, 2026-10-26): one cargo
+compiles the renderer crate and its `cfg(test)` twin side by side, and
+cargo-test finds them built. It is built at WORKSPACE scope, the scope cargo-build
 and cargo-test rebuild it at: a package-scope build resolves features for the
 renderer alone and links different bytes, so until 2026-10-09 the stamp
 vouched for one binary and every gate after cargo-build ran another (which
@@ -418,27 +461,29 @@ still exist, not that the sentence around them is current.
 value is the runner counting each tool's warnings and running rustdoc over
 the workspace, so the runner's own unit tests hold that
 (`warn_count_counts_each_tools_warnings_once`,
-`the_doc_gate_documents_the_workspace`, added on mp-gatetime in f99d8e0)
+`the_doc_gate_documents_the_workspace`, f99d8e0)
 rather than mutations. The four mutations that did it (`unused-binding`,
 `clippy-lint`, `dead-doc-link`, `dead-doc-link-crate`) were anchored in
 engine files, so `prove --since` re-proved the warning counter on every
 branch that touched the fold. `cargo glyph prove` lists these three gates
 as uncovered: their proof is a unit test, not a mutation.
 
-**orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
-declaration reaches is not compiled at all, and rustc says nothing about it.
-cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
-lists the files under `src/` it never reaches. It covers the 5 lib targets
-plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
-loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
-and until this gate only the cargo-test floor might have noticed, by count.
-`tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
-the gate runs under `pixi run`. cargo-modules runs its own `cargo check
---compile-time-deps` (build scripts, proc macros), so the gate gives it
-`target/orphans`, as cargo-check-no-ui has `target/no-ui`. Blind to a file reached only under a cfg the
-host does not set (target_os branches; non-default features, of which there
-are none today). Also blind to glyph3d-native's own bin: its modules all live
-in the lib, so cargo-modules reports every one of them as an orphan of the bin.
+**orphans** (2026-10-11; read off rustc since 2026-10-26). A `.rs` file
+that no `mod` declaration reaches is not compiled at all, and rustc says
+nothing about it. The gate lists every `.rs` file under each workspace
+package's `src/` that no unit of the test build read, by rustc's own
+dep-info (`glyph/src/test_build.rs`): every unit `cargo test --release
+--no-run` builds — each lib, its `cfg(test)` harness, the bins and theirs,
+the integration tests — which is the build cargo-test runs, so the gate
+costs a parse. The realistic loss is a dropped `#[cfg(test)] mod tests;`:
+the file's tests stop existing, and until this gate only the cargo-test
+floor might have noticed, by count. `tests-mod-dropped` proves it. Until
+2026-10-26 it was `tools/check-orphans.sh` over cargo-modules, which loaded
+the workspace again for each of its 9 targets (24 s after an edit, 48 s
+with nothing changed, measured under load) and could not check the
+renderer's bin (its modules live in the lib). Blind to a file reached only
+under a cfg the host does not set (target_os branches; non-default
+features, of which there are none today).
 
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
@@ -455,7 +500,14 @@ floor lives in `build.toml [settings]`. That floor is a ratchet, not an
 equality: adding tests never reddens it, and when the real count rises above
 it every green run prints a NOTE naming the number to raise it to — so it
 cannot decay into a figure far below reality without saying so. Raise it in
-the same commit that adds the tests.
+the same commit that adds the tests. The runner runs the binaries itself, not `cargo test` (2026-10-26): the
+ones `cargo test --release --no-run` names, each from its package's
+directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus `cargo test
+--doc`, all at once (cargo ran them one after another: 29 s serially, 22 s
+at once, measured under load). A failing binary no longer stops the ones
+after it, and a binary that reports no result is red by name. The long
+pole was one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`:
+a grid of 24 cases run one after another, 11 s; run at once, 2.7 s.
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; at the time there were

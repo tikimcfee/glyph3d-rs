@@ -152,7 +152,15 @@ fn changed_since(since: &str) -> Option<(String, ChangeSet)> {
     } else {
         Default::default()
     };
-    Some((base, ChangeSet { files, mutations, gates }))
+    // The changed files' text, for the witness clause of `touches`: not
+    // build.toml, which holds every `expect` (its declarations are compared
+    // above), nor prose, which cannot be a witness.
+    let texts = files
+        .iter()
+        .filter(|f| f.as_str() != "build.toml" && !f.ends_with(".md"))
+        .filter_map(|f| std::fs::read_to_string(root().join(f)).ok())
+        .collect();
+    Some((base, ChangeSet { files, texts, mutations, gates }))
 }
 
 /// What a change set touches. Files are repo-relative paths; `declarations`
@@ -160,21 +168,38 @@ fn changed_since(since: &str) -> Option<(String, ChangeSet)> {
 /// or differ from the base.
 struct ChangeSet {
     files: BTreeSet<String>,
+    /// The text of the changed files that can hold a witness.
+    texts: Vec<String>,
     mutations: BTreeSet<String>,
     gates: BTreeSet<String>,
 }
 
+/// Fields no `glyph gate` run reads, so a change to them cannot change what
+/// a mutation's gate catches: the prose (`compare`, `blind_to`, `why`) and
+/// what `glyph test` alone uses to choose and order gates (`scope`, `tier`,
+/// `apart_from`). Until 2026-10-26 an edit to a gate's `compare` volumes selected
+/// every mutation of that gate, and declaring `tier` on every gate selected
+/// all 116.
+const UNREAD_BY_A_GATE_RUN: [&str; 6] = ["compare", "blind_to", "why", "scope", "tier", "apart_from"];
+
 /// The `[[mutation]]` and `[[gate]]` entries of `current` that are new or
-/// differ from `base`, by name. Read as plain TOML, not as the manifest: the
-/// base may predate a schema change and must still be comparable. A base
-/// that does not parse (or has no build.toml) makes every entry new.
+/// differ from `base`, by name, in a field a gate run reads. Read as plain
+/// TOML, not as the manifest: the base may predate a schema change and must
+/// still be comparable. A base that does not parse (or has no build.toml)
+/// makes every entry new.
 fn declarations_changed(base: Option<&str>, current: &str) -> (BTreeSet<String>, BTreeSet<String>) {
     let entries = |text: Option<&str>, key: &str| -> std::collections::BTreeMap<String, toml::Value> {
         text.and_then(|t| t.parse::<toml::Table>().ok())
             .and_then(|t| t.get(key).and_then(|v| v.as_array()).cloned())
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|v| Some((v.get("name")?.as_str()?.to_string(), v)))
+            .filter_map(|mut v| {
+                let name = v.get("name")?.as_str()?.to_string();
+                if let Some(t) = v.as_table_mut() {
+                    t.retain(|k, _| !UNREAD_BY_A_GATE_RUN.contains(&k));
+                }
+                Some((name, v))
+            })
             .collect()
     };
     let changed = |key: &str| {
@@ -191,14 +216,19 @@ fn declarations_changed(base: Option<&str>, current: &str) -> (BTreeSet<String>,
 /// Whether a change set touches a mutation: its target file changed, the
 /// script its gate runs did, or its own declaration or its gate's did. The
 /// script clause is what makes a gate's own edit re-prove the gate: a change
-/// to `tools/check-orphans.sh` cannot weaken a mutation's target, but it can
+/// to `tools/check-pick-oracle.sh` cannot weaken a mutation's target, but it can
 /// stop the gate noticing it. The declaration clauses are what make a NEW
 /// mutation, or an edited one, prove itself on the branch that adds it,
 /// whether or not its target file changed. Gates built into the runner
 /// (cargo, cargo-test, golden) name no script; a change to the runner itself
-/// selects the mutations that target `glyph/`.
+/// selects the mutations that target `glyph/`. The witness clause (2026-10-26):
+/// a changed file holds the mutation's `expect` — for a cargo-test mutation,
+/// the test that must catch it — so an edit to that test re-proves the
+/// mutations it witnesses, whose targets did not change. It over-selects
+/// where an `expect` is generic text; that costs a run, never a blind spot.
 fn touches(mu: &Mutation, gate_cmd: Option<&str>, changed: &ChangeSet) -> bool {
     changed.files.contains(&mu.file)
+        || changed.texts.iter().any(|t| t.contains(mu.expect.as_str()))
         || gate_cmd.is_some_and(|cmd| cmd.split_whitespace().any(|word| changed.files.contains(word)))
         || changed.mutations.contains(&mu.name)
         || changed.gates.contains(&mu.gate)
@@ -524,6 +554,7 @@ mod tests {
         };
         let set = |files: &[&str], mutations: &[&str], gates: &[&str]| ChangeSet {
             files: files.iter().map(|s| s.to_string()).collect(),
+            texts: Vec::new(),
             mutations: mutations.iter().map(|s| s.to_string()).collect(),
             gates: gates.iter().map(|s| s.to_string()).collect(),
         };
@@ -536,6 +567,13 @@ mod tests {
         assert!(!touches(&mu("native/src/text.rs"), None, &set(&[], &[], &[])), "an empty change set selects nothing");
         assert!(touches(&mu("native/src/fold.rs"), None, &set(&["build.toml"], &["m"], &[])), "its declaration changed");
         assert!(touches(&mu("native/src/fold.rs"), None, &set(&["build.toml"], &[], &["g"])), "its gate's declaration changed");
+        let witness = ChangeSet { texts: vec!["#[test]\nfn y() {}".into()], ..set(&["native/src/other.rs"], &[], &[]) };
+        assert!(!touches(&mu("native/src/fold.rs"), None, &witness), "the expected text `x` is in no changed file");
+        let witness = ChangeSet { texts: vec!["#[test]\nfn catches_it() {}".into()], ..witness };
+        assert!(
+            touches(&Mutation { expect: "catches_it".into(), ..mu("native/src/fold.rs") }, None, &witness),
+            "its witness changed"
+        );
 
         // Declarations are compared as TOML values, by name.
         let base = "[[gate]]\nname = \"g\"\ncmd = \"a\"\n[[gate]]\nname = \"h\"\n\
@@ -548,6 +586,14 @@ mod tests {
         assert_eq!(gates.into_iter().collect::<Vec<_>>(), ["g"]);
         let (mutations, gates) = declarations_changed(None, current);
         assert_eq!((mutations.len(), gates.len()), (3, 2), "no base: every declaration is new");
+
+        // Prose and scheduling are not what a gate run reads.
+        let base = "[[gate]]\nname = \"g\"\ncmd = \"a\"\ncompare = \"old\"\n\
+                    [[mutation]]\nname = \"m\"\nfile = \"f\"\nwhy = \"old\"\n";
+        let current = "[[gate]]\nname = \"g\"\ncmd = \"a\"\ncompare = \"new\"\ntier = \"inner\"\napart_from = [\"h\"]\n\
+                       [[mutation]]\nname = \"m\"\nfile = \"f\"\nwhy = \"new\"\n";
+        let (mutations, gates) = declarations_changed(Some(base), current);
+        assert!(mutations.is_empty() && gates.is_empty(), "{mutations:?} {gates:?}");
     }
 
     /// A mutation's find must name ONE place (C11), and no declared one names two.

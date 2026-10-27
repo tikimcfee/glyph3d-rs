@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::manifest::{Artifact, Class, Manifest};
-use crate::paths::{root, sh};
+use crate::paths::{keep, root, scratch, sh};
 
 pub(crate) fn verify_committed(m: &Manifest) -> bool {
     let mut ok = true;
@@ -15,6 +15,7 @@ pub(crate) fn verify_committed(m: &Manifest) -> bool {
                 println!("PASS  {name} — {last}");
             } else {
                 println!("FAIL  {name} — {last}");
+                println!("      output kept: {}", keep(name, &out));
                 ok = false;
             }
         } else if a.counts.is_some() {
@@ -32,7 +33,7 @@ pub(crate) fn verify_committed(m: &Manifest) -> bool {
 /// Rebuild into a scratch dir and byte-compare. The committed files are never
 /// touched, which is the difference between this and the gate it replaced.
 fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
-    let scratch = std::env::temp_dir().join(format!("glyph-verify-{name}"));
+    let scratch = scratch().join(format!("verify-{name}"));
     let _ = std::fs::remove_dir_all(&scratch);
     if std::fs::create_dir_all(&scratch).is_err() {
         println!("FAIL  {name} — could not make a scratch dir");
@@ -41,6 +42,7 @@ fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
     let (good, out) = sh(&cmd.replace("{scratch}", &scratch.to_string_lossy()), &root());
     if !good {
         println!("FAIL  {name} — rebuild errored: {}", out.lines().last().unwrap_or(""));
+        println!("      output kept: {}", keep(name, &out));
         return false;
     }
     for o in &a.outputs {
@@ -59,7 +61,7 @@ fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
 /// declared in the manifest, never counted off the tree being checked — a
 /// deleted case would otherwise lower both sides and stay green.
 fn verify_corpus(name: &str, a: &Artifact) -> bool {
-    let scratch = std::env::temp_dir().join("glyph-verify-corpus");
+    let scratch = scratch().join("verify-corpus");
     let _ = std::fs::remove_dir_all(&scratch);
     let (good, out) = sh(
         &format!(
@@ -73,6 +75,7 @@ fn verify_corpus(name: &str, a: &Artifact) -> bool {
     if !good {
         println!("FAIL  {name} — a fixture generator errored; the corpus is not rebuildable");
         println!("      {}", out.lines().last().unwrap_or(""));
+        println!("      output kept: {}", keep(name, &out));
         return false;
     }
     let counts = a.counts.as_ref().unwrap();

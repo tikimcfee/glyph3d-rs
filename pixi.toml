@@ -34,7 +34,7 @@ gen-emoji-sheet = "python tools/gen_emoji_sheet.py"
 # ~/.cargo/bin. naga-cli is pinned to the naga in Cargo.lock: a shader that
 # validates under another naga proves nothing about the one that ships.
 # Re-running is cheap; cargo skips a crate already at its version.
-setup = { cmd = "cargo install --locked --root .pixi/cargo-tools naga-cli@30.0.1 cargo-modules@0.27.0 && echo 'setup: rust-analyzer is per host, not here: rustup component add rust-analyzer (or brew install rust-analyzer)'" }
+setup = { cmd = "cargo install --locked --root .pixi/cargo-tools naga-cli@30.0.1 && echo 'setup: rust-analyzer is per host, not here: rustup component add rust-analyzer (or brew install rust-analyzer)'" }
 
 # A fast manual test loop. Never the gate: cargo-test counts `test result`
 # lines against test_floor, which nextest does not print, and nextest skips
