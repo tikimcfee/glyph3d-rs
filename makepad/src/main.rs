@@ -116,8 +116,14 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.host.is_none() {
+            // A scene that cannot be built (a load refused past the
+            // machine's memory, a session that cannot be read) panics with
+            // its reason, which the panic hook has printed: the app exits
+            // on it rather than run on, its HAL containing the panic, with
+            // no scene.
             let (choice, cull_opts, ops) = host::take_plan();
-            self.host = Some(EngineHost::new(choice, cull_opts, &ops));
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| EngineHost::new(choice, cull_opts, &ops)));
+            self.host = Some(built.unwrap_or_else(|_| std::process::exit(1)));
         }
         self.match_event(cx, event);
         let host = self.host.as_mut().expect("built above");

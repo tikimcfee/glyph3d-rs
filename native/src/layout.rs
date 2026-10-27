@@ -149,6 +149,10 @@ impl std::error::Error for LayoutError {}
 /// outside every backend's status range so it can never be confused with one.
 pub const LAYOUT_BAD_PARAMS: i32 = -1;
 
+/// Refusal of a load past what the machine can hold (`crate::budget`),
+/// raised after Pass 1 counted the slots and before any is allocated.
+pub const LAYOUT_PAST_BUDGET: i32 = -2;
+
 // ---------------------------------------------------------------------------
 // What goes in
 // ---------------------------------------------------------------------------

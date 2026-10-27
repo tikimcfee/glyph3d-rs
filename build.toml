@@ -40,8 +40,9 @@
 # tab_stop.rs). Then 341 -> 342: prove_relax's routing test.
 # 342 -> 346 (2026-10-26): the Derived host blocks' four (the block store's
 # two, the blocks against the contiguous emission, the blocks against their
-# buffers after every slot write).
-test_floor = 346
+# buffers after every slot write). 346 -> 348 (2026-10-26): budget.rs's
+# two (a load past the device or the host refused with its numbers).
+test_floor = 348
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

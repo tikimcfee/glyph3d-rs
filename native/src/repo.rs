@@ -624,7 +624,7 @@ fn load_views(
     let sp_backend = tracing::info_span!("repo.backend").entered();
     let mut placements = backend
         .layout_items(&items, &mut arena)
-        .expect("layout failed");
+        .unwrap_or_else(|e| panic!("{e}"));
     drop(sp_backend);
     let backend_dur = t.elapsed();
 

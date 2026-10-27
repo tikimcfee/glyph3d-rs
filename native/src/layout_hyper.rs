@@ -182,6 +182,34 @@ impl HyperLayout {
             let dev = self.device.as_ref().unwrap();
             let unified = dev.is_unified() && dev.host_visible_storage;
 
+            // What the slots will ask of the machine, refused here if it is
+            // more than it has: nothing is allocated yet.
+            let demand = if derived {
+                crate::budget::SlotDemand {
+                    slots: total_survivors as u64,
+                    slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
+                    block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
+                    host_blocks: true,
+                    device: true,
+                    staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
+                }
+            } else {
+                crate::budget::SlotDemand {
+                    slots: total_survivors as u64,
+                    slot_bytes: std::mem::size_of::<glyph_field_instanced::RenderSlot>() as u64,
+                    block_slots: 1,
+                    host_blocks: false,
+                    device: true,
+                    staging: 0,
+                }
+            };
+            match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter)) {
+                Ok(line) => println!("slots: {line}"),
+                Err(why) => {
+                    return Err(LayoutError { backend: "hyper", status: crate::layout::LAYOUT_PAST_BUDGET, what: why });
+                }
+            }
+
             // Derived: each item owns `row_count` consecutive line-table
             // entries; their bases are known now, so Pass 2 writes final
             let inputs = EmitInputs {
