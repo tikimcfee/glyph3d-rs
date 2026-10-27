@@ -1725,8 +1725,9 @@ pub struct G3Renderer {
     /// Per block index, the block while it is resident.
     blocks: Vec<Option<G3ResidentBlock>>,
     residency: BlockResidency,
-    /// Makepad's envelope as last read, logged when it changes.
-    envelope: Option<usize>,
+    /// The device bytes the resident blocks may total: makepad's
+    /// publication envelope, as the host read it at startup.
+    envelope: usize,
     /// The last frame's needed blocks that did not fit the envelope, logged
     /// when it changes.
     unfit: usize,
@@ -1761,7 +1762,11 @@ fn g3_set_pass_camera(cx: &mut Cx, pass: &DrawPass, view_proj: &[f32; 16]) {
 }
 
 impl G3Renderer {
-    pub fn new(cx: &mut Cx) -> Self {
+    /// A renderer whose glyph blocks are resident within `envelope`
+    /// device bytes (makepad's publication envelope; makepad leaves keeping
+    /// under it to the producer).
+    pub fn new(cx: &mut Cx, envelope: usize) -> Self {
+        log!("g3: glyph block envelope {} MiB (makepad's), {} MiB published a frame", envelope >> 20, UPLOAD_PER_FRAME >> 20);
         Self {
             pass: DrawPass::new(cx),
             mask_pass: DrawPass::new(cx),
@@ -1779,7 +1784,7 @@ impl G3Renderer {
             tables: None,
             blocks: Vec::new(),
             residency: BlockResidency::new(UPLOAD_PER_FRAME),
-            envelope: None,
+            envelope,
             unfit: 0,
             meshes: None,
             scratch: Vec::new(),
@@ -1826,17 +1831,7 @@ impl G3Renderer {
         let needed: Vec<usize> = (0..inputs.blocks.len())
             .filter(|&k| inputs.chunk_ranges.get(k).is_some_and(|r| !r.is_empty()) || selected(k))
             .collect();
-        // Makepad's envelope (set from the device's memory budget when its
-        // HAL session starts); it leaves keeping under it to the producer.
-        let envelope = cx.publication_accounting().envelope;
-        assert!(
-            envelope != 0,
-            "makepad set no publication envelope (its backend reported no working set): the glyph blocks would have no bound on the device"
-        );
-        if self.envelope != Some(envelope) {
-            log!("g3: glyph block envelope {} MiB (makepad's), {} MiB published a frame", envelope >> 20, UPLOAD_PER_FRAME >> 20);
-            self.envelope = Some(envelope);
-        }
+        let envelope = self.envelope;
         let plan = self.residency.plan(envelope, inputs.blocks.len(), |k| inputs.blocks[k].len() * 4, &needed);
         for &k in &plan.evict {
             self.blocks[k] = None;

@@ -117,13 +117,26 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         if self.host.is_none() {
+            // The glyph blocks are resident within makepad's publication
+            // envelope, which its HAL sets from the device's memory budget
+            // when the session starts (before the first event). A backend
+            // that reports no budget leaves it 0, and the host refuses to
+            // start there rather than publish without a bound.
+            let envelope = cx.publication_accounting().envelope;
+            if envelope == 0 {
+                eprintln!(
+                    "error: makepad's {:?} backend reports no device memory budget (its publication envelope is 0), so the glyph blocks would have no bound on the device: glyph3d-makepad runs on a backend that reports one (Vulkan with VK_EXT_memory_budget)",
+                    cx.gpu_backend()
+                );
+                std::process::exit(1);
+            }
             // A scene that cannot be built (a load refused past the
             // machine's memory, a session that cannot be read) panics with
             // its reason, which the panic hook has printed: the app exits
             // on it rather than run on, its HAL containing the panic, with
             // no scene.
             let (choice, cull_opts, ops) = host::take_plan();
-            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| EngineHost::new(choice, cull_opts, &ops)));
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| EngineHost::new(choice, cull_opts, &ops, envelope)));
             self.host = Some(built.unwrap_or_else(|_| std::process::exit(1)));
         }
         self.match_event(cx, event);

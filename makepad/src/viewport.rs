@@ -185,7 +185,7 @@ impl Widget for Glyph3dViewport {
         self.dpi = cx.current_dpi_factor();
         if let Some(host) = scope.data.get_mut::<EngineHost>() {
             host.set_viewport((rect.size.x * self.dpi).round() as u32, (rect.size.y * self.dpi).round() as u32);
-            let renderer = self.renderer.get_or_insert_with(|| G3Renderer::new(cx.cx));
+            let renderer = self.renderer.get_or_insert_with(|| G3Renderer::new(cx.cx, host.glyph_envelope));
             let drew = match host.scene.prepare_frame(host.viewport(), host.time()) {
                 Some(frame) => {
                     self.feed.draw(cx, renderer, &mut self.draws, rect, host.scene_generation(), &frame);
