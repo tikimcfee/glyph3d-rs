@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::manifest::{provides, Gate, Manifest};
-use crate::paths::{root, scratch, step};
+use crate::paths::{keep, root, scratch, step};
 use crate::prove::self_exe;
 
 /// What one gate did.
@@ -96,6 +96,9 @@ pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate]) -> Vec<Ran> {
             if gates[i].gpu {
                 gpu_busy = false;
             }
+            // The child's whole output, beside whatever its own gate kept
+            // of the commands under it.
+            let out = if ok { out } else { format!("{out}      full output kept: {}\n", keep(&gates[i].name, &out)) };
             done[i] = Some((ok, out, secs));
             while printed < gates.len() {
                 let Some((_, out, secs)) = &done[printed] else { break };

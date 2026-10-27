@@ -200,6 +200,12 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   the 32-core Linux host under sibling load: a full run after a one-line
   edit in `native/src` 63 s (111 s serially), with nothing changed 38 s
   (95 s).
+- **A red gate keeps its evidence** (2026-10-26) under
+  `target/glyph-scratch/kept/`, named by time, process and what, and
+  prints the path: the child gate's whole output, the whole output of the
+  command that failed under it (each failing test binary's, not just its
+  FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
+  read afterwards; one was lost before this existed.
 - **Two tiers, declared per gate.** `tier = "inner"` gates are what
   `--inner` runs after each change (56 s after a one-line edit, measured
   as above); `tier = "merge"` gates — the compiler's diagnostics: warnings,

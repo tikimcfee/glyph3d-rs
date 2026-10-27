@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::manifest::{Artifact, Class, Manifest};
-use crate::paths::{root, scratch, sh};
+use crate::paths::{keep, root, scratch, sh};
 
 pub(crate) fn verify_committed(m: &Manifest) -> bool {
     let mut ok = true;
@@ -15,6 +15,7 @@ pub(crate) fn verify_committed(m: &Manifest) -> bool {
                 println!("PASS  {name} — {last}");
             } else {
                 println!("FAIL  {name} — {last}");
+                println!("      output kept: {}", keep(name, &out));
                 ok = false;
             }
         } else if a.counts.is_some() {
@@ -41,6 +42,7 @@ fn verify_scratch(name: &str, a: &Artifact, cmd: &str) -> bool {
     let (good, out) = sh(&cmd.replace("{scratch}", &scratch.to_string_lossy()), &root());
     if !good {
         println!("FAIL  {name} — rebuild errored: {}", out.lines().last().unwrap_or(""));
+        println!("      output kept: {}", keep(name, &out));
         return false;
     }
     for o in &a.outputs {
@@ -73,6 +75,7 @@ fn verify_corpus(name: &str, a: &Artifact) -> bool {
     if !good {
         println!("FAIL  {name} — a fixture generator errored; the corpus is not rebuildable");
         println!("      {}", out.lines().last().unwrap_or(""));
+        println!("      output kept: {}", keep(name, &out));
         return false;
     }
     let counts = a.counts.as_ref().unwrap();

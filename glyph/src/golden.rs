@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::manifest::{Artifact, Class, Manifest};
-use crate::paths::{gpu_key, gpu_profile, native, resolve_gpu, root, sh, step, sweep};
+use crate::paths::{gpu_key, gpu_profile, keep, keep_file, native, resolve_gpu, root, sh, step, sweep};
 
 /// A golden equivalent's file-name tag: its arguments' alphanumerics, runs
 /// of anything else collapsed to one `-` (`--field-mode derived` →
@@ -57,6 +57,7 @@ fn render_views(m: &Manifest, equivalents: bool) -> bool {
             if !good {
                 let under = eq.map(|e| format!(" under {e}")).unwrap_or_default();
                 println!("FAIL  {}{under} render errored — {}", v.name, out.lines().last().unwrap_or(""));
+                println!("      output kept: {}", keep(&format!("{}{under}", v.name), &out));
                 ok = false;
             }
         }
@@ -127,6 +128,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                 } else {
                     println!("FAIL  {}.png diverges from baseline — the renderer changed.", v.name);
                     println!("      If that was intended, re-baseline by hand and say so in the commit.");
+                    println!("      the frame kept: {}", keep_file(&v.name, &shot));
                     ok = false;
                 }
                 // The same baseline, under each equivalent: a divergence here
@@ -144,6 +146,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                         (None, false) => {
                             println!("FAIL  {}.png diverges from baseline under {eq} — that variant no longer", v.name);
                             println!("      renders what the plain view does.");
+                            println!("      the frame kept: {}", keep_file(&format!("{} {eq}", v.name), &shot_eq));
                             ok = false;
                         }
                         (Some(why), true) => {
