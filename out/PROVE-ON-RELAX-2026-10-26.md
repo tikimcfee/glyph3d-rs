@@ -399,6 +399,15 @@ Measured on b42034b (97 mutations after the test diet), host load 3 to 5:
   real merge as § 6: mp-cpu-twins (431279e) selects 27 of today's mutations.
   **79 s**, 27 of 27 red: relax's 24 in 76 s (the last clean-tree route agreed
   at 57 s), cargo's 3 in 3 s. Tail: pick-off-by-one 38 s.
+- **The cache clone, since makepad a5299abd2**, is `cache/` alone: a
+  redirected run dir now keeps its build outputs at the workspace's, so the
+  clone no longer invalidates the build-script crates. A renderer mutant's
+  first process re-collects 31 crates, not 334: 8.3 s, where it was 20 s (the
+  shared read-only cache's is 6.0 s), then 1.2 s a process. pick-off-by-one
+  alone went from 38 s to 25 s. The same 27-mutation merge check, run again:
+  **96 s**, 27 of 27 red. The last clean-tree route agreed at 38 s, where it
+  was 57 s, but pick-off-by-one took 54 s among 12 parallel jobs. So the
+  check is load-sensitive, and two runs at host load 3 gave 79 s and 96 s.
 
 The full unscoped run was not repeated (the coordinator's call: `--since` and
 `--mutation` are enough).
