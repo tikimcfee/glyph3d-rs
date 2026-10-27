@@ -6,9 +6,8 @@
 //! the line's f64 advance, which is exactly `line_cells × cell` (every atlas
 //! advance is whole cells and the f64 sum of them is exact), so the count is
 //! recovered at the tab itself by one division — nothing is added to the walk
-//! for any other byte, and a chunk or segment seeded mid-line needs no state
-//! it did not carry already. A walk that counts cells as an integer instead
-//! (the line table's replays) asks [`TabStops::advance_at_cells`].
+//! for any other byte, and a chunk seeded mid-line needs no state it did not
+//! carry already.
 //!
 //! At one cell, [`TabStops::advance`] hands back the trie's advance and its
 //! widening — the `seg_adv += r.advance; line_adv += r.advance as f64` every
@@ -57,19 +56,8 @@ impl TabStops {
         }
     }
 
-    /// [`Self::advance`] for a walk that counts the line's cells itself.
-    #[inline(always)]
-    pub(crate) fn advance_at_cells(self, byte: u8, advance: f32, line_cells: u64) -> (f32, f64) {
-        if byte == b'\t' && self.width.expands() {
-            self.tab(line_cells)
-        } else {
-            (advance, advance as f64)
-        }
-    }
-
     /// A tab on a line at `line_cells`: `f32(k) × cell`, one correctly
-    /// rounded product (what the Visible kernel's `f32(kk) * cell_adv` is),
-    /// and the exact `k × cell` for the f64 carrier.
+    /// rounded product, and the exact `k × cell` for the f64 carrier.
     #[inline(always)]
     fn tab(self, line_cells: u64) -> (f32, f64) {
         let cells = self.width.tab_cells(line_cells);
@@ -84,4 +72,25 @@ pub(crate) fn line_cells(line_advance: f64, cell_advance: f32) -> u64 {
     let cells = line_advance / cell_advance as f64;
     debug_assert_eq!(cells, cells.round(), "a line advance of {line_advance} is not whole cells of {cell_advance}");
     cells.round() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    /// What makes a line's cell count exact (`fold::TabWidth`): every
+    /// codepoint the trie answers, and the bitmap advance, is a whole number
+    /// of cells. Moved here from the retired line table (2026-10-26), whose
+    /// seeds carried the count; the tab stops rest on it.
+    #[test]
+    fn every_trie_advance_is_whole_cells() {
+        let trie = crate::default_trie();
+        let cell = trie.metrics.advance_fu as i32;
+        assert_eq!(trie.bitmap_advance_fu, 2 * cell, "the bitmap advance is two cells");
+        let mut distinct = std::collections::BTreeSet::new();
+        for cp in 0u32..0x11_0000 {
+            let e = trie.lookup(cp);
+            assert_eq!(e.advance_fu % cell, 0, "U+{cp:04X} advance {} fu is not whole cells", e.advance_fu);
+            distinct.insert(e.advance_fu / cell);
+        }
+        assert!(distinct.iter().all(|&c| (0..=2).contains(&c)), "advances in cells: {distinct:?}");
+    }
 }

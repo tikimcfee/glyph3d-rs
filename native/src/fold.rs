@@ -202,11 +202,10 @@ impl ClusterMode {
 ///
 /// WHY DISPLAY CELLS FROM THE LOGICAL LINE, measured against the other two
 /// choices. It is EXACT: every atlas advance is a whole number of cells
-/// (`line_table::tests::every_trie_advance_is_whole_cells`), so a line's
+/// (`tab_stop::tests::every_trie_advance_is_whole_cells`), so a line's
 /// cell count is an integer, and every engine already carries it or recovers
-/// it exactly — the f64 line advance is exactly `cells × cell`, and the
-/// Visible field's segment seeds carry `cells`. It is CHEAP: the count never
-/// resets at a fold boundary, so a chunk or segment seeded mid-line needs no
+/// it exactly — the f64 line advance is exactly `cells × cell`. It is CHEAP:
+/// the count never resets at a fold boundary, so a chunk seeded mid-line needs no
 /// state it did not already have, and nothing but a tab reads it. Leader
 /// columns are wrong as soon as a line holds two tabs (the second would be
 /// measured from a column the first did not advance) or a double-width glyph;
@@ -216,8 +215,8 @@ impl ClusterMode {
 /// THE MEASURES of a tab that spans `k` cells: its ADVANCE lane, and the f32
 /// segment carrier's addend, is `f32(k) × cell` — one correctly rounded
 /// product (WGSL's `*` is correctly rounded too); the f64 line advance takes
-/// `k × cell` exactly, so it stays `cells × cell` and the foldless x and the
-/// Visible seeds stay exact. Its COLUMN is still one leader: wrap, rows,
+/// `k × cell` exactly, so it stays `cells × cell` and the foldless x stays
+/// exact. Its COLUMN is still one leader: wrap, rows,
 /// pages and pick are untouched, as they are by a double-width glyph.
 ///
 /// NO ORACLE past one cell: the JS oracle and the fixture corpus know only
@@ -233,7 +232,7 @@ impl TabWidth {
     pub const ONE_CELL: TabWidth = TabWidth(1);
     /// The widest stop accepted — a bound on input, not on the arithmetic
     /// (`f32(k)` is exact far past it): a stop wider than any editor offers
-    /// is a typo, and the Visible kernel's u32 cell counts stay small.
+    /// is a typo.
     pub const MAX_CELLS: u32 = 64;
 
     /// A width of `cells` cells, refused outside `1..=MAX_CELLS` (a stop
