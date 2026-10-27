@@ -106,7 +106,13 @@ enum Cmd {
         list: bool,
     },
     /// Run a single check by name. Used by `prove`, and useful on its own.
-    Gate { name: String },
+    Gate {
+        name: String,
+        /// As `glyph test --inner` runs it: a gate's own merge-tier parts
+        /// (pixel-ab's `golden_equivalents_merge`) are skipped, and named.
+        #[arg(long)]
+        inner: bool,
+    },
     /// Check build.toml is internally consistent.
     Validate,
     /// What each check compares, and what it cannot see.
@@ -176,7 +182,7 @@ fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool, inner: bool) -> bo
             println!("        {:<7} {}", scope_name(s), if names.is_empty() { "(none)".to_string() } else { names.join(", ") });
         }
     }
-    let ran = run_gates(m, &selected);
+    let ran = run_gates(m, &selected, inner);
     ok &= ran.iter().all(|r| r.ok);
     let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, inner, ok);
     println!();
@@ -261,8 +267,8 @@ fn main() -> ExitCode {
         }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),
-        Cmd::Gate { name } => match m.gate.iter().find(|g| g.name == name) {
-            Some(g) => run_gate(g, &m),
+        Cmd::Gate { name, inner } => match m.gate.iter().find(|g| g.name == name) {
+            Some(g) => run_gate(g, &m, inner),
             None => {
                 println!("FAIL  no gate named {name}");
                 false
@@ -302,6 +308,9 @@ fn main() -> ExitCode {
                 if g.kind == manifest::Kind::GoldenVerify {
                     if !m.settings.golden_equivalents.is_empty() {
                         println!("    equivalents : {}", m.settings.golden_equivalents.join("; "));
+                    }
+                    if !m.settings.golden_equivalents_merge.is_empty() {
+                        println!("    merge tier  : {}", m.settings.golden_equivalents_merge.join("; "));
                     }
                     for v in &m.golden_view {
                         for e in &v.exempt {

@@ -32,15 +32,13 @@ fn shot_path(name: &str, equivalent: Option<&str>) -> PathBuf {
     }
 }
 
-/// Render every golden view into the sweep dir — and, with `equivalents`,
-/// again under each golden equivalent. Shared by the gate and by `drift`
-/// (which compares only the plain frames), so both read the same renders.
-fn render_views(m: &Manifest, equivalents: bool) -> bool {
+/// Render every golden view into the sweep dir, and again under each of
+/// `equivalents`. Shared by the gate and by `drift` (which compares only the
+/// plain frames), so both read the same renders.
+fn render_views(m: &Manifest, equivalents: &[&str]) -> bool {
     let _ = std::fs::create_dir_all(sweep());
     let mut variants: Vec<Option<&str>> = vec![None];
-    if equivalents {
-        variants.extend(m.settings.golden_equivalents.iter().map(|e| Some(e.as_str())));
-    }
+    variants.extend(equivalents.iter().map(|e| Some(*e)));
     let mut ok = true;
     for v in &m.golden_view {
         for eq in &variants {
@@ -95,14 +93,25 @@ fn adapter_note(key: &str, dir: &Path) {
     }
 }
 
-pub(crate) fn verify_golden(m: &Manifest) -> bool {
+/// `inner`: the run is `glyph test --inner`, so the equivalents declared
+/// merge tier (`golden_equivalents_merge`) are skipped, each named.
+pub(crate) fn verify_golden(m: &Manifest, inner: bool) -> bool {
     let a = m.artifact.values().find(|a| a.class == Class::Golden).unwrap();
     let Some(key) = gpu_key() else {
         println!("FAIL  pixel-ab — the renderer did not answer --gpu-key, so this host's golden set is unknown");
         return false;
     };
     let dir = golden_dir(a, key);
-    if !render_views(m, true) {
+    let (equivalents, skipped): (Vec<&str>, Vec<&str>) = m
+        .settings
+        .golden_equivalents
+        .iter()
+        .map(String::as_str)
+        .partition(|e| !inner || !m.settings.golden_equivalents_merge.iter().any(|x| x == e));
+    for e in &skipped {
+        println!("SKIP  every view under {e} — a merge-tier equivalent: runs in a full `glyph test`");
+    }
+    if !render_views(m, &equivalents) {
         return false;
     }
     let mut ok = true;
@@ -138,7 +147,7 @@ pub(crate) fn verify_golden(m: &Manifest) -> bool {
                 // rendered all the same and its distance reported, so the
                 // known difference stays in sight and a stale exemption
                 // shows as one.
-                for eq in &m.settings.golden_equivalents {
+                for eq in &equivalents {
                     let shot_eq = shot_path(&v.name, Some(eq));
                     let equal = golden == std::fs::read(&shot_eq).ok();
                     match (v.exemption(eq), equal) {
@@ -282,7 +291,7 @@ pub(crate) fn cmd_drift(m: &Manifest) -> bool {
         return false;
     };
     step(&format!("drift: this host ({key}) against the other golden sets"));
-    if !render_views(m, false) {
+    if !render_views(m, &[]) {
         return false;
     }
     let base = golden_dir(a, key).parent().unwrap().to_path_buf();
