@@ -38,12 +38,10 @@ tool; re-baselining is a human act (root `AGENTS.md` § pixel-ab).
   `long.md`, `text.rs`, `emoji-view.txt`).
 - `hyper-oracle`: HyperLayout, the production engine, held to the
   oracle-backed fold bit-for-bit (records, host and device Pass 2 in both
-  slot formats, paint, and the visible kernel against Pass 2) over the
+  slot formats) over the
   fixture corpus, `g-pick-repo`, `g-cluster-repo` and the chunk-cut fixtures.
 - `pixel-ab`: the golden views byte-compared per rasterizer key, plain and
-  under each `golden_equivalents` entry (`--field-mode instanced`,
-  `--field-mode visible`; five syntax views are exempt from the visible one,
-  by name, and their distance is still printed).
+  under each `golden_equivalents` entry (`--field-mode instanced`).
 
 ## 3. Performance
 
@@ -56,8 +54,7 @@ python3 tools/bench_hyper.py --repo "$GLYPH_FLAGSHIP_REPO" -n 5 --field-mode der
 It reports walk, Pass 1, Pass 2, backend total (MB/s) and visual init. For
 one run with the stats line, `cargo glyph run --load-repo <dir> --frames 1`.
 Report interleaved A/B runs with machine load noted; the M2 is fanless and
-needs cool-downs. Visible mode's GPU timings: `GLYPH_VISIBLE_TIMING=1` (per
-frame, offscreen) or the F8 HUD.
+needs cool-downs.
 
 ## 4. Launcher vs in-app UI
 

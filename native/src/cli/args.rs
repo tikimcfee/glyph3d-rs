@@ -46,32 +46,6 @@ impl std::str::FromStr for PresentMode {
     }
 }
 
-/// The Visible field's debug tint (`--debug-tint`): colour each glyph by the
-/// LOD tier its line landed in, or by its item's cull state. A diagnostic
-/// lane in the Params uniform; the Instanced and Derived shaders never read
-/// it, so it moves no pixel there.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-#[value(rename_all = "lower")]
-pub enum DebugTint {
-    #[default]
-    Off,
-    /// Colour by LOD tier (glyph / wash / backdrop).
-    Lod,
-    /// Colour by cull state (visible / culled by frustum / culled by LOD).
-    Cull,
-}
-
-impl DebugTint {
-    /// The uniform's encoding (`FramePrepare::debug_tint`).
-    pub fn as_u32(self) -> u32 {
-        match self {
-            DebugTint::Off => 0,
-            DebugTint::Lod => 1,
-            DebugTint::Cull => 2,
-        }
-    }
-}
-
 /// Long-form help tail: the mode summary + verb reference + windowed keys from
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
@@ -89,8 +63,8 @@ VERBS (--verb \"V [ARGS]\", repeatable; applies to the most recent pick):
   move-group dx dy dz | scale-group s
   tint-group rrggbb | tint-cycle | hide-group | show-group | toggle-hidden
   set-glyph-background rrggbb[aa] | set-glyph-transform tx ty tz [s] | reset-glyph-group
-  (--field-mode visible keys the glyph verbs by item:byte; nudge is x-only
-  and scale-glyph is not representable there, as in derived)
+  (in --field-mode derived, nudge is x-only and scale-glyph is not
+  representable)
 
 WINDOWED MODE:
   fly camera — WASD move, E|R up, Q|F down, RIGHT-drag look, scroll = speed,
@@ -236,18 +210,12 @@ pub struct Cli {
     /// Glyph field render mode: `derived` (default since 2026-10-11: compact
     /// 20 B record per glyph, x stored, Y/Z derived in the vertex stage from
     /// the item table), `instanced` (one full 32 B placement record per
-    /// glyph, read as-is by the vertex stage; being retired), or `visible`
-    /// (no slot per glyph — the source bytes and a line table are resident
-    /// and the lines in view are laid out per frame on the GPU;
-    /// `out/VISIBLE-MODE.md`). Switchable live from the Debug panel's
+    /// glyph, read as-is by the vertex stage; being retired). Switchable
+    /// live from the Debug panel's
     /// selector (the scene rebuilds); a load past the Derived slot lanes
     /// falls back to `instanced` and says so.
     #[arg(long, value_name = "MODE", default_value = "derived")]
     pub field_mode: glyph_field::GlyphFieldMode,
-    /// Visible field only: tint glyphs by `lod` tier or `cull` state (`off`
-    /// by default). The other modes ignore it; the F8 HUD names the active one.
-    #[arg(long, value_name = "MODE", default_value = "off")]
-    pub debug_tint: DebugTint,
     /// Ground/sky environment behind the glyph scene: `off` or `ground`
     /// (default: `[environment] mode` in config, itself `off`). Windowed:
     /// the B key toggles it live.
@@ -290,7 +258,7 @@ pub struct Cli {
     #[arg(long, value_name = "R,G,B,A", value_parser = parse_rgba)]
     pub file_bg_color: Option<[f32; 4]>,
     /// "Show glyphs": px per text row at or above which a file is drawn as
-    /// glyphs; below it, a backdrop rectangle (visible mode: a line wash).
+    /// glyphs; below it, a backdrop rectangle.
     /// Default: the config's lod.show_glyphs_px (1.0). Was --lod-min-px, still accepted
     #[arg(long, alias = "lod-min-px", value_name = "F")]
     pub show_glyphs_px: Option<f32>,
@@ -474,7 +442,6 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(layout_mode);
     under!(repo_engine);
     under!(field_mode);
-    under!(debug_tint);
     under!(present_mode);
     under!(Some frames);
     let scene_typed = ["demo", "agent_session", "load_repo", "render_file"]

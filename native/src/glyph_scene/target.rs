@@ -48,8 +48,8 @@ pub(super) struct CompositeState {
     /// pipeline is (always, since `setup` made it unconditional for both
     /// windowed platforms), so an OFFSCREEN frame with a pick carries the
     /// highlight too — the old "copy path never renders selection visuals"
-    /// was stale by 2026-10-10, when `tests/visible_verbs.rs` measured the
-    /// tint in offscreen PNGs. The goldens run no pick, so they are untouched.
+    /// was stale by 2026-10-10, when a pixel test measured the tint in
+    /// offscreen PNGs. The goldens run no pick, so they are untouched.
     pub(super) selection_fx: Option<SelectionFx>,
 }
 
@@ -86,23 +86,12 @@ pub(super) struct MaskSet {
 /// has no slot) selects the whole segment; a pick MISS clears. Verbs never
 /// touch it. Persistent until the next pick — this closes the "sticky
 /// flash" gap.
-///
-/// The Visible field keeps no slot per glyph (its transient buffer is
-/// re-ordered by atomics every frame), so there a selection is a BYTE RANGE
-/// of an item (M3, 2026-10-10): the item is the picked view (a view's
-/// index is its item row, `crate::views`) and the bytes are leader offsets
-/// within the file — the two things the CPU pick already yields. The mask pass asks the field to lay
-/// the range's glyphs out again into its selection buffer and draws that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Selection {
     /// One glyph slot (arena-global split into chunk + chunk-local index).
     Glyph { chunk: u32, local: u32 },
     /// A whole segment/file (arena slot range; split per chunk at draw).
     Segment { slot_base: u32, slot_count: u32 },
-    /// The glyphs of item `item` whose leader byte lies in `[start, end)`
-    /// (Visible field only): one glyph is `[byte, byte + utf8 len)`, a file
-    /// is `[0, byte_len)`.
-    ByteRange { item: u32, start: u32, end: u32 },
 }
 
 impl Selection {
@@ -111,7 +100,6 @@ impl Selection {
         match self {
             Selection::Glyph { chunk, local } => format!("slot chunk {chunk} local {local}"),
             Selection::Segment { slot_base, slot_count } => format!("slots {slot_base}..+{slot_count}"),
-            Selection::ByteRange { item, start, end } => format!("{item}:{start}..{end}"),
         }
     }
 }

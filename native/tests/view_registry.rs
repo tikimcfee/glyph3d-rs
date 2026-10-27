@@ -3,7 +3,7 @@
 //! row is a field the registry carries, never its index.
 //!
 //! Until step A one integer was a file's item row, its group row, its node,
-//! its cull segment, its pick record and its Visible item, and code relied
+//! its cull segment and its pick record, and code relied
 //! on the equality. `GLYPH_PERMUTE_GROUP_ROWS=1` makes the repo loader file
 //! `g-pick-repo`'s files under their group rows in REVERSE, with row 0 a
 //! spare no file draws with (`repo::group_rows_of_views`): every view's
@@ -12,13 +12,12 @@
 //! byte-equal to the same frame of the plain load, in every field:
 //!
 //! - the `repo-wide` frame (the load: slot group lanes, the Derived item
-//!   table, the Visible items, the cull segments and their tints);
+//!   table, the cull segments and their tints);
 //! - the `repo-highlight` frame (the sidecar's placement writes: the Derived
-//!   item lane, Instanced's group lane, the Visible item's spans);
+//!   item lane, Instanced's group lane);
 //! - a scripted verb chain from the whole-field camera — `hide-group` on
-//!   long.md (the cull's hidden flag, `set_item_hidden`), `recolor-line` and
-//!   `set-glyph-background` on alpha.rs (placement writes, a group override
-//!   keyed by item), `tint-group` and `move-group` on sub/deep.py (the node,
+//!   long.md (the cull's hidden flag), `recolor-line` and
+//!   `set-glyph-background` on alpha.rs (placement writes), `tint-group` and `move-group` on sub/deep.py (the node,
 //!   the segment it syncs);
 //! - the library layout (`--layout-mode library`: each file's node goes
 //!   under its page's mount, the tree cull's segment nodes and tints).
@@ -31,6 +30,8 @@
 //! mutation hands back the view's index as its group row and reddens this
 //! on 10 of its 11 pairs (by hand: under `cargo glyph prove` the registry's
 //! unit test fails first, and the failing lib binary stops `cargo test`).
+//! Those were 11 pairs with the Visible field; since its deletion
+//! (2026-10-26) there are 7.
 //! Needs a GPU, like every other render test in this crate.
 
 use std::path::{Path, PathBuf};
@@ -109,7 +110,7 @@ struct Case {
     fields: &'static [&'static str],
 }
 
-const ALL_FIELDS: &[&str] = &["derived", "instanced", "visible"];
+const ALL_FIELDS: &[&str] = &["derived", "instanced"];
 
 const CASES: &[Case] = &[
     Case { name: "repo-wide", args: &[], fields: ALL_FIELDS },
@@ -128,7 +129,7 @@ const CASES: &[Case] = &[
         ],
         fields: ALL_FIELDS,
     },
-    Case { name: "library", args: &["--layout-mode", "library"], fields: &["derived", "visible"] },
+    Case { name: "library", args: &["--layout-mode", "library"], fields: &["derived"] },
 ];
 
 /// One (case, field) pair rendered plain and permuted: the pixels that

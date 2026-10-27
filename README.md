@@ -7,10 +7,7 @@ files you fly through. Glyphs are drawn with Slug-style analytic coverage
 
 What it is built for is SCALE with exactness. A repository of tens of
 thousands of files and on the order of a hundred million glyphs loads in
-seconds, and
-in the visible field mode the GPU lays out only the lines on screen each
-frame, so the per-frame cost follows what you can see, not the size of the
-repo. Underneath, the layout engine is held bit-for-bit to an independent
+seconds. Underneath, the layout engine is held bit-for-bit to an independent
 reference, and every offscreen frame is byte-deterministic, so every change
 is checked by execution rather than argument.
 
@@ -71,18 +68,17 @@ or live from the Debug panel):
 |---|---|---|
 | `derived` (default) | 20 B record | compact; the vertex stage derives Y/Z from per-file tables |
 | `instanced` | 32 B record | every glyph's full placement, read as-is; being retired |
-| `visible` | nothing | the source bytes and a line table stay resident; each frame the GPU culls to the lines in view and lays out only those. Lines too small for glyphs become one-quad washes, files too small for washes become rectangles |
 
-All three render the same pixels on every golden view. No mode guesses
+Both render the same pixels on every golden view. No mode guesses
 colour at load: the lexical syntax colouring was retired on 2026-10-11, and
 colour arrives as byte spans from AST/LSP analysis (`--highlight` takes a
 sidecar of such spans today). `--render-file` is a one-item repo load and
-runs in all three; agent-session and demo scenes use the stored modes (a
-`visible` request there builds `derived`). Derived became
-the default on 2026-10-11, with no pixel moving; `instanced` is being
-retired. Every glyph stays individually editable in every mode
-(recolour, background, transform), keyed by slot in the stored modes and by
-(file, byte) in visible mode. The design log is `out/VISIBLE-MODE.md`.
+runs in both. Derived became the default on 2026-10-11, with no pixel
+moving; `instanced` is being retired. Every glyph stays individually
+editable in every mode (recolour, background, transform), keyed by slot. A
+third mode, `visible` (no slot per glyph: the GPU laid out only the lines
+on screen each frame), was deleted on 2026-10-26; its design log is
+`out/history/VISIBLE-MODE.md`.
 
 ## Verification
 
@@ -107,5 +103,4 @@ Root `AGENTS.md` is the full account, blind spots included.
   fenced (generated, vendored, immutable), and the vocabulary.
 - `native/AGENTS.md`: the renderer crate's rules, module contracts, platform
   notes, and every debug environment variable.
-- `out/VISIBLE-MODE.md`: the visible field mode, milestone by milestone.
 - `out/`: dated reports and design records (history, not current state).

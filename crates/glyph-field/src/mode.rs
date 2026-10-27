@@ -22,23 +22,17 @@ pub enum GlyphFieldMode {
     /// default since 2026-10-11.
     #[default]
     Derived,
-    /// No slot per glyph: the source bytes and a line table are resident and
-    /// the lines in view are laid out per frame on the GPU into a transient
-    /// `DerivedSlot` buffer the Derived shader draws (`glyph-field-visible`;
-    /// behind the flag, M2 of `out/VISIBLE-MODE.md`).
-    Visible,
 }
 
 impl GlyphFieldMode {
     /// Every mode, in declaration order (for help text and tests).
-    pub const ALL: [GlyphFieldMode; 3] = [GlyphFieldMode::Instanced, GlyphFieldMode::Derived, GlyphFieldMode::Visible];
+    pub const ALL: [GlyphFieldMode; 2] = [GlyphFieldMode::Instanced, GlyphFieldMode::Derived];
 
     /// The CLI / log spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             GlyphFieldMode::Instanced => "instanced",
             GlyphFieldMode::Derived => "derived",
-            GlyphFieldMode::Visible => "visible",
         }
     }
 }
@@ -55,7 +49,7 @@ pub struct ParseGlyphFieldModeError(pub String);
 
 impl fmt::Display for ParseGlyphFieldModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown glyph field mode '{}' (expected instanced | derived | visible)", self.0)
+        write!(f, "unknown glyph field mode '{}' (expected instanced | derived)", self.0)
     }
 }
 

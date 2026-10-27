@@ -30,20 +30,17 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
   binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
-  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`);
-  `glyph-field-visible` (2026-10-10; `out/VISIBLE-MODE.md`) is the
-  Visible mode — no slot per glyph: the source bytes, Pass 1's line table and the atlas
-  trie are resident, the lines in view are laid out per frame on the GPU into a
-  transient `DerivedSlot` buffer the Derived shader draws, and lines too small for
-  glyphs are washes (one quad each). The renderer's side of it is
-  `native/src/layout_hyper/visible.rs` (the arena's third form) and the `Visible`
-  arms of `glyph_scene/{setup,render}.rs`. Chosen at load with
-  `--field-mode derived|visible|instanced`, switchable live from the Debug panel.
+  (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`).
+  Chosen at load with `--field-mode derived|instanced`, switchable live from
+  the Debug panel. A third mode, Visible (`glyph-field-visible`: no slot per
+  glyph, the lines in view laid out per frame by a GPU compute kernel;
+  `out/history/VISIBLE-MODE.md`), was deleted on 2026-10-26: the makepad
+  port has no compute and targets Derived alone.
   **Derived is the default since 2026-10-11** (Instanced retirement, step 1 of
   three: no pixel moved — the plain golden frames now render Derived, byte-equal
   to the baselines they always had). Step 2 (2026-10-11) made `--render-file`
   a one-item repo load (`repo::load_file`: HyperLayout, the shared
-  colourisers and every field — Visible for real — with `--copies N` as N
+  colourisers and every field, with `--copies N` as N
   views over the one buffer, tiled); it moved the pixels of `text`, `emoji`
   and `emoji-cluster`, which await adoption (pixel-ab, below). Step 3 deletes
   `glyph-field-instanced`. Until then Instanced stays
@@ -51,10 +48,6 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   is still the fall-back for a load past the Derived lanes. The agent-session
   Carrel stages one item per text block (`agent_transcript::staging::block_item`)
   so Derived lands its glyphs where Instanced's absolute positions do.
-  M3 (2026-10-10) re-keyed selection, the glyph verbs and styling there by
-  (item, byte) in place of the slot (`out/VISIBLE-MODE.md` § M3); the witness
-  is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
-  Derived and Visible mode.
   `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
   behind generation handles, CPU depth-first topology, dirty marks, and a
   CPU resolve of world transforms over the dirty depth-first ranges; every
@@ -63,8 +56,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   changed (the library's page faces and regions follow the same way). The
   default (Derived) frame dispatches no compute since 2026-10-26: the
   resolve, the face pass and the region compose were GPU passes until then
-  (the makepad port draws with no compute dispatch; Visible mode keeps its
-  own). `resolve-bench` (in the crate, run by hand) times the resolve;
+  (the makepad port draws with no compute dispatch). `resolve-bench` (in the crate, run by hand) times the resolve;
   `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built" has
   the GPU form's figures.
   Agent sessions come from gomuxai's `agent` CLI, the one reader of agent
@@ -83,14 +75,14 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   (`skills/glyph-engine-testing/SKILL.md`).
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
-- `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`), `VISIBLE-MODE.md`,
+- `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`),
   design records still cited by code (`EMOJI.md`, `GPU-DIRECTION-2026-10-09.md`),
   open plans, proof PNGs, `tooling-ab/baseline/` (the pixel oracle), and
   `out/history/`: dated reports and executed plans, each bannered as history
   (moved there 2026-10-10).
 - `research/` — background surveys and GPU architecture studies.
 - `experiments/` — its own workspace, outside every gate: the Zed-integration
-  spikes and `gpu-direction/` (the GPU-layout research behind visible mode;
+  spikes and `gpu-direction/` (the GPU-layout research behind the deleted visible mode;
   some of its scripts still name the retired CubeCL engine).
 - `config/defaults.toml` — every named, tunable value (colours, spacings, LOD
   thresholds), compiled in; `launch_config.toml` `[section]`s override it.
@@ -115,8 +107,7 @@ buffers where the GPU allows it and staging otherwise.
   95.2 million glyph instances) loaded and laid out in **~168 ms** backend (576.9 MB/s) /
   **~177 ms** total visual init in `--color-mode flat`, and **~215 ms** backend (450.9 MB/s) /
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
-  These figures are from late 2026-09, before C22's windowed staging and
-  before visible mode (which runs no Pass 2 at all); they have not been
+  These figures are from late 2026-09, before C22's windowed staging; they have not been
   re-measured since. `--color-mode` itself is RETIRED (2026-10-11, with the
   syntax heuristic): every load now paints flat, so the flat figure is the
   one that describes today's load path, and the syntax figure is history.
@@ -128,10 +119,11 @@ buffers where the GPU allows it and staging otherwise.
   launch overhead never beat HyperLayout, and HyperLayout's host staging recovers
   its one discrete-GPU advantage. The measurements and the case are in
   `out/GPU-DIRECTION-2026-10-09.md`; the GPU's next role (laying out only the
-  visible lines from resident bytes) shipped as the visible field mode.
+  visible lines from resident bytes) shipped as the visible field mode on
+  2026-10-10 and was deleted on 2026-10-26 (the makepad port has no compute).
 - Colour is byte spans, never guessed: `ByteSpan` and `Paint::ByteSpans` carry
   byte-range colour from AST/LSP analyses (the `--highlight` sidecar, the
-  seam's style runs; in visible mode the field's span table). Every load
+  seam's style runs). Every load
   paints flat; the lexical syntax heuristic that guessed keywords, strings
   and comments at load (`Paint::SyntaxHeuristic`, `--color-mode syntax`) was
   retired on 2026-10-11 (Ivan: "it should be gone in general"), and with it
@@ -425,7 +417,7 @@ still exist, not that the sentence around them is current.
 **orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
 declaration reaches is not compiled at all, and rustc says nothing about it.
 cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
-lists the files under `src/` it never reaches. It covers the 7 lib targets
+lists the files under `src/` it never reaches. It covers the 5 lib targets
 plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
 loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
 and until this gate only the cargo-test floor might have noticed, by count.
@@ -583,11 +575,13 @@ to compare, and it went with its five mutations (`hyper-cut-head-own-share`,
 `hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`,
 `colorizer-fills-any-word-colour`, `colorizer-last-word-unflushed`). Its
 input, `chunk-cut-paint.txt`, stays: the layout tiers, the windowed-emission
-test and the line-table and visible tests read it as an intra-line-cut
-input. Per-glyph colour through the device Pass 2 is now seen by the
-visible tier's span half (kernel against device under the same spans) and
-by cargo-test's `windowed_emission_matches_unwindowed` (per-record paint
-through the windows).
+test and the line-table tests read it as an intra-line-cut input.
+Per-glyph colour through the device Pass 2 is seen by cargo-test alone:
+`hyper_byte_spans_painting` and `resolve_spans_and_inplace_update_slot_colors`
+(byte spans), `windowed_emission_matches_unwindowed` (per-record paint
+through the windows). (A visible tier's span half saw it too, from
+2026-10-10 until the Visible field was deleted on 2026-10-26; that tier was
+the gate's only GPU use, so every tier now runs on the CPU.)
 Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
 is bit-exact on every tier in both modes (99 M records).
 **Tab stops** (2026-10-11, `fold::TabWidth`; `[layout] tab_width_cells` /
@@ -596,8 +590,7 @@ cells counted from the start of its LOGICAL line (a double-width glyph counts
 two; a wrap segment or column page does not restart the count); one cell is
 the layout before tab stops, and every golden and fixture is taken at one.
 Every engine recovers the line's cells from what it already carries — the
-f64 line advance is exactly `cells x cell`, the Visible seeds carry `cells` —
-and a chunk inside a long line that holds a tab is walked again from the
+f64 line advance is exactly `cells x cell` — and a chunk inside a long line that holds a tab is walked again from the
 true line state by the aggregation (the per-chunk walk measured it from its
 own start). Two more runs of this gate hold every tier to the serial fold at
 `--tab-width 4` (strict: `tab-stops`, `g-cluster-repo`, `g-pick-repo`;
@@ -610,12 +603,11 @@ lineage, which computes the stop itself) and to the oracle-backed one-cell
 fold over the spaces a tab stands for. A TABBED line long enough to be cut
 into chunks reaches no gate corpus; `hyper_oracle::tests::tab_stops_agree_on_every_tier`
 (cargo-test) carries a 135 KB one, asserted to cut where its line is off a
-stop. Mutations: `visible-tab-stop-by-column`, `hyper-device-tab-stop-ignored`,
-`hyper-pass1-seed-cells-ignore-tabs` here; `hyper-tab-chunk-rewalk-skipped`,
-`fold-tab-line-advance-rounded`, `tab-cells-always-a-whole-stop` and
-`visible-item-tab-width-dropped` on cargo-test (the last on
-`native/tests/tab_stops.rs`: Derived, Instanced and Visible draw the same
-`tab-stops` frame at widths 1, 4 and 8). `--render-file` is a one-item
+stop. Mutations: `hyper-device-tab-stop-ignored` here;
+`hyper-tab-chunk-rewalk-skipped`, `fold-tab-line-advance-rounded` and
+`tab-cells-always-a-whole-stop` on cargo-test. `native/tests/tab_stops.rs`
+holds Derived and Instanced to the same `tab-stops` frame at widths 1, 4
+and 8. `--render-file` is a one-item
 repo load since 2026-10-11 and lays its tabs out by this same rule, at its
 own default `[layout] render_file_tab_width_cells = 4` (the stops its
 retired CPU stager had; `text.png` has tabs), `--tab-width` overriding it.
@@ -719,30 +711,17 @@ its crate is deleted (step 3). A divergence under an equivalent with the
 plain frame equal is the VARIANT breaking — never a reason to re-baseline.
 `drift` compares the plain frames only.
 
-**The Visible field as an equivalent (M4, 2026-10-10; exemptions gone
-2026-10-11).** The second entry is `--field-mode visible`. When it was
-added, visible mode applied no load-time syntax paint (by decision) and the
-stored modes did, so the five syntax-painted repo views (repo-wide, -down,
--zoom, -back-oblique, repo-cluster) rendered under it as their stored
-modes' `--color-mode flat` render — token colour short of the baseline and
-nothing else — and were EXEMPT from that one equivalent, each with its why
-on the view (`[[golden_view.exempt]]`). The syntax heuristic's retirement
-(2026-10-11) made every mode paint flat: every golden frame now renders the
-same bytes plain, under `--field-mode instanced` and under `--field-mode
-visible` (measured on vulkan-nvidia, 30 of 30), and the five exemptions were
-removed. So the visible equivalent holds visible mode to pixels on every
-frame but `demo` (no field) — `text`, `emoji` and `emoji-cluster` included,
-which are visible mode for real since `--render-file` became a one-item repo
-load (step 2). `visible-row-off-by-one` proves it reddens (on
-repo-highlight). The mechanism stays for the next variant that legitimately
-differs: an exempt frame is still rendered and its distance printed as a
-NOTE with the pixel count, an exempt frame that turns out byte-equal is
-flagged as a possibly stale exemption, `validate` refuses an exemption
-naming no declared equivalent or no why, and `cargo glyph gates` lists
-every exemption under pixel-ab — a named blind spot, priced like the rest,
-never a quiet drop. Until their candidates are adopted, the frames whose
-token colour went (and step 2's three) are red under this entry as they
-are plain.
+**Exemptions.** An equivalent that legitimately differs on a frame can
+exempt that view (`[[golden_view.exempt]]`, with its why): the frame is
+still rendered and its distance printed as a NOTE with the pixel count, an
+exempt frame that turns out byte-equal is flagged as a possibly stale
+exemption, `validate` refuses an exemption naming no declared equivalent or
+no why, and `cargo glyph gates` lists every exemption under pixel-ab — a
+named blind spot, priced like the rest, never a quiet drop. None exists
+today. (`--field-mode visible` was the second equivalent from 2026-10-10
+until the Visible field was deleted on 2026-10-26; five syntax-painted
+views were exempt from it until the syntax heuristic's retirement on
+2026-10-11.)
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -940,8 +919,8 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
-| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names) and the line-table and visible tests; editing it moves its cuts and the gate's quoted volumes |
-| `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, past `SEGMENT_BYTES` so its tabs sit on both sides of the Visible seeds. Shortening that line or dropping its tabs hollows the visible tier's seeded-tab coverage silently |
+| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names) and the line-table tests; editing it moves its cuts and the gate's quoted volumes |
+| `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, a long tabbed line (built to put tabs on both sides of the deleted Visible field's segment seeds) |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 

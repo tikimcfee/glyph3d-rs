@@ -6,7 +6,7 @@
 > against the tree at `c3a9de5` (Derived the default; Instanced staying as an
 > opt-in field, decided 2026-10-11). It follows
 > `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` (steps 1 and 2 built), the
-> library findings (E6, E19, E20), `out/VISIBLE-MODE.md` § M3 and the
+> library findings (E6, E19, E20), `out/history/VISIBLE-MODE.md` § M3 and the
 > GPU-hierarchy survey. Every claim about the code cites `file:line` as read
 > on this date; anything not read is marked **[inferred]**. No code, shader,
 > manifest or fixture was changed for this note.

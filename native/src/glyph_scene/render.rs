@@ -40,9 +40,8 @@ pub(super) fn encode_frame(
         width,
         height,
     } = *target;
-    let t = frame.time;
     // The tables first: the group rows the resolve changed go up before any
-    // pass reads a row (the Visible field's cull below, the glyph pass);
+    // pass reads a row (the glyph pass);
     // the page faces and regions with them. Nothing moved, nothing written.
     scene.nodes.upload(&ctx.queue, &frame.group_runs);
     if let Some(faces) = &scene.library_faces {
@@ -94,75 +93,6 @@ pub(super) fn encode_frame(
     if scene.params_uploaded.get() != frame.params_generation {
         ctx.queue.write_buffer(&scene.params_buf, 0, bytemuck::bytes_of(&frame.params));
         scene.params_uploaded.set(frame.params_generation);
-    }
-    // The self-culling field's per-frame work (cull, LOD sort, layout of the
-    // glyph-tier lines into its transient slots) goes into THIS encoder
-    // before the glyph pass.
-    if let Some(prepare) = &frame.field_prepare {
-        // C29 (2026-10-10): under GLYPH_CULL_DEBUG, the field's own cull
-        // counters for frame 0 — the F8 HUD's figures, offscreen — read back
-        // BLOCKING at the start of frame 1, before this frame's `prepare`
-        // zeroes them: frame 0 has been submitted by then, where a readback
-        // inside frame 0 would see zeros its own encoder had not run past.
-        // Debug only (a stall per run, never the frame path).
-        if std::env::var_os("GLYPH_CULL_DEBUG").is_some() && (t - 1.0 / 60.0).abs() < 1e-4 {
-            if let Some(v) = scene.field.visible() {
-                let c = v.read_counters(&ctx.queue);
-                use glyph_field_visible::tables::counter as k;
-                println!(
-                    "CULLDBG visible (frame 0): items {} visible, {} backdrop, {} hidden, {} culled of {} | lines {} candidate: {} glyph, {} wash, {} dropped | segments {} | slots {} ({} dropped) | wash boxes {} ({} past the cap, not drawn)",
-                    c[k::ITEMS_VISIBLE],
-                    c[k::ITEMS_BACKDROP],
-                    c[k::ITEMS_HIDDEN],
-                    c[k::ITEMS_CULLED],
-                    v.stats().items_total,
-                    c[k::LINES_CANDIDATE],
-                    c[k::LINES_GLYPH],
-                    c[k::LINES_WASH],
-                    c[k::LINES_DROPPED],
-                    c[k::SEG_FIT_END],
-                    c[k::SLOT_FIT_END],
-                    c[k::SLOTS_DROPPED],
-                    c[k::WASH],
-                    c[k::WASH].saturating_sub(v.limits().max_wash),
-                );
-            }
-        }
-        // C30 (2026-10-10): under GLYPH_VISIBLE_TIMING, wait for the GPU
-        // before each `prepare` so the field's stats ring lands every frame,
-        // then print its GPU cull and layout times (the F8 HUD's `gpu cull
-        // … layout …`, two frames behind). A timing instrument for offscreen
-        // runs: the wait serializes frames, so never the frame path.
-        let timing = std::env::var_os("GLYPH_VISIBLE_TIMING").is_some() && scene.field.visible().is_some();
-        if timing {
-            let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        }
-        scene.field.prepare(&ctx.queue, encoder, prepare);
-        if timing {
-            if let Some(v) = scene.field.visible() {
-                let s = v.stats();
-                println!(
-                    "VISTIME t={t:.4} cull_ms={:.4} layout_ms={:.4} lines_candidate={} lines_glyph={} slots={}",
-                    s.cull_ms, s.layout_ms, s.lines_candidate, s.lines_glyph, s.slots
-                );
-            }
-        }
-        // The selection mask's content, right after `prepare` and before any
-        // pass (same encoder): the field lays the selected byte range's
-        // glyphs out again into its selection buffer, which the mask pass
-        // below draws. Gated exactly as that pass is (the mask machinery is
-        // built for both drivers since the mask pipeline became
-        // unconditional — an offscreen frame with a pick carries the
-        // highlight too, which is what lets `tests/visible_verbs.rs` witness
-        // this pass by pixel).
-        if let (Some(visible), Some((item, start, end)), true, true) = (
-            scene.field.visible(),
-            frame.selection.as_ref().and_then(|s| s.byte_range),
-            comp.selection_fx.is_some(),
-            vt.mask.is_some(),
-        ) {
-            visible.prepare_mask(&ctx.queue, encoder, item, start, end);
-        }
     }
     if let Some(env) = &frame.env {
         scene.environment.write(&ctx.queue, env);
@@ -291,14 +221,7 @@ pub(super) fn encode_frame(
                     .as_ref()
                     .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
                 pass.set_pipeline(scene.field.glyph_pipeline());
-                // A self-drawing field draws what its `prepare` emitted
-                // (the ranges are empty for it by construction); then its
-                // wash tier — one quad per line too small for glyphs —
-                // under its own pipeline.
                 scene.field.record_draws(&mut pass, &glyph_ranges);
-                if let Some(visible) = scene.field.visible() {
-                    visible.record_wash_draw(&mut pass);
-                }
                 if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                     p.borrow().end_query(&mut pass, q);
                 }
@@ -315,10 +238,7 @@ pub(super) fn encode_frame(
     // selection exists (no selection → the L3 command stream is
     // unchanged, which is every golden frame). Both drivers have the mask
     // machinery (`CompositeState::selection_fx`), so an offscreen frame
-    // with a pick carries the tint — `tests/visible_verbs.rs` reads it.
-    // The Visible field's selection is a byte range (M3): `prepare_mask`
-    // above laid its glyphs out into the field's selection buffer, and the
-    // mask pass draws that buffer under the same mask pipeline.
+    // with a pick carries the tint.
     let selection_phase = frame.selection.is_some().then_some(Phase::Selection);
     // The pool slot the composite will read: the scene slot, or the
     // tinted ping-pong partner when a selection was rendered.
@@ -356,15 +276,7 @@ pub(super) fn encode_frame(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
-            if sel.byte_range.is_some() {
-                // The Visible field: what `prepare_mask` emitted, one
-                // indirect draw over its selection buffer.
-                if let Some(visible) = scene.field.visible() {
-                    visible.record_mask_draw(&mut pass);
-                }
-            } else {
-                scene.field.record_draws(&mut pass, &sel.ranges.pairs());
-            }
+            scene.field.record_draws(&mut pass, &sel.ranges.pairs());
         }
         if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
             p.borrow().end_query(encoder, q);
