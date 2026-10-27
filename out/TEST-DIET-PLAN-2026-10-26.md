@@ -161,9 +161,18 @@ Per mutation on the cargo route (provejit's scoped runs):
 - **once per run:** a clean-tree check for each gate (cargo-test 26–68 s)
   and a final rebuild (21–27 s).
 
-Relax `--jit` cannot run the six compiler-diagnostic mutations,
-`tests-silently-ignored`, the WGSL mutations on cargo-test, or any data
-mutation.
+Relax `--jit` (provejit's later figures, `out/PROVE-ON-RELAX-2026-10-26.md`
+§ 6 on `mp-prove-jit`) runs 93 of the 116 mutations. Its source overlay
+covers `include_str!`, so 12 of the 13 WGSL mutations route. Cargo keeps
+23:
+- the six compiler-diagnostic mutations;
+- the data, Python and TOML ones;
+- `fixture-deleted` (a file removal);
+- `tests-silently-ignored`;
+- `derived-curve-cap-128` (its test reads the shader from disk).
+
+The full unscoped prove on relax took 13 min 50 s with all 116 red,
+against 41.4 min on cargo. A 27-mutation merge selection took 107 s.
 
 **What a mutation is for.** It proves once that a check can fail. A
 cargo-test mutation names the test it reddens. That test can only go
