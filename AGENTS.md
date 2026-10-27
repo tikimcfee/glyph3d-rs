@@ -194,7 +194,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
 - **The gates run at once** (2026-10-26, `glyph/src/schedule.rs`), each a
   child `glyph gate`, their output printed in `build.toml` order as each
   finishes. A gate waits only for an earlier gate that provides an artifact
-  it `needs`; the gates that open the GPU (`gpu = true`) run one at a time;
+  it `needs`, and never beside a gate either one declares `apart_from`:
+  pixel-ab, pick-oracle and hyper-oracle are apart from cargo-test, whose
+  GPU integration binaries were measured to slow a pixel-ab beside them
+  from 7 s to 21 s, so overlapping them saved nothing; the three run beside
+  each other (8-11 s together, 13 s in turn);
   cargo's lock orders the cargo gates sharing `target/`. The run ends with a
   TIME line: wall, products, gate seconds summed, the slowest. Measured on
   the 32-core Linux host under sibling load, at the end of the branch that

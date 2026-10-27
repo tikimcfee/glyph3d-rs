@@ -32,8 +32,8 @@
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
 # test and float_tables' eight. 384: the runner's dep-info parse (orphans);
 # 385: the scheduler's waits; 387: warn_count over each tool's output and
-# the doc gate's --workspace pin (test diet step 2).
-test_floor = 387
+# the doc gate's --workspace pin (test diet step 2); 388: apart_from as declared.
+test_floor = 388
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -288,12 +288,16 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 # Since 2026-10-26 the gates run AT ONCE, each as a child `glyph gate`, and
 # their output is printed in the order below as each one finishes. A gate
 # waits only for an earlier gate that provides an artifact it needs, and
-#   gpu = true    gates that open the GPU run one at a time among themselves
-#                 (cargo-test, whose GPU integration binaries are most of
-#                 its run, pick-oracle, hyper-oracle, pixel-ab; measured by
-#                 hiding Vulkan: repo-verify and reference-port pass without
-#                 a device). cargo's own lock orders the cargo gates sharing
-#                 target/.
+#   apart_from    gates this one never runs beside, where running together
+#                 was measured to cost more than it saves (2026-10-26, on the
+#                 32-core Linux host): pixel-ab, pick-oracle and hyper-oracle
+#                 apart from cargo-test, whose GPU integration binaries slow
+#                 a pixel-ab beside them from 7 s to 21 s (beside its CPU-
+#                 bound unit tests alone, 10 s), so the overlap saved nothing
+#                 (29 s against 28 s in turn). The three run beside each
+#                 other: 8-11 s together against 13 s in turn. No two gates
+#                 share an output path (each scratch is its own). cargo's own
+#                 lock orders the cargo gates sharing target/.
 #   tier          `inner` is what `glyph test --inner` runs after each change;
 #                 `merge` gates run only in a full `glyph test`, which runs
 #                 every tier. The merge tier is the compiler's diagnostics —
@@ -312,7 +316,6 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 name = "manifest"
 scope = "corpus"
 tier = "inner"
-gpu = false
 kind = "cmd"
 cmd = "target/release/glyph validate"
 needs = []
@@ -323,7 +326,6 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 name = "committed-artifacts"
 scope = "corpus"
 tier = "merge"
-gpu = false
 kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
@@ -334,7 +336,6 @@ blind_to = "whether the INPUTS are right — reproducibility, not truth"
 name = "atlas-tables"
 scope = "corpus"
 tier = "merge"
-gpu = false
 kind = "cmd"
 cmd = "python3 tools/check_atlas.py"
 pass_line = "ATLAS TABLES OK"
@@ -350,7 +351,6 @@ blind_to = "any codepoint or sequence outside the pins: it proves the tables are
 name = "atlas-verify"
 scope = "corpus"
 tier = "merge"
-gpu = false
 kind = "cmd"
 cmd = "python3 tools/verify_atlas.py"
 pass_line = "VERIFY OK"
@@ -361,7 +361,6 @@ blind_to = "what a curve DRAWS (the texture is checked for shape and range, neve
 name = "vendor-hashes"
 scope = "corpus"
 tier = "merge"
-gpu = false
 kind = "cmd"
 cmd = "python3 tools/vendor-manifest.py --check"
 needs = []
@@ -372,7 +371,6 @@ blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored 
 name = "cargo-build"
 scope = "rust"
 tier = "merge"
-gpu = false
 kind = "cargo"
 cmd = "build"
 needs = []
@@ -382,7 +380,6 @@ compare = "rustc warning count vs zero"
 name = "cargo-check-no-ui"
 scope = "rust"
 tier = "merge"
-gpu = false
 kind = "cargo"
 cmd = "check-no-ui"
 needs = []
@@ -393,7 +390,6 @@ blind_to = "whether either build RUNS correctly — they are checked, not execut
 name = "cargo-clippy"
 scope = "rust"
 tier = "merge"
-gpu = false
 kind = "cargo"
 cmd = "clippy"
 needs = []
@@ -404,7 +400,6 @@ blind_to = "anything silenced with #[expect(..., reason)] — a stale expectatio
 name = "cargo-doc"
 scope = "rust"
 tier = "merge"
-gpu = false
 kind = "cargo"
 cmd = "doc"
 needs = []
@@ -419,7 +414,6 @@ blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment
 name = "orphans"
 scope = "rust"
 tier = "merge"
-gpu = false
 kind = "orphans"
 needs = []
 compare = "every .rs file under each workspace package's src/ vs the union of the source files its units read, from rustc's dep-info for every unit `cargo test --release --no-run` builds (lib, its cfg(test) harness, bins and their harnesses, integration tests) — the same build cargo-test runs"
@@ -429,7 +423,6 @@ blind_to = "a file reached only under a cfg the host does not set (cfg(test) and
 name = "cargo-test"
 scope = "rust"
 tier = "inner"
-gpu = true
 kind = "cargo-test"
 needs = []
 compare = "summed tests-actually-ran vs settings.test_floor ratchet; whole-binary dropout check"
@@ -439,7 +432,7 @@ blind_to = "nothing, structurally — that is what the floor is for. Holds the t
 name = "pick-oracle"
 scope = "render"
 tier = "inner"
-gpu = true
+apart_from = ["cargo-test"]
 kind = "cmd"
 cmd = "bash tools/check-pick-oracle.sh"
 pass_line = "ALL PASS"
@@ -459,7 +452,6 @@ blind_to = "pick paths outside the scripted set"
 name = "reference-port"
 scope = "corpus"
 tier = "inner"
-gpu = false
 kind = "cmd"
 cmd = "bash tools/check-fixture-parity.sh"
 pass_line = "ALL PASS"
@@ -495,7 +487,7 @@ blind_to = "HyperLayout entirely — these are fold.rs/scan.rs/bake.rs/text.rs, 
 name = "hyper-oracle"
 scope = "render"
 tier = "inner"
-gpu = true
+apart_from = ["cargo-test"]
 kind = "cmd"
 cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4 && GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
 pass_line = "hyper-oracle PASS"
@@ -514,7 +506,6 @@ blind_to = "Shared with the reference and so invisible here: the atlas trie (Tri
 name = "repo-verify"
 scope = "render"
 tier = "inner"
-gpu = false
 kind = "repo-verify"
 cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine hyper --repo-verify --repo-scan-only"
 modes = ["down", "back"]
@@ -529,7 +520,6 @@ blind_to = "any fault in HyperLayout itself — both sides are HyperLayout (hype
 name = "repo-verify-direct"
 scope = "render"
 tier = "inner"
-gpu = false
 kind = "repo-verify"
 cmd = "--load-repo fixtures/g-pick-repo --wrap-mode {mode} --repo-engine direct --repo-verify --repo-scan-only"
 modes = ["down", "back"]
@@ -541,7 +531,7 @@ blind_to = "the wire-record tier (direct makes none) and every fault both calls 
 name = "pixel-ab"
 scope = "render"
 tier = "inner"
-gpu = true
+apart_from = ["cargo-test"]
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
 compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced, --field-mode visible) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"

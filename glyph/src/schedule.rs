@@ -7,9 +7,10 @@
 //! output is its own; the blocks are printed in manifest order as each one
 //! finishes, so a run reads the same as a serial one. A gate starts when
 //! every earlier gate that provides an artifact it `needs` has finished (the
-//! order `validate` holds the manifest to), and a `gpu` gate only when no
-//! other is running. Nothing else is ordered here: cargo's lock orders the
-//! cargo gates that share `target/`.
+//! order `validate` holds the manifest to), and never beside a gate either
+//! one declares `apart_from` (a measured contention: the GPU gates beside
+//! cargo-test's GPU binaries). Nothing else is ordered here: cargo's lock
+//! orders the cargo gates that share `target/`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,6 +73,12 @@ fn waits_for(m: &Manifest, gates: &[&Gate]) -> Vec<Vec<usize>> {
         .collect()
 }
 
+/// Whether `a` and `b` may run at the same time: neither declares itself
+/// apart from the other.
+fn may_overlap(a: &Gate, b: &Gate) -> bool {
+    !a.apart_from.contains(&b.name) && !b.apart_from.contains(&a.name)
+}
+
 /// Run `gates`, printing each one's block in order; one `Ran` per gate.
 /// `inner` passes `--inner` to each child (a gate's own merge-tier parts).
 pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate], inner: bool) -> Vec<Ran> {
@@ -79,18 +86,19 @@ pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate], inner: bool) -> Vec<Ran> 
     let waits = waits_for(m, gates);
     let mut started = vec![false; gates.len()];
     let mut done: Vec<Option<(bool, String, f64)>> = (0..gates.len()).map(|_| None).collect();
-    let mut gpu_busy = false;
+    let mut running = vec![false; gates.len()];
     let mut printed = 0;
     let (tx, rx) = mpsc::channel::<(usize, bool, String, f64)>();
     std::thread::scope(|s| {
         while printed < gates.len() {
             for i in 0..gates.len() {
                 let ready = !started[i] && waits[i].iter().all(|&j| done[j].is_some());
-                if !ready || (gates[i].gpu && gpu_busy) {
+                let apart = (0..gates.len()).any(|j| running[j] && !may_overlap(gates[i], gates[j]));
+                if !ready || apart {
                     continue;
                 }
                 started[i] = true;
-                gpu_busy |= gates[i].gpu;
+                running[i] = true;
                 let (tx, runner, name) = (tx.clone(), &runner, gates[i].name.as_str());
                 s.spawn(move || {
                     let t = Instant::now();
@@ -99,9 +107,7 @@ pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate], inner: bool) -> Vec<Ran> 
                 });
             }
             let Ok((i, ok, out, secs)) = rx.recv() else { break };
-            if gates[i].gpu {
-                gpu_busy = false;
-            }
+            running[i] = false;
             // The child's whole output, beside whatever its own gate kept
             // of the commands under it.
             let out = if ok { out } else { format!("{out}      full output kept: {}\n", keep(&gates[i].name, &out)) };
@@ -160,5 +166,19 @@ mod tests {
         assert_eq!(named("hyper-oracle"), ["committed-artifacts"]);
         assert!(named("pixel-ab").is_empty());
         assert!(named("cargo-test").is_empty());
+    }
+
+    /// The measured contention, as declared: the GPU gates never beside
+    /// cargo-test, either way round, and beside each other freely.
+    #[test]
+    fn the_gpu_gates_stay_apart_from_cargo_test_only() {
+        let m = load().expect("build.toml loads");
+        let g = |name: &str| m.gate.iter().find(|g| g.name == name).expect("a declared gate");
+        for name in ["pixel-ab", "pick-oracle", "hyper-oracle"] {
+            assert!(!may_overlap(g(name), g("cargo-test")), "{name} beside cargo-test");
+            assert!(!may_overlap(g("cargo-test"), g(name)), "cargo-test beside {name}");
+        }
+        assert!(may_overlap(g("pixel-ab"), g("pick-oracle")));
+        assert!(may_overlap(g("cargo-test"), g("cargo-clippy")));
     }
 }

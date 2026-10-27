@@ -295,7 +295,10 @@ fn main() -> ExitCode {
         }
         Cmd::Gates => {
             for g in &m.gate {
-                println!("  {}  [{:?}, tier {:?}{}]", g.name, g.scope, g.tier, if g.gpu { ", gpu" } else { "" });
+                println!("  {}  [{:?}, tier {:?}]", g.name, g.scope, g.tier);
+                if !g.apart_from.is_empty() {
+                    println!("    apart from : {}", g.apart_from.join(", "));
+                }
                 if let Some(c) = &g.compare {
                     println!("    compares : {c}");
                 }
