@@ -169,16 +169,18 @@ mod tests {
     }
 
     /// The measured contention, as declared: the GPU gates never beside
-    /// cargo-test, either way round, and beside each other freely.
+    /// cargo-test, either way round, and beside each other freely;
+    /// hyper-oracle, CPU-only since the Visible tier went, beside anything.
     #[test]
     fn the_gpu_gates_stay_apart_from_cargo_test_only() {
         let m = load().expect("build.toml loads");
         let g = |name: &str| m.gate.iter().find(|g| g.name == name).expect("a declared gate");
-        for name in ["pixel-ab", "pick-oracle", "hyper-oracle"] {
+        for name in ["pixel-ab", "pick-oracle"] {
             assert!(!may_overlap(g(name), g("cargo-test")), "{name} beside cargo-test");
             assert!(!may_overlap(g("cargo-test"), g(name)), "cargo-test beside {name}");
         }
         assert!(may_overlap(g("pixel-ab"), g("pick-oracle")));
+        assert!(may_overlap(g("hyper-oracle"), g("cargo-test")));
         assert!(may_overlap(g("cargo-test"), g("cargo-clippy")));
     }
 }

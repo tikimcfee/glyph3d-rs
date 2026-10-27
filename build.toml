@@ -287,12 +287,15 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 # waits only for an earlier gate that provides an artifact it needs, and
 #   apart_from    gates this one never runs beside, where running together
 #                 was measured to cost more than it saves (2026-10-26, on the
-#                 32-core Linux host): pixel-ab, pick-oracle and hyper-oracle
-#                 apart from cargo-test, whose GPU integration binaries slow
-#                 a pixel-ab beside them from 7 s to 21 s (beside its CPU-
+#                 32-core Linux host): pixel-ab and pick-oracle apart from
+#                 cargo-test, whose GPU integration binaries slow a
+#                 pixel-ab beside them from 7 s to 21 s (beside its CPU-
 #                 bound unit tests alone, 10 s), so the overlap saved nothing
-#                 (29 s against 28 s in turn). The three run beside each
-#                 other: 8-11 s together against 13 s in turn. No two gates
+#                 (29 s against 28 s in turn). The two run beside each
+#                 other. hyper-oracle was apart too until its Visible tier
+#                 went (2026-10-26): CPU-only since, it runs beside
+#                 cargo-test at no cost (0.5 s alone, 0.6-0.7 s beside it,
+#                 cargo-test unchanged at 6.7 s; measured twice). No two gates
 #                 share an output path (each scratch is its own). cargo's own
 #                 lock orders the cargo gates sharing target/.
 #   tier          `inner` is what `glyph test --inner` runs after each change;
@@ -483,7 +486,6 @@ blind_to = "HyperLayout entirely — these are fold.rs/text.rs and the trie, not
 name = "hyper-oracle"
 scope = "render"
 tier = "inner"
-apart_from = ["cargo-test"]
 kind = "cmd"
 cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4 && GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
 pass_line = "hyper-oracle PASS"
