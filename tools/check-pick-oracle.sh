@@ -22,9 +22,9 @@ set -uo pipefail
 # target/, not a shared /tmp path: two worktrees running the gate at once
 # wrote each other's screenshots there (2026-10-26).
 cd "$(dirname "$0")/.."
-SCRATCH="$PWD/target/glyph-scratch/pick-oracle"
+SCRATCH="${GLYPH_SCRATCH:-$PWD/target/glyph-scratch}/pick-oracle"
 mkdir -p "$SCRATCH"
-BIN=target/release/glyph3d-native
+BIN=${GLYPH_RENDERER:-target/release/glyph3d-native}
 # Unlike its siblings this script had no binary guard for most of its life:
 # run out of order it died with a raw shell error instead of a diagnosis.
 [ -x "$BIN" ] || { echo "FAIL  $BIN missing — run: cargo glyph build"; exit 1; }
