@@ -1693,18 +1693,18 @@ impl G3PhaseList {
 /// (BGRA8), the tables, the block and mesh publications; draws one frame in
 /// glyph3d's phase order and composites it into a rect.
 ///
-/// FIRST-FRAME HITCH: the native frame builder uploads every new retained
-/// publication in the frame that first draws it (no per-frame upload budget
-/// on native: `fb_instances` ignores `list_and_upload_budget`). The
-/// flagship's 95M slots × 20 B = ~1.9 GB in ~360 blocks of 5.2 MB therefore
-/// lands in ONE frame: a CPU copy of 1.9 GB into upload buffers plus the PCIe
-/// transfer, on the order of 0.2–0.5 s at PCIe 4 rates, plus the same again
-/// in resident VRAM (as glyph3d's own storage buffers). To spread it, append
-/// blocks over several frames (a block appended never moves the ones before
-/// it, so nothing re-uploads); a block not yet handed in simply draws
-/// nothing. Selecting glyphs costs one more upload per selected block (its
-/// mask copy, kept per block index in `mask_lists` so it is not repeated as
-/// the selection changes).
+/// RESIDENCY (2026-10-26): a block is published only while the cull draws
+/// it (or the selection covers it), within the host's envelope
+/// ([`G3Residency`]). Each frame the blocks the frame needs and does not
+/// hold are published, in arena order, up to the per-frame upload budget
+/// (the native frame builder uploads a new retained publication in the
+/// frame that first draws it, with no budget of its own); to make room, the
+/// held blocks the frame does not need are evicted, least recently drawn
+/// first. A needed block not yet published draws nothing until it is. A
+/// tree past the device (1.29B slots, 24 GiB, against a 7 GiB envelope) is
+/// drawn from the host blocks a view at a time. Selecting glyphs costs one
+/// more upload per selected block (its mask copy, in the block's own mask
+/// list).
 pub struct G3Renderer {
     pass: DrawPass,
     mask_pass: DrawPass,
@@ -1715,19 +1715,52 @@ pub struct G3Renderer {
     quads_list: G3PhaseList,
     cubes_list: G3PhaseList,
     glyph_list: G3PhaseList,
-    /// One mask list per block index, made on first selection: a block's
-    /// mask item stays at index 0 of its own list, so re-selecting it never
-    /// re-uploads.
-    mask_lists: Vec<Option<G3PhaseList>>,
     color: Texture,
     depth: Texture,
     mask: Texture,
     geoms: G3MeshGeometries,
     tables: Option<G3Tables>,
-    blocks: Vec<G3GlyphBlock>,
+    /// Per block index, the block while it is resident.
+    blocks: Vec<Option<G3ResidentBlock>>,
+    residency: G3Residency,
+    /// Bytes of the resident blocks.
+    resident_bytes: usize,
+    /// Frames synced, for least-recently-drawn eviction.
+    frame: u64,
+    /// The last frame's needed blocks that did not fit the envelope, logged
+    /// when it changes.
+    unfit: usize,
     meshes: Option<G3MeshPublications>,
     scratch: Vec<f32>,
     seen: G3Seen,
+}
+
+/// What the host lets the glyph blocks hold of the device: `envelope`
+/// bytes resident at once, `upload_per_frame` bytes published a frame.
+#[derive(Clone, Copy, Debug)]
+pub struct G3Residency {
+    pub envelope: usize,
+    pub upload_per_frame: usize,
+}
+
+impl Default for G3Residency {
+    /// No envelope: every block the frame needs is published, at most
+    /// 256 MiB of them a frame.
+    fn default() -> Self {
+        Self { envelope: usize::MAX, upload_per_frame: 256 << 20 }
+    }
+}
+
+/// A resident block: its publication, drawn at index 0 of a list of its
+/// own (so it stays put whichever other blocks are drawn or evicted), and
+/// its selection mask's list.
+struct G3ResidentBlock {
+    block: G3GlyphBlock,
+    list: G3PhaseList,
+    mask: Option<G3PhaseList>,
+    bytes: usize,
+    /// The last frame that needed it.
+    needed: u64,
 }
 
 fn g3_set_pass_camera(cx: &mut Cx, pass: &DrawPass, view_proj: &[f32; 16]) {
@@ -1758,13 +1791,16 @@ impl G3Renderer {
             quads_list: G3PhaseList::new(cx),
             cubes_list: G3PhaseList::new(cx),
             glyph_list: G3PhaseList::new(cx),
-            mask_lists: Vec::new(),
             color: Texture::new_with_format(cx, TextureFormat::RenderRGBAf16 { size: TextureSize::Auto, initial: true }),
             depth: Texture::new_with_format(cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true }),
             mask: Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true }),
             geoms: G3MeshGeometries::new(cx),
             tables: None,
             blocks: Vec::new(),
+            residency: G3Residency::default(),
+            resident_bytes: 0,
+            frame: 0,
+            unfit: 0,
             meshes: None,
             scratch: Vec::new(),
             seen: G3Seen::default(),
@@ -1774,6 +1810,15 @@ impl G3Renderer {
     /// The generations consumed so far.
     pub fn seen(&self) -> G3Seen {
         self.seen
+    }
+
+    pub fn set_residency(&mut self, residency: G3Residency) {
+        self.residency = residency;
+    }
+
+    /// Resident blocks and their bytes.
+    pub fn resident(&self) -> (usize, usize) {
+        (self.blocks.iter().flatten().count(), self.resident_bytes)
     }
 
     fn sync(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
@@ -1787,33 +1832,7 @@ impl G3Renderer {
             }
             self.seen.groups = Some(inputs.groups_generation);
         }
-        // Blocks by identity: only a new Arc at an index is re-published.
-        // One log line per sync that republished any (a load, an edit), so
-        // an edit's upload is visible: it should name one block, not all.
-        self.blocks.truncate(inputs.blocks.len());
-        let mut republished = Vec::new();
-        for (k, words) in inputs.blocks.iter().enumerate() {
-            if self.blocks.get(k).is_some_and(|b| b.is(words)) {
-                continue;
-            }
-            republished.push(k);
-            let block = G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot");
-            if k < self.blocks.len() {
-                self.blocks[k] = block;
-            } else {
-                self.blocks.push(block);
-            }
-        }
-        if !republished.is_empty() {
-            let shown: Vec<usize> = republished.iter().copied().take(8).collect();
-            log!(
-                "g3: republished {} of {} glyph blocks {:?}{}",
-                republished.len(),
-                self.blocks.len(),
-                shown,
-                if republished.len() > shown.len() { " ..." } else { "" }
-            );
-        }
+        self.sync_blocks(cx, inputs);
         if self.seen.meshes != Some(inputs.meshes_generation) || self.meshes.is_none() {
             self.meshes = Some(G3MeshPublications {
                 faces: g3_publish_meshes(inputs.faces),
@@ -1822,6 +1841,108 @@ impl G3Renderer {
                 group_faces: G3GroupFaceSpec::publish(inputs.group_faces),
             });
             self.seen.meshes = Some(inputs.meshes_generation);
+        }
+    }
+
+    /// Publish what the frame needs of the blocks, by identity and within
+    /// the residency (see [`G3Renderer`]). A held block whose `Arc` is
+    /// still the host's is not re-published; a new `Arc` (an edit)
+    /// re-publishes that block only. One log line per sync that published
+    /// or evicted any, so an edit's upload is visible: it should name one
+    /// block, not all.
+    fn sync_blocks(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
+        self.frame += 1;
+        let frame = self.frame;
+        for gone in self.blocks.drain(inputs.blocks.len().min(self.blocks.len())..).flatten() {
+            self.resident_bytes -= gone.bytes;
+        }
+        self.blocks.resize_with(inputs.blocks.len(), || None);
+        let selected = |k: usize| inputs.selection.and_then(|s| s.chunk_ranges.get(k)).is_some_and(|r| !r.is_empty());
+        let needed: Vec<usize> = (0..inputs.blocks.len())
+            .filter(|&k| inputs.chunk_ranges.get(k).is_some_and(|r| !r.is_empty()) || selected(k))
+            .collect();
+        let mut republished = Vec::new();
+        let mut published = Vec::new();
+        let mut evicted = 0usize;
+        let mut uploaded = 0usize;
+        let mut unfit = 0usize;
+        // The held blocks first: all of them are this frame's before any
+        // eviction looks for one that is not.
+        let mut missing = Vec::new();
+        for &k in &needed {
+            let words = &inputs.blocks[k];
+            match &mut self.blocks[k] {
+                Some(held) => {
+                    held.needed = frame;
+                    if !held.block.is(words) {
+                        held.block = G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot");
+                        republished.push(k);
+                    }
+                }
+                None => missing.push(k),
+            }
+        }
+        for k in missing {
+            let words = &inputs.blocks[k];
+            let bytes = words.len() * 4;
+            if uploaded > 0 && uploaded + bytes > self.residency.upload_per_frame {
+                continue;
+            }
+            // Room: evict the held blocks this frame does not need, least
+            // recently needed first.
+            while self.resident_bytes + bytes > self.residency.envelope {
+                let victim = self
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, b)| b.as_ref().filter(|b| b.needed != frame).map(|b| (b.needed, j)))
+                    .min();
+                let Some((_, j)) = victim else { break };
+                let gone = self.blocks[j].take().expect("the victim is resident");
+                self.resident_bytes -= gone.bytes;
+                evicted += 1;
+            }
+            if self.resident_bytes + bytes > self.residency.envelope {
+                unfit += 1;
+                continue;
+            }
+            self.blocks[k] = Some(G3ResidentBlock {
+                block: G3GlyphBlock::new(words).expect("a DerivedSlot block is 5 words a slot"),
+                list: G3PhaseList::new(cx),
+                mask: None,
+                bytes,
+                needed: frame,
+            });
+            self.resident_bytes += bytes;
+            uploaded += bytes;
+            published.push(k);
+        }
+        if !(republished.is_empty() && published.is_empty() && evicted == 0) {
+            let shown: Vec<usize> = republished.iter().chain(&published).copied().take(8).collect();
+            let (resident, bytes) = self.resident();
+            log!(
+                "g3: republished {} and published {} glyph blocks {:?}{}, evicted {}; {} of {} resident ({} MiB), {} needed",
+                republished.len(),
+                published.len(),
+                shown,
+                if republished.len() + published.len() > shown.len() { " ..." } else { "" },
+                evicted,
+                resident,
+                self.blocks.len(),
+                bytes >> 20,
+                needed.len(),
+            );
+        }
+        if unfit != self.unfit {
+            if unfit > 0 {
+                log!(
+                    "g3: the view needs {} glyph blocks, {} past the {} MiB envelope: they draw nothing",
+                    needed.len(),
+                    unfit,
+                    self.residency.envelope >> 20
+                );
+            }
+            self.unfit = unfit;
         }
     }
 
@@ -1869,14 +1990,18 @@ impl G3Renderer {
             self.quads_list.draw(cxd, |cx| draws.mesh.draw_retained(cx, quad, &meshes.quads));
             self.cubes_list.draw(cxd, |cx| draws.mesh.draw_retained(cx, cube, &meshes.cubes));
 
-            // Every block draws, at its own index, even with nothing visible
-            // ([0..0]), so block k is always item k.
+            // The resident blocks the cull draws, each in its own list, in
+            // arena order (glyph3d's blend order).
             draws.glyph.prepare(cxd, tables, &inputs.glyph_params);
-            let blocks = &self.blocks;
+            let blocks = &mut self.blocks;
             self.glyph_list.draw(cxd, |cx| {
-                for (k, block) in blocks.iter().enumerate() {
-                    let ranges = inputs.chunk_ranges.get(k).copied().unwrap_or(&[]);
-                    block.draw(cx, &mut draws.glyph.draw_vars, ranges);
+                for (k, held) in blocks.iter_mut().enumerate() {
+                    let Some(held) = held else { continue };
+                    let Some(ranges) = inputs.chunk_ranges.get(k).filter(|r| !r.is_empty()) else { continue };
+                    let block = &held.block;
+                    held.list.draw(cx, |cx| {
+                        block.draw(cx, &mut draws.glyph.draw_vars, ranges);
+                    });
                 }
             });
 
@@ -1898,12 +2023,13 @@ impl G3Renderer {
                 self.mask_list.begin_always(cxd);
                 let mask = &mut draws.glyph_mask.draw_super;
                 mask.prepare(cxd, tables, &inputs.glyph_params);
-                self.mask_lists.resize_with(self.blocks.len(), || None);
-                for (k, block) in self.blocks.iter().enumerate() {
+                for (k, held) in self.blocks.iter_mut().enumerate() {
+                    let Some(held) = held else { continue };
                     let Some(ranges) = selection.chunk_ranges.get(k).filter(|r| !r.is_empty()) else {
                         continue;
                     };
-                    let list = self.mask_lists[k].get_or_insert_with(|| G3PhaseList::new(cxd));
+                    let block = &held.block;
+                    let list = held.mask.get_or_insert_with(|| G3PhaseList::new(cxd));
                     list.draw(cxd, |cx| {
                         block.draw(cx, &mut mask.draw_vars, ranges);
                     });

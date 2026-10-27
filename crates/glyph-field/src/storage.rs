@@ -120,6 +120,22 @@ impl<S: SlotRecord> SlotStorage<S> {
         storage
     }
 
+    /// The host blocks alone, no device copy: for a field a host renderer
+    /// draws from its blocks (`FieldResources::slots_on_device`). The chunk
+    /// counts are the blocks'; there are no chunk buffers.
+    pub fn host_only(slots: HostSlots) -> Self {
+        let chunk_counts = (0..slots.blocks().len()).map(|k| slots.block_len(k) as u32).collect();
+        Self {
+            chunks: Vec::new(),
+            chunk_counts,
+            chunk_capacity: slots.block_slots() as u32,
+            glyph_count: slots.len() as u32,
+            mapped_base: None,
+            host: Some(RefCell::new(slots)),
+            _slot: std::marker::PhantomData,
+        }
+    }
+
     /// The storage `source` describes: a Device source's buffers bound as-is
     /// (no upload, no transcode, no copy), a Host source's records transcoded
     /// by `transcode` and uploaded.
@@ -164,6 +180,12 @@ impl<S: SlotRecord> SlotStorage<S> {
         self.glyph_count
     }
 
+    /// Whether the slots have a device copy (every storage but
+    /// [`Self::host_only`]).
+    pub fn on_device(&self) -> bool {
+        !self.chunks.is_empty()
+    }
+
     /// The host blocks, when the storage keeps them.
     pub fn host_slots(&self) -> Option<Ref<'_, HostSlots>> {
         self.host.as_ref().map(RefCell::borrow)
@@ -182,6 +204,7 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// The buffer holding `slot` and the byte address of `slot`'s first byte
     /// plus `field_offset` within it.
     pub fn address(&self, slot: u32, field_offset: u64) -> (&wgpu::Buffer, u64) {
+        assert!(self.on_device(), "a host-only field has no device copy of slot {slot}");
         let chunk = &self.chunks[(slot / self.chunk_capacity) as usize];
         let local = (slot % self.chunk_capacity) as u64;
         (&chunk.buffer, chunk.offset + local * Self::SLOT_BYTES + field_offset)
@@ -191,8 +214,10 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// (4-aligned offsets — write_buffer's requirement).
     pub fn write_field(&self, queue: &wgpu::Queue, slot: u32, field_offset: u64, data: &[u8]) {
         self.patch_host(slot, field_offset, data);
-        let (buffer, offset) = self.address(slot, field_offset);
-        queue.write_buffer(buffer, offset, data);
+        if self.on_device() {
+            let (buffer, offset) = self.address(slot, field_offset);
+            queue.write_buffer(buffer, offset, data);
+        }
     }
 
     /// Whole-slot upload of a contiguous run, one write per chunk it touches.
@@ -202,8 +227,10 @@ impl<S: SlotRecord> SlotStorage<S> {
             for (i, slot) in piece.iter().enumerate() {
                 self.patch_host(first_slot + run_offset + i as u32, 0, bytemuck::bytes_of(slot));
             }
-            let (buffer, offset) = self.address(first_slot + run_offset, 0);
-            queue.write_buffer(buffer, offset, bytemuck::cast_slice(piece));
+            if self.on_device() {
+                let (buffer, offset) = self.address(first_slot + run_offset, 0);
+                queue.write_buffer(buffer, offset, bytemuck::cast_slice(piece));
+            }
         }
     }
 

@@ -98,6 +98,13 @@ pub trait GlyphField {
         None
     }
 
+    /// Whether this device holds a copy of the slots: false for a field
+    /// built for a host renderer that draws from its blocks
+    /// (`FieldResources::slots_on_device`), whose wgpu draw draws nothing.
+    fn slots_on_device(&self) -> bool {
+        true
+    }
+
     /// The group overrides table as the shader reads it, on the host
     /// (Derived; index 0 unused). None for a field without one.
     fn group_overrides(&self) -> Option<std::cell::Ref<'_, [u32]>> {

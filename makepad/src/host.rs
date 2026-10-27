@@ -22,6 +22,7 @@ use glyph3d_native::relayout::{rebuild_for_relayout, RelayoutRequest};
 use glyph3d_native::scene::{SceneKey, SceneLike};
 use glyph3d_native::{SceneChoice, SceneCullOptions};
 
+use crate::g3_passes::G3Residency;
 use crate::sessions::SessionBrowser;
 
 /// The format the engine's wgpu pipelines are built for (the scene builds
@@ -139,7 +140,10 @@ impl EngineHost {
     /// its startup ops (`--pick`, `--verb`, `--cam-pose`, `--highlight`)
     /// through the same entry points the panels use.
     pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op]) -> Self {
-        let ctx = pollster::block_on(gpu::init(None));
+        let mut ctx = pollster::block_on(gpu::init(None));
+        // The makepad passes draw the glyphs from the field's host blocks:
+        // the engine's device gets no copy of them.
+        ctx.host_draws_glyphs = true;
         let (mut scene, probe) =
             glyph3d_native::build_scene_probed(&ctx, COLOR_FORMAT, &choice, CameraMode::Fly, cull_opts);
         // The options follow the mode the scene BUILT (a load past the
@@ -199,6 +203,34 @@ impl EngineHost {
 
     pub fn scene_generation(&self) -> u64 {
         self.scene_generation
+    }
+
+    /// What the glyph blocks may hold of the device: makepad's retained
+    /// envelope (`retained_device_envelope`, a quarter of the device's
+    /// budget on a discrete GPU) over the budget the driver reports, and
+    /// 256 MiB published a frame. With no budget reported, no envelope.
+    pub fn residency(&self) -> G3Residency {
+        use makepad_widgets::makepad_draw::makepad_platform::retained_instances::retained_device_envelope;
+        let residency = match glyph3d_native::budget::device_memory(&self.ctx.adapter) {
+            Some(memory) => {
+                let unified = self.ctx.profile.memory_architecture() == gpu::MemoryArchitecture::Unified;
+                G3Residency {
+                    envelope: retained_device_envelope(memory.budget_bytes, memory.heap_bytes, unified),
+                    ..G3Residency::default()
+                }
+            }
+            None => G3Residency::default(),
+        };
+        if residency.envelope == usize::MAX {
+            makepad_widgets::log!("g3: the device reports no memory budget: the glyph blocks have no envelope");
+        } else {
+            makepad_widgets::log!(
+                "g3: glyph block envelope {} MiB, {} MiB published a frame",
+                residency.envelope >> 20,
+                residency.upload_per_frame >> 20
+            );
+        }
+        residency
     }
 
     /// Wall-clock seconds since the host started: the frame's time.
