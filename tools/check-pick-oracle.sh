@@ -18,10 +18,12 @@ set -uo pipefail
 # Screenshots here are throwaway: they exist so the binary has somewhere to
 # write while we read its stdout. They used to go to tracked files in out/ and
 # be restored with `git checkout` afterwards, which left the tree dirty whenever
-# a run died — and check-all reads the working tree.
-SCRATCH="${TMPDIR:-/tmp}/glyph-pick-oracle"
-mkdir -p "$SCRATCH"
+# a run died — and check-all reads the working tree. Under this checkout's
+# target/, not a shared /tmp path: two worktrees running the gate at once
+# wrote each other's screenshots there (2026-10-26).
 cd "$(dirname "$0")/.."
+SCRATCH="$PWD/target/glyph-scratch/pick-oracle"
+mkdir -p "$SCRATCH"
 BIN=target/release/glyph3d-native
 # Unlike its siblings this script had no binary guard for most of its life:
 # run out of order it died with a raw shell error instead of a diagnosis.

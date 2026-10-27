@@ -30,13 +30,15 @@
 # was deleted with its five tests (GPU against CPU, its WGSL pins, the range
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
-# test and float_tables' eight. Lowered 383 -> 371 on purpose (2026-10-26):
-# scan.rs and bake.rs were deleted with their twelve tests. Then 371 -> 338:
-# the Visible field was deleted with its 33 (the crate's, the line of tests
-# that held it to the device Pass 2, visible_verbs and visible_repeat).
-# Then 338 -> 336: the line table's two tests (its whole-cells test moved
-# to tab_stop.rs).
-test_floor = 336
+# test and float_tables' eight. 384: the runner's dep-info parse (orphans);
+# 385: the scheduler's waits; 387: warn_count over each tool's output and
+# the doc gate's --workspace pin (test diet step 2); 388: apart_from as declared.
+# Lowered 388 -> 341 on purpose (2026-10-26, test diet): scan.rs and bake.rs
+# went with their twelve tests, the Visible field with its 33 (the crate's,
+# the tests that held it to the device Pass 2, visible_verbs and
+# visible_repeat), the line table with two (its whole-cells test moved to
+# tab_stop.rs).
+test_floor = 341
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -50,6 +52,11 @@ test_floor = 336
 # equivalent (`[[golden_view.exempt]]`, rendered and reported, never judged)
 # for a variant that legitimately differs; none is today.
 golden_equivalents = ["--field-mode instanced"]
+# The golden equivalents that run in the merge tier only (2026-10-26, test
+# diet step 6): a field the makepad port does not have, held byte-equal
+# before every landing, not after every change. Each names a declared
+# equivalent exactly; `glyph test --inner` prints each one it skips.
+golden_equivalents_merge = ["--field-mode instanced"]
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -75,7 +82,13 @@ outputs = ["target/release/glyph3d-native"]
 # dependencies' features reach this binary. config/ holds the compiled-in
 # settings defaults (main, 2026-10-09).
 inputs = ["native/src/**/*", "native/Cargo.toml", "crates/**/*", "glyph/Cargo.toml", "config/**/*", "Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
-build = "cargo build --release"
+# The test binaries in the same invocation (2026-10-26): cargo-test needs
+# them next, and one cargo compiles the renderer crate and its cfg(test)
+# twin side by side rather than one after the other — 22 s against 17 + 15
+# for a one-line edit in native/src, measured. The units are the same ones
+# `cargo build --release` and `cargo test --release` make (both are fresh
+# afterwards, measured), so the binary is the same bytes either way.
+build = "cargo build --release --lib --bins --tests"
 note = "Pure-Rust native renderer."
 
 # ── Committed artifacts ──────────────────────────────────────────────────
@@ -264,11 +277,34 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 #   rust    you touched native/, crates/ or glyph/
 #   render  you touched layout, shaders, or anything that moves a pixel
 #   corpus  you touched fixtures, generators, or vendored inputs
-# `glyph test` with no scope runs all of them, in the order below.
-# The battery `glyph check` runs, in order. `needs` lists artifacts that must
-# be current/verified first; the runner enforces the order below, which
-# satisfies them. Names, not numbers — positions in this list have been
-# renumbered twice already and a name survives renumbering.
+# `glyph test` with no scope runs all of them. `needs` lists artifacts that
+# must be current/verified first; the order below satisfies them, and
+# `validate` holds it to that. Names, not numbers — positions in this list
+# have been renumbered twice already and a name survives renumbering.
+#
+# Since 2026-10-26 the gates run AT ONCE, each as a child `glyph gate`, and
+# their output is printed in the order below as each one finishes. A gate
+# waits only for an earlier gate that provides an artifact it needs, and
+#   apart_from    gates this one never runs beside, where running together
+#                 was measured to cost more than it saves (2026-10-26, on the
+#                 32-core Linux host): pixel-ab, pick-oracle and hyper-oracle
+#                 apart from cargo-test, whose GPU integration binaries slow
+#                 a pixel-ab beside them from 7 s to 21 s (beside its CPU-
+#                 bound unit tests alone, 10 s), so the overlap saved nothing
+#                 (29 s against 28 s in turn). The three run beside each
+#                 other: 8-11 s together against 13 s in turn. No two gates
+#                 share an output path (each scratch is its own). cargo's own
+#                 lock orders the cargo gates sharing target/.
+#   tier          `inner` is what `glyph test --inner` runs after each change;
+#                 `merge` gates run only in a full `glyph test`, which runs
+#                 every tier. The merge tier is the compiler's diagnostics —
+#                 warnings, clippy, rustdoc, the no-default-features builds,
+#                 orphan modules: they judge the code's form, not what it
+#                 computes — and the corpus checks (committed artifacts, the
+#                 atlas, vendored hashes), whose inputs a change to the
+#                 renderer does not touch (test diet step 6, 2026-10-26).
+#                 A full run before landing still answers them. Declared
+#                 here, never decided at run time; a skipped gate is printed.
 
 # First, because every gate below reads the map this checks. It is the only
 # gate whose subject is build.toml itself: a manifest that lies makes each
@@ -276,6 +312,7 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 [[gate]]
 name = "manifest"
 scope = "corpus"
+tier = "inner"
 kind = "cmd"
 cmd = "target/release/glyph validate"
 needs = []
@@ -285,6 +322,7 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
+tier = "merge"
 kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, atlas, fixtures
 needs = []
 compare = "each committed artifact rebuilt (scratch or generator check mode) vs its committed bytes"
@@ -294,6 +332,7 @@ blind_to = "whether the INPUTS are right — reproducibility, not truth"
 [[gate]]
 name = "atlas-tables"
 scope = "corpus"
+tier = "merge"
 kind = "cmd"
 cmd = "python3 tools/check_atlas.py"
 pass_line = "ATLAS TABLES OK"
@@ -308,6 +347,7 @@ blind_to = "any codepoint or sequence outside the pins: it proves the tables are
 [[gate]]
 name = "atlas-verify"
 scope = "corpus"
+tier = "merge"
 kind = "cmd"
 cmd = "python3 tools/verify_atlas.py"
 pass_line = "VERIFY OK"
@@ -317,6 +357,7 @@ blind_to = "what a curve DRAWS (the texture is checked for shape and range, neve
 [[gate]]
 name = "vendor-hashes"
 scope = "corpus"
+tier = "merge"
 kind = "cmd"
 cmd = "python3 tools/vendor-manifest.py --check"
 needs = []
@@ -326,6 +367,7 @@ blind_to = "upstream drift (by design) and a wrong-but-self-consistent vendored 
 [[gate]]
 name = "cargo-build"
 scope = "rust"
+tier = "merge"
 kind = "cargo"
 cmd = "build"
 needs = []
@@ -334,6 +376,7 @@ compare = "rustc warning count vs zero"
 [[gate]]
 name = "cargo-check-no-ui"
 scope = "rust"
+tier = "merge"
 kind = "cargo"
 cmd = "check-no-ui"
 needs = []
@@ -343,6 +386,7 @@ blind_to = "whether either build RUNS correctly — they are checked, not execut
 [[gate]]
 name = "cargo-clippy"
 scope = "rust"
+tier = "merge"
 kind = "cargo"
 cmd = "clippy"
 needs = []
@@ -352,6 +396,7 @@ blind_to = "anything silenced with #[expect(..., reason)] — a stale expectatio
 [[gate]]
 name = "cargo-doc"
 scope = "rust"
+tier = "merge"
 kind = "cargo"
 cmd = "doc"
 needs = []
@@ -359,20 +404,22 @@ compare = "rustdoc warning count vs zero over every workspace crate (the rendere
 blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment names still exists, not that the sentence around it is current"
 
 # A .rs file no `mod` declaration reaches is not compiled, and rustc says
-# nothing (2026-10-11). cargo-modules comes from `pixi run setup`.
+# nothing (2026-10-11). Read off the test build's dep-info since 2026-10-26
+# (rustc's own list of what each unit compiled); until then cargo-modules,
+# which reloaded the workspace for each of 9 targets, 24-48 s every run.
 [[gate]]
 name = "orphans"
 scope = "rust"
-kind = "cmd"
-cmd = "pixi run bash tools/check-orphans.sh"
-pass_line = "ORPHANS OK"
+tier = "merge"
+kind = "orphans"
 needs = []
-compare = "every .rs file under each target's src/ vs the files its module tree reaches (cargo-modules, #[cfg(test)] enabled), over the 5 lib targets plus the glyph and resolve-bench bins"
-blind_to = "a file reached only under a cfg the host does not set (cfg(test) is analysed; target_os branches and non-default features are not — every feature is default today); the glyph3d-native bin, whose modules all live in the lib and read as orphans of the bin; experiments/, its own workspace"
+compare = "every .rs file under each workspace package's src/ vs the union of the source files its units read, from rustc's dep-info for every unit `cargo test --release --no-run` builds (lib, its cfg(test) harness, bins and their harnesses, integration tests) — the same build cargo-test runs"
+blind_to = "a file reached only under a cfg the host does not set (cfg(test) and the default features are compiled; target_os branches and non-default features are not); experiments/, its own workspace"
 
 [[gate]]
 name = "cargo-test"
 scope = "rust"
+tier = "inner"
 kind = "cargo-test"
 needs = []
 compare = "summed tests-actually-ran vs settings.test_floor ratchet; whole-binary dropout check"
@@ -381,6 +428,8 @@ blind_to = "nothing, structurally — that is what the floor is for. Holds the t
 [[gate]]
 name = "pick-oracle"
 scope = "render"
+tier = "inner"
+apart_from = ["cargo-test"]
 kind = "cmd"
 cmd = "bash tools/check-pick-oracle.sh"
 pass_line = "ALL PASS"
@@ -399,6 +448,7 @@ blind_to = "pick paths outside the scripted set"
 [[gate]]
 name = "reference-port"
 scope = "corpus"
+tier = "inner"
 kind = "cmd"
 cmd = "bash tools/check-fixture-parity.sh"
 pass_line = "ALL PASS"
@@ -432,6 +482,8 @@ blind_to = "HyperLayout entirely — these are fold.rs/text.rs and the trie, not
 [[gate]]
 name = "hyper-oracle"
 scope = "render"
+tier = "inner"
+apart_from = ["cargo-test"]
 kind = "cmd"
 cmd = "GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4 && GLYPH_TRACE=warn target/release/glyph3d-native --hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
 pass_line = "hyper-oracle PASS"
@@ -442,6 +494,8 @@ blind_to = "Shared with the reference and so invisible here: the atlas trie (Tri
 [[gate]]
 name = "pixel-ab"
 scope = "render"
+tier = "inner"
+apart_from = ["cargo-test"]
 kind = "golden-verify"
 needs = ["renderer", "pixel-baselines"]
 compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
@@ -593,12 +647,12 @@ expect = "Coverage DROPPED"
 [[mutation]]
 name = "tests-mod-dropped"
 gate = "orphans"
-why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the agent event reader's suite (gomuxai's conformance corpus, the staging of what it reads); only the cargo-test floor could see its loss, and only by count. CONSUMED BY: cargo-modules' walk of glyph3d-native's lib module tree under --cfg-test"
+why = "the loss this gate exists for: a `#[cfg(test)] mod tests;` deleted, so every test in that file stops compiling and rustc, clippy and the doc build stay silent. agent_transcript/tests.rs holds the agent event reader's suite (gomuxai's conformance corpus, the staging of what it reads); only the cargo-test floor could see its loss, and only by count. CONSUMED BY: the dep-info of glyph3d-native's cfg(test) lib harness, which then no longer lists the file"
 file = "native/src/agent_transcript.rs"
 op = "replace"
 find = "#[cfg(test)]\nmod tests;\n"
 with = ""
-expect = "FAIL  orphans glyph3d-native --lib"
+expect = "native/src/agent_transcript/tests.rs"
 
 [[mutation]]
 name = "coverage-scale"
