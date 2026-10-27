@@ -187,10 +187,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   child `glyph gate`, their output printed in `build.toml` order as each
   finishes. A gate waits only for an earlier gate that provides an artifact
   it `needs`, and never beside a gate either one declares `apart_from`:
-  pixel-ab, pick-oracle and hyper-oracle are apart from cargo-test, whose
-  GPU integration binaries were measured to slow a pixel-ab beside them
-  from 7 s to 21 s, so overlapping them saved nothing; the three run beside
-  each other (8-11 s together, 13 s in turn);
+  pixel-ab and pick-oracle are apart from cargo-test, whose GPU
+  integration binaries were measured to slow a pixel-ab beside them from
+  7 s to 21 s, so overlapping them saved nothing; the two run beside each
+  other, and hyper-oracle, CPU-only since its Visible tier went, beside
+  everything (measured: no cost either way);
   cargo's lock orders the cargo gates sharing `target/`. The run ends with a
   TIME line: wall, products, gate seconds summed, the slowest. Measured on
   the 32-core Linux host under sibling load, at the end of the branch that
