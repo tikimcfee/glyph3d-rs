@@ -34,7 +34,9 @@
 # scan.rs and bake.rs were deleted with their twelve tests. Then 371 -> 338:
 # the Visible field was deleted with its 33 (the crate's, the line of tests
 # that held it to the device Pass 2, visible_verbs and visible_repeat).
-test_floor = 338
+# Then 338 -> 336: the line table's two tests (its whole-cells test moved
+# to tab_stop.rs).
+test_floor = 336
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -883,20 +885,6 @@ with = '''    } else if l > 0 {
         l
     } else {'''
 expect = "pagination_agrees_on_every_tier"
-
-[[mutation]]
-name = "seed-cut-resets-segment-advance"
-gate = "cargo-test"
-why = "2026-10-11: line_table's seed test had no mutation, so nothing showed it could fail. A cut treated as a fold-unit boundary: Pass 1's line walk records every seed with its segment advance zeroed, so Visible mode lays the segment after each cut in a wrapped or column-paged line from x 0. The unit test names the seed and the field; hyper-oracle's visible tier also reddens, on wide.txt and chunk-cut.txt, as kernel slots at the wrong x (measured 2026-10-11). CONSUMED BY: the seed push in Pass 1's per-line walk (non-ASCII lines), read by seeds_obey_the_cut_rule_and_the_fold_state at a 32-byte segment under wraps 0, 7 and 100"
-file = "native/src/layout_hyper.rs"
-op = "replace"
-find = '''                        col: line_col as u32,
-                        seg_adv,
-                        cells,'''
-with = '''                        col: line_col as u32,
-                        seg_adv: 0.0,
-                        cells,'''
-expect = "seeds_obey_the_cut_rule_and_the_fold_state"
 
 [[mutation]]
 name = "hyper-chunk-seed-product"

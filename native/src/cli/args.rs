@@ -143,12 +143,6 @@ pub struct Cli {
     /// or single text files.
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub hyper_oracle_check: Vec<PathBuf>,
-    /// Build the visible-set line table (Pass 1's per-line index and the
-    /// long-line segment seeds, `layout_hyper/line_table.rs`) over the given
-    /// inputs and print what it holds — lines, seeds, bytes — then exit. The
-    /// same inputs `--hyper-oracle-check` takes.
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    pub line_table_stats: Vec<PathBuf>,
     /// Stage E2: load a whole repository as a field of code pages
     #[arg(long, value_name = "DIR")]
     pub load_repo: Option<PathBuf>,
@@ -337,7 +331,7 @@ pub struct RawOps {
 /// Whether this run looks for a personal `launch_config.toml` on its own.
 /// Only an interactive run does. Screenshot runs never do, and neither does
 /// any run that checks or measures (`--repo-scan-only`, the
-/// `--fixture-*` and `--hyper-oracle-check` instruments, `--line-table-stats`,
+/// `--fixture-*` and `--hyper-oracle-check` instruments,
 /// `--gpu-key` / `--gpu-profile`, `--generate`): every gate launches the
 /// binary as one of these, and a personal override (a color, a wrap mode, a
 /// field mode) must not reach what a gate compares. Until 2026-10-10 only
@@ -351,8 +345,7 @@ pub(crate) fn discovers_launch_config(cli: &Cli) -> bool {
         || !cli.fixture_reference.is_empty()
         || !cli.fixture_trie.is_empty()
         || !cli.fixture_fold.is_empty()
-        || !cli.hyper_oracle_check.is_empty()
-        || !cli.line_table_stats.is_empty();
+        || !cli.hyper_oracle_check.is_empty();
     cli.screenshot.is_none() && !checks
 }
 

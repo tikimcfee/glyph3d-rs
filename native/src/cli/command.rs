@@ -44,9 +44,6 @@ pub enum FixtureTask {
     /// HyperLayout vs the oracle-backed fold; the mode and the tab width
     /// apply to directory and text inputs (fixtures carry their own).
     HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode, crate::fold::TabWidth),
-    /// The visible-set line table over the inputs, printed (M1 of the
-    /// GPU-direction plan).
-    LineTableStats(Vec<PathBuf>, crate::fold::ClusterMode),
 }
 
 /// Execution plan for rendering a scene.
@@ -116,12 +113,6 @@ impl Cli {
                 self.hyper_oracle_check.clone(),
                 self.cluster_mode,
                 self.resolved_tab_width(),
-            ));
-        }
-        if !self.line_table_stats.is_empty() {
-            return CliCommand::Fixture(FixtureTask::LineTableStats(
-                self.line_table_stats.clone(),
-                self.cluster_mode,
             ));
         }
 

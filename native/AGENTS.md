@@ -79,9 +79,7 @@ caller; the short version:
   (gate `hyper-oracle`, `hyper_oracle.rs`) uses it to hold HyperLayout to the
   oracle-backed fold. (`--repo-verify`, which held HyperLayout to itself, was
   deleted on 2026-10-26: every `--repo-engine` is the same HyperLayout, and no
-  mutation could make it fail.) `--line-table-stats <PATH>...` (same inputs) builds and
-  prints the visible-set field's line table (`layout_hyper/line_table.rs`,
-  M1 of `out/VISIBLE-MODE.md`): lines, long-line segment seeds, sizes.
+  mutation could make it fail.)
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, and aligned 8-burst /
@@ -143,8 +141,8 @@ caller; the short version:
   rebuild is a chunk's start inside a long line: the per-chunk Pass 1 walk
   measures its tabs from the chunk's start, so `aggregate_chunk_prepasses`
   walks a newline-free chunk that holds a tab again from the true state
-  (`walk_line_state`); the line-table replays and `measure_continued_lines`
-  take the true seed already. `--render-file` is a one-item repo
+  (`walk_line_state`); `measure_continued_lines` takes the true seed
+  already. `--render-file` is a one-item repo
   load (2026-10-11) with its own default, `[layout]
   render_file_tab_width_cells` (4, the stops its retired CPU stager had;
   `--tab-width` overrides it there too), resolved by
