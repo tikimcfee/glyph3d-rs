@@ -140,8 +140,10 @@ pub(crate) struct Gate {
     pub(crate) name: String,
     pub(crate) scope: Scope,
     pub(crate) tier: Tier,
-    /// Opens the GPU: runs one at a time with the other GPU gates.
-    pub(crate) gpu: bool,
+    /// Gates this one never runs beside (`glyph test`'s scheduler), where
+    /// running together was measured to cost more than it saves.
+    #[serde(default)]
+    pub(crate) apart_from: Vec<String>,
     pub(crate) kind: Kind,
     #[serde(default)]
     pub(crate) needs: Vec<String>,
@@ -283,6 +285,11 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
                  nothing and report success",
                 g.name
             ));
+        }
+        for a in &g.apart_from {
+            if !gates.contains(a.as_str()) || *a == g.name {
+                p.push(format!("gate {} is apart_from '{a}', which is not another declared gate", g.name));
+            }
         }
         if g.kind == Kind::Cmd && g.cmd.is_none() {
             p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));

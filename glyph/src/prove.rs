@@ -177,10 +177,10 @@ struct ChangeSet {
 /// Fields no `glyph gate` run reads, so a change to them cannot change what
 /// a mutation's gate catches: the prose (`compare`, `blind_to`, `why`) and
 /// what `glyph test` alone uses to choose and order gates (`scope`, `tier`,
-/// `gpu`). Until 2026-10-26 an edit to a gate's `compare` volumes selected
+/// `apart_from`). Until 2026-10-26 an edit to a gate's `compare` volumes selected
 /// every mutation of that gate, and declaring `tier` on every gate selected
 /// all 116.
-const UNREAD_BY_A_GATE_RUN: [&str; 6] = ["compare", "blind_to", "why", "scope", "tier", "gpu"];
+const UNREAD_BY_A_GATE_RUN: [&str; 6] = ["compare", "blind_to", "why", "scope", "tier", "apart_from"];
 
 /// The `[[mutation]]` and `[[gate]]` entries of `current` that are new or
 /// differ from `base`, by name, in a field a gate run reads. Read as plain
@@ -590,7 +590,7 @@ mod tests {
         // Prose and scheduling are not what a gate run reads.
         let base = "[[gate]]\nname = \"g\"\ncmd = \"a\"\ncompare = \"old\"\n\
                     [[mutation]]\nname = \"m\"\nfile = \"f\"\nwhy = \"old\"\n";
-        let current = "[[gate]]\nname = \"g\"\ncmd = \"a\"\ncompare = \"new\"\ntier = \"inner\"\ngpu = true\n\
+        let current = "[[gate]]\nname = \"g\"\ncmd = \"a\"\ncompare = \"new\"\ntier = \"inner\"\napart_from = [\"h\"]\n\
                        [[mutation]]\nname = \"m\"\nfile = \"f\"\nwhy = \"new\"\n";
         let (mutations, gates) = declarations_changed(Some(base), current);
         assert!(mutations.is_empty() && gates.is_empty(), "{mutations:?} {gates:?}");
