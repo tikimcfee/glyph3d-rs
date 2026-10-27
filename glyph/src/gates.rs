@@ -11,8 +11,9 @@ fn warn_count(out: &str) -> usize {
     out.lines().filter(|l| l.starts_with("warning") && !l.contains("generated")).count()
 }
 
-fn gate_cargo(g: &Gate) -> bool {
-    let cmd = match g.cmd.as_deref() {
+/// The command a `kind = "cargo"` gate's `cmd` names.
+fn cargo_cmd(name: Option<&str>) -> Option<&'static str> {
+    Some(match name {
         Some("build") => "cargo build --release",
         Some("clippy") => "cargo clippy --release --all-targets",
         // Doc links are the one rename hazard nothing else in this battery can
@@ -40,10 +41,14 @@ fn gate_cargo(g: &Gate) -> bool {
             " && grep -q '^glyph3d-native ' target/no-ui/tree.txt",
             " && ! grep -E '^(winit|egui)' target/no-ui/tree.txt",
         ),
-        other => {
-            println!("FAIL  {} has unknown cargo cmd {other:?}", g.name);
-            return false;
-        }
+        _ => return None,
+    })
+}
+
+fn gate_cargo(g: &Gate) -> bool {
+    let Some(cmd) = cargo_cmd(g.cmd.as_deref()) else {
+        println!("FAIL  {} has unknown cargo cmd {:?}", g.name, g.cmd);
+        return false;
     };
     let (good, out) = sh(cmd, &root());
     if !good {
@@ -378,7 +383,9 @@ fn needs_met(g: &Gate, m: &Manifest) -> bool {
     true
 }
 
-pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
+/// `inner`: the run is `glyph test --inner`, for a gate with merge-tier
+/// parts of its own (pixel-ab's merge-tier equivalents).
+pub(crate) fn run_gate(g: &Gate, m: &Manifest, inner: bool) -> bool {
     if !needs_met(g, m) {
         return false;
     }
@@ -388,7 +395,7 @@ pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
         Kind::Cargo => gate_cargo(g),
         Kind::CargoTest => gate_cargo_test(m),
         Kind::Orphans => gate_orphans(),
-        Kind::GoldenVerify => verify_golden(m),
+        Kind::GoldenVerify => verify_golden(m, inner),
         Kind::RepoVerify => gate_repo_verify(g),
     }
 }
@@ -396,6 +403,38 @@ pub(crate) fn run_gate(g: &Gate, m: &Manifest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the zero-warning gates count, over each tool's own output (test
+    /// diet step 2, 2026-10-26: this replaces four mutations that each paid
+    /// a renderer rebuild to show a warning reddens its gate). One warning
+    /// each from rustc, clippy and rustdoc, with the location lines and
+    /// cargo's summary line that follow it, counts once; a clean build
+    /// counts none; a warning from cargo itself counts, as every warning
+    /// does against a zero-warning gate.
+    #[test]
+    fn warn_count_counts_each_tools_warnings_once() {
+        let rustc = "warning: unused variable: `x`\n --> src/a.rs:1:5\n  |\n1 | let x = 1;\n  |     ^ help: prefix it\n\n\
+                     warning: `crate` (lib) generated 1 warning\n    Finished `release` profile";
+        let clippy = "warning: this `if` has identical blocks\n --> src/a.rs:3:9\n\
+                      warning: `crate` (lib) generated 1 warning (run `cargo clippy --fix` to apply 1 suggestion)";
+        let rustdoc = "warning: unresolved link to `Foo::bar`\n --> src/a.rs:2:7\n\
+                       warning: `crate` (lib doc) generated 1 warning\n   Generated target/doc/crate/index.html";
+        for (tool, out) in [("rustc", rustc), ("clippy", clippy), ("rustdoc", rustdoc)] {
+            assert_eq!(warn_count(out), 1, "{tool}: {out}");
+        }
+        assert_eq!(warn_count("   Compiling crate v0.1.0\n    Finished `release` profile [optimized] target(s) in 1.0s"), 0);
+        assert_eq!(warn_count("warning: unused manifest key: package.foo"), 1);
+    }
+
+    /// The doc gate documents every workspace crate, not the renderer alone:
+    /// until 2026-10-11 a dead link in crates/ or glyph/ was read by nothing
+    /// (the dead-doc-link-crate mutation measured it).
+    #[test]
+    fn the_doc_gate_documents_the_workspace() {
+        let doc = cargo_cmd(Some("doc")).expect("the doc gate's command");
+        assert!(doc.contains("--workspace"), "{doc}");
+        assert!(cargo_cmd(Some("nonsense")).is_none());
+    }
 
     /// Dep-info's make syntax: the target before `: `, escaped spaces kept
     /// inside a path, phony `path:` lines and `#` comments.

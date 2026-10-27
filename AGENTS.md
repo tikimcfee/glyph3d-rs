@@ -208,15 +208,16 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
   read afterwards; one was lost before this existed.
 - **Two tiers, declared per gate.** `tier = "inner"` gates are what
-  `--inner` runs after each change (53 s after a one-line edit, 30 s with
-  nothing changed, measured as above: on an idle 32-core host the merge
-  gates fit beside the GPU gates' chain, so what `--inner` saves there is
-  their CPU, which siblings share); `tier = "merge"` gates — the compiler's diagnostics: warnings,
-  clippy, rustdoc, the no-default-features builds — run only in a full
-  `glyph test`, and `--inner` names each one it skipped. They judge the
-  code's form, not what it computes, and each recompiles the renderer in its
-  own configuration. An `--inner` verdict says "not a landing run"; land on
-  a full one.
+  `--inner` runs after each change; `tier = "merge"` gates run only in a
+  full `glyph test`, and `--inner` names each one it skipped. The merge
+  tier is the compiler's diagnostics — warnings, clippy, rustdoc, the
+  no-default-features builds, orphan modules: they judge the code's form,
+  not what it computes — and the corpus checks (committed artifacts, the
+  atlas, vendored hashes), whose inputs a renderer change does not touch.
+  Inside pixel-ab, `[settings] golden_equivalents_merge` puts the
+  `--field-mode instanced` equivalent in the merge tier too: a field the
+  makepad port does not have (test diet step 6, 2026-10-26). An `--inner`
+  verdict says "not a landing run"; land on a full one.
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.

@@ -31,8 +31,9 @@
 # coalescing) and three took their place (the frame resolve against the chain
 # walk; the group table read back). Then 374 -> 383: frame.rs's ChunkRanges
 # test and float_tables' eight. 384: the runner's dep-info parse (orphans);
-# 385: the scheduler's waits.
-test_floor = 385
+# 385: the scheduler's waits; 387: warn_count over each tool's output and
+# the doc gate's --workspace pin (test diet step 2).
+test_floor = 387
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -52,6 +53,11 @@ test_floor = 385
 # (and step 2's three --render-file frames) are red here until a human
 # adopts their candidates.
 golden_equivalents = ["--field-mode instanced", "--field-mode visible"]
+# The golden equivalents that run in the merge tier only (2026-10-26, test
+# diet step 6): a field the makepad port does not have, held byte-equal
+# before every landing, not after every change. Each names a declared
+# equivalent exactly; `glyph test --inner` prints each one it skips.
+golden_equivalents_merge = ["--field-mode instanced"]
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -291,11 +297,13 @@ cmd = "--load-repo fixtures/g-pick-repo --frames 2 --focus-file alpha.rs --zoom 
 #   tier          `inner` is what `glyph test --inner` runs after each change;
 #                 `merge` gates run only in a full `glyph test`, which runs
 #                 every tier. The merge tier is the compiler's diagnostics —
-#                 warnings, clippy, rustdoc, the no-default-features builds:
-#                 they judge the code's form, not what it computes, each
-#                 recompiles the renderer in its own configuration, and a
-#                 full run before landing still answers them. Declared here,
-#                 never decided at run time; a skipped gate is printed.
+#                 warnings, clippy, rustdoc, the no-default-features builds,
+#                 orphan modules: they judge the code's form, not what it
+#                 computes — and the corpus checks (committed artifacts, the
+#                 atlas, vendored hashes), whose inputs a change to the
+#                 renderer does not touch (test diet step 6, 2026-10-26).
+#                 A full run before landing still answers them. Declared
+#                 here, never decided at run time; a skipped gate is printed.
 
 # First, because every gate below reads the map this checks. It is the only
 # gate whose subject is build.toml itself: a manifest that lies makes each
@@ -314,7 +322,7 @@ blind_to = "whether the declared inputs are the RIGHT ones — it proves a patte
 [[gate]]
 name = "committed-artifacts"
 scope = "corpus"
-tier = "inner"
+tier = "merge"
 gpu = false
 kind = "verify-committed"   # glyph-schema, emoji-sheet, cluster-classes, emoji-corpus, atlas, fixtures
 needs = []
@@ -325,7 +333,7 @@ blind_to = "whether the INPUTS are right — reproducibility, not truth"
 [[gate]]
 name = "atlas-tables"
 scope = "corpus"
-tier = "inner"
+tier = "merge"
 gpu = false
 kind = "cmd"
 cmd = "python3 tools/check_atlas.py"
@@ -341,7 +349,7 @@ blind_to = "any codepoint or sequence outside the pins: it proves the tables are
 [[gate]]
 name = "atlas-verify"
 scope = "corpus"
-tier = "inner"
+tier = "merge"
 gpu = false
 kind = "cmd"
 cmd = "python3 tools/verify_atlas.py"
@@ -352,7 +360,7 @@ blind_to = "what a curve DRAWS (the texture is checked for shape and range, neve
 [[gate]]
 name = "vendor-hashes"
 scope = "corpus"
-tier = "inner"
+tier = "merge"
 gpu = false
 kind = "cmd"
 cmd = "python3 tools/vendor-manifest.py --check"
@@ -410,7 +418,7 @@ blind_to = "whether the prose is TRUE; it checks that every symbol a doc comment
 [[gate]]
 name = "orphans"
 scope = "rust"
-tier = "inner"
+tier = "merge"
 gpu = false
 kind = "orphans"
 needs = []

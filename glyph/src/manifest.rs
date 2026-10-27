@@ -30,6 +30,10 @@ pub(crate) struct Settings {
     /// covered without a second golden set to adopt and keep in step.
     #[serde(default)]
     pub(crate) golden_equivalents: Vec<String>,
+    /// The golden equivalents that run in the merge tier only: skipped,
+    /// and named, by `glyph test --inner` (test diet step 6, 2026-10-26).
+    #[serde(default)]
+    pub(crate) golden_equivalents_merge: Vec<String>,
 }
 
 /// How an artifact is verified is a property of its CLASS, not a per-artifact
@@ -316,6 +320,14 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
             }
             if !tags.insert(equivalent_tag(e)) {
                 p.push(format!("golden equivalent '{e}' collides with another's file tag"));
+            }
+        }
+        for e in &m.settings.golden_equivalents_merge {
+            if !m.settings.golden_equivalents.contains(e) {
+                p.push(format!(
+                    "golden_equivalents_merge names '{e}', which is not a declared golden equivalent; \
+                     it would put nothing in the merge tier"
+                ));
             }
         }
         // An exemption names a declared equivalent, exactly, with a reason;

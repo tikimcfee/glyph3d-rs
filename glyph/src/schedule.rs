@@ -42,8 +42,13 @@ fn stable_runner() -> PathBuf {
     }
 }
 
-fn run_child(runner: &Path, name: &str) -> (bool, String) {
-    match Command::new(runner).arg("gate").arg(name).current_dir(root()).output() {
+fn run_child(runner: &Path, name: &str, inner: bool) -> (bool, String) {
+    let mut cmd = Command::new(runner);
+    cmd.arg("gate").arg(name).current_dir(root());
+    if inner {
+        cmd.arg("--inner");
+    }
+    match cmd.output() {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -68,7 +73,8 @@ fn waits_for(m: &Manifest, gates: &[&Gate]) -> Vec<Vec<usize>> {
 }
 
 /// Run `gates`, printing each one's block in order; one `Ran` per gate.
-pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate]) -> Vec<Ran> {
+/// `inner` passes `--inner` to each child (a gate's own merge-tier parts).
+pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate], inner: bool) -> Vec<Ran> {
     let runner = stable_runner();
     let waits = waits_for(m, gates);
     let mut started = vec![false; gates.len()];
@@ -88,7 +94,7 @@ pub(crate) fn run_gates(m: &Manifest, gates: &[&Gate]) -> Vec<Ran> {
                 let (tx, runner, name) = (tx.clone(), &runner, gates[i].name.as_str());
                 s.spawn(move || {
                     let t = Instant::now();
-                    let (ok, out) = run_child(runner, name);
+                    let (ok, out) = run_child(runner, name, inner);
                     let _ = tx.send((i, ok, out, t.elapsed().as_secs_f64()));
                 });
             }
