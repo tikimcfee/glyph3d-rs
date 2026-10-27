@@ -378,6 +378,11 @@ pub struct GpuContext {
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
+    /// A host renderer draws the glyphs from the field's host blocks (the
+    /// makepad port), so the Derived field gives this device no copy of its
+    /// slots (2026-10-26). False for this crate's own renderer, which
+    /// draws them from the device; set by the host before it builds.
+    pub host_draws_glyphs: bool,
 }
 
 /// The renderer's device context handles passed across layout stages.
@@ -393,6 +398,8 @@ pub struct SharedDevice {
     pub memory_arch: MemoryArchitecture,
     pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
     pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
+    /// `GpuContext::host_draws_glyphs`.
+    pub host_draws_glyphs: bool,
 }
 
 impl SharedDevice {
@@ -409,6 +416,7 @@ impl SharedDevice {
             memory_arch,
             prefetched_walk: ctx.prefetched_walk.clone(),
             prefetched_atlas: ctx.prefetched_atlas.clone(),
+            host_draws_glyphs: ctx.host_draws_glyphs,
         }
     }
 
@@ -645,6 +653,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
         prefetched_walk: std::sync::Arc::new(std::sync::Mutex::new(None)),
         prefetched_atlas: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        host_draws_glyphs: false,
     }
 }
 

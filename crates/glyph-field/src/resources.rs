@@ -47,6 +47,12 @@ pub struct FieldResources<'a> {
     /// (Derived: `[glyph_scene] derived_block_slots`), when it builds its
     /// blocks itself from host records. The other modes ignore it.
     pub block_slots: usize,
+    /// Whether a field that keeps host blocks also uploads them, one buffer
+    /// per block, for this device to draw. False when a host renderer draws
+    /// from the blocks itself (the makepad port, 2026-10-26): the field then
+    /// holds no device copy, its writes patch the blocks alone, and its
+    /// wgpu draw has no chunks to draw. The other modes ignore it.
+    pub slots_on_device: bool,
 }
 
 /// The targets the field's main pipeline renders into.

@@ -56,5 +56,11 @@ The engine prepares each frame on the CPU (`SceneLike::prepare_frame`:
 camera, cull, environment, the rows that changed) and the six glyph3d passes,
 ported to makepad draw shaders (`src/g3_passes.rs`), draw it; the glyphs come
 from the Derived field's host blocks, published to the GPU as they are
-(`src/frame_feed.rs`). The engine still builds a wgpu device of its own for
-the scene's construction; nothing is drawn through it.
+(`src/frame_feed.rs`). Only the blocks the view draws are published, within
+an envelope of a quarter of the device's memory budget; the rest are evicted
+and published again from the host blocks as the camera moves, so a tree
+larger than the device (the linux kernel's 1.29B glyphs, 24 GiB) draws a view
+at a time. The engine still builds a wgpu device of its own for the scene's
+construction; the glyph slots are not uploaded to it, and nothing is drawn
+through it. A load past the host's memory is refused before it allocates,
+with the numbers.

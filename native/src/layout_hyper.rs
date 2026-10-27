@@ -190,7 +190,7 @@ impl HyperLayout {
                     slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
                     block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
                     host_blocks: true,
-                    device: true,
+                    device: !dev.host_draws_glyphs,
                     staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
                 }
             } else {
@@ -1851,6 +1851,7 @@ mod tests {
             item_params: &[],
             item_of_group: &[],
             block_slots: chunk_cap,
+            slots_on_device: true,
         };
 
         let source = SlotSource::Device {
