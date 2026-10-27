@@ -240,7 +240,7 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   `tier` on every gate selected all 116). And a mutation is selected when
   a changed file other than build.toml or prose holds its `expect`: its
   witness changed (for a cargo-test mutation, the test that must catch it),
-  though its target did not. On the branch that brought both, 116 became
+  though its target did not. At the commit that brought both, 116 became
   29. `--list` prints a
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
