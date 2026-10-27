@@ -33,7 +33,7 @@
 set -uo pipefail
 shopt -s nullglob
 cd "$(dirname "$0")/.."
-BIN=target/release/glyph3d-native
+BIN=${GLYPH_RENDERER:-target/release/glyph3d-native}
 PIPE_EXPECTED=26
 FAIL=0
 
