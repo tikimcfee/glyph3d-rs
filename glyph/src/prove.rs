@@ -45,7 +45,18 @@ pub(crate) fn self_exe() -> &'static Path {
 
 /// Runs one gate in a child of ourselves so its output can be read.
 fn gate_output(name: &str) -> (bool, String) {
-    let out = Command::new(self_exe()).arg("gate").arg(name).current_dir(root()).output();
+    gate_output_with(name, &[])
+}
+
+/// The same, with `env` added to the child's environment (prove's relax route runs a
+/// gate with the renderer under relax this way).
+pub(crate) fn gate_output_with(name: &str, env: &[(&str, &std::ffi::OsStr)]) -> (bool, String) {
+    let mut c = Command::new(self_exe());
+    c.arg("gate").arg(name).current_dir(root());
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output();
     match out {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -61,7 +72,7 @@ fn gate_output(name: &str) -> (bool, String) {
 /// caught nothing.
 /// Non-overlapping occurrences of `find` in `text` (an empty `find` counts
 /// as absent: it would "match" everywhere and mutate nothing in particular).
-fn find_matches(text: &str, find: &str) -> usize {
+pub(crate) fn find_matches(text: &str, find: &str) -> usize {
     if find.is_empty() {
         0
     } else {
@@ -69,7 +80,7 @@ fn find_matches(text: &str, find: &str) -> usize {
     }
 }
 
-fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
+pub(crate) fn apply_mutation(mu: &Mutation) -> Result<Vec<u8>, String> {
     let f = root().join(&mu.file);
     let before = std::fs::read(&f).map_err(|e| format!("{}: {e}", mu.file))?;
     match mu.op.as_str() {
@@ -240,6 +251,7 @@ pub(crate) fn cmd_prove(
     only_mutations: &[String],
     since: Option<&str>,
     list: bool,
+    jobs: usize,
 ) -> bool {
     let covered: BTreeSet<&str> = m.mutation.iter().map(|mu| mu.gate.as_str()).collect();
     let uncovered: Vec<&str> =
@@ -296,7 +308,48 @@ pub(crate) fn cmd_prove(
         println!("LIST      {} of {} mutations selected; nothing was built or mutated", selected.len(), m.mutation.len());
         return true;
     }
+    // Each mutation as its gate declares (prove_relax.rs): under relax, in
+    // parallel and never writing the tree; the rest here, on cargo, beside
+    // relax where relax cannot see it and after it where it could.
+    let (total, wall) = (selected.len(), std::time::Instant::now());
+    fail |= !crate::prove_relax::prove_selected(m, &selected, jobs, |rest| prove_cargo(m, rest));
 
+    println!("WALL      {:.0}s, relax and cargo together", wall.elapsed().as_secs_f64());
+    println!();
+    println!(
+        "COVERAGE  {} gates, {} with mutations, {} uncovered",
+        m.gate.len(),
+        covered.len(),
+        uncovered.len()
+    );
+    if !uncovered.is_empty() {
+        println!("          uncovered: {}", uncovered.join(", "));
+        println!("          an uncovered gate is an unproven claim, not a passing one.");
+    }
+    println!();
+    println!(
+        "{}",
+        if fail {
+            "PROVE: FAILURES — see above".to_string()
+        } else if scoped {
+            format!(
+                "PROVE: {} selected mutation{} reddened — a scoped run proves its scope, not the manifest",
+                total,
+                if total == 1 { "" } else { "s" },
+            )
+        } else {
+            "PROVE: every declared mutation reddened its gate".to_string()
+        }
+    );
+    !fail
+}
+
+
+/// The cargo route: each mutation applied to the working tree, its products
+/// rebuilt, its gate run, the file restored and proven restored. True when
+/// every one reddened its gate for its stated reason.
+pub(crate) fn prove_cargo(m: &Manifest, selected: &[&Mutation]) -> bool {
+    let mut fail = false;
     // Whether a gate reads a built product (the renderer). `needs_met` only
     // checks that the product EXISTS, so such a gate runs whatever binary is
     // on disk — after a deferred restore, possibly the previous mutant.
@@ -501,32 +554,6 @@ pub(crate) fn cmd_prove(
         let top: Vec<String> = slowest.iter().take(5).map(|(n, t)| format!("{n} {t:.0}s")).collect();
         println!("          slowest: {}", top.join(", "));
     }
-    println!();
-    println!(
-        "COVERAGE  {} gates, {} with mutations, {} uncovered",
-        m.gate.len(),
-        covered.len(),
-        uncovered.len()
-    );
-    if !uncovered.is_empty() {
-        println!("          uncovered: {}", uncovered.join(", "));
-        println!("          an uncovered gate is an unproven claim, not a passing one.");
-    }
-    println!();
-    println!(
-        "{}",
-        if fail {
-            "PROVE: FAILURES — see above".to_string()
-        } else if scoped {
-            format!(
-                "PROVE: {} selected mutation{} reddened — a scoped run proves its scope, not the manifest",
-                selected.len(),
-                if selected.len() == 1 { "" } else { "s" },
-            )
-        } else {
-            "PROVE: every declared mutation reddened its gate".to_string()
-        }
-    );
     !fail
 }
 

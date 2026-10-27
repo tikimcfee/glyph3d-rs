@@ -150,6 +150,22 @@ pub(crate) struct Gate {
     pub(crate) pass_line: Option<String>,
     pub(crate) compare: Option<String>,
     pub(crate) blind_to: Option<String>,
+    /// How `prove` proves this gate's mutations: under makepad's relax JIT,
+    /// in parallel and through its source overlay (prove_relax.rs). Declared,
+    /// never inferred: a gate without one is proven on cargo.
+    pub(crate) relax: Option<Relax>,
+}
+
+/// How `prove` runs a gate's mutations under relax.
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Relax {
+    /// cargo-test: the test a mutation's `expect` names, under `relax test`;
+    /// the whole suite, judged as the gate judges it, when it names none.
+    Test,
+    /// a gate that runs the renderer: the gate itself, with the renderer
+    /// under `relax run` (`GLYPH_RENDERER`).
+    Renderer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +295,17 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
             if !gates.contains(a.as_str()) || *a == g.name {
                 p.push(format!("gate {} is apart_from '{a}', which is not another declared gate", g.name));
             }
+        }
+        match g.relax {
+            Some(Relax::Test) if g.kind != Kind::CargoTest => {
+                p.push(format!("gate {} declares relax = \"test\" but is not kind=cargo-test", g.name));
+            }
+            Some(Relax::Renderer)
+                if !g.needs.iter().any(|n| m.artifact.get(n).is_some_and(|a| a.class == Class::Product)) =>
+            {
+                p.push(format!("gate {} declares relax = \"renderer\" but needs no product to run", g.name));
+            }
+            _ => {}
         }
         if g.kind == Kind::Cmd && g.cmd.is_none() {
             p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));

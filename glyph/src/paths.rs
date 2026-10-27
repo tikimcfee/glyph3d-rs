@@ -18,8 +18,10 @@ pub(crate) fn stamps() -> PathBuf {
 /// its paths were shared by every worktree, and a gate that `rm -rf`s its
 /// scratch first ate another worktree's mid-run (2026-10-26, when gates
 /// started running in parallel across helpers).
+/// `GLYPH_SCRATCH` overrides it: prove's relax route gives each mutant its
+/// own, so mutants running one gate at once never share its scratch.
 pub(crate) fn scratch() -> PathBuf {
-    root().join("target/glyph-scratch")
+    std::env::var_os("GLYPH_SCRATCH").map(PathBuf::from).unwrap_or_else(|| root().join("target/glyph-scratch"))
 }
 /// Where a failure's evidence is kept: `target/glyph-scratch/kept/`, named
 /// by when, which process, and what, so nothing overwrites it.
@@ -60,13 +62,26 @@ pub(crate) fn keep_file(what: &str, file: &Path) -> String {
     shown(&path, r)
 }
 
+/// Where the golden renders land: `GLYPH_SWEEP` when set (prove's relax route gives
+/// each mutant its own, so mutants rendering at once never share a frame),
+/// otherwise the battery's untracked sweep directory.
 pub(crate) fn sweep() -> PathBuf {
-    root().join("out/tooling-ab/sweep")
+    std::env::var_os("GLYPH_SWEEP").map(PathBuf::from).unwrap_or_else(|| root().join("out/tooling-ab/sweep"))
+}
+
+/// The renderer the gates run: `GLYPH_RENDERER` when it is set (prove's relax route
+/// sets it to the renderer under relax), otherwise the built product. Every
+/// gate reaches the renderer through this one path; `sh` exports it, so a
+/// gate's command and scripts read `$GLYPH_RENDERER`.
+pub(crate) fn renderer() -> PathBuf {
+    std::env::var_os("GLYPH_RENDERER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root().join("target/release/glyph3d-native"))
 }
 
 /// Every external command goes through here so failures look the same.
 pub(crate) fn sh(cmd: &str, cwd: &Path) -> (bool, String) {
-    let out = Command::new("bash").arg("-c").arg(cmd).current_dir(cwd).output();
+    let out = Command::new("bash").arg("-c").arg(cmd).current_dir(cwd).env("GLYPH_RENDERER", renderer()).output();
     match out {
         Ok(o) => {
             let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
@@ -91,13 +106,13 @@ pub(crate) fn step(msg: &str) {
 }
 
 /// This host's golden-set key (`<backend>-<vendor>`), asked of the renderer
-/// ONCE. `None` when the renderer is not built or refused to answer — a
+/// the gates run (`renderer()`) ONCE. `None` when the renderer is not built or refused to answer — a
 /// caller that needs it says which. Not resolved at manifest load: the
 /// answer needs the product that `build` is about to make.
 pub(crate) fn gpu_key() -> Option<&'static str> {
     static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
-        let bin = root().join("target/release/glyph3d-native");
+        let bin = renderer();
         if !bin.exists() {
             return None;
         }
@@ -114,7 +129,7 @@ pub(crate) fn gpu_key() -> Option<&'static str> {
 pub(crate) fn gpu_profile() -> Option<&'static str> {
     static TEXT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
-        let bin = root().join("target/release/glyph3d-native");
+        let bin = renderer();
         let out = Command::new(&bin).arg("--gpu-profile").current_dir(native()).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     })

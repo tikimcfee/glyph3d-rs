@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::manifest::{Artifact, Class, Manifest};
+use crate::manifest::{Artifact, Class, GoldenView, Manifest};
 use crate::paths::{gpu_key, gpu_profile, keep, keep_file, native, resolve_gpu, root, sh, step, sweep};
 
 /// A golden equivalent's file-name tag: its arguments' alphanumerics, runs
@@ -32,6 +32,21 @@ fn shot_path(name: &str, equivalent: Option<&str>) -> PathBuf {
     }
 }
 
+/// The views the gate renders and judges: every declared one, or the ones
+/// `GLYPH_GOLDEN_VIEWS` names (comma-separated). prove's relax route names the view
+/// a mutation's `expect` claims diverges, so a mutant renders that frame and
+/// not thirty. Err names a view that is not declared: a filter that selects
+/// nothing must not pass.
+fn views(m: &Manifest) -> Result<Vec<&GoldenView>, String> {
+    let Some(names) = std::env::var("GLYPH_GOLDEN_VIEWS").ok().filter(|n| !n.is_empty()) else {
+        return Ok(m.golden_view.iter().collect());
+    };
+    names
+        .split(',')
+        .map(|n| m.golden_view.iter().find(|v| v.name == n).ok_or_else(|| format!("GLYPH_GOLDEN_VIEWS names {n:?}, which is no golden_view")))
+        .collect()
+}
+
 /// Render every golden view into the sweep dir, and again under each of
 /// `equivalents`. Shared by the gate and by `drift` (which compares only the
 /// plain frames), so both read the same renders.
@@ -40,12 +55,19 @@ fn render_views(m: &Manifest, equivalents: &[&str]) -> bool {
     let mut variants: Vec<Option<&str>> = vec![None];
     variants.extend(equivalents.iter().map(|e| Some(*e)));
     let mut ok = true;
-    for v in &m.golden_view {
+    let views = match views(m) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("FAIL  pixel-ab — {e}");
+            return false;
+        }
+    };
+    for v in views {
         for eq in &variants {
             let shot = shot_path(&v.name, *eq);
             let (good, out) = sh(
                 &format!(
-                    "../target/release/glyph3d-native {} {} --screenshot {}",
+                    "\"$GLYPH_RENDERER\" {} {} --screenshot {}",
                     v.cmd,
                     eq.unwrap_or(""),
                     shot.to_string_lossy()
@@ -116,7 +138,7 @@ pub(crate) fn verify_golden(m: &Manifest, inner: bool) -> bool {
     }
     let mut ok = true;
     let mut missing: Vec<&str> = Vec::new();
-    for v in &m.golden_view {
+    for v in views(m).unwrap_or_default() {
         let shot = sweep().join(format!("{}.png", v.name));
         let baseline = a
             .outputs
