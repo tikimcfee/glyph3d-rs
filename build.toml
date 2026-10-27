@@ -997,11 +997,6 @@ op = "replace"
 find = "const MAX_CURVES: u32 = 512u;"
 with = "const MAX_CURVES: u32 = 128u;"
 expect = "every_glyph_shader_covers_the_largest_outline"
-# relax's code cache serves this mutant stale: curve_cap.rs holds the shaders
-# in a const array over the field crates' include_str! constants, and the
-# cache keeps that aggregate's value when the included file changes
-# (measured 2026-10-26: green with the cache on or read-only, red with it off).
-relax_cache = "off"
 
 [[mutation]]
 name = "render-file-copies-stacked"

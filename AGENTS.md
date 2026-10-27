@@ -276,8 +276,7 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   whole suite under relax, judged by the floor, when it names none), the
   golden view it names. A renderer gate's mutation of a file the renderer
   reads at run time (a fixture) is applied on disk, last and one at a
-  time. A mutation relax's cache would serve stale declares
-  `relax_cache = "off"`. Gates with no declaration (the compiler's
+  time. Gates with no declaration (the compiler's
   diagnostics, the corpus gates) are proven on cargo: their Rust mutations
   beside relax, which reads those files from untouched copies, the rest
   after it. The renderer a gate runs is the parameter `GLYPH_RENDERER`

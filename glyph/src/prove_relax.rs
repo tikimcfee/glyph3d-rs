@@ -56,11 +56,6 @@
 //! (20 s on the renderer); now it re-collects the 31 the shared cache does
 //! (8.3 s against 6.0 s read-only on the shared one, then 1.2 s a process;
 //! measured 2026-10-26).
-//! A mutation whose mutant relax's cache would serve stale declares
-//! `relax_cache = "off"` (a constant aggregate over another crate's
-//! `include_str!` constant keeps its cached value, measured 2026-10-26;
-//! RELAX_STALE_CONST in makepad's mail has the repro), and runs uncached.
-//!
 //! The cargo route's Rust mutations run BESIDE the relax phase: relax reads
 //! their files from untouched copies through the overlay (`Pristine`), so it
 //! never sees a cargo mutant. The cargo route's other mutations write files
@@ -525,11 +520,7 @@ fn clone_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn scratch_env(mu: &Mutation, r: &Route, dir: &Path) -> Result<Vec<(&'static str, OsString)>, String> {
     std::fs::create_dir_all(dir.join("scratch")).map_err(|e| format!("its scratch did not make: {e}"))?;
     let mut env: Vec<(&str, OsString)> = vec![("GLYPH_SCRATCH", dir.join("scratch").into())];
-    if mu.relax_cache.as_deref() == Some("off") {
-        // Declared on the mutation (`relax_cache = "off"`, with its why):
-        // relax's cache keeps a stale value for it.
-        env.push(("MAKEPAD_RUN_CACHE", "off".into()));
-    } else if spawns_relax(r) {
+    if spawns_relax(r) {
         let cache = dir.join("run-dir");
         // Only the code cache: relax keeps a redirected run dir's build
         // outputs (build/, build-scripts/, native/) at the workspace's own
@@ -1002,7 +993,6 @@ mod tests {
         assert_eq!((t.package.as_str(), t.target.clone()), ("glyph", vec!["--bins".to_string()]));
         let t = test("derived-empty-load-panics");
         assert_eq!((t.package.as_str(), t.target.clone()), ("glyph3d-native", vec!["--test".to_string(), "empty_load".to_string()]));
-        assert_eq!(by("derived-curve-cap-128").relax_cache.as_deref(), Some("off"), "declared: relax's cache serves it stale");
         assert_eq!(test("derived-curve-cap-128").target, ["--test", "curve_cap"], "curve_cap reads the embedded shader");
         assert_eq!(route(&m, by("tests-silently-ignored")), Ok(Some((Route::Suite, Apply::Overlay))), "the floor's text: the suite");
         assert_eq!(route(&m, by("hyper-head-advance")), Ok(Some((Route::Renderer("hyper-oracle".into()), Apply::Overlay))));

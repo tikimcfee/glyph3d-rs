@@ -182,9 +182,6 @@ pub(crate) struct Mutation {
     #[serde(rename = "with")]
     pub(crate) with_: Option<String>,
     pub(crate) rebuild: Option<String>,
-    /// `"off"`: prove's relax route runs this mutant with relax's code cache
-    /// off, because the cache would serve it stale (its `why` says how).
-    pub(crate) relax_cache: Option<String>,
 }
 
 pub(crate) fn load() -> Result<Manifest, String> {
@@ -315,19 +312,6 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
         }
         if g.pass_line.is_some() && g.cmd.is_none() {
             p.push(format!("gate {} declares pass_line but has no cmd to match it against", g.name));
-        }
-    }
-
-    for mu in &m.mutation {
-        let relax_gate = m.gate.iter().any(|g| g.name == mu.gate && g.relax.is_some());
-        match mu.relax_cache.as_deref() {
-            None => {}
-            Some("off") if relax_gate => {}
-            Some("off") => p.push(format!(
-                "mutation {} declares relax_cache but its gate {} is not proven under relax",
-                mu.name, mu.gate
-            )),
-            Some(other) => p.push(format!("mutation {} declares relax_cache = {other:?}; the only value is \"off\"", mu.name)),
         }
     }
 
