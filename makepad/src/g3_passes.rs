@@ -1374,14 +1374,14 @@ impl G3Tables {
     pub fn new(cx: &mut Cx, statics: &G3StaticTables, groups: &G3GroupTable) -> Self {
         let g = groups.table;
         Self {
-            groups: g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, &g),
+            groups: g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, g),
             groups_size: (g.width, g.height),
             group_count: groups.group_count,
-            items: g3_float_texture(cx, "item_table", TABLE_WIDTH, &statics.items),
-            overrides: g3_float_texture(cx, "group_overrides", TABLE_WIDTH, &statics.overrides),
-            advances: g3_float_texture(cx, "glyph_advances", TABLE_WIDTH, &statics.advances),
-            glyphmap: g3_float_texture(cx, "glyphmap", TABLE_WIDTH, &statics.glyphmap),
-            curves: g3_float_texture(cx, "curves", TABLE_WIDTH, &statics.curves),
+            items: g3_float_texture(cx, "item_table", TABLE_WIDTH, statics.items),
+            overrides: g3_float_texture(cx, "group_overrides", TABLE_WIDTH, statics.overrides),
+            advances: g3_float_texture(cx, "glyph_advances", TABLE_WIDTH, statics.advances),
+            glyphmap: g3_float_texture(cx, "glyphmap", TABLE_WIDTH, statics.glyphmap),
+            curves: g3_float_texture(cx, "curves", TABLE_WIDTH, statics.curves),
             emoji: Self::emoji_texture(cx, &statics.emoji),
         }
     }
@@ -1390,7 +1390,9 @@ impl G3Tables {
     fn emoji_texture(cx: &mut Cx, sheet: &G3EmojiSheet) -> Texture {
         let data: Vec<u32> = sheet
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| (p[2] as u32) | ((p[1] as u32) << 8) | ((p[0] as u32) << 16) | ((p[3] as u32) << 24))
             .collect();
         Texture::new_with_format(
@@ -1414,7 +1416,7 @@ impl G3Tables {
         let g = groups.table;
         self.group_count = groups.group_count;
         if (g.width, g.height) != self.groups_size {
-            self.groups = g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, &g);
+            self.groups = g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, g);
             self.groups_size = (g.width, g.height);
             return;
         }
@@ -1540,7 +1542,7 @@ impl G3GlyphBlock {
     pub fn draw(&self, cx: &mut CxDraw, draw_vars: &mut DrawVars, ranges: &[Range<u32>]) -> Area {
         let area = cx.add_retained_instances(draw_vars, &self.retained);
         if let Area::Instance(ia) = &area {
-            let ranges: &[Range<u32>] = if ranges.is_empty() { &[0..0] } else { ranges };
+            let ranges: &[Range<u32>] = if ranges.is_empty() { std::slice::from_ref(&(0..0)) } else { ranges };
             cx.draw_lists[ia.draw_list_id].draw_items.set_instance_ranges(ia.draw_item_id, ranges);
         }
         draw_vars.area = cx.update_area_refs(draw_vars.area, area);
