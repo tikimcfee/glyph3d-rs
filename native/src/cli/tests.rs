@@ -51,7 +51,6 @@ fn defaults_match_old_parser() {
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("shelf"), crate::repo::RepoLayoutMode::Shelf);
     assert_eq!(parse_layout_mode("carrel"), crate::repo::RepoLayoutMode::Carrel);
-    assert!(!cli.repo_verify);
     assert!(cli.focus_file.is_none());
     assert!(!cli.repo_scan_only);
     assert!(!cli.no_cull);
@@ -87,7 +86,7 @@ fn scalar_flags_parse() {
         "--file-backgrounds", "--file-bg-color", "0.15,0.15,0.20,0.80",
         "--show-glyphs-px", "2.0", "--text-detail-px", "12",
         "--load-repo", "fixtures/g-pick-repo",
-        "--repo-engine", "batch", "--repo-verify", "--focus-file", "alpha",
+        "--repo-engine", "batch", "--focus-file", "alpha",
         "--wrap-mode", "back", "--z-wrap-spacing", "0.6", "--cluster-mode", "cluster",
         "--layout-mode", "carrel",
         "--render-file", "src/main.rs",
@@ -118,7 +117,6 @@ fn scalar_flags_parse() {
     assert_eq!(cli.z_wrap_spacing, 0.6);
     assert_eq!(cli.cluster_mode, fold::ClusterMode::Cluster);
     assert_eq!(cli.layout_mode, crate::repo::RepoLayoutMode::Carrel);
-    assert!(cli.repo_verify);
     assert_eq!(cli.focus_file.as_deref(), Some("alpha"));
     assert_eq!(cli.render_file, Some(PathBuf::from("src/main.rs")));
 }
@@ -217,7 +215,7 @@ fn the_retired_color_mode_flag_is_refused() {
 fn field_mode_parses_and_refuses_unknown() {
     assert_eq!(parse(&["--field-mode", "derived"]).field_mode, glyph_field::GlyphFieldMode::Derived);
     assert_eq!(parse(&["--field-mode", "instanced"]).field_mode, glyph_field::GlyphFieldMode::Instanced);
-    assert_eq!(parse(&["--field-mode", "visible"]).field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert!(try_parse(&["--field-mode", "visible"]).is_err(), "the Visible field was deleted on 2026-10-26");
     assert_eq!(parse(&[]).field_mode, glyph_field::GlyphFieldMode::Derived, "the default is derived (2026-10-11)");
     assert_eq!(parse(&[]).field_mode, glyph_field::GlyphFieldMode::default(), "clap's default is the enum's");
     let text = match try_parse(&["--field-mode", "vertexy"]) {
@@ -225,18 +223,12 @@ fn field_mode_parses_and_refuses_unknown() {
         Err(e) => e.to_string(),
     };
     assert!(text.contains("vertexy"), "the error must name the bad value: {text}");
-    // The visible mode reaches the scene options as itself, and its debug
-    // tint rides beside it: off by default (the uniform lane stays 0, so the
-    // stored modes' Params bytes are what they were), a named tier otherwise.
-    let plan = match parse(&["--load-repo", ".", "--field-mode", "visible"]).action() {
+    // The mode reaches the scene options as itself.
+    let plan = match parse(&["--load-repo", ".", "--field-mode", "instanced"]).action() {
         CliCommand::Render(plan) => plan,
         _ => panic!("a repo load renders"),
     };
-    assert_eq!(plan.cull_opts.field_mode, glyph_field::GlyphFieldMode::Visible);
-    assert_eq!(plan.cull_opts.debug_tint, 0);
-    assert_eq!(parse(&["--debug-tint", "lod"]).debug_tint.as_u32(), 1);
-    assert_eq!(parse(&["--debug-tint", "cull"]).debug_tint.as_u32(), 2);
-    assert!(try_parse(&["--debug-tint", "rainbow"]).is_err(), "clap must refuse an unknown tint");
+    assert_eq!(plan.cull_opts.field_mode, glyph_field::GlyphFieldMode::Instanced);
 }
 
 /// Out-of-domain spacing is REFUSED at the boundary with the flag and the
@@ -633,14 +625,6 @@ fn cli_action_dispatch_variants() {
         }
         other => panic!("--hyper-oracle-check dispatched to {other:?}"),
     }
-    let cli = parse(&["--line-table-stats", "some/dir", "--cluster-mode", "leader"]);
-    match cli.action() {
-        CliCommand::Fixture(FixtureTask::LineTableStats(paths, mode)) => {
-            assert_eq!(paths.len(), 1);
-            assert_eq!(mode, crate::fold::ClusterMode::Leader, "the CLI mode rides along");
-        }
-        other => panic!("--line-table-stats dispatched to {other:?}"),
-    }
 
     // 4. RepoScanOnly
     let cli = parse(&["--load-repo", "some/dir", "--repo-scan-only"]);
@@ -745,20 +729,16 @@ fn screenshot_runs_never_discover_launch_config() {
 
 /// Every way a gate launches the binary without `--screenshot` is a check or
 /// a measurement, and none reads a personal launch config (2026-10-10: a
-/// saved `field_mode = "visible"` reddened repo-verify-direct).
+/// saved field mode reddened a gate).
 #[test]
 fn check_runs_never_discover_launch_config() {
     for args in [
-        &["--load-repo", "r", "--repo-engine", "direct", "--repo-verify", "--repo-scan-only"][..],
-        &["--load-repo", "r", "--repo-verify"],
+        &["--load-repo", "r", "--repo-engine", "direct", "--repo-scan-only"][..],
         &["--load-repo", "r", "--repo-scan-only"],
         &["--fixture-trie", "f"],
         &["--fixture-fold", "f"],
-        &["--fixture-scan", "f"],
-        &["--fixture-bake", "f"],
         &["--fixture-reference", "f"],
         &["--hyper-oracle-check", "f"],
-        &["--line-table-stats", "f"],
         &["--gpu-key"],
         &["--gpu-profile"],
     ] {
@@ -773,7 +753,7 @@ fn check_runs_never_discover_launch_config() {
 #[test]
 fn launch_config_scene_yields_to_a_typed_scene() {
     let tmp = std::env::temp_dir().join(format!("test_launch_cfg_scene_{}.toml", std::process::id()));
-    std::fs::write(&tmp, "load_repo = \"/cfg/repo\"\nfocus_file = \"alpha\"\nfield_mode = \"visible\"\n")
+    std::fs::write(&tmp, "load_repo = \"/cfg/repo\"\nfocus_file = \"alpha\"\nfield_mode = \"instanced\"\n")
         .expect("write temp config");
     let cfg = tmp.to_str().unwrap();
 
@@ -786,6 +766,6 @@ fn launch_config_scene_yields_to_a_typed_scene() {
     assert_eq!(typed.load_repo, None, "the file's repo must not outrank a typed --render-file");
     assert_eq!(typed.render_file, Some(PathBuf::from("x.rs")));
     // Non-scene keys still apply.
-    assert_eq!(typed.field_mode, glyph_field::GlyphFieldMode::Visible);
+    assert_eq!(typed.field_mode, glyph_field::GlyphFieldMode::Instanced);
 }
 

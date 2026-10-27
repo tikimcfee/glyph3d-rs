@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 pub mod agent_transcript;
 pub mod atlas;
-pub mod bake;
 pub mod cli;
 pub mod config;
 pub mod fixture;
@@ -25,7 +24,6 @@ pub mod offscreen;
 pub mod relayout;
 pub mod repo;
 pub mod revision;
-pub mod scan;
 pub mod scene;
 pub mod seam;
 pub mod spatial_scene;
@@ -80,7 +78,6 @@ pub enum SceneChoice {
     Repo {
         dir: PathBuf,
         strategy: repo::Strategy,
-        verify: bool,
         focus: Option<String>,
         wrap_mode: fold::WrapMode,
         z_wrap_spacing: f64,
@@ -110,9 +107,6 @@ pub struct SceneCullOptions {
     pub greek_onset_px: Option<f32>,
     /// Which glyph-field implementation the scene builds (`--field-mode`).
     pub field_mode: glyph_scene::GlyphFieldMode,
-    /// The Visible field's debug tint (`--debug-tint`): 0 off, 1 by LOD
-    /// tier, 2 by cull state. The other modes ignore it.
-    pub debug_tint: u32,
     /// The ground/sky environment (`--environment`, `[environment] mode`).
     pub environment: config::EnvironmentMode,
     /// Explicit ground height (`--ground-y`); None = below the scene.
@@ -130,7 +124,6 @@ impl Default for SceneCullOptions {
             greek_pure: true,
             greek_onset_px: None,
             field_mode: glyph_scene::GlyphFieldMode::default(),
-            debug_tint: 0,
             environment: config::settings().environment.mode,
             ground_y: None,
         }
@@ -185,8 +178,7 @@ pub fn build_scene_from_staged(
 /// live loop's rebuilds keep the mode the run was launched with (until
 /// 2026-10-10 they hardcoded Instanced, so a `--field-mode derived` live
 /// session silently rebuilt as Instanced on the first edit). The mode the
-/// scene BUILDS still follows the staged arena (`glyph_scene::setup`): a
-/// host-staged arena cannot carry a Visible field and falls back.
+/// scene BUILDS still follows the staged arena (`glyph_scene::setup`).
 pub fn build_scene_from_staged_mode(
     ctx: &GpuContext,
     color_format: wgpu::TextureFormat,
@@ -253,7 +245,6 @@ fn build_scene_impl(
         if let Some(onset) = cull_opts.greek_onset_px {
             scene.set_greek_onset_px(onset);
         }
-        scene.set_debug_tint(cull_opts.debug_tint);
         scene.set_environment(cull_opts.environment, cull_opts.ground_y);
         let p = probe.then(|| scene.init_ui_probe());
         (Box::new(scene) as Box<dyn SceneLike>, p)
@@ -264,7 +255,7 @@ fn build_scene_impl(
         SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
         SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, tab_width, wrap_mode, z_wrap_spacing } => {
             // A one-file repo load (2026-10-11): HyperLayout, flat paint and
-            // whichever field was asked for, Visible included.
+            // whichever field was asked for.
             let params = repo::RepoParams {
                 wrap_mode: *wrap_mode,
                 z_wrap_spacing: *z_wrap_spacing,
@@ -324,7 +315,6 @@ fn build_scene_impl(
         SceneChoice::Repo {
             dir,
             strategy,
-            verify,
             focus,
             wrap_mode,
             z_wrap_spacing,
@@ -372,7 +362,6 @@ fn build_scene_impl(
                     prefetched,
                     &params,
                     *strategy,
-                    *verify,
                     Some(ctx),
                     arena,
                     None,

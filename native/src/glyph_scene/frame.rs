@@ -97,13 +97,10 @@ impl ChunkRanges {
 
 /// The selection a frame highlights: the selected glyphs' slot ranges per
 /// chunk (drawn into the mask) and the tint the composite adds where the
-/// mask covers. The Visible field's selection is a byte range it lays out
-/// itself (`byte_range`, wgpu only); its `ranges` are empty.
+/// mask covers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameSelection {
     pub ranges: ChunkRanges,
-    /// (item, start byte, end byte) for the Visible field.
-    pub byte_range: Option<(u32, u32, u32)>,
     /// rgb (linear) and strength: `[glyph_scene] selection_tint`.
     pub tint: [f32; 4],
 }
@@ -174,8 +171,6 @@ pub struct FrameData<'a> {
     /// The item table the Derived shader reads, fixed for the scene's life.
     pub item_table: &'a [glyph_field::ItemParamsGpu],
     // ── for the wgpu half only ──
-    /// The self-culling (Visible) field's per-frame inputs.
-    pub field_prepare: Option<glyph_field::FramePrepare>,
     pub costs: FrameCosts,
     /// The frame uniform the stored fields' shaders read.
     pub(super) uniform: FrameUniform,
@@ -188,7 +183,7 @@ impl GlyphScene {
         let (width, height) = viewport;
         // The transform tree first: the moved subtrees resolve and the group
         // rows they changed are planned before anything reads a row (the
-        // cull below, the Visible field's prepare, the glyph pass).
+        // cull below, the glyph pass).
         let (plan, group_runs) = self.nodes.prepare();
         // The library's page faces follow their sheets' resolved worlds: the
         // faces of the sheets the resolve reached (faces.rs).
@@ -206,7 +201,6 @@ impl GlyphScene {
         if let (Some(probe), Some(cull)) = (&self.ui_probe, &self.cull) {
             let p = probe.borrow();
             cull.lod_min_px.set(p.lod_min_px);
-            cull.lod_backdrop_px.set(p.lod_backdrop_px);
             cull.file_backgrounds.set(p.file_backgrounds);
             cull.file_bg_color.set(p.file_bg_color);
         }
@@ -221,14 +215,7 @@ impl GlyphScene {
             };
             self.set_greek_mode(mode);
             self.set_greek_onset_px(p.greek_onset_px);
-            self.set_debug_tint(p.debug_tint);
         }
-        // A field that culls and draws itself (Visible): the scene's
-        // per-file glyph ranges are not built for it, its slot math is
-        // never asked, and the CPU cull keeps only two jobs — the BACKDROP
-        // quads (under the field's backdrop threshold, not the glyph one,
-        // so a washed item is not also a backdrop) and the hidden flags.
-        let self_drawing = self.field.draws_itself();
 
         // Stage L (L1): every lane of the frame uniform. px_scale is shared
         // with the cull below (the uniform needs it even under --no-cull).
@@ -244,29 +231,6 @@ impl GlyphScene {
             flags: 0,
             _pad1: 0,
         };
-        // The self-culling field's per-frame inputs. The thresholds are the
-        // cull cells (live from the panel in windowed runs, the `[lod]`
-        // settings offscreen): the glyph tier is the existing
-        // `show_glyphs_px`, the backdrop tier the visible mode's own.
-        let field_prepare = self_drawing.then(|| {
-            let p = self.params.get();
-            let (lod_glyph_px, lod_backdrop_px) =
-                self.cull.as_ref().map(|c| (c.lod_min_px.get(), c.lod_backdrop_px.get())).unwrap_or_else(|| {
-                    let s = &crate::config::settings().lod;
-                    (s.show_glyphs_px, s.visible_backdrop_px)
-                });
-            glyph_field::FramePrepare {
-                view_proj: frame.view_proj.to_cols_array_2d(),
-                eye: frame.eye.to_array(),
-                viewport: [width as f32, height as f32],
-                px_scale,
-                lod_glyph_px,
-                lod_backdrop_px,
-                greek_mode: p.greek_mode,
-                debug_tint: p.debug_tint,
-                time: t,
-            }
-        });
         let env = self.environment.is_on().then(|| {
             let env_cam = EnvCamera { eye: frame.eye.as_dvec3(), vp_rel: frame.view_proj_rel, far: frame.far, fit: self.fit };
             self.environment.frame_uniform(&env_cam, self.environment.ground_y(self.scene_min_y))
@@ -278,7 +242,7 @@ impl GlyphScene {
         // counts (one full range per chunk — identical draws to the pre-L2
         // per-chunk loop) and has no backdrops.
         let mut cull_ms = 0.0f32;
-        let chunk_count = if self_drawing { 0 } else { self.field.chunk_count() };
+        let chunk_count = self.field.chunk_count();
         let phase_draws: PhaseDraws = if let Some(cull) = &self.cull {
             // The profiler's and the HUD's cull figure read the same clock.
             let cull_t0 = std::time::Instant::now();
@@ -286,15 +250,12 @@ impl GlyphScene {
                 planes: frustum_planes(&frame.view_proj),
                 eye: frame.eye,
                 px_scale,
-                lod_min_px: if self_drawing { cull.lod_backdrop_px.get() } else { cull.lod_min_px.get() },
+                lod_min_px: cull.lod_min_px.get(),
                 file_backgrounds: cull.file_backgrounds.get(),
                 file_bg_color: cull.file_bg_color.get(),
                 backdrop_at_front: cull.backdrop_at_front,
             };
-            // No chunks for a self-drawing field: zero chunks means the cull
-            // builds no glyph range (and never asks the field for its slot
-            // math).
-            let chunk_cap = if self_drawing { 1 } else { self.field.chunk_capacity() };
+            let chunk_cap = self.field.chunk_capacity();
             let phase_draws = match &cull.tree {
                 // A library load: top-down over the transform tree, the flat
                 // cull's draws without a per-file box write per move.
@@ -312,10 +273,6 @@ impl GlyphScene {
                 );
             }
             phase_draws
-        } else if self_drawing {
-            // --no-cull on a self-drawing field: it still culls itself; the
-            // scene simply has no backdrops to offer.
-            PhaseDraws { backdrops: Vec::new(), glyph_ranges: Vec::new() }
         } else {
             PhaseDraws {
                 backdrops: Vec::new(),
@@ -343,11 +300,6 @@ impl GlyphScene {
                         .collect();
                     ChunkRanges::from_pairs(&pairs, self.field.chunk_count())
                 }
-                Selection::ByteRange { .. } => ChunkRanges::default(),
-            },
-            byte_range: match sel {
-                Selection::ByteRange { item, start, end } => Some((*item, *start, *end)),
-                _ => None,
             },
             tint: crate::config::settings().glyph_scene.selection_tint,
         });
@@ -390,7 +342,6 @@ impl GlyphScene {
             slots: self.field.host_slots(),
             group_overrides: self.field.group_overrides(),
             item_table: &self.item_table,
-            field_prepare,
             costs,
             uniform,
         }
@@ -488,14 +439,11 @@ impl GlyphScene {
             p.cull_instances = 0;
             p.cull_backdrops = 0;
         }
-        // The HUD's readout: what the field is, what the CPU cull cost, and
-        // the self-culling field's own counters (its readback lags a frame
-        // or two; nothing here waits for it).
+        // The HUD's readout: what the field is and what the CPU cull cost.
         p.field_mode = Some(self.field.mode());
         p.cull_cpu_ms = cull_ms;
         p.segments = self.cull.as_ref().map_or(0, |c| c.segments.len());
         p.hidden_segments = self.cull.as_ref().map_or(0, |c| c.hidden.iter().filter(|h| **h).count());
-        p.visible_stats = self.field.visible().map(|v| v.stats());
         // The layout dial's readout: the field's depth extent over the
         // segment table (per frame, so group z-moves show too). None
         // under --no-cull — no segment table to measure.

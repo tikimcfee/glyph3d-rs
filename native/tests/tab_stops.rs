@@ -1,28 +1,18 @@
 //! Tab stops through the renderer (2026-10-11; the rule is
-//! `fold::TabWidth`): the three glyph fields draw the same frame at every
-//! tab width.
+//! `fold::TabWidth`): both glyph fields draw the same frame at every tab
+//! width.
 //!
 //! `fixtures/tab-stops` (tabs at a line's start, after ASCII, after
 //! non-ASCII and double-width glyphs, back to back, inside wrapped rows, and
-//! one line past the Visible field's segment size so its tabs sit on both
-//! sides of a seed) is rendered through the release binary exactly as the
-//! golden runner drives it, under `--field-mode derived`, `instanced` and
-//! `visible`. Derived and Instanced draw slots the device Pass 2 placed;
-//! Visible lays its lines out per frame on the GPU from the bytes, the line
-//! table and the item's tab width (`VisibleStaging::item` → the kernel's
-//! `ItemGpu::tab_width`) — so a field that lost the width, or measured a
-//! stop differently, draws a different frame. The frames must be byte-equal
+//! one long line) is rendered through the release binary exactly as the
+//! golden runner drives it, under `--field-mode derived` and `instanced`,
+//! each drawing the slots the device Pass 2 placed. The frames must be byte-equal
 //! at widths 1, 4 and 8; the default (no flag, the `[layout]
 //! tab_width_cells` setting) must equal `--tab-width 1`, which is the layout
 //! before tab stops; and each wider width must move pixels, or the fixture
 //! has stopped exercising tabs. The repo load is flat paint (every load is,
-//! since the syntax heuristic's retirement, 2026-10-11), so the three
-//! fields agree on colour.
-//!
-//! Mutation `visible-item-tab-width-dropped` (the production Visible item
-//! built at one cell) reddens this; `hyper_oracle`'s grid cannot see it,
-//! since it builds its own Visible items. Needs a GPU, like every other
-//! render test in this crate.
+//! since the syntax heuristic's retirement, 2026-10-11), so the two fields
+//! agree on colour. Needs a GPU, like every other render test in this crate.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,7 +62,7 @@ fn every_field_draws_the_same_frame_at_every_tab_width() {
     for width in [1u32, 4, 8] {
         let w = width.to_string();
         let mut frames: Vec<(&str, image::RgbaImage)> = Vec::new();
-        for field in ["derived", "instanced", "visible"] {
+        for field in ["derived", "instanced"] {
             let out = dir.join(format!("{field}-{width}.png"));
             frames.push((field, render(&out, &["--field-mode", field, "--tab-width", &w])));
         }

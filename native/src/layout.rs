@@ -444,10 +444,10 @@ impl ItemPlacement {
 /// Where laid-out glyphs land. The CALLER owns it and passes it in; a backend
 /// appends and never reads back.
 ///
-/// Three forms: a host `Vec<GlyphInstance>` (the engine's neutral 48 B
-/// records); the EMITTED form, slots already in the field's own format
+/// Two forms: a host `Vec<GlyphInstance>` (the engine's neutral 48 B
+/// records), and the EMITTED form, slots already in the field's own format
 /// ([`EmittedSlots`]: Derived blocks on the host, Instanced slots on the
-/// device); and the visible form, no slots at all.
+/// device).
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
@@ -455,12 +455,6 @@ pub struct GlyphArena {
     /// own slots. No 48 B record exists; every slice-returning accessor
     /// panics on it.
     emitted: Option<EmittedSlots>,
-    /// The third form (`--field-mode visible`, 2026-10-10): NO slots at all.
-    /// Pass 1's line table and the items' own bytes, which the field lays out
-    /// per frame on the GPU (`layout_hyper::visible`). `instances` stays
-    /// empty, so the slice accessors return nothing rather than panicking;
-    /// `len()` reports the glyphs the items WOULD produce.
-    visible: Option<crate::layout_hyper::VisibleStaging>,
 }
 
 /// Precomputed per-item tint statistics accumulated during layout Pass 2.
@@ -536,19 +530,13 @@ impl GlyphArena {
 
     /// Wrap a host Vec (the text and agent-session scenes stage from their own layout).
     pub fn from_vec(instances: Vec<GlyphInstance>) -> Self {
-        Self { instances, emitted: None, visible: None }
+        Self { instances, emitted: None }
     }
 
     /// The emitted form: Pass 2's slots in the field's own format.
     pub fn from_emitted(emitted: EmittedSlots) -> Self {
         assert!(emitted.len > 0, "an emitted arena with zero slots is the host form's job");
-        Self { instances: Vec::new(), emitted: Some(emitted), visible: None }
-    }
-
-    /// The visible form: no slots, the line table and (once the loader moves
-    /// them in) the bytes.
-    pub fn from_visible(staging: crate::layout_hyper::VisibleStaging) -> Self {
-        Self { instances: Vec::new(), emitted: None, visible: Some(staging) }
+        Self { instances: Vec::new(), emitted: Some(emitted) }
     }
 
     /// True on the emitted form: the field's own slots, no 48 B records.
@@ -556,24 +544,8 @@ impl GlyphArena {
         self.emitted.is_some()
     }
 
-    /// True on the visible form — no slots; the field lays out per frame.
-    pub fn is_visible(&self) -> bool {
-        self.visible.is_some()
-    }
-
-    /// The visible form's staging. None on the other two forms.
-    pub fn visible_staging(&self) -> Option<&crate::layout_hyper::VisibleStaging> {
-        self.visible.as_ref()
-    }
-
-    /// The visible form's staging, to finish (the loader moves the bytes in,
-    /// `into_staged` builds the items).
-    pub fn visible_staging_mut(&mut self) -> Option<&mut crate::layout_hyper::VisibleStaging> {
-        self.visible.as_mut()
-    }
-
     /// The emitted slots, for the field to bind (Instanced) or keep and
-    /// upload (Derived). None on the other forms.
+    /// upload (Derived). None on the host form.
     pub fn emitted_slots(&self) -> Option<&EmittedSlots> {
         self.emitted.as_ref()
     }
@@ -583,13 +555,10 @@ impl GlyphArena {
         self.emitted.take()
     }
 
-    /// Slots written so far — the next item's `slot_base`. On the visible
-    /// form, the glyphs the items would produce (nothing is written).
+    /// Slots written so far — the next item's `slot_base`.
     pub fn len(&self) -> usize {
         if let Some(d) = &self.emitted {
             d.len
-        } else if let Some(v) = &self.visible {
-            usize::try_from(v.glyph_count).expect("glyph count exceeds usize")
         } else {
             self.instances.len()
         }
@@ -815,14 +784,6 @@ impl LayoutEngine {
         Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
     }
 
-    /// A device-less HyperLayout that still knows the field mode: for
-    /// Instanced and Derived it is `hyper()` (no device, host records); for
-    /// Visible it stages the line table and bytes, which needs no device —
-    /// the `--repo-scan-only` and live (`load_items`) doors to that mode.
-    pub fn hyper_with_mode(field_mode: glyph_field::GlyphFieldMode) -> Self {
-        Self::Hyper(crate::layout_hyper::HyperLayout::with_field_mode(field_mode))
-    }
-
     /// Sets prefetched inputs from the background prefetch thread for HyperLayout.
     pub(crate) fn set_hyper_prefetched(&mut self, data: crate::layout_hyper::PrefetchedHyperData) {
         let Self::Hyper(h) = self;
@@ -881,9 +842,6 @@ impl VerifyLayout for LayoutEngine {
 /// backend can differ from it about the fold (the thing the corpus actually
 /// checks) and is held to it for the rest. A second hand-written copy of this
 /// loop would be a second place for the paint index to slip.
-///
-/// A backend that compacts on its own is held to the same output by
-/// `--repo-verify`, which diffs arenas and placements, not just records.
 ///
 /// Blank records (`glyph_id == 0` — missing or whitespace) emit no instance;
 /// their advance is already baked into the surviving records' X by the fold,
@@ -1007,9 +965,9 @@ pub struct VerifyReport {
 /// Diff two backends at the seam, bit-exact, and say where they first differ.
 ///
 /// THIS IS WHAT A NEW BACKEND IS SCORED BY, which is why it compares three
-/// things rather than one. The old `--repo-verify` compared RECORDS
-/// only; records alone cannot see a difference in compaction, in paint
-/// indexing, or in either extent — every one of which now lives behind the
+/// things rather than one. Records alone (all the first `--repo-verify`
+/// compared) cannot see a difference in compaction, in paint indexing, or in
+/// either extent — every one of which now lives behind the
 /// seam and every one of which a new backend has to get right. Instances and
 /// placements close that, and records stay because they are the finest
 /// granularity available and they see blanks, which instances by construction

@@ -7,7 +7,7 @@
 //!                    the terminal launcher (`launcher/`): pick a scene and
 //!                    its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
-//!                    `--field-mode derived|visible|instanced`, derived the
+//!                    `--field-mode derived|instanced`, derived the
 //!                    default since 2026-10-11).
 //!   `--render-file P`  one text file; `--agent-session P` an agent transcript;
 //!                    `--demo` the quad-field stress demo.
@@ -15,8 +15,8 @@
 //!                    offscreen: render, write a PNG, exit. Deterministic (a
 //!                    fixed virtual clock), which is what the golden views
 //!                    rest on.
-//!   check instruments  `--fixture-*`, `--hyper-oracle-check`, `--repo-verify`,
-//!                    `--gpu-key`, ...: run by the `cargo glyph` gates.
+//!   check instruments  `--fixture-*`, `--hyper-oracle-check`, `--gpu-key`,
+//!                    ...: run by the `cargo glyph` gates.
 //!
 //! This file is the CLI SHELL (clap parsing, run-mode dispatch, help); the
 //! renderer lives in the library — `src/lib.rs`.
@@ -96,25 +96,14 @@ fn main() {
             FixtureTask::Reference(paths) => fixture::run_fixture_reference(&paths),
             FixtureTask::Trie(paths) => fixture::run_fixture_trie(&paths),
             FixtureTask::Fold(paths) => fixture::run_fixture_fold(&paths),
-            FixtureTask::Scan(paths) => scan::run_fixture_scan(&paths),
-            FixtureTask::Bake(paths) => bake::run_fixture_bake(&paths),
             FixtureTask::HyperOracle(paths, mode, tab_width) => hyper_oracle::run_hyper_oracle_check(&paths, mode, tab_width),
-            FixtureTask::LineTableStats(paths, mode) => {
-                glyph3d_native::layout_hyper::line_table::run_line_table_stats(&paths, mode)
-            }
         },
         CliCommand::RepoScanOnly {
             dir,
             params,
             strategy,
-            verify,
         } => {
-            let load = repo::load_repo(
-                &dir,
-                &params,
-                strategy,
-                verify,
-            );
+            let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
         }
         CliCommand::Render(plan) => {

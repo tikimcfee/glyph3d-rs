@@ -12,7 +12,7 @@
 //! **The view's index is its item row**, in every field and every table
 //! that is per item: the row of the GPU item table (`ItemParamsGpu`, which
 //! [`Views::item_table`] writes), the item lane of a Derived slot, the
-//! Visible field's item, the pick record (`PickContext::files[view]`) and
+//! pick record (`PickContext::files[view]`) and
 //! the layout's per-item outputs (placements, tints, blocks). That is one
 //! name for one thing.
 //!
@@ -21,7 +21,7 @@
 //! cull segment ([`Views::segment`]), the slot range ([`Views::slots`]).
 //! Until this table existed one integer wore all of those names at a repo
 //! load — file `i` was item `i`, group `i`, node `nodes[i]`, segment `i`,
-//! `files[i]` and Visible item `i` — and a dozen readers relied on the
+//! and `files[i]` — and a dozen readers relied on the
 //! equality without saying so (the design note's § 1.3 lists them). The
 //! witness that none does any more is `native/tests/view_registry.rs`: a
 //! load whose group rows are permuted against its views renders the
@@ -48,8 +48,7 @@ const NO_VIEW: u32 = u32::MAX;
 pub struct View {
     /// The buffer the view's bytes come from, in its producer's numbering:
     /// the walked file's index at a repo load, the text block's at an agent
-    /// session, 0 at `--render-file` (every copy reads the one file, and
-    /// the Visible field reads it from one host buffer).
+    /// session, 0 at `--render-file` (every copy reads the one file).
     pub buffer: u32,
     /// The bytes of that buffer the view covers: the whole buffer today.
     pub bytes: Range<u32>,
@@ -65,12 +64,10 @@ pub struct View {
     /// text stager's copies shared one cover segment until 2026-10-11; as
     /// views of a repo load each copy has its own.)
     pub segment: u32,
-    /// The arena slots its glyphs occupy (empty where none are stored: the
-    /// Visible field lays glyphs out per frame).
+    /// The arena slots its glyphs occupy.
     pub slots: Range<u32>,
     /// Its extent before the group's transform: a repo file's is its cull
-    /// segment's local box (ink plus the segment pads), the box the Visible
-    /// field culls the item by; an agent block's and a text copy's are the
+    /// segment's local box (ink plus the segment pads); an agent block's and a text copy's are the
     /// boxes their producers measured.
     pub local_min: [f32; 3],
     pub local_max: [f32; 3],

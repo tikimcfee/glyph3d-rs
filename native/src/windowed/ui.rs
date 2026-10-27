@@ -34,7 +34,7 @@ pub(super) struct EguiUi {
     pub(super) discovered_sessions: Option<Result<Vec<crate::agent_transcript::SessionInfo>, String>>,
     /// The field HUD (F8 toggles): the always-on top-left readout of what
     /// the glyph field is and what it did this frame. Independent of the
-    /// Debug window; open by default in `--field-mode visible`.
+    /// Debug window; closed by default.
     pub(super) hud_open: bool,
     /// Where gomuxai looked (`agent sessions --dirs --json`, one line), or
     /// why it couldn't say.

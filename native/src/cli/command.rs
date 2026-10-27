@@ -16,14 +16,13 @@ pub enum CliCommand {
     },
     /// Inspect and print GPU device profile / key, then exit.
     GpuInfo(GpuInfoMode),
-    /// Reference port parity check over .pipe.bin / .bake.bin fixtures.
+    /// Reference port parity check over .pipe.bin fixtures.
     Fixture(FixtureTask),
     /// Headless repo scan, layout, and statistics measurement without a GPU.
     RepoScanOnly {
         dir: PathBuf,
         params: RepoParams,
         strategy: Strategy,
-        verify: bool,
     },
     /// Render execution plan (windowed or offscreen).
     Render(RenderPlan),
@@ -42,14 +41,9 @@ pub enum FixtureTask {
     Reference(Vec<PathBuf>),
     Trie(Vec<PathBuf>),
     Fold(Vec<PathBuf>),
-    Scan(Vec<PathBuf>),
-    Bake(Vec<PathBuf>),
     /// HyperLayout vs the oracle-backed fold; the mode and the tab width
     /// apply to directory and text inputs (fixtures carry their own).
     HyperOracle(Vec<PathBuf>, crate::fold::ClusterMode, crate::fold::TabWidth),
-    /// The visible-set line table over the inputs, printed (M1 of the
-    /// GPU-direction plan).
-    LineTableStats(Vec<PathBuf>, crate::fold::ClusterMode),
 }
 
 /// Execution plan for rendering a scene.
@@ -114,23 +108,11 @@ impl Cli {
         if !self.fixture_fold.is_empty() {
             return CliCommand::Fixture(FixtureTask::Fold(self.fixture_fold.clone()));
         }
-        if !self.fixture_scan.is_empty() {
-            return CliCommand::Fixture(FixtureTask::Scan(self.fixture_scan.clone()));
-        }
-        if !self.fixture_bake.is_empty() {
-            return CliCommand::Fixture(FixtureTask::Bake(self.fixture_bake.clone()));
-        }
         if !self.hyper_oracle_check.is_empty() {
             return CliCommand::Fixture(FixtureTask::HyperOracle(
                 self.hyper_oracle_check.clone(),
                 self.cluster_mode,
                 self.resolved_tab_width(),
-            ));
-        }
-        if !self.line_table_stats.is_empty() {
-            return CliCommand::Fixture(FixtureTask::LineTableStats(
-                self.line_table_stats.clone(),
-                self.cluster_mode,
             ));
         }
 
@@ -152,7 +134,6 @@ impl Cli {
                 dir,
                 params,
                 strategy: self.repo_engine,
-                verify: self.repo_verify,
             };
         }
 
@@ -178,7 +159,6 @@ impl Cli {
             SceneChoice::Repo {
                 dir: dir.clone(),
                 strategy: self.repo_engine,
-                verify: self.repo_verify,
                 focus: self.focus_file.clone(),
                 wrap_mode: self.wrap_mode,
                 z_wrap_spacing: self.z_wrap_spacing,
@@ -211,7 +191,6 @@ impl Cli {
             greek_pure,
             greek_onset_px: self.text_detail_px,
             field_mode: self.field_mode,
-            debug_tint: self.debug_tint.as_u32(),
             environment: self
                 .environment
                 .unwrap_or(crate::config::settings().environment.mode),

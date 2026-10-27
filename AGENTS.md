@@ -32,20 +32,17 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
   (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`;
   its slots live in host blocks that are its chunks, 2026-10-26, so a makepad
-  renderer draws from the same copy the wgpu field uploads from);
-  `glyph-field-visible` (2026-10-10; `out/VISIBLE-MODE.md`) is the
-  Visible mode — no slot per glyph: the source bytes, Pass 1's line table and the atlas
-  trie are resident, the lines in view are laid out per frame on the GPU into a
-  transient `DerivedSlot` buffer the Derived shader draws, and lines too small for
-  glyphs are washes (one quad each). The renderer's side of it is
-  `native/src/layout_hyper/visible.rs` (the arena's third form) and the `Visible`
-  arms of `glyph_scene/{setup,render}.rs`. Chosen at load with
-  `--field-mode derived|visible|instanced`, switchable live from the Debug panel.
+  renderer draws from the same copy the wgpu field uploads from).
+  Chosen at load with `--field-mode derived|instanced`, switchable live from
+  the Debug panel. A third mode, Visible (`glyph-field-visible`: no slot per
+  glyph, the lines in view laid out per frame by a GPU compute kernel;
+  `out/history/VISIBLE-MODE.md`), was deleted on 2026-10-26: the makepad
+  port has no compute and targets Derived alone.
   **Derived is the default since 2026-10-11** (Instanced retirement, step 1 of
   three: no pixel moved — the plain golden frames now render Derived, byte-equal
   to the baselines they always had). Step 2 (2026-10-11) made `--render-file`
   a one-item repo load (`repo::load_file`: HyperLayout, the shared
-  colourisers and every field — Visible for real — with `--copies N` as N
+  colourisers and every field, with `--copies N` as N
   views over the one buffer, tiled); it moved the pixels of `text`, `emoji`
   and `emoji-cluster`, which await adoption (pixel-ab, below). Step 3 deletes
   `glyph-field-instanced`. Until then Instanced stays
@@ -53,10 +50,6 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   is still the fall-back for a load past the Derived lanes. The agent-session
   Carrel stages one item per text block (`agent_transcript::staging::block_item`)
   so Derived lands its glyphs where Instanced's absolute positions do.
-  M3 (2026-10-10) re-keyed selection, the glyph verbs and styling there by
-  (item, byte) in place of the slot (`out/VISIBLE-MODE.md` § M3); the witness
-  is `native/tests/visible_verbs.rs`, a pixel comparison of the same verb in
-  Derived and Visible mode.
   `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
   behind generation handles, CPU depth-first topology, dirty marks, and a
   CPU resolve of world transforms over the dirty depth-first ranges; every
@@ -65,8 +58,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   changed (the library's page faces and regions follow the same way). The
   default (Derived) frame dispatches no compute since 2026-10-26: the
   resolve, the face pass and the region compose were GPU passes until then
-  (the makepad port draws with no compute dispatch; Visible mode keeps its
-  own). `resolve-bench` (in the crate, run by hand) times the resolve;
+  (the makepad port draws with no compute dispatch). `resolve-bench` (in the crate, run by hand) times the resolve;
   `out/DESIGN-VIEWS-AND-TRANSFORMS-2026-10-10.md` § "Step 1: as built" has
   the GPU form's figures.
   Agent sessions come from gomuxai's `agent` CLI, the one reader of agent
@@ -78,21 +70,21 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `agy_brain_dir` and `kimi_sessions_dir`, passed to it as its app config
   (`launch_config.example.toml`).
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
-  (26 `.pipe.bin` + 8 `.bake.bin`, their generators and vendored inputs), and
+  (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
 - `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`).
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
-- `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`), `VISIBLE-MODE.md`,
+- `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`),
   design records still cited by code (`EMOJI.md`, `GPU-DIRECTION-2026-10-09.md`),
   open plans, proof PNGs, `tooling-ab/baseline/` (the pixel oracle), and
   `out/history/`: dated reports and executed plans, each bannered as history
   (moved there 2026-10-10).
 - `research/` — background surveys and GPU architecture studies.
 - `experiments/` — its own workspace, outside every gate: the Zed-integration
-  spikes and `gpu-direction/` (the GPU-layout research behind visible mode;
+  spikes and `gpu-direction/` (the GPU-layout research behind the deleted visible mode;
   some of its scripts still name the retired CubeCL engine).
 - `config/defaults.toml` — every named, tunable value (colours, spacings, LOD
   thresholds), compiled in; `launch_config.toml` `[section]`s override it.
@@ -117,8 +109,7 @@ buffers where the GPU allows it and staging otherwise.
   95.2 million glyph instances) loaded and laid out in **~168 ms** backend (576.9 MB/s) /
   **~177 ms** total visual init in `--color-mode flat`, and **~215 ms** backend (450.9 MB/s) /
   **~226 ms** total visual init in `--color-mode syntax` on Apple Silicon Metal.
-  These figures are from late 2026-09, before C22's windowed staging and
-  before visible mode (which runs no Pass 2 at all); they have not been
+  These figures are from late 2026-09, before C22's windowed staging; they have not been
   re-measured since. `--color-mode` itself is RETIRED (2026-10-11, with the
   syntax heuristic): every load now paints flat, so the flat figure is the
   one that describes today's load path, and the syntax figure is history.
@@ -130,10 +121,11 @@ buffers where the GPU allows it and staging otherwise.
   launch overhead never beat HyperLayout, and HyperLayout's host staging recovers
   its one discrete-GPU advantage. The measurements and the case are in
   `out/GPU-DIRECTION-2026-10-09.md`; the GPU's next role (laying out only the
-  visible lines from resident bytes) shipped as the visible field mode.
+  visible lines from resident bytes) shipped as the visible field mode on
+  2026-10-10 and was deleted on 2026-10-26 (the makepad port has no compute).
 - Colour is byte spans, never guessed: `ByteSpan` and `Paint::ByteSpans` carry
   byte-range colour from AST/LSP analyses (the `--highlight` sidecar, the
-  seam's style runs; in visible mode the field's span table). Every load
+  seam's style runs). Every load
   paints flat; the lexical syntax heuristic that guessed keywords, strings
   and comments at load (`Paint::SyntaxHeuristic`, `--color-mode syntax`) was
   retired on 2026-10-11 (Ivan: "it should be gone in general"), and with it
@@ -158,6 +150,7 @@ or mutation survival.
 ```sh
 cargo glyph build          bring the renderer up to date
 cargo glyph test           run everything; nonzero if anything is wrong
+cargo glyph test --inner   after each change: every gate but the merge tier
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
 cargo glyph run --demo     build if stale, then launch the renderer; arguments
@@ -192,6 +185,38 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   scope rust"), and a selection of ZERO gates is refused as `CHECK-ALL:
   NOTHING RAN`, never green: a scope once outlived its last gate and printed
   ALL GATES GREEN over nothing until it was removed (2026-10-09).
+- **The gates run at once** (2026-10-26, `glyph/src/schedule.rs`), each a
+  child `glyph gate`, their output printed in `build.toml` order as each
+  finishes. A gate waits only for an earlier gate that provides an artifact
+  it `needs`, and never beside a gate either one declares `apart_from`:
+  pixel-ab and pick-oracle are apart from cargo-test, whose GPU
+  integration binaries were measured to slow a pixel-ab beside them from
+  7 s to 21 s, so overlapping them saved nothing; the two run beside each
+  other, and hyper-oracle, CPU-only since its Visible tier went, beside
+  everything (measured: no cost either way);
+  cargo's lock orders the cargo gates sharing `target/`. The run ends with a
+  TIME line: wall, products, gate seconds summed, the slowest. Measured on
+  the 32-core Linux host under sibling load, at the end of the branch that
+  brought it (`out/GATETIME-2026-10-26.md`): a full run after a one-line
+  edit in `native/src` 53 s (111 s serially), with nothing changed 27-41 s
+  (95 s).
+- **A red gate keeps its evidence** (2026-10-26) under
+  `target/glyph-scratch/kept/`, named by time, process and what, and
+  prints the path: the child gate's whole output, the whole output of the
+  command that failed under it (each failing test binary's, not just its
+  FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
+  read afterwards; one was lost before this existed.
+- **Two tiers, declared per gate.** `tier = "inner"` gates are what
+  `--inner` runs after each change; `tier = "merge"` gates run only in a
+  full `glyph test`, and `--inner` names each one it skipped. The merge
+  tier is the compiler's diagnostics — warnings, clippy, rustdoc, the
+  no-default-features builds, orphan modules: they judge the code's form,
+  not what it computes — and the corpus checks (committed artifacts, the
+  atlas, vendored hashes), whose inputs a renderer change does not touch.
+  Inside pixel-ab, `[settings] golden_equivalents_merge` puts the
+  `--field-mode instanced` equivalent in the merge tier too: a field the
+  makepad port does not have (test diet step 6, 2026-10-26). An `--inner`
+  verdict says "not a landing run"; land on a full one.
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
@@ -209,7 +234,14 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   branch touched" — and also selects every mutation of a gate whose own
   script changed, and every mutation whose `build.toml` declaration, or
   whose gate's, is new or edited, so a mutation proves itself on the branch
-  that adds it (`--changed` is `--since HEAD`). `--list` prints a
+  that adds it (`--changed` is `--since HEAD`). Since 2026-10-26 "edited"
+  means a field a gate run reads: prose (`compare`, `blind_to`, `why`) and
+  `glyph test`'s own `scope`, `tier` and `gpu` do not count (declaring
+  `tier` on every gate selected all 116). And a mutation is selected when
+  a changed file other than build.toml or prose holds its `expect`: its
+  witness changed (for a cargo-test mutation, the test that must catch it),
+  though its target did not. At the commit that brought both, 116 became
+  29. `--list` prints a
   selection and stops, so a run's size is known before it is paid for.
   A scoped run's verdict names its scope ("a scoped
   run proves its scope, not the manifest"); the unscoped run remains the
@@ -230,6 +262,30 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   own mutations are seen by its unit tests; `cargo test` never relinks
   `target/release/glyph`, measured, so a declared runner rebuild only made the
   mutant runner run its own gate.)
+- **How `prove` runs a mutation is declared per gate** (2026-10-26,
+  `glyph/src/prove_relax.rs`, `out/PROVE-ON-RELAX-2026-10-26.md`). A gate
+  with `relax = "test"` (cargo-test) or `relax = "renderer"` (pick-oracle,
+  reference-port, hyper-oracle, pixel-ab) has its mutations proven under
+  makepad's relax JIT, `--jobs` (default 8) at a time, through relax's
+  source overlay (`MAKEPAD_RUN_OVERLAY`): the working tree is never written
+  for them. **It expects a relax built in a makepad checkout**
+  (`cargo build --release -p relax-runner --bin relax`, then
+  `target/release/relax`), named by `GLYPH_RELAX` (default: `relax` on
+  PATH). Without one that runs, prove stops before proving anything; a
+  relax gate's mutation is never handed to cargo. Each route's clean tree
+  runs natively and under relax first, and a disagreement fails loud with
+  the diff (it once caught a gate whose PASS line was a log line). What the
+  route proves is the mutation's claim: the test its `expect` names (the
+  whole suite under relax, judged by the floor, when it names none), the
+  golden view it names. A renderer gate's mutation of a file the renderer
+  reads at run time (a fixture) is applied on disk, last and one at a
+  time. Gates with no declaration (the compiler's
+  diagnostics, the corpus gates) are proven on cargo: their Rust mutations
+  beside relax, which reads those files from untouched copies, the rest
+  after it. The renderer a gate runs is the parameter `GLYPH_RENDERER`
+  (default: the built product), which the gate commands, scripts and golden
+  renders read; `GLYPH_SCRATCH`, `GLYPH_SWEEP` and `GLYPH_GOLDEN_VIEWS` move
+  or narrow a run's scratch, renders and views.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -252,8 +308,9 @@ read by nothing at all.
 earlier agents' picks that no gate used). `pixi install` brings up what
 conda-forge carries: fontTools (the emoji-sheet gate runs in this env),
 ast-grep, difftastic, nextest, samply. `pixi run setup` builds the cargo-only
-tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga, and
-cargo-modules (the orphans gate's tool). Under `pixi run` both sets are on PATH. **Rust and
+tools into `.pixi/cargo-tools`: naga-cli pinned to `Cargo.lock`'s naga
+(cargo-modules, the orphans gate's tool until 2026-10-26, went when the gate
+began reading rustc's dep-info). Under `pixi run` both sets are on PATH. **Rust and
 rust-analyzer stay per host**, so rust-analyzer matches the host's rustc
 (`rustup component add rust-analyzer`, or `brew install rust-analyzer` where
 Rust came from Homebrew). `pixi task list` shows the doors: `check [scope]`,
@@ -289,7 +346,7 @@ Reading and editing, in order of preference (measured 2026-10-11,
 
 ## What the checks actually do
 
-Seventeen gates (2026-10-11; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
+Fifteen gates (2026-10-26; `cargo glyph gates` is the live list), in `build.toml` order. For each: what it compares, what makes it
 red, and **what it cannot see**. The last is the part worth reading. A check is
 a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
@@ -302,7 +359,10 @@ is a *product*: nothing to compare against, it only has to be CURRENT.
 Currency is a content hash of the declared inputs — `native/src`, `crates/`,
 `native/Cargo.toml`, `glyph/Cargo.toml`, and the root `Cargo.toml`,
 `Cargo.lock` and `.cargo/config.toml` — stamped at build time, rebuilt only
-when that hash moved. It is built at WORKSPACE scope, the scope cargo-build
+when that hash moved. Its build makes the test binaries too
+(`cargo build --release --lib --bins --tests`, 2026-10-26): one cargo
+compiles the renderer crate and its `cfg(test)` twin side by side, and
+cargo-test finds them built. It is built at WORKSPACE scope, the scope cargo-build
 and cargo-test rebuild it at: a package-scope build resolves features for the
 renderer alone and links different bytes, so until 2026-10-09 the stamp
 vouched for one binary and every gate after cargo-build ran another (which
@@ -350,10 +410,10 @@ sweep. Blind to every codepoint and sequence outside the pins.
 
 The same gate rebuilds the **fixture corpus** in a **scratch copy** of
 `engine/fixtures` (generators + vendored inputs + the `../glyph_schema.mjs`
-edge) and byte-compares against the committed 34 — an older form deleted the
+edge) and byte-compares against the committed 26 — an older form deleted the
 committed fixtures in place and restored them with `git checkout`, which
-needed the restore to be exactly right. The expected counts (26 pipe + 8 bake)
-are **declared in build.toml**, never derived from the tree under test: the
+needed the restore to be exactly right. The expected count (26 pipe)
+is **declared in build.toml**, never derived from the tree under test: the
 old gate `ls`-counted the tree it was checking, so a deleted fixture lowered
 both sides of the comparison and stayed green (measured 2026-09-06: eleven of
 twelve gates green on a shrunken corpus; only the fixture.rs pin caught it).
@@ -416,33 +476,46 @@ one lint per commit with all of its fixes. Blind to anything silenced with
 
 **cargo-doc.** `cargo doc --workspace --release --no-deps`, zero warnings (every
 workspace crate since 2026-10-11; before that the renderer alone, so a dead
-link in `crates/` or `glyph/` was read by nothing: `dead-doc-link-crate`
-measured 0 warnings under the old command and 2 under the new one). Red when a doc comment names
+link in `crates/` or `glyph/` was read by nothing: a planted one measured
+0 warnings under the old command and 2 under the new one). Red when a doc comment names
 a symbol that no longer exists, or leaves an HTML tag open. It exists because
 renames are constant here and this was the one class the battery could not see:
 two links to `Engine::records` survived its rename to `read_back` through a full
 green run. Blind to whether the prose is TRUE — it checks that the symbols named
 still exist, not that the sentence around them is current.
 
-**orphans** (`tools/check-orphans.sh`, 2026-10-11). A `.rs` file that no `mod`
-declaration reaches is not compiled at all, and rustc says nothing about it.
-cargo-modules walks each target's module tree with `#[cfg(test)]` enabled and
-lists the files under `src/` it never reaches. It covers the 7 lib targets
-plus the `glyph` and `resolve-bench` bins, about 30 s in all. The realistic
-loss is a dropped `#[cfg(test)] mod tests;`: the file's tests stop existing,
-and until this gate only the cargo-test floor might have noticed, by count.
-`tests-mod-dropped` proves it. cargo-modules comes from `pixi run setup`, and
-the gate runs under `pixi run`. cargo-modules runs its own `cargo check
---compile-time-deps` (build scripts, proc macros), so the gate gives it
-`target/orphans`, as cargo-check-no-ui has `target/no-ui`. Blind to a file reached only under a cfg the
-host does not set (target_os branches; non-default features, of which there
-are none today). Also blind to glyph3d-native's own bin: its modules all live
-in the lib, so cargo-modules reports every one of them as an orphan of the bin.
+**What proves cargo-build, cargo-clippy and cargo-doc** (2026-10-26). Their
+value is the runner counting each tool's warnings and running rustdoc over
+the workspace, so the runner's own unit tests hold that
+(`warn_count_counts_each_tools_warnings_once`,
+`the_doc_gate_documents_the_workspace`, f99d8e0)
+rather than mutations. The four mutations that did it (`unused-binding`,
+`clippy-lint`, `dead-doc-link`, `dead-doc-link-crate`) were anchored in
+engine files, so `prove --since` re-proved the warning counter on every
+branch that touched the fold. `cargo glyph prove` lists these three gates
+as uncovered: their proof is a unit test, not a mutation.
+
+**orphans** (2026-10-11; read off rustc since 2026-10-26). A `.rs` file
+that no `mod` declaration reaches is not compiled at all, and rustc says
+nothing about it. The gate lists every `.rs` file under each workspace
+package's `src/` that no unit of the test build read, by rustc's own
+dep-info (`glyph/src/test_build.rs`): every unit `cargo test --release
+--no-run` builds — each lib, its `cfg(test)` harness, the bins and theirs,
+the integration tests — which is the build cargo-test runs, so the gate
+costs a parse. The realistic loss is a dropped `#[cfg(test)] mod tests;`:
+the file's tests stop existing, and until this gate only the cargo-test
+floor might have noticed, by count. `tests-mod-dropped` proves it. Until
+2026-10-26 it was `tools/check-orphans.sh` over cargo-modules, which loaded
+the workspace again for each of its 9 targets (24 s after an edit, 48 s
+with nothing changed, measured under load) and could not check the
+renderer's bin (its modules live in the lib). Blind to a file reached only
+under a cfg the host does not set (target_os branches; non-default
+features, of which there are none today).
 
 **cargo-test.** Every test binary in the workspace: naga WGSL validation (the
 renderer's and each field-mode crate's), CLI parity, encase lane layout,
 `ItemParams` validation, the layout-seam suites, the fixture loader and its
-refusals, the fold/scan/bake unit suites (monoid domain, wrap and paginate
+refusals, the fold unit suites (wrap, paginate and tab-stop
 rules), `text::reference_layout` bit-exact against every in-domain fixture's
 recorded answers, the agent event reader against gomuxai's vendored
 conformance corpus (`tools/vendor/gomuxai/`), the launcher, and the runner's own
@@ -454,7 +527,14 @@ floor lives in `build.toml [settings]`. That floor is a ratchet, not an
 equality: adding tests never reddens it, and when the real count rises above
 it every green run prints a NOTE naming the number to raise it to — so it
 cannot decay into a figure far below reality without saying so. Raise it in
-the same commit that adds the tests.
+the same commit that adds the tests. The runner runs the binaries itself, not `cargo test` (2026-10-26): the
+ones `cargo test --release --no-run` names, each from its package's
+directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus `cargo test
+--doc`, all at once (cargo ran them one after another: 29 s serially, 22 s
+at once, measured under load). A failing binary no longer stops the ones
+after it, and a binary that reports no result is red by name. The long
+pole was one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`:
+a grid of 24 cases run one after another, 11 s; run at once, 2.7 s.
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; at the time there were
@@ -464,9 +544,9 @@ the old check printing `PASS tests green` and the new one printing
 `FAIL — 82 tests ran, floor is 85`. The realistic loss was never deletion — it
 is a dropped `mod` declaration or an `#[ignore]` that outlives its reason,
 neither of which rustc says a word about. **This matters more than it looks**,
-because the pins that keep the fixture corpus from silently shrinking
-(`native/src/fixture.rs`, 26 pipe; `native/src/bake.rs`, 8 bake — both worded
-"update deliberately") live inside this check.
+because the pin that keeps the fixture corpus from silently shrinking
+(`native/src/fixture.rs`, 26 pipe, worded "update deliberately") lives inside
+this check.
 
 **pick-oracle** (`tools/check-pick-oracle.sh`). Scripted picks and pixel-ray
 round trips from the native binary against an independent Python fold oracle.
@@ -482,20 +562,19 @@ reports FAIL, but every check after the abort point silently did not run.
 Blind to pick paths outside the scripted set.
 
 **reference-port** (`tools/check-fixture-parity.sh`; re-gated 2026-10-09).
-The Rust layout forms against the JS oracle's recorded answers, five halves,
+The Rust layout forms against the JS oracle's recorded answers, three halves,
 with the volumes they clear — quote these when you change it, because a count
 that quietly drops is how this check would go vacuous without going red:
 `--fixture-trie` (26 fixtures, 23,552 trie entries rebuilt from bytes),
 `--fixture-fold` (the serial fold, 155,222 leaders, 1,874,328 per-byte lanes
-bit-exact), `--fixture-scan` (208 cases across 8 tunings; 1,188,024
-leader-lanes bit-exact, 53,752 within 1e-4), `--fixture-bake` (8 fixtures,
-27,315 leaders, 167 checkpoints, 530 seed-protocol queries) and
-`--fixture-reference` (text.rs over its domain: 4 fixtures, 5,332 records).
-The script declares the corpus size (26 + 8) and refuses any other; the bake
-fails if no query ran, the reference if nothing was in domain. Red on any lane
-that leaves its tier. `phantom-row` and `advance-zeroed` prove it reddens
+bit-exact) and `--fixture-reference` (text.rs over its domain: 4 fixtures,
+5,332 records). The script declares the corpus size (26) and refuses any
+other; the reference fails if nothing was in domain. Red on any lane that
+differs. (The scan form and the bake, `scan.rs`/`bake.rs`, held here until
+2026-10-26, were deleted: nothing shipped them; the scan was the retired GPU
+compute layout's dispatch structure.) `phantom-row` and `advance-zeroed` prove it reddens
 through the fold, `fixture-deleted` that a shrunken corpus is refused. Blind
-to the engines that SHIP — these are `fold.rs`/`scan.rs`/`bake.rs`/`text.rs`,
+to the engines that SHIP — these are `fold.rs`/`text.rs` and the trie,
 not HyperLayout — to the atlas trie (each fixture carries its own
 synthetic one), and silently to the 22 fixtures outside text.rs's domain. The
 parse is checked only through the lanes computed from it: the second loader
@@ -585,12 +664,14 @@ glyphs). When every load began painting flat there was nothing left for it
 to compare, and it went with its five mutations (`hyper-cut-head-own-share`,
 `hyper-cut-tail-own-share`, `hyper-comment-line-indent-painted`,
 `colorizer-fills-any-word-colour`, `colorizer-last-word-unflushed`). Its
-input, `chunk-cut-paint.txt`, stays: the layout tiers, the windowed-emission
-test and the line-table and visible tests read it as an intra-line-cut
-input. Per-glyph colour through the device Pass 2 is now seen by the
-visible tier's span half (kernel against device under the same spans) and
-by cargo-test's `windowed_emission_matches_unwindowed` (per-record paint
-through the windows).
+input, `chunk-cut-paint.txt`, stays: the layout tiers and the windowed-emission
+test read it as an intra-line-cut input.
+Per-glyph colour through the device Pass 2 is seen by cargo-test alone:
+`hyper_byte_spans_painting` and `resolve_spans_and_inplace_update_slot_colors`
+(byte spans), `windowed_emission_matches_unwindowed` (per-record paint
+through the windows). (A visible tier's span half saw it too, from
+2026-10-10 until the Visible field was deleted on 2026-10-26; that tier was
+the gate's only GPU use, so every tier now runs on the CPU.)
 Measured but ungated (2026-10-09): a 94 MB tree of crates.io sources
 is bit-exact on every tier in both modes (99 M records).
 **Tab stops** (2026-10-11, `fold::TabWidth`; `[layout] tab_width_cells` /
@@ -599,8 +680,7 @@ cells counted from the start of its LOGICAL line (a double-width glyph counts
 two; a wrap segment or column page does not restart the count); one cell is
 the layout before tab stops, and every golden and fixture is taken at one.
 Every engine recovers the line's cells from what it already carries — the
-f64 line advance is exactly `cells x cell`, the Visible seeds carry `cells` —
-and a chunk inside a long line that holds a tab is walked again from the
+f64 line advance is exactly `cells x cell` — and a chunk inside a long line that holds a tab is walked again from the
 true line state by the aggregation (the per-chunk walk measured it from its
 own start). Two more runs of this gate hold every tier to the serial fold at
 `--tab-width 4` (strict: `tab-stops`, `g-cluster-repo`, `g-pick-repo`;
@@ -613,36 +693,16 @@ lineage, which computes the stop itself) and to the oracle-backed one-cell
 fold over the spaces a tab stands for. A TABBED line long enough to be cut
 into chunks reaches no gate corpus; `hyper_oracle::tests::tab_stops_agree_on_every_tier`
 (cargo-test) carries a 135 KB one, asserted to cut where its line is off a
-stop. Mutations: `visible-tab-stop-by-column`, `hyper-device-tab-stop-ignored`,
-`hyper-pass1-seed-cells-ignore-tabs` here; `hyper-tab-chunk-rewalk-skipped`,
-`fold-tab-line-advance-rounded`, `tab-cells-always-a-whole-stop` and
-`visible-item-tab-width-dropped` on cargo-test (the last on
-`native/tests/tab_stops.rs`: Derived, Instanced and Visible draw the same
-`tab-stops` frame at widths 1, 4 and 8). `--render-file` is a one-item
+stop. Mutations: `hyper-device-tab-stop-ignored` here;
+`hyper-tab-chunk-rewalk-skipped`, `fold-tab-line-advance-rounded` and
+`tab-cells-always-a-whole-stop` on cargo-test. `native/tests/tab_stops.rs`
+holds Derived and Instanced to the same `tab-stops` frame at widths 1, 4
+and 8. `--render-file` is a one-item
 repo load since 2026-10-11 and lays its tabs out by this same rule, at its
 own default `[layout] render_file_tab_width_cells = 4` (the stops its
 retired CPU stager had; `text.png` has tabs), `--tab-width` overriding it.
 The agent-session cards stage through their own CPU code, which keeps fixed
 4-cell stops and reads no setting.
-
-**repo-verify** and **repo-verify-direct** (`--repo-verify`, re-gated
-2026-10-09). `--repo-engine hyper` and `direct` over `g-pick-repo`, both wrap
-modes, diffed against a fresh recording HyperLayout at the seam: placements,
-instances, and records where both sides have them (`direct` has none and its
-PASS line says `0 records`). Each refuses a verify over zero items — before
-2026-09-07 a missing corpus printed `PASS: 0 items` and exited 0. Read the
-pair honestly: **every `--repo-engine` constructs the same
-HyperLayout**, so this is HyperLayout against HyperLayout. Under
-`--repo-scan-only` (no GPU) the sides differ only by `hyper`'s background
-prefetch of Pass 1, and for `direct` not at all, so these catch
-nondeterminism in the parallel passes and prefetch drift — truth is
-hyper-oracle's job. `batch`/`naive` are not gated: they run the reference's
-own code path verbatim. Both gates are UNCOVERED in prove, and that is the
-finding, not an omission: since C15 the prefetch and the inline Pass 1 are
-one driver (`pass1_over_chunks`) and differ only in how the chunk list is
-built (before it, only in a segment-advance table g-pick-repo never read:
-doubling it stayed green, measured 2026-10-09), and nothing separates
-`direct` from its reference without a device.
 
 **pixel-ab.** The golden views re-rendered and byte-compared against
 `out/tooling-ab/baseline/<key>/` — `cargo glyph graph` lists them, and the count
@@ -690,7 +750,7 @@ actually picked (`metal-apple`, `vulkan-nvidia`), resolved by the runner from
 the `{gpu}` token in build.toml. The first Linux run showed why: against the
 Metal set, NVIDIA's Vulkan rasterizer differs by ~1 level over 1-4% of pixels
 plus a few dozen ISOLATED single-pixel coverage flips at quad edges, while every
-numeric check — fold, scan, bake, picks — is bit-exact. Pixels
+numeric check — fold, picks — is bit-exact. Pixels
 are a property of the rasterizer; the layout is not. Making vendors agree is
 not a goal and nothing here tries. The key is deliberately coarser than the
 hardware (a 5090 and a 4090 share a set until a diff proves otherwise); each set
@@ -741,30 +801,17 @@ its crate is deleted (step 3). A divergence under an equivalent with the
 plain frame equal is the VARIANT breaking — never a reason to re-baseline.
 `drift` compares the plain frames only.
 
-**The Visible field as an equivalent (M4, 2026-10-10; exemptions gone
-2026-10-11).** The second entry is `--field-mode visible`. When it was
-added, visible mode applied no load-time syntax paint (by decision) and the
-stored modes did, so the five syntax-painted repo views (repo-wide, -down,
--zoom, -back-oblique, repo-cluster) rendered under it as their stored
-modes' `--color-mode flat` render — token colour short of the baseline and
-nothing else — and were EXEMPT from that one equivalent, each with its why
-on the view (`[[golden_view.exempt]]`). The syntax heuristic's retirement
-(2026-10-11) made every mode paint flat: every golden frame now renders the
-same bytes plain, under `--field-mode instanced` and under `--field-mode
-visible` (measured on vulkan-nvidia, 30 of 30), and the five exemptions were
-removed. So the visible equivalent holds visible mode to pixels on every
-frame but `demo` (no field) — `text`, `emoji` and `emoji-cluster` included,
-which are visible mode for real since `--render-file` became a one-item repo
-load (step 2). `visible-row-off-by-one` proves it reddens (on
-repo-highlight). The mechanism stays for the next variant that legitimately
-differs: an exempt frame is still rendered and its distance printed as a
-NOTE with the pixel count, an exempt frame that turns out byte-equal is
-flagged as a possibly stale exemption, `validate` refuses an exemption
-naming no declared equivalent or no why, and `cargo glyph gates` lists
-every exemption under pixel-ab — a named blind spot, priced like the rest,
-never a quiet drop. Until their candidates are adopted, the frames whose
-token colour went (and step 2's three) are red under this entry as they
-are plain.
+**Exemptions.** An equivalent that legitimately differs on a frame can
+exempt that view (`[[golden_view.exempt]]`, with its why): the frame is
+still rendered and its distance printed as a NOTE with the pixel count, an
+exempt frame that turns out byte-equal is flagged as a possibly stale
+exemption, `validate` refuses an exemption naming no declared equivalent or
+no why, and `cargo glyph gates` lists every exemption under pixel-ab — a
+named blind spot, priced like the rest, never a quiet drop. None exists
+today. (`--field-mode visible` was the second equivalent from 2026-10-10
+until the Visible field was deleted on 2026-10-26; five syntax-painted
+views were exempt from it until the syntax heuristic's retirement on
+2026-10-11.)
 
 **Which view covers what, because the answer is not uniform.** `repo-wide`
 renders the default wrap mode (`back` — a wrap costs DEPTH); `repo-down` exists
@@ -848,16 +895,16 @@ engine-check, and its Mojo halves). Four checked pure-Rust paths whose
 instruments kept shipping and kept passing, run by nothing for nine days;
 they came back as reference-port, repo-verify(-direct) and
 cubecl-chain/-fork (the last two retired again on 2026-10-09 with the CubeCL
-engine itself; their corpus, `native/fixtures/cubecl-fork/`, stays, read by
+engine itself, repo-verify(-direct) on 2026-10-26: HyperLayout against
+itself, which no mutation could make fail; their corpus, `native/fixtures/cubecl-fork/`, stays, read by
 hyper-oracle), and the check that never existed — HyperLayout against
 the oracle — arrived with them, red. In those nine days HyperLayout became the
 only engine, and nothing compared it to anything but itself.
 
 The lessons these gates taught stay true and are the pattern for any new one:
-**a check must refuse to pass having compared nothing** (the bake fails if no
-query ran, the reference fails if nothing was in domain, repo-verify refuses
-zero items, STRICT refuses an unexercised bucket, the parity script refuses a
-corpus of the wrong size), and a count that quietly drops is how a check goes
+**a check must refuse to pass having compared nothing** (the reference fails
+if nothing was in domain, STRICT refuses an unexercised bucket, the parity
+script refuses a corpus of the wrong size), and a count that quietly drops is how a check goes
 vacuous without going red — quote the volumes. And a gate that compares an
 engine to itself is a determinism check: say so in its `blind_to`.
 
@@ -962,8 +1009,8 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
 | `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
-| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names) and the line-table and visible tests; editing it moves its cuts and the gate's quoted volumes |
-| `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, past `SEGMENT_BYTES` so its tabs sit on both sides of the Visible seeds. Shortening that line or dropping its tabs hollows the visible tier's seeded-tab coverage silently |
+| `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names); editing it moves its cuts and the gate's quoted volumes |
+| `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, a long tabbed line (built to put tabs on both sides of the deleted Visible field's segment seeds) |
 | `native/fixtures/cubecl-fork/` | IMMUTABLE | named for the retired CubeCL fork check, now read by hyper-oracle (both runs) — the only committed input exercising paginate's m >= 3 / segment >= 3 classes, the cluster classes at wrap/page boundaries, and the empty-item placement class (`clusters.txt` + `empty.txt`). Editing it hollows hyper-oracle's coverage of those classes silently |
 | `out/tooling-ab/baseline/<key>/` | tracked pixel oracle, one set per rasterizer; **golden** in build.toml | changes only on purpose, with a note saying why; the runner refuses to regenerate it. A new host adopts its own set by hand (the gate prints how); it never edits another's |
 
@@ -1012,7 +1059,8 @@ single most common way to misread the repo, so:
   substance ("since the layout seam", "since the carrier split") over the letter.
 - **`Stage 0`–`4` is ambiguous and binds to two different lists.** The live one is
   the reference port: 0 = fixture parity, 1 = trie, 2 = fold, 3 = scan,
-  4 = bake — the `--fixture-*` instruments carry those names, and the
+  4 = bake (3 and 4 deleted 2026-10-26) — the `--fixture-*` instruments carry
+  those names, and the
   `port: stage N` commits record them. The dead one numbered the layout-seam
   work. Some source comments still reference the dead scheme unqualified.
   Name the thing, not the number.

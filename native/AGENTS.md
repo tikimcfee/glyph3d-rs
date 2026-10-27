@@ -58,7 +58,7 @@ caller; the short version:
   What DID delete the copy is the direct path: `HyperLayout::layout_items`
   writes instances straight into the caller's arena and materializes no 32 B
   wire record at all. The record path (`VerifyLayout`) remains as the
-  verification form, and only `--repo-verify` takes it. Run
+  verification form, and only `--hyper-oracle-check` takes it. Run
   `--repo-scan-only --repo-engine hyper|direct|batch|naive` for the per-stage
   split rather than trusting a figure here.
 - `ItemParams::validate` runs in `LayoutGlyphs::layout_items`, a PROVIDED
@@ -74,18 +74,12 @@ caller; the short version:
   compaction. Indexing it by instance is the tempting mistake and
   `layout::tests::paint_is_indexed_by_record_so_blanks_consume_an_entry`
   is what catches it.
-- `--repo-verify` diffs two backends at the seam — placements and instances
-  always, and records when BOTH paths have them (`layout::diff_backends`). It
-  used to compare records only, which cannot see compaction, paint or extents at
-  all. Today it diffs the chosen `--repo-engine` against a recording
-  `HyperLayout` reference run; `direct` has no records and reports `0 records`.
-  Gated again since 2026-10-09 as `repo-verify` (`hyper`) and
-  `repo-verify-direct`. Every strategy is the same HyperLayout, so these are
-  HyperLayout against HyperLayout; `--hyper-oracle-check` (gate
-  `hyper-oracle`, `hyper_oracle.rs`) is the one that holds HyperLayout to the
-  oracle-backed fold. `--line-table-stats <PATH>...` (same inputs) builds and
-  prints the visible-set field's line table (`layout_hyper/line_table.rs`,
-  M1 of `out/VISIBLE-MODE.md`): lines, long-line segment seeds, sizes.
+- `layout::diff_backends` diffs two backends at the seam: placements and
+  instances always, and records when BOTH have them. `--hyper-oracle-check`
+  (gate `hyper-oracle`, `hyper_oracle.rs`) uses it to hold HyperLayout to the
+  oracle-backed fold. (`--repo-verify`, which held HyperLayout to itself, was
+  deleted on 2026-10-26: every `--repo-engine` is the same HyperLayout, and no
+  mutation could make it fail.)
 - **`HyperLayout` (`hyper`) is the DEFAULT layout engine** in pure Rust: a parallel,
   cache-blocked CPU layout engine using Rayon, intra-file line chunking, wrap-aware
   chunking for minified files, background pipelined prepasses, and aligned 8-burst /
@@ -98,8 +92,7 @@ caller; the short version:
   Instanced is being retired.
 - **Paint is flat at load, colour arrives as spans** (2026-10-11). Every load
   paints `Paint::Flat`; per-glyph colour comes afterwards as byte spans (the
-  `--highlight` sidecar and the seam's style runs: `style_file` in a stored
-  field, `VisibleField::set_item_spans` in visible mode). `Paint::PerRecord`
+  `--highlight` sidecar and the seam's style runs: `style_file`). `Paint::PerRecord`
   and `Paint::ByteSpans` remain the layout's per-glyph forms. The lexical
   syntax heuristic — `Paint::SyntaxHeuristic`, `text::colorize_leaders`
   and the per-line device colouring with C17's whole-line colours at chunk
@@ -113,10 +106,10 @@ caller; the short version:
   CubeCL compute engine, `cubecl`, was retired 2026-10-09):
   - `hyper` (default): parallel Rust CPU layout with sub-200ms visual init.
   - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
-    background prefetch. Under `--repo-verify`, `direct` records nothing (the
-    diff covers placements and instances only) while `batch` and `naive` take
-    the recording path; the stats line prints their readback/compaction phases.
-- `--field-mode derived|visible|instanced` selects the glyph field mode:
+    background prefetch; the stats line prints `batch`/`naive`'s
+    readback/compaction phases.
+- `--field-mode derived|instanced` selects the glyph field mode (a third,
+  `visible`, was deleted on 2026-10-26; `out/history/VISIBLE-MODE.md`):
   - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
     retirement step 1 — no golden pixel moved): compact word layout, x stored,
     Y/Z derived in the vertex stage from the item table. Host-staged scenes
@@ -129,41 +122,10 @@ caller; the short version:
   - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
     held byte-equal to every golden by the `--field-mode instanced`
     equivalent until step 3 deletes its crate.
-  - `visible` (2026-10-10; a golden equivalent since M4, every frame held since
-    2026-10-11; the default is `derived`; `out/VISIBLE-MODE.md`): no slot per
-    glyph. HyperLayout runs Pass 1 WITH the line table and no Pass 2; the arena
-    comes back in its third form (`layout_hyper::VisibleStaging`: the table, one
-    seed per item, and — moved in by the loader, never copied — the walk's own
-    byte Vecs), `into_staged` finishes the field's items with the shelf's group
-    offsets, and `glyph_scene::setup` hands it all to `VisibleField::new`. The
-    placements come from `pass2_host::compute_single_item_placement`, held
-    bit-exact to the device Pass 2 (`visible::tests::placements_agree_with_the_derived_device_pass2`).
-    The field culls and draws itself (`GlyphField::prepare` before the glyph
-    pass; the CPU cull keeps only the backdrops, under `[lod] visible_backdrop_px`,
-    and the hidden flags). It paints flat at load like every mode (it was the
-    only one until the syntax heuristic's retirement, 2026-10-11); a
-    `--highlight` sidecar becomes byte spans (`VisibleField::set_item_spans`).
-    **Everything the scene keyed by SLOT is keyed by (item, byte) here** (M3,
-    2026-10-10; `out/VISIBLE-MODE.md` § M3): the item is the picked VIEW (a
-    view's index is its item row, `crate::views`; since 2026-10-11 its group
-    row is a separate field, never assumed equal) and the byte the glyph's
-    leader offset — both from the CPU pick. The selection is a
-    `Selection::ByteRange` the field lays out again into its mask buffer
-    (`prepare_mask` after `prepare`, same encoder; `record_mask_draw` in the
-    mask pass); the glyph verbs merge into one `GlyphOverride` per (item,
-    byte) (`glyph_overrides`, the scene's map, is the source of truth —
-    colour, x nudge, group; y/z nudge and `scale-glyph` are not representable,
-    as in Derived, and the reply says so); `recolor-line` is a span over the
-    row's byte range; `hide-group` also calls `set_item_hidden`, and every
-    item carries a LOCAL box its cull carries through the live group row
-    (2026-10-10; until then every `sync_segment` pushed a world box with
-    `set_item_bbox`). The stored
-    modes' slot paths are untouched. `--debug-tint lod|cull`
-    colours its glyphs by LOD tier or cull state (the other modes never read it).
   - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
     2026-10-10): item count vs `ITEM_MAX`, rows per item vs `ROW_MAX`, column pages
     vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), checked once per load before
-    any slot is emitted. A Derived or Visible load past them falls back to
+    any slot is emitted. A Derived load past them falls back to
     `instanced` with ONE warning naming the item and the limit; the field the scene
     builds follows the arena, and the panel/HUD show the mode actually built.
     TEMPORARY (2026-10-11): with Derived the default, this fall-back is the
@@ -183,9 +145,8 @@ caller; the short version:
   rebuild is a chunk's start inside a long line: the per-chunk Pass 1 walk
   measures its tabs from the chunk's start, so `aggregate_chunk_prepasses`
   walks a newline-free chunk that holds a tab again from the true state
-  (`walk_line_state`); the line-table replays and `measure_continued_lines`
-  take the true seed already. The scan form refuses a width past one cell
-  (it has no stops; the oracle has none). `--render-file` is a one-item repo
+  (`walk_line_state`); `measure_continued_lines` takes the true seed
+  already. `--render-file` is a one-item repo
   load (2026-10-11) with its own default, `[layout]
   render_file_tab_width_cells` (4, the stops its retired CPU stager had;
   `--tab-width` overrides it there too), resolved by
@@ -282,9 +243,7 @@ its staging text predates C22). Key touchpoints:
   hardware nobody has measured.
 - `GLYPH_HYPER_ORACLE_STRICT=1` — the hyper-oracle gate's form: besides
   refusing zero records, refuse a corpus in which the reference resolved no
-  sequence or no ASCII-led one. `GLYPH_HYPER_ORACLE_NO_GPU` skips the visible
-  tier (the GPU kernel vs Pass 2) on a host without a usable adapter, and says
-  so; the gate never sets it.
+  sequence or no ASCII-led one.
 - `GLYPH_PERMUTE_GROUP_ROWS=1` — repo loads (and `--render-file`, a
   one-item repo load since 2026-10-11): files the views under their group
   rows in REVERSE, with row 0 a spare no view draws with
@@ -296,19 +255,7 @@ its staging text predates C22). Key touchpoints:
 - `GLYPH_PICK_DEBUG=1` — pick-path diagnostics: pixel ray, AABB hits, local
   point, candidate records (glyph_scene/pick.rs pick functions).
 - `GLYPH_CULL_DEBUG=1` — at t=0.0 prints cull stats: visible draw ranges,
-  instance count, backdrop count. In `--field-mode visible` the field's own
-  cull counters follow on the next frame (`CULLDBG visible (frame 0): items
-  a visible, b backdrop, c hidden, d culled of n | lines …`), read back
-  blocking once frame 0 has been submitted — the F8 HUD's figures, offscreen,
-  so a cull disagreement can be reproduced with `--cam-pose` and numbers
-  (C29, 2026-10-10).
-- `GLYPH_VISIBLE_TIMING=1` — `--field-mode visible`, offscreen: waits for the
-  GPU before every frame's `prepare` so the stats ring lands each frame, and
-  prints `VISTIME t=… cull_ms=… layout_ms=… lines_candidate=… …` — the F8
-  HUD's `gpu cull` (every cull pass, first begin to last end) and `layout`,
-  two frames behind. Run a pose for ~150 `--frames` and take the median of
-  the settled frames (C30, 2026-10-10). The wait serializes frames: an
-  instrument, never the frame path.
+  instance count, backdrop count.
 - `GLYPH_LIBRARY_TIMING=1` — `--layout-mode library` (2026-10-10,
   `native/src/library.rs`): one `LIBTIME` line per animated frame — nodes
   moved (dir and sheet local rows written), the CPU stages (`ease_ms`, the
@@ -341,22 +288,15 @@ its staging text predates C22). Key touchpoints:
   the measured figures.
 - `GLYPH_G_DUMP=<slot>[,<len>]` — offscreen only: reads back instance bytes
   at `slot` from the glyph arena and prints hex (buffer write-path audits).
-  `GLYPH_G_DUMP=<item>:<byte>[,<len>]` (M3, 2026-10-10) is the Visible
-  field's form: the glyph whose leader is `byte` of item `item` is LOCATED in
-  the transient slot buffer of the last prepared frame (`VisibleField::locate`,
-  a blocking segment-list readback) and its 20 B slot printed; "not laid out
-  in the last frame" when the line was culled or washed. Both forms now run
-  AFTER the frames and the readback wait (the stored form used to run before
-  the first frame; a stored slot reads the same either way). The PNG is
-  untouched by either. `offscreen::parse_dump_spec` is the parser.
+  It runs AFTER the frames and the readback wait. The PNG is untouched.
+  `offscreen::parse_dump_spec` is the parser.
 - `GLYPH_K4_SELFTEST=1` — windowed, dev-only (Stage K): at t≈3 s moves the
   Debug panel's "Show glyphs" slider programmatically (1.0 → 16.0 px per text
   row) and logs the cull counters before/after — exercises the panel → probe
   → CullState → cull path without a human at the mouse. (The panel's LOD
   block since C26, 2026-10-10: "Text detail" = `[lod] text_detail_px`, the
   greeking onset, with the fuzz toggle and smooth/pure beside it; "Show
-  glyphs" = `[lod] show_glyphs_px`, the backdrop tier, with visible mode's
-  "File rectangle" = `[lod] visible_backdrop_px` under it; the panel keeps
+  glyphs" = `[lod] show_glyphs_px`, the backdrop tier; the panel keeps
   them ordered, the moved handle winning — `UiProbeState::keep_lod_order`.
   CLI: `--text-detail-px`, `--show-glyphs-px`; the old `--greek-onset-px` /
   `--lod-min-px` and launch_config keys still parse.)
@@ -376,29 +316,17 @@ its staging text predates C22). Key touchpoints:
   The button shows on repo and text scenes; demo and agent-session scenes carry
   no mode and hide it.
 - `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
-  cycles the field mode Instanced → Derived → Visible through the SAME
+  cycles the field mode Instanced → Derived through the SAME
   rebuild arm the Debug panel's selector fires, printing the F8 HUD line
   (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild.
-- `GLYPH_VISIBLE_VERB_SELFTEST=1` — windowed, dev-only (M3, 2026-10-10): from
-  t≈3 s, one step every fourth frame, through the SAME entry points the CLI op
-  stream and the panel use (`apply_pick`, then `apply_verb` on `parse_verb`
-  literals): picks the first file's row 0 col 0 (`=file[:row[:col]]` picks
-  elsewhere), then `recolor-glyph`, `nudge-glyph 0.5 0 0`,
-  `set-glyph-background 2050c0`, `hide-group`, `show-group`, printing each
-  reply (`VISIBLE-VERB-SELFTEST step N (...)`) and the F8 HUD line after it
-  (`... hud after step N: ...`, which carries `selection item:start..end` and
-  `pick file byte N` in visible mode). Meant for `--field-mode visible`; in a
-  stored mode the same steps run through the slot paths.
 - `GLYPH_GRAB_SELFTEST=file[:dx:dy]` — windowed, dev-only (C29, 2026-10-10):
   the GRAB path through the window's own entry points — `apply_pick` on
   `file` (row 0 col 0), `on_cursor` to park the cursor at the centre,
   `on_key(G)` to grab, ten `on_cursor` steps along (dx, dy) px (default 0,
   400: straight down), `on_key(G)` to release — one step every fourth frame
   from t≈3 s, printing the HUD line after each (`GRAB-SELFTEST step N …`)
-  and the group's offset at the end (`move-group 0 0 0`). An item still in
-  view after the drag must stay counted visible (`items a/b`): the
-  field's item cull carries the item's local box through the live group
-  row (since 2026-10-10; before, the drag pushed a world box every step). Pair it with `--cam-pose` so the drag lands where you want.
+  and the group's offset at the end (`move-group 0 0 0`). Pair it with
+  `--cam-pose` so the drag lands where you want.
 - `GLYPH_DRAG_SCRIPT=g|c:DX:DY[:EVENTS[:FRAMES]]` — offscreen (2026-10-10): a grab
   drag scripted through the window's own entry points — cursor parked at
   the viewport centre, the grab key (`g` the picked file, `c` its zone; pick
@@ -423,9 +351,9 @@ its staging text predates C22). Key touchpoints:
   so a frame can follow a DIFFERENT one, as every windowed frame does and
   no static offscreen run did. STEP is `pose X Y Z YAW PITCH` (the
   `--cam-pose` form, degrees) or `show-glyphs-px PX` (the panel's "Show
-  glyphs" slider, set live). C32 — the Visible layout laying out a stale
-  tail of the previous frame's segment list — was invisible offscreen until
-  this: `GLYPH_FRAME_SCRIPT="0:pose <elsewhere>;1:pose <target>" --frames 4`
+  glyphs" slider, set live). Built for C32 (a defect of the since-deleted
+  Visible field that only a frame following a different one showed):
+  `GLYPH_FRAME_SCRIPT="0:pose <elsewhere>;1:pose <target>" --frames 4`
   against a static render of the target. Use `--frames` past the last step.
 - `GLYPH_POSE_PRINT=1` — windowed: F2 (screenshot) also prints the frame's
   camera as the `--cam-pose X Y Z YAW PITCH` argument (degrees) that
@@ -433,13 +361,9 @@ its staging text predates C22). Key touchpoints:
   the clipboard — so a view seen once can become a golden view's command.
 - **F8** toggles the field HUD (windowed, egui): a top-left readout, separate
   from the F1 Debug window, of the field mode, engine, segments/hidden,
-  backdrops, CPU cull ms, fps and — for the Visible field — items and lines
-  per tier (glyph / wash / backdrop), segments, slots (and dropped) and the
-  GPU cull/layout/draw ms from `VisibleField::stats()`; the stored modes show
-  their instance and draw-range counts. Open by default in `--field-mode visible`.
-  Since M3 it also shows the selection in the field's own key
-  (`item:start..end` for Visible, the slot or slot range otherwise) and the
-  pick's `file byte N`.
+  backdrops, CPU cull ms, fps, and the instance and draw-range counts. It
+  also shows the selection (the slot or slot range) and the pick's
+  `file byte N`.
 - `GLYPH_L3_SHADER_COMPOSITE=1` — offscreen, dev-only (Stage L): makes the
   offscreen target Bgra8UnormSrgb, forcing the WINDOWED shader-composite
   path (composite.wgsl) under the deterministic oracle driver; the readback

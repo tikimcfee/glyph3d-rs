@@ -8,7 +8,9 @@
 //! the default, ☃ lost its eyes and ☠ smeared a bar down its cell. No golden
 //! frame holds a glyph over 128 curves, so no pixel check could see it.
 //!
-//! This test READS the shaders and the atlas; it never modifies them.
+//! It reads the shaders as the renderer embeds them (each field crate's
+//! `include_str!` constant), so what it checks is what ships; and it reads
+//! the atlas; it modifies neither.
 
 use std::path::{Path, PathBuf};
 
@@ -16,21 +18,19 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// The glyph field shaders that run the curve loop (Visible draws through
-/// the Derived one).
-const SHADERS: [&str; 2] = [
-    "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl",
-    "crates/glyph-field-instanced/shaders/glyph_field.wgsl",
+/// The glyph field shaders that run the curve loop, by the file each embeds.
+const SHADERS: [(&str, &str); 2] = [
+    ("crates/glyph-field-derived/shaders/glyph_field_derived.wgsl", glyph_field_derived::GLYPH_FIELD_DERIVED_WGSL),
+    ("crates/glyph-field-instanced/shaders/glyph_field.wgsl", glyph_field_instanced::GLYPH_FIELD_WGSL),
 ];
 
-fn max_curves(path: &Path) -> u32 {
-    let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+fn max_curves(path: &str, src: &str) -> u32 {
     let line = src
         .lines()
         .find(|l| l.trim_start().starts_with("const MAX_CURVES: u32 ="))
-        .unwrap_or_else(|| panic!("{}: no `const MAX_CURVES: u32 =` line", path.display()));
+        .unwrap_or_else(|| panic!("{path}: no `const MAX_CURVES: u32 =` line"));
     let value = line.split('=').nth(1).unwrap().trim().trim_end_matches(';').trim_end_matches('u');
-    value.parse().unwrap_or_else(|e| panic!("{}: MAX_CURVES {value:?}: {e}", path.display()))
+    value.parse().unwrap_or_else(|e| panic!("{path}: MAX_CURVES {value:?}: {e}"))
 }
 
 /// The largest curve count of any outline slot in `glyphmap.bin`
@@ -59,8 +59,8 @@ fn every_glyph_shader_covers_the_largest_outline() {
     // Refuse to pass over an atlas that read as nothing.
     assert!(entries > 4_000, "glyphmap.bin read {entries} slots");
     assert!(largest > 128, "largest outline read as {largest} curves; the atlas has outlines over 128");
-    for rel in SHADERS {
-        let cap = max_curves(&repo().join(rel));
+    for (rel, src) in SHADERS {
+        let cap = max_curves(rel, src);
         assert!(cap >= largest, "{rel}: MAX_CURVES {cap} cuts off the atlas's largest outline ({largest} curves)");
     }
 }

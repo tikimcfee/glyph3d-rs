@@ -6,12 +6,11 @@
 //! the first producer of several views over one buffer (`crate::views`).
 //! Each copy is laid out as its own item (a stored slot names its item, so
 //! copies cannot share slots) and drawn with its own group row at its grid
-//! offset (`repo::tile_views`); the Visible field reads every copy's bytes
-//! from the one host buffer (`VisibleStaging::item_bytes`).
+//! offset (`repo::tile_views`).
 //!
 //! Witnessed through the release binary, offscreen, at a camera parked on
 //! the gap between the 2x2 grid's copies, so the frame's quadrants are the
-//! copies: in Derived, Instanced and Visible alike, the four-copy frame's
+//! copies: in Derived and Instanced alike, the four-copy frame's
 //! top-left quadrant is the one-copy frame's byte for byte (copy 0 is where
 //! a lone file is) and each other quadrant carries ink the one-copy frame
 //! does not (the copies did not stack on copy 0). And the Derived frame of
@@ -23,8 +22,7 @@
 //! default of its own, `[layout] render_file_tab_width_cells` (4, the stops
 //! of the CPU stager it replaced; a repo load's default is one cell). The
 //! frame with no flag must be the `--tab-width 4` frame and not the
-//! `--tab-width 1` one, in the default field and in Visible (which reads
-//! the width from the item, not from slots). Mutation
+//! `--tab-width 1` one. Mutation
 //! `render-file-tab-width-dropped` (the scene building the recipe without
 //! the width) reddens it, and `copies_tile_in_every_field` with it, whose
 //! camera is parked for the 4-cell block; the CLI test sees only the parsed
@@ -74,7 +72,7 @@ fn quadrant_diff(a: &image::RgbaImage, b: &image::RgbaImage, right: bool, bottom
 fn copies_tile_in_every_field() {
     let dir = std::env::temp_dir().join(format!("glyph-render-file-copies-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    for field in ["derived", "instanced", "visible"] {
+    for field in ["derived", "instanced"] {
         let mode = ["--field-mode", field];
         let one = render(&[&mode[..], &POSE_ON_THE_GAP[..]].concat(), &dir.join(format!("one-{field}.png")));
         let four =
@@ -102,17 +100,13 @@ fn differing(a: &image::RgbaImage, b: &image::RgbaImage) -> usize {
 fn tabs_take_the_render_file_default() {
     let dir = std::env::temp_dir().join(format!("glyph-render-file-tabs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    for field in ["derived", "visible"] {
-        let frame = |name: &str, extra: &[&str]| {
-            render(&[&["--field-mode", field][..], extra].concat(), &dir.join(format!("{field}-{name}.png")))
-        };
-        let default = frame("default", &[]);
-        let four = frame("4", &["--tab-width", "4"]);
-        let one = frame("1", &["--tab-width", "1"]);
-        let n = differing(&default, &four);
-        assert_eq!(n, 0, "{field}: --render-file's default differs from --tab-width 4 in {n} px: its default must be 4 cells");
-        let n = differing(&four, &one);
-        assert!(n > 500, "{field}: --tab-width 4 and 1 differ in only {n} px: the width does not reach --render-file's load");
-    }
+    let frame = |name: &str, extra: &[&str]| render(extra, &dir.join(format!("{name}.png")));
+    let default = frame("default", &[]);
+    let four = frame("4", &["--tab-width", "4"]);
+    let one = frame("1", &["--tab-width", "1"]);
+    let n = differing(&default, &four);
+    assert_eq!(n, 0, "--render-file's default differs from --tab-width 4 in {n} px: its default must be 4 cells");
+    let n = differing(&four, &one);
+    assert!(n > 500, "--tab-width 4 and 1 differ in only {n} px: the width does not reach --render-file's load");
     let _ = std::fs::remove_dir_all(&dir);
 }

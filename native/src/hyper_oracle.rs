@@ -3,9 +3,8 @@
 //! `HyperLayout` (`layout_hyper*`) is the production layout engine: every
 //! `--load-repo` runs it, whatever `--repo-engine` says. Before this
 //! instrument nothing compared it to the JS oracle. The
-//! `--fixture-*` instruments hold `fold.rs`, `scan.rs`, `bake.rs` and
-//! `text.rs` to the oracle's recorded answers; `--repo-verify` holds
-//! HyperLayout to HyperLayout. A defect HyperLayout carries alone was
+//! `--fixture-*` instruments hold `fold.rs`, the trie and `text.rs` to
+//! the oracle's recorded answers. A defect HyperLayout carries alone was
 //! therefore visible only through pixels — and the goldens were re-adopted
 //! after HyperLayout landed, so they pin whatever it does.
 //!
@@ -51,8 +50,9 @@
 //!
 //! WHAT IT CANNOT SEE: the device path past the emitter (the staging copy into
 //! VRAM, the buffer chunking), the Derived field's vertex-stage Y/Z (the slot
-//! carries none), the background prefetch of Pass 1 (repo-verify holds it to
-//! the inline Pass 1 used here), and anything both sides share, above.
+//! carries none), the background prefetch of Pass 1 (it runs the same Pass 1
+//! driver as the inline Pass 1 used here), and anything both sides share,
+//! above.
 //!
 //! INPUTS. A `.pipe.bin` fixture contributes its bytes and item params (each
 //! item laid out as its own buffer, as a repo file is); a directory is walked
@@ -506,24 +506,6 @@ pub struct CorpusDiff {
     pub device_render_bad: usize,
     pub device_derived_bad: usize,
     pub device_placement_bad: usize,
-    /// The VISIBLE tier (M2, 2026-10-10): the visible field's layout kernel
-    /// run headless over EVERY line of the corpus
-    /// (`glyph_field_visible::layout_all_lines`), its `DerivedSlot`s compared
-    /// byte for byte, in slot order, with the device Pass 2's Derived
-    /// emission above — the same record from the same bytes, the GPU's fold
-    /// against HyperLayout's. Slots compared and slots differing; 0 compared
-    /// when no device was given.
-    pub visible_slots: usize,
-    pub visible_bad: usize,
-    /// The visible tier's SPAN half (M3, 2026-10-10): the same kernel under
-    /// byte-range colour (a deterministic synthetic span set per item)
-    /// against the device Pass 2 under `Paint::ByteSpans` with the same
-    /// spans — the colouring every visible-mode recolour rides on. Slots
-    /// compared, slots differing, and how many reference slots carried a
-    /// span colour (anti-vacuity).
-    pub visible_span_slots: usize,
-    pub visible_span_bad: usize,
-    pub visible_span_colored: usize,
     /// Tabs the reference laid out wider than the one cell the trie gives
     /// them (tab stops, 2026-10-11) — anti-vacuity for a `--tab-width` run.
     pub expanded_tabs: usize,
@@ -549,11 +531,6 @@ impl Default for CorpusDiff {
             device_render_bad: 0,
             device_derived_bad: 0,
             device_placement_bad: 0,
-            visible_slots: 0,
-            visible_bad: 0,
-            visible_span_slots: 0,
-            visible_span_bad: 0,
-            visible_span_colored: 0,
             expanded_tabs: 0,
             firsts: Vec::new(),
             seam: Ok(()),
@@ -562,140 +539,7 @@ impl Default for CorpusDiff {
 }
 
 /// Lay one corpus out both ways and diff it.
-/// What the visible tier needs: a device to run the kernel on and the trie
-/// in the kernel's form. `None` skips the tier (a host with no adapter; the
-/// gate's STRICT run refuses that).
-pub struct VisibleOracle {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub trie: glyph_field_visible::TrieUpload,
-}
-
-impl VisibleOracle {
-    /// A headless device, and the trie the renderer would upload.
-    pub fn new(trie: &TrieTable) -> Self {
-        let ctx = pollster::block_on(crate::gpu::init(None));
-        Self { device: ctx.device, queue: ctx.queue, trie: crate::layout_hyper::visible::trie_upload(trie) }
-    }
-}
-
-/// The visible tier's inputs for a corpus: Pass 1 with the line table over
-/// all its items at once (as a load runs it), one `VisibleItem` per item,
-/// and the kernel over every line.
-fn visible_slots_of(
-    corpus: &Corpus,
-    trie: &TrieTable,
-    v: &VisibleOracle,
-    spans: Option<&[Vec<crate::layout::ByteSpan>]>,
-) -> Vec<DerivedSlot> {
-    use crate::layout_hyper::{chunk, pass1_over_chunks_with_lines, SEGMENT_BYTES};
-    let em = trie.metrics.em_height_fu;
-    let bitmap_adv = crate::text::fu_to_world(trie.bitmap_advance_fu, em);
-    let item_bytes: Vec<&[u8]> = corpus.items.iter().map(|c| c.bytes.as_slice()).collect();
-    let params: Vec<ItemParams> = corpus.items.iter().map(|c| c.params).collect();
-    let (defs, ranges) = chunk::slice_byte_buffers_into_chunk_defs(&item_bytes);
-    let chunks: Vec<chunk::LayoutChunk<'_>> = defs
-        .iter()
-        .map(|d| chunk::LayoutChunk {
-            item_index: d.item_index,
-            bytes: &item_bytes[d.item_index][d.byte_offset..d.byte_offset + d.byte_len],
-            byte_offset: d.byte_offset,
-        })
-        .collect();
-    let agg = pass1_over_chunks_with_lines(&chunks, &ranges, &item_bytes, &params, trie, bitmap_adv, em, Some(SEGMENT_BYTES));
-    let table = agg.line_table.as_ref().expect("Pass 1 was asked for lines");
-    // The spans as the kernel reads them: one global run, each item's
-    // sorted and `span_base..span_base + span_count`.
-    let mut gpu_spans: Vec<glyph_field_visible::ByteSpanGpu> = Vec::new();
-    let mut span_ranges: Vec<(u32, u32)> = Vec::with_capacity(corpus.items.len());
-    for i in 0..corpus.items.len() {
-        let base = gpu_spans.len() as u32;
-        if let Some(all) = spans {
-            for sp in &all[i] {
-                gpu_spans.push(glyph_field_visible::ByteSpanGpu { start: sp.start, end: sp.end, color: sp.color });
-            }
-        }
-        span_ranges.push((base, gpu_spans.len() as u32 - base));
-    }
-    let mut byte_base = 0u64;
-    let items: Vec<glyph_field_visible::VisibleItem> = corpus
-        .items
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let p = &c.params;
-            let mut gp = glyph_field::ItemParamsGpu::from(p);
-            gp.group = i as u32;
-            let lines = table.item_lines(i);
-            let it = glyph_field_visible::VisibleItem {
-                params: gp,
-                origin_x: p.origin_x,
-                stride_x: if p.has_page && p.page_rows > 0 {
-                    agg.prepasses[i].max_row_extent + p.page_gap_x
-                } else {
-                    0.0
-                },
-                wrap_width: p.wrap_width,
-                wrap_mode: match p.wrap_mode {
-                    fold::WrapMode::Down => glyph_field_visible::WRAP_DOWN,
-                    fold::WrapMode::Back => glyph_field_visible::WRAP_BACK,
-                },
-                cluster: u32::from(p.cluster_mode == ClusterMode::Cluster),
-                tab_width: p.tab_width.cells(),
-                byte_base,
-                byte_len: c.bytes.len() as u32,
-                first_line: lines.start as u32,
-                line_count: (lines.end - lines.start) as u32,
-                span_base: span_ranges[i].0,
-                span_count: span_ranges[i].1,
-                bbox_min: [0.0; 3],
-                bbox_max: [0.0; 3],
-                group_id: i as u32,
-            };
-            byte_base += c.bytes.len() as u64;
-            it
-        })
-        .collect();
-    let inputs = glyph_field_visible::VisibleInputs {
-        item_bytes: &item_bytes,
-        items: &items,
-        lines: bytemuck::cast_slice(&table.entries),
-        seeds: bytemuck::cast_slice(&table.seeds),
-        segment_bytes: table.segment_bytes,
-        trie: &v.trie,
-        spans: &gpu_spans,
-        default_color: DEFAULT_COLOR_PACKED,
-    };
-    glyph_field_visible::layout_all_lines(&v.device, &v.queue, &inputs)
-}
-
-/// The span tier's colours: three spans' worth, none the default.
-const SPAN_TIER_COLORS: [u32; 3] = [0xFF20_40C0, 0xFF60_C040, 0xFFC0_4060];
-
-/// A deterministic span set over an item of `len` bytes: a run of 5 bytes
-/// every 13 from byte 3 (9 bytes every seventh), cycling three colours —
-/// dense enough to land inside sequences, across chunk and segment cuts and
-/// on newlines, sparse enough to leave default colour between. Sorted and
-/// disjoint, as the paint requires.
-fn span_tier_spans(len: usize) -> Vec<crate::layout::ByteSpan> {
-    let mut out = Vec::new();
-    let mut k = 0u32;
-    let mut start = 3usize;
-    while start < len {
-        let run = if k.is_multiple_of(7) { 9 } else { 5 };
-        let end = (start + run).min(len);
-        out.push(crate::layout::ByteSpan {
-            start: start as u32,
-            end: end as u32,
-            color: SPAN_TIER_COLORS[(k % 3) as usize],
-        });
-        k += 1;
-        start += 13;
-    }
-    out
-}
-
-pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&VisibleOracle>) -> Result<CorpusDiff, String> {
+pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff, String> {
     let items: Vec<LayoutItem<'_>> = corpus
         .items
         .iter()
@@ -785,78 +629,6 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
     }
     out.device_slots = render_slots.len();
 
-    // The VISIBLE tier (M2, 2026-10-10): the visible field's kernel over
-    // every line, against the device Pass 2's Derived slots above — same
-    // bytes, same record, slot order = item, line, byte on both sides.
-    if let Some(v) = visible {
-        let got = visible_slots_of(corpus, trie, v, None);
-        out.visible_slots = derived_slots.len();
-        if got.len() != derived_slots.len() {
-            out.visible_bad += got.len().abs_diff(derived_slots.len()).max(1);
-            out.firsts.push((
-                format!("{} (visible kernel)", corpus.name),
-                format!("{} slots from the kernel, {} from the device Pass 2", got.len(), derived_slots.len()),
-            ));
-        }
-        let mut first_bad: Option<usize> = None;
-        for (k, (g, d)) in got.iter().zip(derived_slots.iter()).enumerate() {
-            if g != d {
-                out.visible_bad += 1;
-                first_bad.get_or_insert(k);
-            }
-        }
-        if let Some(k) = first_bad {
-            let item = derived_places
-                .iter()
-                .position(|p| (p.slot_base as usize..p.slot_base as usize + p.slot_count as usize).contains(&k))
-                .map(|i| corpus.items[i].label.clone())
-                .unwrap_or_else(|| "?".into());
-            out.firsts.push((
-                format!("{item} (visible kernel)"),
-                format!("slot {k}: kernel {:?} vs device Pass 2 {:?}", got[k], derived_slots[k]),
-            ));
-        }
-
-        // The SPAN half (M3): byte-range colour on both sides — the device
-        // Pass 2 under Paint::ByteSpans, the kernel with the same spans.
-        let span_sets: Vec<Vec<crate::layout::ByteSpan>> =
-            corpus.items.iter().map(|c| span_tier_spans(c.bytes.len())).collect();
-        let span_items: Vec<LayoutItem<'_>> = items
-            .iter()
-            .zip(span_sets.iter())
-            .map(|(it, sp)| LayoutItem { paint: Paint::ByteSpans(sp), ..*it })
-            .collect();
-        let (dev_spans, dev_span_places) = device_pass2_derived_on_host(&span_items, trie);
-        let got_spans = visible_slots_of(corpus, trie, v, Some(&span_sets));
-        out.visible_span_slots = dev_spans.len();
-        out.visible_span_colored += dev_spans.iter().filter(|d| d.color != DEFAULT_COLOR_PACKED).count();
-        if got_spans.len() != dev_spans.len() {
-            out.visible_span_bad += got_spans.len().abs_diff(dev_spans.len()).max(1);
-            out.firsts.push((
-                format!("{} (visible kernel, spans)", corpus.name),
-                format!("{} slots from the kernel, {} from the device Pass 2", got_spans.len(), dev_spans.len()),
-            ));
-        }
-        let mut first_bad: Option<usize> = None;
-        for (k, (g, d)) in got_spans.iter().zip(dev_spans.iter()).enumerate() {
-            if g != d {
-                out.visible_span_bad += 1;
-                first_bad.get_or_insert(k);
-            }
-        }
-        if let Some(k) = first_bad {
-            let item = dev_span_places
-                .iter()
-                .position(|p| (p.slot_base as usize..p.slot_base as usize + p.slot_count as usize).contains(&k))
-                .map(|i| corpus.items[i].label.clone())
-                .unwrap_or_else(|| "?".into());
-            out.firsts.push((
-                format!("{item} (visible kernel, spans)"),
-                format!("slot {k}: kernel {:?} vs device Pass 2 {:?}", got_spans[k], dev_spans[k]),
-            ));
-        }
-    }
-
     let ref_all: Vec<GlyphRecord> = refs.iter().flat_map(|r| r.records.iter().copied()).collect();
     let hyper_all: Vec<GlyphRecord> = hyper_recs.into_iter().flatten().collect();
     out.seam = diff_backends(
@@ -871,14 +643,6 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>, visible: Option<&Visi
 pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_width: fold::TabWidth) -> ! {
     let strict = std::env::var("GLYPH_HYPER_ORACLE_STRICT").is_ok_and(|v| v == "1");
     let trie = crate::default_trie();
-    // The visible tier runs the kernel on this host's GPU; a host without
-    // one can still run the five CPU tiers, and says so.
-    let visible = if std::env::var_os("GLYPH_HYPER_ORACLE_NO_GPU").is_some() {
-        println!("hyper-oracle NOTE: GLYPH_HYPER_ORACLE_NO_GPU set — the visible tier is skipped");
-        None
-    } else {
-        Some(VisibleOracle::new(&trie))
-    };
     let mut total = CorpusDiff::default();
     let mut failed = 0usize;
     let mut first: Option<(String, String)> = None;
@@ -890,7 +654,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
                 std::process::exit(1);
             }
         };
-        let d = match diff_corpus(&corpus, &trie, visible.as_ref()) {
+        let d = match diff_corpus(&corpus, &trie) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("hyper-oracle FAIL: {}: HyperLayout refused the corpus: {e}", corpus.name);
@@ -902,18 +666,16 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             && d.instance_bad == 0
             && d.placement_bad == 0
             && device_bad == 0
-            && d.visible_bad == 0
-            && d.visible_span_bad == 0
             && d.seam.is_ok();
         if clean {
             println!(
-                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact, visible kernel {} slots flat + {} under spans ({} coloured) ({} sequence heads, {} ASCII-led)",
-                corpus.name, d.items, d.records, d.instances, d.device_slots, d.visible_slots, d.visible_span_slots, d.visible_span_colored, d.heads, d.ascii_heads
+                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact ({} sequence heads, {} ASCII-led)",
+                corpus.name, d.items, d.records, d.instances, d.device_slots, d.heads, d.ascii_heads
             );
         } else {
             failed += 1;
             println!(
-                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements; visible kernel {}/{} slots flat, {}/{} under spans ({} sequence heads, {} ASCII-led)",
+                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements ({} sequence heads, {} ASCII-led)",
                 corpus.name,
                 d.record_bad,
                 d.records,
@@ -924,10 +686,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
                 d.device_render_bad,
                 d.device_derived_bad,
                 d.device_placement_bad,
-                d.visible_bad,
-                d.visible_slots,
-                d.visible_span_bad,
-                d.visible_span_slots,
                 d.heads,
                 d.ascii_heads
             );
@@ -957,11 +715,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         total.device_render_bad += d.device_render_bad;
         total.device_derived_bad += d.device_derived_bad;
         total.device_placement_bad += d.device_placement_bad;
-        total.visible_slots += d.visible_slots;
-        total.visible_bad += d.visible_bad;
-        total.visible_span_slots += d.visible_span_slots;
-        total.visible_span_bad += d.visible_span_bad;
-        total.visible_span_colored += d.visible_span_colored;
         total.expanded_tabs += d.expanded_tabs;
     }
 
@@ -975,20 +728,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         eprintln!("hyper-oracle FAIL: the device tier compared nothing — 0 slots emitted");
         std::process::exit(1);
     }
-    if visible.is_some() && total.visible_slots == 0 {
-        eprintln!("hyper-oracle FAIL: the visible tier compared nothing — 0 slots");
-        std::process::exit(1);
-    }
-    if visible.is_some() && total.visible_span_colored == 0 {
-        eprintln!("hyper-oracle FAIL: the visible tier's span half compared nothing coloured");
-        std::process::exit(1);
-    }
     if tab_width.expands() && total.expanded_tabs == 0 {
         eprintln!("hyper-oracle FAIL: --tab-width {tab_width} compared no tab wider than one cell — the corpus does not exercise tab stops");
-        std::process::exit(1);
-    }
-    if strict && visible.is_none() {
-        eprintln!("hyper-oracle FAIL (strict): the visible tier did not run (no device)");
         std::process::exit(1);
     }
     if strict && (total.heads == 0 || total.ascii_heads == 0) {
@@ -1003,7 +744,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             println!("first divergence: {label}: {f}");
         }
         eprintln!(
-            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements; visible kernel: {}/{} slots flat, {}/{} under spans",
+            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements",
             paths.len(),
             total.record_bad,
             total.records,
@@ -1016,15 +757,11 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             total.device_derived_bad,
             total.device_slots,
             total.device_placement_bad,
-            total.visible_bad,
-            total.visible_slots,
-            total.visible_span_bad,
-            total.visible_span_slots,
         );
         std::process::exit(1);
     }
     println!(
-        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led); the visible kernel's {} slots equal the device Pass 2's, and {} again under byte-range spans ({} coloured){}",
+        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led)",
         paths.len(),
         total.items,
         total.records,
@@ -1033,10 +770,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         total.device_slots,
         total.heads,
         total.ascii_heads,
-        total.visible_slots,
-        total.visible_span_slots,
-        total.visible_span_colored,
-        if visible.is_some() { "" } else { " (tier skipped: no device)" }
     );
     if tab_width.expands() {
         println!(
@@ -1067,7 +800,7 @@ mod tests {
         let rp = repo_params(ClusterMode::Cluster, fold::TabWidth::ONE_CELL);
         let text = b"fn main() {\n    let x = 1; // a comment that is long enough to wrap twice over\n}\n";
         let params = crate::repo::file_item_params(&rp, text.len(), 3);
-        let d = diff_corpus(&corpus_of(text, params), &crate::default_trie(), None).expect("layout");
+        let d = diff_corpus(&corpus_of(text, params), &crate::default_trie()).expect("layout");
         assert!(d.records > 0 && d.instances > 0, "compared nothing");
         assert_eq!(d.device_slots, d.instances, "the device tier emitted a different survivor count");
         assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{:?}", d.firsts);
@@ -1090,7 +823,7 @@ mod tests {
         for (mode, want_heads) in [(ClusterMode::Cluster, true), (ClusterMode::Leader, false)] {
             let rp = repo_params(mode, fold::TabWidth::ONE_CELL);
             let params = crate::repo::file_item_params(&rp, text.len(), 2);
-            let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie, None).expect("layout");
+            let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie).expect("layout");
             assert!(d.records > 0 && d.device_slots == d.instances, "{mode:?}: compared nothing");
             assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{mode:?}: {:?}", d.firsts);
             assert_eq!(
@@ -1117,8 +850,6 @@ mod tests {
     #[test]
     fn pagination_agrees_on_every_tier() {
         let trie = crate::default_trie();
-        // The visible tier too: the kernel over every shape of the grid.
-        let visible = VisibleOracle::new(&trie);
         let texts: [&str; 3] = [
             "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
             "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9 is the widest unterminated",
@@ -1167,13 +898,9 @@ mod tests {
                         .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
                         .collect(),
                 };
-                let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
+                let d = diff_corpus(&corpus, &trie).expect("layout");
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
                 assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
-                assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
-                assert_eq!(d.visible_bad, 0, "{at}: visible kernel: {:?}", d.firsts);
-                assert_eq!(d.visible_span_bad, 0, "{at}: visible kernel under spans: {:?}", d.firsts);
-                assert!(d.visible_span_colored > 0, "{at}: the span half saw no colour");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
                     (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
@@ -1356,16 +1083,15 @@ mod tests {
         s
     }
 
-    /// TAB STOPS (2026-10-11) on every tier, host, device and the Visible
-    /// kernel, against the serial fold with the same stops — the oracle has
+    /// TAB STOPS (2026-10-11) on every tier, host and device, against the
+    /// serial fold with the same stops — the oracle has
     /// none, so this fold (itself held to `text::reference_layout` and to
     /// the oracle-backed one-cell fold over the spaces a tab stands for, in
     /// `fold::tests`) is the reference past one cell. Widths 4 (every
     /// product `f32(k) × cell` exact) and 8 (k = 5 and 7 round: the f64 line
     /// advance must take the exact multiple). The corpus puts tabs before and
     /// after non-ASCII glyphs, inside wraps (wrap 7 and 100, both modes), on
-    /// row and column pages, across the Visible field's segment seeds (a line
-    /// past `SEGMENT_BYTES`) and across HyperLayout's intra-line chunk cuts (a
+    /// row and column pages, and across HyperLayout's intra-line chunk cuts (a
     /// line past twice the chunk threshold with no newline), where a chunk
     /// must start from the line's true cells — the per-chunk walk measures
     /// from its own start, and the aggregation walks a tabbed chunk again.
@@ -1373,7 +1099,6 @@ mod tests {
     fn tab_stops_agree_on_every_tier() {
         use crate::layout_hyper::chunk::{slice_byte_buffers_into_chunk_defs, CHUNK_THRESHOLD_BYTES};
         let trie = crate::default_trie();
-        let visible = VisibleOracle::new(&trie);
         let cell = trie.resolve(0x09).advance as f64;
         let small = "\tlead\n\
             a\tb\tcc\tddd\teeee\t|\n\
@@ -1383,15 +1108,14 @@ mod tests {
             \n\
             no tab here, and a line long enough to wrap at seven\n\
             tail\t";
-        let seeded = format!("{}\nafter\tthe\tlong line\n", tabbed_line(3 * crate::layout_hyper::SEGMENT_BYTES));
         let cut = tabbed_line(2 * CHUNK_THRESHOLD_BYTES + 4096);
         assert!(!cut.contains('\n'));
         // The same line ENDING inside a later chunk: that chunk holds a
         // newline, so the aggregation does not walk it again, and its
-        // continued first line's tabs rest on the line-table replays and
-        // `measure_continued_lines` taking the true seed (review, 2026-10-11).
+        // continued first line's tabs rest on `measure_continued_lines`
+        // taking the true seed (review, 2026-10-11).
         let cut_then_ends = format!("{cut}\tthe\tline\tends\nnext\tline\t|\n");
-        let texts: [&str; 4] = [small, &seeded, &cut, &cut_then_ends];
+        let texts: [&str; 3] = [small, &cut, &cut_then_ends];
         // (wrap, mode, page_rows, page_cols, pages_wide)
         let shapes: [(i32, fold::WrapMode, i32, i32, i32); 6] = [
             (0, fold::WrapMode::Back, 0, 0, 1),
@@ -1406,74 +1130,86 @@ mod tests {
         // the one it claims to be.
         let (defs, _) = slice_byte_buffers_into_chunk_defs(&[cut.as_bytes()]);
         assert!(defs.len() >= 3, "the cut text is {} chunk(s)", defs.len());
-        let mut compared = 0usize;
-        let mut moved = 0usize;
-        for width in [4u32, 8] {
-            let tab_width = fold::TabWidth::new(width).expect("a width");
-            let mut off_stop_cuts = 0usize;
-            for cluster in [ClusterMode::Cluster, ClusterMode::Leader] {
-                for (wrap, mode, rows, cols, wide) in shapes {
-                    let params = ItemParams {
-                        origin_x: 0.5,
-                        origin_y: -1.0,
-                        origin_z: 2.0,
-                        line_height: 1.1,
-                        z_step: 0.4,
-                        wrap_width: wrap,
-                        wrap_mode: mode,
-                        cluster_mode: cluster,
-                        tab_width,
-                        has_page: rows != 0 || cols != 0,
-                        page_rows: rows,
-                        page_cols: cols,
-                        pages_wide: wide,
-                        page_gap_x: 0.8,
-                        band_stride_y: 9.5,
-                        depth_per_band: -2.5,
-                        depth_per_col: 0.75,
-                        ..ItemParams::default()
-                    };
-                    let corpus = Corpus {
-                        name: "tabs".into(),
-                        items: texts
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
-                            .collect(),
-                    };
-                    let d = diff_corpus(&corpus, &trie, Some(&visible)).expect("layout");
-                    let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
-                    assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
-                    assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
-                    assert_eq!(
-                        (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
-                        (0, 0, 0),
-                        "{at}: {:?}",
-                        d.firsts
-                    );
-                    assert_eq!(d.visible_slots, d.device_slots, "{at}: the visible tier compared every slot");
-                    assert_eq!((d.visible_bad, d.visible_span_bad), (0, 0), "{at}: visible kernel: {:?}", d.firsts);
-                    assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
-                    compared += d.instances;
-                    // The cut text's chunks, read off the reference: a chunk
-                    // holding a tab whose line is off a stop where it starts.
-                    if wrap == 0 && cols == 0 {
-                        let r = reference_item(cut.as_bytes(), &params, &trie);
-                        let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
-                        moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
-                        for def in &defs[1..] {
-                            let first = r.record_bytes.iter().position(|&b| b >= def.byte_offset).expect("a record in the chunk");
-                            let cells = ((r.records[first].x() as f64 - params.origin_x) / cell).round() as u64;
-                            let chunk = &cut.as_bytes()[def.byte_offset..def.byte_offset + def.byte_len];
-                            if !cells.is_multiple_of(width as u64) && chunk.contains(&b'\t') {
-                                off_stop_cuts += 1;
-                            }
+        // The 24 cases run at once: one after another they were 11 s of
+        // the renderer's 13 s unit-test run, the long pole of cargo-test
+        // (2026-10-26). Each case is independent; the tallies are summed.
+        use rayon::prelude::*;
+        let cases: Vec<_> = [4u32, 8]
+            .into_iter()
+            .flat_map(|width| {
+                [ClusterMode::Cluster, ClusterMode::Leader]
+                    .into_iter()
+                    .flat_map(move |cluster| shapes.into_iter().map(move |shape| (width, cluster, shape)))
+            })
+            .collect();
+        let tallies: Vec<(u32, usize, usize, usize)> = cases
+            .par_iter()
+            .map(|&(width, cluster, (wrap, mode, rows, cols, wide))| {
+                let tab_width = fold::TabWidth::new(width).expect("a width");
+                let (mut moved, mut off_stop_cuts) = (0usize, 0usize);
+                let params = ItemParams {
+                    origin_x: 0.5,
+                    origin_y: -1.0,
+                    origin_z: 2.0,
+                    line_height: 1.1,
+                    z_step: 0.4,
+                    wrap_width: wrap,
+                    wrap_mode: mode,
+                    cluster_mode: cluster,
+                    tab_width,
+                    has_page: rows != 0 || cols != 0,
+                    page_rows: rows,
+                    page_cols: cols,
+                    pages_wide: wide,
+                    page_gap_x: 0.8,
+                    band_stride_y: 9.5,
+                    depth_per_band: -2.5,
+                    depth_per_col: 0.75,
+                    ..ItemParams::default()
+                };
+                let corpus = Corpus {
+                    name: "tabs".into(),
+                    items: texts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
+                        .collect(),
+                };
+                let d = diff_corpus(&corpus, &trie).expect("layout");
+                let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
+                assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
+                assert_eq!(
+                    (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
+                    (0, 0, 0),
+                    "{at}: {:?}",
+                    d.firsts
+                );
+                assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
+                // The cut text's chunks, read off the reference: a chunk
+                // holding a tab whose line is off a stop where it starts.
+                if wrap == 0 && cols == 0 {
+                    let r = reference_item(cut.as_bytes(), &params, &trie);
+                    let one = reference_item(cut.as_bytes(), &ItemParams { tab_width: fold::TabWidth::ONE_CELL, ..params }, &trie);
+                    moved += r.records.iter().zip(&one.records).filter(|(a, b)| a.x() != b.x()).count();
+                    for def in &defs[1..] {
+                        let first = r.record_bytes.iter().position(|&b| b >= def.byte_offset).expect("a record in the chunk");
+                        let cells = ((r.records[first].x() as f64 - params.origin_x) / cell).round() as u64;
+                        let chunk = &cut.as_bytes()[def.byte_offset..def.byte_offset + def.byte_len];
+                        if !cells.is_multiple_of(width as u64) && chunk.contains(&b'\t') {
+                            off_stop_cuts += 1;
                         }
                     }
                 }
-            }
+                (width, d.instances, moved, off_stop_cuts)
+            })
+            .collect();
+        for width in [4u32, 8] {
+            let off_stop_cuts: usize = tallies.iter().filter(|t| t.0 == width).map(|t| t.3).sum();
             assert!(off_stop_cuts > 0, "width {width}: no chunk of the cut text starts off a stop with a tab in it");
         }
+        let compared: usize = tallies.iter().map(|t| t.1).sum();
+        let moved: usize = tallies.iter().map(|t| t.2).sum();
         assert!(compared > 100_000, "the grid compared only {compared} instances");
         assert!(moved > 10_000, "the stops moved only {moved} glyphs of the cut text");
     }

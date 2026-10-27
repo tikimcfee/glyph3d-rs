@@ -1727,6 +1727,7 @@ dependencies = [
  "glob",
  "png",
  "serde",
+ "serde_json",
  "sha2",
  "toml 0.8.23",
 ]
@@ -1766,18 +1767,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glyph-field-visible"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glyph-field",
- "glyph-field-derived",
- "log",
- "naga",
- "wgpu",
-]
-
-[[package]]
 name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
@@ -1802,7 +1791,6 @@ dependencies = [
  "glyph-field",
  "glyph-field-derived",
  "glyph-field-instanced",
- "glyph-field-visible",
  "glyph-scene-graph",
  "image",
  "log",
