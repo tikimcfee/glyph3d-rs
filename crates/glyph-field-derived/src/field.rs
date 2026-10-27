@@ -66,7 +66,11 @@ impl DerivedField {
                 "the Derived field keeps its slots on the host (2026-10-26): a device slot source is the Instanced field's"
             ),
         };
-        let storage = SlotStorage::from_source(device, queue, SlotSource::Blocks(slots), &transcode, &LABELS);
+        let storage = if resources.slots_on_device {
+            SlotStorage::from_source(device, queue, SlotSource::Blocks(slots), &transcode, &LABELS)
+        } else {
+            SlotStorage::host_only(slots)
+        };
 
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived item table"),
@@ -214,6 +218,10 @@ impl GlyphField for DerivedField {
 
     fn host_slots(&self) -> Option<std::cell::Ref<'_, glyph_field::HostSlots>> {
         self.core.storage().host_slots()
+    }
+
+    fn slots_on_device(&self) -> bool {
+        self.core.storage().on_device()
     }
 
     fn group_overrides(&self) -> Option<std::cell::Ref<'_, [u32]>> {

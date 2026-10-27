@@ -32,7 +32,9 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
   (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`;
   its slots live in host blocks that are its chunks, 2026-10-26, so a makepad
-  renderer draws from the same copy the wgpu field uploads from).
+  renderer draws from the same copy the wgpu field uploads from; for a host
+  that draws them itself, `GpuContext::host_draws_glyphs`, the field uploads
+  nothing).
   Chosen at load with `--field-mode derived|instanced`, switchable live from
   the Debug panel. A third mode, Visible (`glyph-field-visible`: no slot per
   glyph, the lines in view laid out per frame by a GPU compute kernel;

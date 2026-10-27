@@ -1777,6 +1777,7 @@ dependencies = [
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bevy_ecs",
  "bevy_transform",
  "bytemuck",
