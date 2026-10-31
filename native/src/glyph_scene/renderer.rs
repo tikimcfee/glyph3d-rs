@@ -9,6 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 
+use super::cull::BackdropGpu;
 use super::environment::EnvironmentGpu;
 use super::mesh::MeshPipeline;
 use super::target::CompositeState;
@@ -17,6 +18,8 @@ pub(crate) struct SceneGpu {
     /// For the pooled targets `set_viewport` (re)creates.
     pub(super) device: wgpu::Device,
     pub(super) environment: EnvironmentGpu,
+    /// The far-LOD backdrop pass (None without the cull, `--no-cull`).
+    pub(super) backdrops: Option<BackdropGpu>,
     /// The frame uniform (`FrameData::uniform`), written every frame.
     pub(super) camera_buf: wgpu::Buffer,
     /// The glyph params (`FrameData::params`) and the generation it holds.

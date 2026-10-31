@@ -293,15 +293,7 @@ impl GlyphScene {
         // segment no view uses).
         let segment_group_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(|s| views.group_row_of_segment(s)).collect();
         let cull = if cull_enabled {
-            let mut cull = CullState::new(
-                ctx,
-                POOL_FORMAT, // Stage L (L3): the backdrop pipeline renders into the pool
-                depth_format,
-                &camera_buf,
-                &segments,
-                &groups,
-                &segment_group_rows,
-            );
+            let mut cull = CullState::new(&segments, &groups, &segment_group_rows);
             let library_root = staged.controller.as_ref().and_then(|c| c.library.as_ref()).and_then(|l| l.nodes.as_ref()).map(|n| n.root);
             cull.backdrop_at_front = library_root.is_some();
             if let Some(root) = library_root {
@@ -334,6 +326,11 @@ impl GlyphScene {
             None
         };
 
+        // The backdrop pass draws the CPU cull's survivors; no cull, no pass.
+        // Stage L (L3): the backdrop pipeline renders into the pool.
+        let backdrops = cull
+            .as_ref()
+            .map(|c| super::cull::BackdropGpu::new(device, POOL_FORMAT, depth_format, &camera_buf, c.segments.len() as u32));
         // Stage L (L3): the composite machinery (persistent half). The
         // pooled target itself is sized by set_viewport — GlyphScene::new
         // doesn't know the viewport (the drivers decide it later).
@@ -391,6 +388,7 @@ impl GlyphScene {
             gpu: super::renderer::SceneGpu {
                 device: device.clone(),
                 environment: super::environment::EnvironmentGpu::new(device, depth_format),
+                backdrops,
                 camera_buf,
                 params_buf,
                 params_uploaded: Cell::new(0),
