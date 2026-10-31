@@ -18,19 +18,36 @@
 use std::sync::Arc;
 
 use glyph3d_native::atlas::Atlas;
-use glyph3d_native::float_tables::{self, AtlasTables, FloatTexture, TexelRect};
+use glyph3d_native::float_tables::{self, FloatTexture, TexelRect};
 use glyph3d_native::glyph_scene::{FrameData, RegionParams};
 
-use crate::g3_passes::{G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
+use crate::g3_passes::{G3AtlasTables, G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
 
-/// The scene's atlas as the passes take it, converted on the first frame
-/// from the atlas the scene was staged against (`FrameData::atlas`, held
-/// here; 2026-10-31: this decoded the emoji sheet a second time until
-/// then). Every scene a process builds stages against the same atlas.
-struct AtlasStatics {
-    tables: AtlasTables,
-    atlas: Arc<Atlas>,
-    emoji_rgba: Vec<u8>,
+/// Every scene a process builds stages against the same immutable atlas
+/// (`assets/atlas/` + the `--emoji-sheet` path), so `G3AtlasTables` is built
+/// and handed to `G3Renderer` once (`ATLAS_GENERATION = 1`), keeping neither
+/// `FloatTexture` copies nor the `361.79 MiB` emoji buffer in `FrameFeed`.
+const ATLAS_GENERATION: u64 = 1;
+
+fn emoji_sheet_of(atlas: &Atlas) -> G3EmojiSheet {
+    let byte_len = atlas.emoji.byte_len();
+    assert_eq!(byte_len % 4, 0, "emoji sheet byte_len is 4-byte RGBA8 texels");
+    let mut bgra = vec![0u32; byte_len / 4];
+    // SAFETY: `u32` has alignment 4 >= `u8` alignment 1 and size 4, and `bgra`
+    // holds `byte_len / 4` initialized elements (`byte_len` bytes).
+    let dst_bytes = unsafe { std::slice::from_raw_parts_mut(bgra.as_mut_ptr() as *mut u8, byte_len) };
+    atlas.emoji.copy_into(dst_bytes);
+    for px in &mut bgra {
+        let [r, g, b, a] = px.to_ne_bytes();
+        *px = (b as u32) | ((g as u32) << 8) | ((r as u32) << 16) | ((a as u32) << 24);
+    }
+    G3EmojiSheet {
+        width: atlas.emoji.sheet.layer_w as usize,
+        height: atlas.emoji.sheet.layer_h as usize,
+        layers: atlas.emoji.sheet.layers as usize,
+        max_level: atlas.emoji.mip_levels as usize - 1,
+        bgra,
+    }
 }
 
 /// The tables of the scene being drawn.
@@ -54,7 +71,6 @@ struct SceneTables {
 
 #[derive(Default)]
 pub struct FrameFeed {
-    statics: Option<AtlasStatics>,
     scene: Option<SceneTables>,
     /// The blocks as makepad takes them, refreshed per frame (a refcount
     /// each), kept so the inputs can borrow them.
@@ -100,12 +116,15 @@ impl FrameFeed {
         scene_generation: u64,
         frame: &FrameData<'_>,
     ) {
-        let statics = self.statics.get_or_insert_with(|| {
-            let atlas = Arc::clone(frame.atlas);
-            let tables = float_tables::atlas_tables_of(&atlas);
-            let mut emoji_rgba = vec![0u8; atlas.emoji.byte_len()];
-            atlas.emoji.copy_into(&mut emoji_rgba);
-            AtlasStatics { tables, atlas, emoji_rgba }
+        let atlas_generation = ATLAS_GENERATION;
+        let atlas = (renderer.seen().atlas != Some(atlas_generation)).then(|| {
+            let tables = float_tables::atlas_tables_of(frame.atlas);
+            G3AtlasTables {
+                glyphmap: tables.glyphmap,
+                curves: tables.curves,
+                advances: tables.glyph_advances,
+                emoji: emoji_sheet_of(frame.atlas),
+            }
         });
 
         let overrides: &[u32] = &frame.group_overrides;
@@ -148,18 +167,8 @@ impl FrameFeed {
         self.blocks.clear();
         self.blocks.extend(frame.slots.blocks().iter().map(words_as_f32));
         let statics_view = G3StaticTables {
-            glyphmap: &statics.tables.glyphmap,
-            curves: &statics.tables.curves,
-            advances: &statics.tables.glyph_advances,
             items: &tables.items,
             overrides: &tables.overrides,
-            emoji: G3EmojiSheet {
-                width: statics.atlas.emoji.sheet.layer_w as usize,
-                height: statics.atlas.emoji.sheet.layer_h as usize,
-                layers: statics.atlas.emoji.sheet.layers as usize,
-                max_level: statics.atlas.emoji.mip_levels as usize - 1,
-                rgba: &statics.emoji_rgba,
-            },
         };
         let chunk_ranges = frame.glyph_ranges.per_chunk();
         let selection_ranges = frame.selection.as_ref().map(|s| s.ranges.per_chunk());
@@ -197,7 +206,9 @@ impl FrameFeed {
         }
         let [r, g, b, a] = frame.clear_color;
         let groups_generation = generation(scene_generation, tables.groups_version);
-        let inputs = G3FrameInputs {
+        let mut inputs = G3FrameInputs {
+            atlas_generation,
+            atlas,
             tables_generation: generation(scene_generation, tables.tables_version),
             tables: &statics_view,
             blocks: &self.blocks,
@@ -225,7 +236,7 @@ impl FrameFeed {
             chunk_ranges: &chunk_ranges,
             selection,
         };
-        renderer.draw_frame(cx, draws, rect, &inputs);
+        renderer.draw_frame(cx, draws, rect, &mut inputs);
         // The renderer consumed this generation: its rects are uploaded.
         if renderer.seen().groups == Some(groups_generation) {
             tables.dirty.clear();
