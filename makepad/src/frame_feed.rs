@@ -17,16 +17,19 @@
 
 use std::sync::Arc;
 
-use glyph3d_native::atlas::EmojiLevels;
+use glyph3d_native::atlas::Atlas;
 use glyph3d_native::float_tables::{self, AtlasTables, FloatTexture, TexelRect};
 use glyph3d_native::glyph_scene::{FrameData, RegionParams};
 
 use crate::g3_passes::{G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
 
-/// The process's atlas tables and emoji texels, loaded on the first frame.
+/// The scene's atlas as the passes take it, converted on the first frame
+/// from the atlas the scene was staged against (`FrameData::atlas`, held
+/// here; 2026-10-31: this decoded the emoji sheet a second time until
+/// then). Every scene a process builds stages against the same atlas.
 struct AtlasStatics {
-    atlas: AtlasTables,
-    emoji: EmojiLevels,
+    tables: AtlasTables,
+    atlas: Arc<Atlas>,
     emoji_rgba: Vec<u8>,
 }
 
@@ -98,11 +101,11 @@ impl FrameFeed {
         frame: &FrameData<'_>,
     ) {
         let statics = self.statics.get_or_insert_with(|| {
-            let atlas = float_tables::atlas_tables(&glyph3d_native::atlas_dir());
-            let emoji = EmojiLevels::load(&glyph3d_native::default_emoji_sheet());
-            let mut emoji_rgba = vec![0u8; emoji.byte_len()];
-            emoji.copy_into(&mut emoji_rgba);
-            AtlasStatics { atlas, emoji, emoji_rgba }
+            let atlas = Arc::clone(frame.atlas);
+            let tables = float_tables::atlas_tables_of(&atlas);
+            let mut emoji_rgba = vec![0u8; atlas.emoji.byte_len()];
+            atlas.emoji.copy_into(&mut emoji_rgba);
+            AtlasStatics { tables, atlas, emoji_rgba }
         });
 
         let overrides: &[u32] = &frame.group_overrides;
@@ -145,16 +148,16 @@ impl FrameFeed {
         self.blocks.clear();
         self.blocks.extend(frame.slots.blocks().iter().map(words_as_f32));
         let statics_view = G3StaticTables {
-            glyphmap: &statics.atlas.glyphmap,
-            curves: &statics.atlas.curves,
-            advances: &statics.atlas.glyph_advances,
+            glyphmap: &statics.tables.glyphmap,
+            curves: &statics.tables.curves,
+            advances: &statics.tables.glyph_advances,
             items: &tables.items,
             overrides: &tables.overrides,
             emoji: G3EmojiSheet {
-                width: statics.emoji.sheet.layer_w as usize,
-                height: statics.emoji.sheet.layer_h as usize,
-                layers: statics.emoji.sheet.layers as usize,
-                max_level: statics.emoji.mip_levels as usize - 1,
+                width: statics.atlas.emoji.sheet.layer_w as usize,
+                height: statics.atlas.emoji.sheet.layer_h as usize,
+                layers: statics.atlas.emoji.sheet.layers as usize,
+                max_level: statics.atlas.emoji.mip_levels as usize - 1,
                 rgba: &statics.emoji_rgba,
             },
         };
