@@ -26,6 +26,7 @@ path = "src/main.rs"
 # windowed driver is an optional feature, those go with it).
 glyph3d-native = { path = "../native", default-features = false }
 glyph-field = { path = "../crates/glyph-field", default-features = false }
+makepad-texcomp = { path = "../../makepad/libs/texcomp" }
 makepad-widgets = { path = "../../makepad/widgets", default-features = false }
 # The engine's CLI, which the host parses as its own: the version the
 # engine resolves, so the graph unifies. (wgpu and pollster were here while

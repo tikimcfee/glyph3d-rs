@@ -102,6 +102,12 @@ impl WidgetNode for Glyph3dViewport {
 
 impl Widget for Glyph3dViewport {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::GpuReset) {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.reset_gpu();
+            }
+            self.area.redraw(cx);
+        }
         let Some(host) = scope.data.get_mut::<EngineHost>() else { return };
 
         if self.next_frame.is_event(event).is_some() {

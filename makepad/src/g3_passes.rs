@@ -15,7 +15,7 @@
 //! `RenderRGBAf16` target (`color_format: @Rgba16F`), so blending happens in
 //! linear light as it does in glyph3d's `Rgba8UnormSrgb` pool; the composite
 //! encodes linear → sRGB into the UI. The selection mask renders into a
-//! `RenderBGRAu8` target (`@Bgra8NoBlend`, coverage in alpha).
+//! `RenderRu8` target (`@Ru8`, coverage in `.x`).
 //!
 //! Depth: glyph3d is Reverse-Z (`GreaterEqual`, clear 0.0). The scene pass
 //! sets `DrawPass::set_reverse_z(cx, true)` and clears depth with 0.0; the
@@ -815,11 +815,11 @@ script_mod! {
     }
 
     // The selection mask: the same glyphs (the same chunk publications,
-    // ranges = the selection) into a BGRA8 data target, blending off, no
-    // depth, coverage in alpha.
+    // ranges = the selection) into a single-channel R8 data target, blending
+    // off, no depth, coverage in R.
     mod.draw.DrawG3GlyphMask = mod.std.set_type_default() do #(DrawG3GlyphMask::script_shader(vm)){
         ..mod.draw.DrawG3Glyph
-        color_format: @Bgra8NoBlend
+        color_format: @Ru8
         alpha_blend: false
         depth_write: false
         u_mask_mode: uniform(1.0)
@@ -851,7 +851,7 @@ script_mod! {
             let m = self.t_mask.sample(self.pos)
             let mut rgb = scene.xyz
             if self.u_has_selection > 0.5 {
-                rgb = rgb + self.u_tint.xyz * m.w * self.u_tint.w
+                rgb = rgb + self.u_tint.xyz * m.x * self.u_tint.w
             }
             let srgb = self.linear_to_srgb(rgb)
             return vec4(srgb.x, srgb.y, srgb.z, 1.0)
@@ -943,9 +943,8 @@ fn g3_draw_retained(cx: &mut CxDraw, draw_vars: &mut DrawVars, publication: &Ret
     draw_vars.area = cx.update_area_refs(draw_vars.area, area);
 }
 
-fn g3_inv_size(texture: &Texture, cx: &Cx) -> [f32; 2] {
-    let (w, h) = texture.allocated_size(cx).unwrap_or((1, 1));
-    [1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32]
+fn g3_inv_size(size: (u32, u32)) -> [f32; 2] {
+    [1.0 / size.0.max(1) as f32, 1.0 / size.1.max(1) as f32]
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,7 +1234,7 @@ impl DrawG3GroupFace {
     pub fn draw_retained(&mut self, cx: &mut CxDraw, geometry_id: GeometryId, tables: &G3Tables, specs: &RetainedInstances) {
         self.draw_vars.geometry_id = Some(geometry_id);
         g3_set_texture(cx, &mut self.draw_vars, live_id!(t_groups), &tables.groups);
-        let inv = g3_inv_size(&tables.groups, cx);
+        let inv = g3_inv_size(tables.groups_size);
         self.draw_vars.set_uniform(cx, live_id!(u_groups_inv_size), &inv);
         self.draw_vars.set_uniform(cx, live_id!(u_max_groups), &[tables.group_count as f32]);
         self.draw_vars.set_uniform(cx, live_id!(u_bias_k), &[G3_MESH_BIAS_K]);
@@ -1301,14 +1300,22 @@ impl DrawG3Region {
 // Pass 5: glyphs — tables, params and the retained blocks
 // ---------------------------------------------------------------------------
 
-/// The emoji sheet: `layers` BGRA8 images (`b | g << 8 | r << 16 | a << 24`),
-/// each with its mip chain (levels 0..=max_level concatenated), layer-major.
+/// Decoded or block-compressed emoji sheet texels: `layers` images, each with
+/// its mip chain (levels `0..=max_level` concatenated), layer-major.
+pub enum G3EmojiPayload {
+    /// BC7 RGBA8 blocks (`16` bytes per `4×4` tile, `4×` smaller in VRAM).
+    Bc7(Vec<u8>),
+    /// Fallback packed `0xAARRGGBB` (`b | g << 8 | r << 16 | a << 24`).
+    Bgra(Vec<u32>),
+}
+
+/// The emoji sheet: `layers` mipmapped images, layer-major.
 pub struct G3EmojiSheet {
     pub width: usize,
     pub height: usize,
     pub layers: usize,
     pub max_level: usize,
-    pub bgra: Vec<u32>,
+    pub payload: G3EmojiPayload,
 }
 
 /// Process-static atlas tables (`FrameData::atlas`), uploaded once per
@@ -1370,15 +1377,20 @@ pub struct G3Tables {
     pub group_count: u32,
     /// ItemParamsGpu (64 B): 4 RGBA texels per item, 1024 wide.
     pub items: Texture,
+    items_size: (u32, u32),
     /// group_overrides (R), 1024 wide.
     pub overrides: Texture,
+    overrides_size: (u32, u32),
     /// glyph_advances (R), 1024 wide.
     pub advances: Texture,
+    advances_size: (u32, u32),
     /// The glyph map: one texel per slot, NO_CELL → -1.0.
     pub glyphmap: Texture,
+    glyphmap_size: (u32, u32),
     /// Curves: two texels per quadratic, u16 coords as exact floats.
     pub curves: Texture,
-    /// The emoji sheet (sRGB-encoded BGRA8 layers, mips).
+    curves_size: (u32, u32),
+    /// The emoji sheet (BC7-compressed RGBA8 or fallback BGRA8 layers + mips).
     pub emoji: Texture,
 }
 
@@ -1403,16 +1415,24 @@ pub struct G3GroupTable<'a> {
 impl G3Tables {
     pub fn new(cx: &mut Cx, atlas: G3AtlasTables, statics: &G3StaticTables, groups: &G3GroupTable) -> Self {
         let g = groups.table;
+        let advances_size = (atlas.advances.width, atlas.advances.height);
+        let glyphmap_size = (atlas.glyphmap.width, atlas.glyphmap.height);
+        let curves_size = (atlas.curves.width, atlas.curves.height);
         Self {
             groups: g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, g),
             groups_size: (g.width, g.height),
             group_count: groups.group_count,
-            items: g3_float_texture(cx, "item_table", TABLE_WIDTH, statics.items),
-            overrides: g3_float_texture(cx, "group_overrides", TABLE_WIDTH, statics.overrides),
-            advances: g3_float_texture_owned(cx, "glyph_advances", TABLE_WIDTH, atlas.advances),
-            glyphmap: g3_float_texture_owned(cx, "glyphmap", TABLE_WIDTH, atlas.glyphmap),
-            curves: g3_float_texture_owned(cx, "curves", TABLE_WIDTH, atlas.curves),
-            emoji: Self::emoji_texture(cx, atlas.emoji),
+            items: g3_float_texture(cx, "item_table", TABLE_WIDTH, statics.items).discard_cpu_after_upload(cx),
+            items_size: (statics.items.width, statics.items.height),
+            overrides: g3_float_texture(cx, "group_overrides", TABLE_WIDTH, statics.overrides).discard_cpu_after_upload(cx),
+            overrides_size: (statics.overrides.width, statics.overrides.height),
+            advances: g3_float_texture_owned(cx, "glyph_advances", TABLE_WIDTH, atlas.advances).discard_cpu_after_upload(cx),
+            advances_size,
+            glyphmap: g3_float_texture_owned(cx, "glyphmap", TABLE_WIDTH, atlas.glyphmap).discard_cpu_after_upload(cx),
+            glyphmap_size,
+            curves: g3_float_texture_owned(cx, "curves", TABLE_WIDTH, atlas.curves).discard_cpu_after_upload(cx),
+            curves_size,
+            emoji: Self::emoji_texture(cx, atlas.emoji).discard_cpu_after_upload(cx),
         }
     }
 
@@ -1422,22 +1442,34 @@ impl G3Tables {
         self.groups_size = (g.width, g.height);
         self.group_count = groups.group_count;
         g3_update_float_texture(cx, &self.items, "item_table", TABLE_WIDTH, statics.items);
+        self.items_size = (statics.items.width, statics.items.height);
         g3_update_float_texture(cx, &self.overrides, "group_overrides", TABLE_WIDTH, statics.overrides);
+        self.overrides_size = (statics.overrides.width, statics.overrides.height);
     }
 
     fn emoji_texture(cx: &mut Cx, sheet: G3EmojiSheet) -> Texture {
-        Texture::new_with_format(
-            cx,
-            TextureFormat::VecArrayMipBGRAu8_32 {
+        let format = match sheet.payload {
+            G3EmojiPayload::Bc7(bc7) => TextureFormat::VecArrayMipCompressed {
                 width: sheet.width,
                 height: sheet.height,
                 layers: sheet.layers,
-                data: Some(sheet.bgra),
+                format: CompressedTextureFormat::Bc7,
+                data: Some(bc7),
                 max_level: Some(sheet.max_level),
                 wrap: TextureWrap::ClampToEdge,
                 updated: TextureUpdated::Full,
             },
-        )
+            G3EmojiPayload::Bgra(bgra) => TextureFormat::VecArrayMipBGRAu8_32 {
+                width: sheet.width,
+                height: sheet.height,
+                layers: sheet.layers,
+                data: Some(bgra),
+                max_level: Some(sheet.max_level),
+                wrap: TextureWrap::ClampToEdge,
+                updated: TextureUpdated::Full,
+            },
+        };
+        Texture::new_with_format(cx, format)
     }
 
     /// Bring the group texture up to `groups`: a resized table updates the
@@ -1483,12 +1515,12 @@ impl G3Tables {
         g3_set_texture(cx, dv, live_id!(t_glyphmap), &self.glyphmap);
         g3_set_texture(cx, dv, live_id!(t_curves), &self.curves);
         g3_set_texture(cx, dv, live_id!(t_emoji), &self.emoji);
-        dv.set_uniform(cx, live_id!(u_groups_inv_size), &g3_inv_size(&self.groups, cx));
-        dv.set_uniform(cx, live_id!(u_items_inv_size), &g3_inv_size(&self.items, cx));
-        dv.set_uniform(cx, live_id!(u_overrides_inv_size), &g3_inv_size(&self.overrides, cx));
-        dv.set_uniform(cx, live_id!(u_advances_inv_size), &g3_inv_size(&self.advances, cx));
-        dv.set_uniform(cx, live_id!(u_glyphmap_inv_size), &g3_inv_size(&self.glyphmap, cx));
-        dv.set_uniform(cx, live_id!(u_curves_inv_size), &g3_inv_size(&self.curves, cx));
+        dv.set_uniform(cx, live_id!(u_groups_inv_size), &g3_inv_size(self.groups_size));
+        dv.set_uniform(cx, live_id!(u_items_inv_size), &g3_inv_size(self.items_size));
+        dv.set_uniform(cx, live_id!(u_overrides_inv_size), &g3_inv_size(self.overrides_size));
+        dv.set_uniform(cx, live_id!(u_advances_inv_size), &g3_inv_size(self.advances_size));
+        dv.set_uniform(cx, live_id!(u_glyphmap_inv_size), &g3_inv_size(self.glyphmap_size));
+        dv.set_uniform(cx, live_id!(u_curves_inv_size), &g3_inv_size(self.curves_size));
         dv.set_uniform(cx, live_id!(u_max_groups), &[self.group_count as f32]);
     }
 }
@@ -1523,7 +1555,7 @@ impl DrawG3Glyph {
     }
 }
 
-/// The selection-mask variant (`@Bgra8NoBlend`, no blend, no depth,
+/// The selection-mask variant (`@Ru8`, no blend, no depth,
 /// `u_mask_mode = 1`). Draws the same chunk publications.
 #[derive(Script, ScriptHook, Debug)]
 #[repr(C)]
@@ -1593,7 +1625,7 @@ pub struct DrawG3Composite {
 }
 
 impl DrawG3Composite {
-    /// `scene`: the RenderRGBAf16 scene target; `mask`: the RenderBGRAu8
+    /// `scene`: the RenderRGBAf16 scene target; `mask`: the RenderRu8
     /// selection mask, read only when `tint` is Some (rgb, strength).
     pub fn set_inputs(&mut self, cx: &Cx, scene: &Texture, mask: &Texture, tint: Option<[f32; 4]>) {
         let dv = &mut self.draw_super.draw_vars;
@@ -1728,7 +1760,7 @@ impl G3PhaseList {
 }
 
 /// Owns the scene pass (RGBA16F + Depth32), the selection mask pass
-/// (BGRA8), the tables, the block and mesh publications; draws one frame in
+/// (Ru8), the tables, the block and mesh publications; draws one frame in
 /// glyph3d's phase order and composites it into a rect.
 ///
 /// RESIDENCY (2026-10-26): a block is published only while the cull draws
@@ -1813,7 +1845,7 @@ impl G3Renderer {
             glyph_list: G3PhaseList::new(cx),
             color: Texture::new_with_format(cx, TextureFormat::RenderRGBAf16 { size: TextureSize::Auto, initial: true }),
             depth: Texture::new_with_format(cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true }),
-            mask: Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true }),
+            mask: Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Auto, initial: true }),
             geoms: G3MeshGeometries::new(cx),
             tables: None,
             blocks: Vec::new(),
@@ -1829,6 +1861,13 @@ impl G3Renderer {
     /// The generations consumed so far.
     pub fn seen(&self) -> G3Seen {
         self.seen
+    }
+
+    /// Re-populate GPU-only table textures on `Event::GpuReset` (their CPU
+    /// copies were released after upload via `discard_cpu_after_upload`).
+    pub fn reset_gpu(&mut self) {
+        self.tables = None;
+        self.seen = G3Seen::default();
     }
 
     fn sync(&mut self, cx: &mut Cx, inputs: &mut G3FrameInputs) {
