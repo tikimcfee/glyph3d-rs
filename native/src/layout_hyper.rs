@@ -147,19 +147,31 @@ impl HyperLayout {
             drop(sp_pass1);
             (chunks, item_chunk_ranges, agg)
         };
-        // The Derived lanes are release-time
-        // limits: past them a slot would pack a wrong lane and misplace
-        // glyphs, so the load falls back to Instanced, once, loudly.
-        let field_mode = if allow_device {
+        // The Derived lanes are release-time limits: past them a slot would
+        // pack a wrong lane and misplace glyphs. An item past one is laid
+        // out EMPTY, loudly, and every other item as it would have been: a
+        // limit costs its own file, never the load (2026-10-31; until then
+        // the whole load fell back to the Instanced field). Only where
+        // Derived slots are packed: the host instances a device-less load
+        // emits carry absolute positions and no lane (hyper-oracle's host
+        // tier lays out items past every lane on purpose).
+        if allow_device && self.device.is_some() && self.field_mode == GlyphFieldMode::Derived {
             let params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-            let (mode, note) = effective_field_mode(self.field_mode, &derived_lane_limits(&agg.prepasses, &params));
-            if let Some(note) = note {
-                log::warn!("{note}");
+            let over = derived_lane_overflow(&agg.prepasses, &params);
+            if !over.is_empty() {
+                for (item, why) in &over {
+                    log::warn!("item {item}: {why}; laid out empty, the rest of the load is unaffected");
+                }
+                let mut kept: Vec<LayoutItem<'_>> = items.to_vec();
+                for (item, _) in &over {
+                    kept[*item].bytes = &[];
+                }
+                // An emptied item has no survivors, so the second Pass 1
+                // finds nothing past a lane and this runs once.
+                return self.layout_items_internal(&kept, arena, allow_device);
             }
-            mode
-        } else {
-            self.field_mode
-        };
+        }
+        let field_mode = self.field_mode;
 
         let prepasses = agg.prepasses;
         let chunk_slot_bases = agg.chunk_slot_bases;
@@ -286,53 +298,44 @@ impl HyperLayout {
 
 /// The Derived slot's lanes have fixed widths (`glyph_field_derived::derive`:
 /// `item:20`, `row:24 | x_page:8`), asserted only in debug builds where they
-/// are packed. This is the release-time decision, made ONCE per load from
-/// Pass 1's aggregate, before any slot is emitted or any field built: the
-/// item count against `ITEM_MAX`, each item's `row_count` against `ROW_MAX`,
-/// and each column-paged item's widest column page (`max_line_cols /
-/// page_cols`) against `X_PAGE_MAX`. `Err` names the first item and limit.
-pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Result<(), String> {
+/// are packed. This is the release-time decision, made once per load from
+/// Pass 1's aggregate, before any slot is emitted or any field built: every
+/// item whose slots could not be packed, each with the limit it passes —
+/// its `row_count` against `ROW_MAX`, a column-paged item's widest column
+/// page (`max_line_cols / page_cols`) against `X_PAGE_MAX`, and an item past
+/// `ITEM_MAX` that has a glyph to place (one with none packs no lane).
+pub fn derived_lane_overflow(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Vec<(usize, String)> {
     use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
-    if prepasses.len() as u64 > u64::from(ITEM_MAX) + 1 {
-        return Err(format!(
-            "{} items, but the Derived item lane holds at most {} (ITEM_MAX {ITEM_MAX})",
-            prepasses.len(),
-            u64::from(ITEM_MAX) + 1
-        ));
-    }
+    let mut over = Vec::new();
     for (i, (pre, p)) in prepasses.iter().zip(params).enumerate() {
+        if i as u64 > u64::from(ITEM_MAX) {
+            if pre.survivor_count > 0 {
+                over.push((i, format!("past the Derived item lane, which holds {} items (ITEM_MAX {ITEM_MAX})", u64::from(ITEM_MAX) + 1)));
+            }
+            continue;
+        }
         // Rows are 0..row_count.
         if pre.row_count > 0 && pre.row_count - 1 > ROW_MAX {
-            return Err(format!(
-                "item {i}: {} rows, but the Derived row lane holds at most {} (ROW_MAX {ROW_MAX})",
-                pre.row_count,
-                u64::from(ROW_MAX) + 1
+            over.push((
+                i,
+                format!("{} rows, but the Derived row lane holds at most {} (ROW_MAX {ROW_MAX})", pre.row_count, u64::from(ROW_MAX) + 1),
             ));
+            continue;
         }
         if p.has_page && p.page_cols > 0 {
             let pages = pre.max_line_cols / p.page_cols as u32;
             if pages > X_PAGE_MAX {
-                return Err(format!(
-                    "item {i}: a line of {} leaders reaches column page {pages} at page_cols {}, but the Derived lane holds at most {X_PAGE_MAX} (X_PAGE_MAX)",
-                    pre.max_line_cols, p.page_cols
+                over.push((
+                    i,
+                    format!(
+                        "a line of {} leaders reaches column page {pages} at page_cols {}, but the Derived lane holds at most {X_PAGE_MAX} (X_PAGE_MAX)",
+                        pre.max_line_cols, p.page_cols
+                    ),
                 ));
             }
         }
     }
-    Ok(())
-}
-
-/// The field mode a load builds, given the one asked for and the lane
-/// check: a Derived request past the lanes becomes Instanced,
-/// with the warning to print. Instanced has no lanes to exceed.
-pub fn effective_field_mode(requested: GlyphFieldMode, limits: &Result<(), String>) -> (GlyphFieldMode, Option<String>) {
-    match (requested, limits) {
-        (GlyphFieldMode::Instanced, _) | (_, Ok(())) => (requested, None),
-        (mode, Err(why)) => (
-            GlyphFieldMode::Instanced,
-            Some(format!("field mode {mode} refused for this load — {why}; falling back to instanced")),
-        ),
-    }
+    over
 }
 
 /// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
@@ -1885,53 +1888,66 @@ mod tests {
         }
     }
 
-    /// THE LANE LIMITS ARE A LOAD-TIME DECISION. A synthetic prepass past
-    /// each Derived lane is refused with the item and the limit named; one
-    /// within every lane passes, including the exact boundaries.
+    /// THE LANE LIMITS ARE A LOAD-TIME DECISION, PER ITEM. Every item past a
+    /// Derived lane is named with its limit; one within every lane passes,
+    /// including the exact boundaries, and an item past the item lane with
+    /// nothing to place packs no lane and is not named.
     #[test]
-    fn derived_lane_limits_refuse_past_each_lane_and_name_the_item() {
+    fn derived_lane_overflow_names_every_item_past_a_lane() {
         use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
         let plain = ItemParams::default();
         let paged = ItemParams { has_page: true, page_cols: 10, ..ItemParams::default() };
 
         // Within: the boundary rows and the boundary column page pass.
         let ok = [prepass_with(ROW_MAX + 1, 5), prepass_with(1, (X_PAGE_MAX + 1) * 10 - 1), prepass_with(0, 0)];
-        assert_eq!(derived_lane_limits(&ok, &[plain, paged, paged]), Ok(()));
+        assert!(derived_lane_overflow(&ok, &[plain, paged, paged]).is_empty());
 
-        // Rows: item 1 has one row too many.
-        let rows = [prepass_with(3, 1), prepass_with(ROW_MAX + 2, 1)];
-        let why = derived_lane_limits(&rows, &[plain, plain]).unwrap_err();
-        assert!(why.contains("item 1") && why.contains("ROW_MAX"), "{why}");
+        // Rows and column pages, each named; a plain item has no column
+        // page to exceed, whatever its widest line.
+        let mixed = [prepass_with(3, 1), prepass_with(ROW_MAX + 2, 1), prepass_with(1, (X_PAGE_MAX + 1) * 10), prepass_with(1, (X_PAGE_MAX + 1) * 10)];
+        let over = derived_lane_overflow(&mixed, &[plain, plain, paged, plain]);
+        assert_eq!(over.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 2], "{over:?}");
+        assert!(over[0].1.contains("ROW_MAX") && over[1].1.contains("X_PAGE_MAX"), "{over:?}");
 
-        // Column pages: item 0's widest line reaches page X_PAGE_MAX + 1 —
-        // only because it IS column-paged; the same line under a plain item
-        // has no column page to exceed.
-        let wide = [prepass_with(1, (X_PAGE_MAX + 1) * 10)];
-        let why = derived_lane_limits(&wide, &[paged]).unwrap_err();
-        assert!(why.contains("item 0") && why.contains("X_PAGE_MAX"), "{why}");
-        assert_eq!(derived_lane_limits(&wide, &[plain]), Ok(()));
-
-        // Items: one past the item lane.
-        let many = vec![prepass_with(1, 1); ITEM_MAX as usize + 2];
+        // Items: the two past the item lane are named, an empty one is not.
+        let mut many = vec![prepass_with(1, 1); ITEM_MAX as usize + 4];
+        many[ITEM_MAX as usize + 2].survivor_count = 0;
         let params = vec![plain; many.len()];
-        let why = derived_lane_limits(&many, &params).unwrap_err();
-        assert!(why.contains("ITEM_MAX"), "{why}");
-        assert_eq!(derived_lane_limits(&many[..ITEM_MAX as usize + 1], &params[..ITEM_MAX as usize + 1]), Ok(()));
+        let over = derived_lane_overflow(&many, &params);
+        let first_past = ITEM_MAX as usize + 1;
+        assert_eq!(over.iter().map(|o| o.0).collect::<Vec<_>>(), [first_past, first_past + 2], "{over:?}");
+        assert!(over[0].1.contains("ITEM_MAX"), "{over:?}");
     }
 
-    /// The fallback decision: Derived past the lanes becomes Instanced with
-    /// a warning that names the reason; within them, or for Instanced
-    /// itself, the request stands and nothing is said.
+    /// An item past a lane costs that item alone (2026-10-31: the torvalds/linux
+    /// rule — a limit drops its component, never the load). Item 1's line
+    /// reaches a column page past `X_PAGE_MAX`; it is laid out empty, and
+    /// items 0 and 2 land exactly where a load without it puts them: the
+    /// same placements, the same Derived slots in the host blocks.
     #[test]
-    fn effective_field_mode_falls_back_to_instanced_past_the_lanes() {
-        let refused: Result<(), String> = Err("item 7: too many rows".into());
-        let mode = GlyphFieldMode::Derived;
-        let (got, note) = effective_field_mode(mode, &refused);
-        assert_eq!(got, GlyphFieldMode::Instanced);
-        let note = note.expect("a fallback is announced");
-        assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
-        assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
-        assert_eq!(effective_field_mode(GlyphFieldMode::Instanced, &refused), (GlyphFieldMode::Instanced, None));
+    fn an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched() {
+        use crate::layout::{GlyphArena, LayoutGlyphs, LayoutItem, SlotResidence, DEFAULT_COLOR_PACKED};
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let plain = ItemParams { line_height: 1.25, ..ItemParams::default() };
+        let paged = ItemParams { has_page: true, page_cols: 1, page_rows: 4, ..plain };
+        let wide = "x".repeat(glyph_field_derived::X_PAGE_MAX as usize + 2);
+        let item = |bytes, params, group_id| LayoutItem { bytes, params, group_id, paint: Paint::Flat(DEFAULT_COLOR_PACKED) };
+        let run = |items: &[LayoutItem<'_>]| {
+            let mut arena = GlyphArena::new();
+            let mut engine = HyperLayout::with_device(crate::gpu::SharedDevice::from_ctx(&ctx), GlyphFieldMode::Derived);
+            let placements = engine.layout_items(items, &mut arena).expect("layout");
+            let Some(SlotResidence::Host(slots)) = arena.take_emitted().map(|e| e.residence) else {
+                panic!("a Derived load with a device emits host blocks");
+            };
+            let words: Vec<u32> = (0..slots.len() as u32).flat_map(|k| slots.slot(k).to_vec()).collect();
+            (placements, words)
+        };
+        let (with, with_words) = run(&[item(b"fn a() {}\n", plain, 0), item(wide.as_bytes(), paged, 1), item(b"let b = 2;\n", plain, 2)]);
+        let (without, without_words) = run(&[item(b"fn a() {}\n", plain, 0), item(b"", paged, 1), item(b"let b = 2;\n", plain, 2)]);
+        assert_eq!((with[1].slot_count, with[1].record_count), (0, 0), "the item past the lane is empty");
+        assert!(with.iter().zip(&without).all(|(a, b)| a.bit_eq(b)), "placements differ from a load without the item");
+        assert_eq!(with_words, without_words, "the other items' slots differ");
+        assert!(with[0].slot_count > 0 && with[2].slot_count > 0, "the other items placed nothing");
     }
 
     /// `max_line_cols` is the widest line in leaders over the whole item,

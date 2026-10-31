@@ -355,6 +355,7 @@ pub enum Paint<'a> {
 
 /// One item to lay out: the bytes, how to lay them out, how to paint them, and
 /// which group row the resulting instances answer to.
+#[derive(Clone, Copy)]
 pub struct LayoutItem<'a> {
     pub bytes: &'a [u8],
     pub params: ItemParams,

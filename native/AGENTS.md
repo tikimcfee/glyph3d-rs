@@ -122,16 +122,16 @@ caller; the short version:
   - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
     held byte-equal to every golden by the `--field-mode instanced`
     equivalent until step 3 deletes its crate.
-  - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
-    2026-10-10): item count vs `ITEM_MAX`, rows per item vs `ROW_MAX`, column pages
-    vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), checked once per load before
-    any slot is emitted. A Derived load past them falls back to
-    `instanced` with ONE warning naming the item and the limit; the field the scene
-    builds follows the arena, and the panel/HUD show the mode actually built.
-    TEMPORARY (2026-10-11): with Derived the default, this fall-back is the
-    last thing Instanced does for a default load; step 3 of its retirement
-    makes it a refusal (workarounds: widen a lane, or split an oversized file
-    into several items).
+  - **The Derived lanes are a load-time limit, per file** (`layout_hyper::derived_lane_overflow`,
+    2026-10-10; per file since 2026-10-31): rows per item vs `ROW_MAX`, column pages
+    vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), and items with a glyph past
+    `ITEM_MAX`, checked once per load before any slot is emitted. Each item past a
+    lane is laid out EMPTY with a warning naming it and its limit; every other item
+    lands exactly where it would have (`an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched`).
+    A limit costs its own file, never the load: torvalds/linux must always load
+    (Ivan, 2026-10-31). Until that day the whole load fell back to Instanced. The
+    emptied file keeps its bytes, so the pick cache refuses it (its bytes re-derive
+    slots the layout never placed) rather than map a verb onto the next file's slots.
 - **Tab stops are a recipe parameter** (`ItemParams::tab_width`, the
   type `fold::TabWidth`; 2026-10-11): a tab spans to the next multiple of N
   display cells of its logical line. A repo load takes `--tab-width`, else

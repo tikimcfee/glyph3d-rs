@@ -206,8 +206,8 @@ pub struct Cli {
     /// the item table), `instanced` (one full 32 B placement record per
     /// glyph, read as-is by the vertex stage; being retired). Switchable
     /// live from the Debug panel's
-    /// selector (the scene rebuilds); a load past the Derived slot lanes
-    /// falls back to `instanced` and says so.
+    /// selector (the scene rebuilds). A file past the Derived slot lanes is
+    /// laid out empty and named; the rest of the load is unaffected.
     #[arg(long, value_name = "MODE", default_value = "derived")]
     pub field_mode: glyph_field::GlyphFieldMode,
     /// Ground/sky environment behind the glyph scene: `off` or `ground`

@@ -208,7 +208,7 @@ impl GlyphScene {
         // glyph_field::upload_host_slots).
         // The field the scene BUILDS follows the arena, not the request: the
         // layout may have fallen back (a Derived load past the slot lanes —
-        // `layout_hyper::derived_lane_limits` — emits Instanced and says
+        // `layout_hyper::derived_lane_overflow`, before 2026-10-31 — emitted Instanced and said
         // so). The probe reads `field.mode()`, so the panel and the HUD show
         // what was built.
         let built_mode = match arena.emitted_slots() {
