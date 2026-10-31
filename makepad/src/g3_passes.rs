@@ -1301,29 +1301,63 @@ impl DrawG3Region {
 // Pass 5: glyphs — tables, params and the retained blocks
 // ---------------------------------------------------------------------------
 
-/// The emoji sheet: `layers` RGBA8 images, each with its mip chain
-/// (levels 0..=max_level concatenated), layer-major, as glyph3d loads it.
-#[derive(Clone, Copy)]
-pub struct G3EmojiSheet<'a> {
+/// The emoji sheet: `layers` BGRA8 images (`b | g << 8 | r << 16 | a << 24`),
+/// each with its mip chain (levels 0..=max_level concatenated), layer-major.
+pub struct G3EmojiSheet {
     pub width: usize,
     pub height: usize,
     pub layers: usize,
     pub max_level: usize,
-    pub rgba: &'a [u8],
+    pub bgra: Vec<u32>,
 }
 
-fn g3_float_texture(cx: &mut Cx, name: &str, width: u32, table: &FloatTexture) -> Texture {
-    assert_eq!(table.width, width, "{name}: the shader addresses a {width}-wide table");
-    let (w, h) = (table.width as usize, table.height as usize);
-    assert_eq!(table.data.len(), w * h * table.channels as usize, "{name}: payload is not {w}x{h}x{}", table.channels);
-    let data = Some(table.data.to_vec());
+/// Process-static atlas tables (`FrameData::atlas`), uploaded once per
+/// `atlas_generation` and kept across scene relayouts and override edits.
+pub struct G3AtlasTables {
+    pub glyphmap: FloatTexture,
+    pub curves: FloatTexture,
+    pub advances: FloatTexture,
+    pub emoji: G3EmojiSheet,
+}
+
+fn g3_float_texture_vec(cx: &mut Cx, name: &str, width: u32, w: u32, h: u32, channels: u32, vec: Vec<f32>) -> Texture {
+    assert_eq!(w, width, "{name}: the shader addresses a {width}-wide table");
+    let (w, h) = (w as usize, h as usize);
+    assert_eq!(vec.len(), w * h * channels as usize, "{name}: payload is not {w}x{h}x{channels}");
+    let data = Some(vec);
     let updated = TextureUpdated::Full;
-    let format = match table.channels {
+    let format = match channels {
         4 => TextureFormat::VecRGBAf32 { width: w, height: h, data, updated },
         1 => TextureFormat::VecRf32 { width: w, height: h, data, updated },
         c => panic!("{name}: {c}-channel float tables have no texture format"),
     };
     Texture::new_with_format(cx, format)
+}
+
+fn g3_float_texture(cx: &mut Cx, name: &str, width: u32, table: &FloatTexture) -> Texture {
+    g3_float_texture_vec(cx, name, width, table.width, table.height, table.channels, table.data.to_vec())
+}
+
+fn g3_float_texture_owned(cx: &mut Cx, name: &str, width: u32, table: FloatTexture) -> Texture {
+    g3_float_texture_vec(cx, name, width, table.width, table.height, table.channels, table.data)
+}
+
+fn g3_update_float_texture(cx: &mut Cx, tex: &Texture, name: &str, expected_width: u32, table: &FloatTexture) {
+    assert_eq!(table.width, expected_width, "{name}: the shader addresses a {expected_width}-wide table");
+    let (w, h) = (table.width as usize, table.height as usize);
+    assert_eq!(table.data.len(), w * h * table.channels as usize, "{name}: payload is not {w}x{h}x{}", table.channels);
+    match (table.channels, tex.get_format(cx)) {
+        (4, TextureFormat::VecRGBAf32 { width, height, data, updated })
+        | (1, TextureFormat::VecRf32 { width, height, data, updated }) => {
+            *width = w;
+            *height = h;
+            let buf = data.get_or_insert_with(Vec::new);
+            buf.clear();
+            buf.extend_from_slice(&table.data);
+            *updated = TextureUpdated::Full;
+        }
+        (c, _) => panic!("{name}: {c}-channel float table does not match existing texture format"),
+    }
 }
 
 /// glyph3d's GPU tables as Makepad lookup textures, read with
@@ -1348,15 +1382,11 @@ pub struct G3Tables {
     pub emoji: Texture,
 }
 
-/// The tables that change on load or edit (everything but the groups).
+/// The scene tables that change on scene load, relayout or override edit.
 #[derive(Clone, Copy)]
 pub struct G3StaticTables<'a> {
-    pub glyphmap: &'a FloatTexture,
-    pub curves: &'a FloatTexture,
-    pub advances: &'a FloatTexture,
     pub items: &'a FloatTexture,
     pub overrides: &'a FloatTexture,
-    pub emoji: G3EmojiSheet<'a>,
 }
 
 /// The group table and what changed in it since the renderer last saw it.
@@ -1371,7 +1401,7 @@ pub struct G3GroupTable<'a> {
 }
 
 impl G3Tables {
-    pub fn new(cx: &mut Cx, statics: &G3StaticTables, groups: &G3GroupTable) -> Self {
+    pub fn new(cx: &mut Cx, atlas: G3AtlasTables, statics: &G3StaticTables, groups: &G3GroupTable) -> Self {
         let g = groups.table;
         Self {
             groups: g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, g),
@@ -1379,29 +1409,30 @@ impl G3Tables {
             group_count: groups.group_count,
             items: g3_float_texture(cx, "item_table", TABLE_WIDTH, statics.items),
             overrides: g3_float_texture(cx, "group_overrides", TABLE_WIDTH, statics.overrides),
-            advances: g3_float_texture(cx, "glyph_advances", TABLE_WIDTH, statics.advances),
-            glyphmap: g3_float_texture(cx, "glyphmap", TABLE_WIDTH, statics.glyphmap),
-            curves: g3_float_texture(cx, "curves", TABLE_WIDTH, statics.curves),
-            emoji: Self::emoji_texture(cx, &statics.emoji),
+            advances: g3_float_texture_owned(cx, "glyph_advances", TABLE_WIDTH, atlas.advances),
+            glyphmap: g3_float_texture_owned(cx, "glyphmap", TABLE_WIDTH, atlas.glyphmap),
+            curves: g3_float_texture_owned(cx, "curves", TABLE_WIDTH, atlas.curves),
+            emoji: Self::emoji_texture(cx, atlas.emoji),
         }
     }
 
-    /// RGBA8 bytes → BGRA u32 texels (`b | g << 8 | r << 16 | a << 24`).
-    fn emoji_texture(cx: &mut Cx, sheet: &G3EmojiSheet) -> Texture {
-        let data: Vec<u32> = sheet
-            .rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|p| (p[2] as u32) | ((p[1] as u32) << 8) | ((p[0] as u32) << 16) | ((p[3] as u32) << 24))
-            .collect();
+    pub fn update_scene(&mut self, cx: &mut Cx, statics: &G3StaticTables, groups: &G3GroupTable) {
+        let g = groups.table;
+        g3_update_float_texture(cx, &self.groups, "groups", GROUP_TABLE_WIDTH, g);
+        self.groups_size = (g.width, g.height);
+        self.group_count = groups.group_count;
+        g3_update_float_texture(cx, &self.items, "item_table", TABLE_WIDTH, statics.items);
+        g3_update_float_texture(cx, &self.overrides, "group_overrides", TABLE_WIDTH, statics.overrides);
+    }
+
+    fn emoji_texture(cx: &mut Cx, sheet: G3EmojiSheet) -> Texture {
         Texture::new_with_format(
             cx,
             TextureFormat::VecArrayMipBGRAu8_32 {
                 width: sheet.width,
                 height: sheet.height,
                 layers: sheet.layers,
-                data: Some(data),
+                data: Some(sheet.bgra),
                 max_level: Some(sheet.max_level),
                 wrap: TextureWrap::ClampToEdge,
                 updated: TextureUpdated::Full,
@@ -1409,14 +1440,14 @@ impl G3Tables {
         )
     }
 
-    /// Bring the group texture up to `groups`: a resized table is a new
-    /// texture; otherwise only the dirty rectangles are copied and uploaded
-    /// (all of it when none are named).
+    /// Bring the group texture up to `groups`: a resized table updates the
+    /// handle's dimensions in place; otherwise only the dirty rectangles are
+    /// copied and uploaded (all of it when none are named).
     pub fn update_groups(&mut self, cx: &mut Cx, groups: &G3GroupTable) {
         let g = groups.table;
         self.group_count = groups.group_count;
         if (g.width, g.height) != self.groups_size {
-            self.groups = g3_float_texture(cx, "groups", GROUP_TABLE_WIDTH, g);
+            g3_update_float_texture(cx, &self.groups, "groups", GROUP_TABLE_WIDTH, g);
             self.groups_size = (g.width, g.height);
             return;
         }
@@ -1616,9 +1647,11 @@ pub struct G3Selection<'a> {
 /// the one it last consumed (`G3Renderer::seen`), so a host may pass the
 /// same borrowed data every frame at no cost. Glyph blocks need no
 /// generation: a block's identity (`Arc::ptr_eq`) is its generation.
-#[derive(Clone, Copy)]
 pub struct G3FrameInputs<'a> {
-    // ── on load / on edit ──
+    // ── once per atlas ──
+    pub atlas_generation: u64,
+    pub atlas: Option<G3AtlasTables>,
+    // ── on load / on relayout / on override edit ──
     pub tables_generation: u64,
     pub tables: &'a G3StaticTables<'a>,
     /// The Derived field's chunks, in arena order: DerivedSlot words as f32
@@ -1661,6 +1694,7 @@ pub struct G3FrameInputs<'a> {
 /// group dirty rects once `groups` reaches the generation they belong to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct G3Seen {
+    pub atlas: Option<u64>,
     pub tables: Option<u64>,
     pub groups: Option<u64>,
     pub meshes: Option<u64>,
@@ -1797,9 +1831,17 @@ impl G3Renderer {
         self.seen
     }
 
-    fn sync(&mut self, cx: &mut Cx, inputs: &G3FrameInputs) {
-        if self.seen.tables != Some(inputs.tables_generation) || self.tables.is_none() {
-            self.tables = Some(G3Tables::new(cx, inputs.tables, &inputs.groups));
+    fn sync(&mut self, cx: &mut Cx, inputs: &mut G3FrameInputs) {
+        if self.seen.atlas != Some(inputs.atlas_generation) || self.tables.is_none() {
+            let atlas = inputs.atlas.take().expect("new atlas_generation requires G3FrameInputs::atlas");
+            self.tables = Some(G3Tables::new(cx, atlas, inputs.tables, &inputs.groups));
+            self.seen.atlas = Some(inputs.atlas_generation);
+            self.seen.tables = Some(inputs.tables_generation);
+            self.seen.groups = Some(inputs.groups_generation);
+        } else if self.seen.tables != Some(inputs.tables_generation) {
+            if let Some(tables) = &mut self.tables {
+                tables.update_scene(cx, inputs.tables, &inputs.groups);
+            }
             self.seen.tables = Some(inputs.tables_generation);
             self.seen.groups = Some(inputs.groups_generation);
         } else if self.seen.groups != Some(inputs.groups_generation) {
@@ -1887,7 +1929,7 @@ impl G3Renderer {
     /// pass list follows the inputs: sky and ground only with an env (ground
     /// only from above), the mask pass only with a selection, empty lists
     /// draw nothing. Returns the composite's area.
-    pub fn draw_frame(&mut self, cx: &mut Cx2d, draws: &mut G3Draws, rect: Rect, inputs: &G3FrameInputs) -> Area {
+    pub fn draw_frame(&mut self, cx: &mut Cx2d, draws: &mut G3Draws, rect: Rect, inputs: &mut G3FrameInputs) -> Area {
         self.sync(cx, inputs);
         let (Some(tables), Some(meshes)) = (&self.tables, &self.meshes) else {
             return Area::Empty;
