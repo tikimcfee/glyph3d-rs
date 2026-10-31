@@ -145,11 +145,9 @@ fn main() {
                 _ => None,
             };
             if let Some(emoji_sheet) = emoji_sheet_path {
-                let dev = ctx.device.clone();
-                let q = ctx.queue.clone();
                 let atlas_handle = std::thread::spawn(move || {
                     let t = std::time::Instant::now();
-                    let a = atlas::Atlas::load_device(&dev, &q, &emoji_sheet);
+                    let a = atlas::Atlas::load(&emoji_sheet);
                     log::info!("prefetched atlas loaded in {:?}", t.elapsed());
                     a
                 });
