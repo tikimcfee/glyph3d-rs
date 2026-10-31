@@ -111,6 +111,18 @@ pub fn atlas_tables(dir: &Path) -> AtlasTables {
     }
 }
 
+/// [`atlas_tables`] from an atlas already loaded (a scene's, 2026-10-31:
+/// `FrameData::atlas`), so a host renderer converts the tables the scene
+/// was staged against without reading or decoding them again.
+pub fn atlas_tables_of(atlas: &atlas::Atlas) -> AtlasTables {
+    let (gm, cv) = (&atlas.glyphmap, &atlas.curves);
+    AtlasTables {
+        glyphmap: glyphmap_texels(gm.width(), gm.height(), gm.payload()),
+        curves: curve_texels(cv.width(), cv.height(), cv.payload()),
+        glyph_advances: advance_texels(&atlas.glyph_advances),
+    }
+}
+
 /// The glyph map, one texel per slot: every lane exact, NO_CELL in the
 /// `emoji_cell` lane as -1.0. NO_CELL in any other lane is refused like any
 /// integer past 2^24.

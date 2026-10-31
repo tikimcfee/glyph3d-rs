@@ -1144,16 +1144,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glyph-field-instanced"
-version = "0.1.0"
-dependencies = [
- "bytemuck 1.25.2",
- "encase",
- "glyph-field",
- "wgpu",
-]
-
-[[package]]
 name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
@@ -1168,8 +1158,6 @@ dependencies = [
  "glyph-field",
  "glyph3d-native",
  "makepad-widgets",
- "pollster",
- "wgpu",
 ]
 
 [[package]]
@@ -1186,7 +1174,6 @@ dependencies = [
  "glam",
  "glyph-field",
  "glyph-field-derived",
- "glyph-field-instanced",
  "glyph-scene-graph",
  "image",
  "log",
@@ -1503,6 +1490,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-a11y"
+version = "0.1.0"
+
+[[package]]
 name = "makepad-alloc-epoch"
 version = "1.0.0"
 
@@ -1525,7 +1516,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-atspi"
+version = "0.1.0"
+dependencies = [
+ "makepad-dbus-wire",
+]
+
+[[package]]
 name = "makepad-byteorder-lite"
+version = "0.1.0"
+
+[[package]]
+name = "makepad-dbus-wire"
 version = "0.1.0"
 
 [[package]]
@@ -1570,7 +1572,7 @@ dependencies = [
  "rustybuzz",
  "ttf-parser",
  "unicode-bidi",
- "unicode-linebreak",
+ "unicode-script",
  "unicode-segmentation 1.12.0",
 ]
 
@@ -1604,6 +1606,7 @@ dependencies = [
  "rustybuzz",
  "sdfer",
  "ttf-parser",
+ "unicode-script",
 ]
 
 [[package]]
@@ -1633,7 +1636,10 @@ name = "makepad-hal"
 version = "1.0.0"
 dependencies = [
  "fxhash",
+ "makepad-a11y",
  "makepad-apple-sys",
+ "makepad-atspi",
+ "makepad-dbus-wire",
  "makepad-font-core",
  "makepad-gpu-trace",
  "makepad-jni-sys",
@@ -1754,10 +1760,12 @@ version = "2.0.0"
 dependencies = [
  "bitflags 2.10.0",
  "foldhash 0.2.0",
+ "makepad-a11y",
  "makepad-alloc-epoch",
  "makepad-android-state",
  "makepad-apple-sys",
  "makepad-futures",
+ "makepad-gpu-trace",
  "makepad-hal",
  "makepad-jni-sys",
  "makepad-key-code",
@@ -1838,6 +1846,7 @@ dependencies = [
  "makepad-network",
  "makepad-strict-json",
  "makepad-toml-parser",
+ "makepad-windows-sys",
 ]
 
 [[package]]
@@ -3218,10 +3227,6 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
-
-[[package]]
-name = "unicode-linebreak"
-version = "0.1.5"
 
 [[package]]
 name = "unicode-properties"

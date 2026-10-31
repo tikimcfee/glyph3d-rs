@@ -175,6 +175,10 @@ pub struct FrameData<'a> {
     pub group_overrides_version: u64,
     /// The item table the Derived shader reads, fixed for the scene's life.
     pub item_table: &'a [glyph_field::ItemParamsGpu],
+    /// The atlas the scene was staged against (glyph map, curves, advances,
+    /// the emoji sheet's levels), fixed for the scene's life: a host
+    /// renderer's static tables, held by the `Arc` as long as it needs them.
+    pub atlas: &'a std::sync::Arc<crate::atlas::Atlas>,
     // ── for the wgpu half only ──
     pub costs: FrameCosts,
     /// The frame uniform the stored fields' shaders read.
@@ -349,6 +353,7 @@ impl GlyphScene {
             group_overrides: self.field.group_overrides(),
             group_overrides_version: self.field.group_overrides_version(),
             item_table: &self.item_table,
+            atlas: &self.atlas,
             costs,
             uniform,
         }

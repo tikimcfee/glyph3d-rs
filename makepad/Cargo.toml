@@ -27,11 +27,9 @@ path = "src/main.rs"
 glyph3d-native = { path = "../native", default-features = false }
 glyph-field = { path = "../crates/glyph-field" }
 makepad-widgets = { path = "../../makepad/widgets", default-features = false }
-# What the engine's API still takes while it builds against a wgpu device
-# (the scene, the stand-in viewport) and its CLI, which the host parses as
-# its own: the versions the engine resolves, so the graph unifies.
-wgpu = "30"
-pollster = "0.4"
+# The engine's CLI, which the host parses as its own: the version the
+# engine resolves, so the graph unifies. (wgpu and pollster were here while
+# the engine's scene built against a wgpu device, until 2026-10-31.)
 clap = "4"
 
 [workspace]

@@ -118,7 +118,7 @@ impl Widget for Glyph3dViewport {
                 Event::MouseMove(me) => {
                     let (dx, dy) = (me.lock_delta.x as f32, me.lock_delta.y as f32);
                     if dx != 0.0 || dy != 0.0 {
-                        host.scene.on_mouse_look(&host.ctx, dx, dy);
+                        host.scene.on_mouse_look(dx, dy);
                     }
                     cx.repin_mouse_pointer();
                     return;
@@ -138,21 +138,21 @@ impl Widget for Glyph3dViewport {
                     Some(b) if b.is_secondary() => self.set_looking(cx, host, true),
                     Some(b) if b.is_primary() && !host.looking => {
                         let (x, y) = self.physical(cx, fe.abs);
-                        host.scene.on_click(&host.ctx, x, y);
+                        host.scene.on_click(x, y);
                     }
                     _ => {}
                 }
             }
             Hit::FingerMove(fe) => {
                 let (x, y) = self.physical(cx, fe.abs);
-                host.scene.on_cursor(&host.ctx, x, y);
+                host.scene.on_cursor(x, y);
             }
             Hit::FingerHoverIn(fh) | Hit::FingerHoverOver(fh) => {
                 let (x, y) = self.physical(cx, fh.abs);
-                host.scene.on_cursor(&host.ctx, x, y);
+                host.scene.on_cursor(x, y);
             }
             Hit::FingerScroll(fs) => {
-                host.scene.on_scroll(&host.ctx, (-fs.scroll.y / PX_PER_LINE) as f32);
+                host.scene.on_scroll((-fs.scroll.y / PX_PER_LINE) as f32);
             }
             // Backquote toggles mouse-look (a hand without a usable right
             // button), Escape ends it; neither is the scene's.
