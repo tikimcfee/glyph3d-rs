@@ -71,7 +71,7 @@ impl GlyphScene {
         // The rows as nodes under an identity root: the first frame's resolve
         // rebuilds columns 0-3 of every row with the bits uploaded here, so
         // only a row a library load moved goes up again.
-        let mut nodes = super::nodes::GroupNodes::new(&group_buf, &groups);
+        let mut nodes = super::nodes::GroupNodes::new(&groups);
         // Each view's node is its group row's (`crate::views`).
         let mut views = staged.views;
         views.attach_nodes(|group_row| nodes.node(group_row));
@@ -355,8 +355,6 @@ impl GlyphScene {
 
         Self {
             field,
-            _emoji_view: emoji_view,
-            camera_buf,
             depth_format,
             center,
             half_w,
@@ -365,7 +363,6 @@ impl GlyphScene {
             camera_mode,
             fly,
             cull,
-            group_buf,
             nodes,
             views,
             pick,
@@ -384,19 +381,25 @@ impl GlyphScene {
             viewport: Cell::new((1600, 1000)), // refreshed every render()
             tint_step,
             ui_probe: None,
-            device: device.clone(),
-            composite,
-            params_buf,
             params: Cell::new(params),
             params_generation: Cell::new(0),
-            params_uploaded: Cell::new(0),
-            mesh_pipeline,
-            mesh_frame_bg,
             library_faces,
             library_regions,
             picked_region: None,
             scene_min_y: staged.bounds_min[1],
-            environment: super::environment::Environment::new(device, depth_format),
+            environment: super::environment::Environment::new(),
+            gpu: super::renderer::SceneGpu {
+                device: device.clone(),
+                environment: super::environment::EnvironmentGpu::new(device, depth_format),
+                camera_buf,
+                params_buf,
+                params_uploaded: Cell::new(0),
+                group_buf,
+                mesh_pipeline,
+                mesh_frame_bg,
+                _emoji_view: emoji_view,
+                composite,
+            },
             item_table,
         }
     }
