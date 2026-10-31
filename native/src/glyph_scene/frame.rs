@@ -160,14 +160,14 @@ pub struct FrameData<'a> {
     pub meshes_generation: u64,
     pub quads: &'a [MeshInstance],
     pub cubes: &'a [MeshInstance],
-    // ── what a host renderer draws the glyphs from (2026-10-26; the wgpu
-    // half binds the field's own buffers) ──
-    /// The field's slots on the host, in blocks that are its chunks
-    /// (Derived; None for a field without them). A block's `Arc` identity
-    /// is its generation: a write gives the block it touched a new one.
-    pub slots: Option<Ref<'a, glyph_field::HostSlots>>,
+    // ── what a renderer draws the glyphs from (2026-10-26; the wgpu half
+    // syncs its device copy from the field itself, 2026-10-31) ──
+    /// The field's slots on the host, in blocks that are its chunks. A
+    /// consumer holding the blocks' `Arc`s sees a written block as a new
+    /// one; one holding none reads `HostSlots::version`.
+    pub slots: Ref<'a, glyph_field::HostSlots>,
     /// The Derived field's group overrides table (index 0 unused).
-    pub group_overrides: Option<Ref<'a, [u32]>>,
+    pub group_overrides: Ref<'a, [u32]>,
     /// The item table the Derived shader reads, fixed for the scene's life.
     pub item_table: &'a [glyph_field::ItemParamsGpu],
     // ── for the wgpu half only ──

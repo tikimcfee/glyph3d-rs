@@ -6,8 +6,8 @@ use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
 use crate::layout::EmittedSlots;
 use crate::text::StagedText;
-use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
-use glyph_field_derived::DerivedField;
+use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldGpu, GlyphFieldMode, SlotSource};
+use glyph_field_derived::{DerivedField, DerivedFieldGpu};
 use super::{
     CameraMode, CullState, FlyCamera, GlyphScene,
     cull::SegCull,
@@ -186,10 +186,6 @@ impl GlyphScene {
             emoji_sheet: &emoji_view,
             emoji_sampler: &emoji_sampler,
             glyph_advances: &atlas_gpu.glyph_advances,
-            item_params: &item_table,
-            item_of_group: &item_of_group,
-            block_slots: crate::config::settings().glyph_scene.derived_block_slots as usize,
-            slots_on_device: !ctx.host_draws_glyphs,
         };
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let targets = FieldTargets {
@@ -201,30 +197,27 @@ impl GlyphScene {
         // The arena's forms map onto the field's sources. An EMITTED arena is
         // already the field's own slots: 20 B DerivedSlots in host blocks the
         // Derived field keeps. A HOST arena is the engine's neutral records,
-        // which the field transcodes and uploads. Unified-memory direct upload
-        // is a property of the adapter, decided here (Metal +
-        // MAPPABLE_PRIMARY_BUFFERS — see glyph_field::upload_host_slots).
-        // (Until 2026-10-31 a load past the Derived lanes fell back to the
-        // Instanced field, and the field built here followed the arena; a
-        // file past a lane is now laid out empty instead.)
+        // which the field transcodes into its blocks. Either way the field
+        // keeps its slots on the host and its draw uploads them
+        // (`DerivedFieldGpu`). (Until 2026-10-31 a load past the Derived
+        // lanes fell back to the Instanced field, and the field built here
+        // followed the arena; a file past a lane is now laid out empty.)
         let source = match arena.take_emitted() {
             Some(EmittedSlots { slots, .. }) => SlotSource::Blocks(slots),
-            None => SlotSource::Host {
-                slices: arena.instance_chunks(),
-                glyph_count: instances_len,
-                direct_host_upload: ctx.profile.backend == wgpu::Backend::Metal
-                    && ctx.profile.mappable_primary_buffers,
-            },
+            None => SlotSource::Host { slices: arena.instance_chunks(), glyph_count: instances_len },
         };
+        let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
         let field: Box<dyn GlyphField> = match field_mode {
-            GlyphFieldMode::Derived => Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets)),
+            GlyphFieldMode::Derived => Box::new(DerivedField::new(source, &item_table, &item_of_group, block_slots)),
+        };
+        let field_gpu: Box<dyn GlyphFieldGpu> = match field_mode {
+            GlyphFieldMode::Derived => Box::new(DerivedFieldGpu::new(device, &ctx.queue, &*field, &resources, targets)),
         };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
         log::info!(
-            "glyph field ({}{}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
+            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
             field.mode(),
-            if field.slots_on_device() { "" } else { ", host blocks only: the host draws them" },
             instances_len,
             (instances_len * field.slot_bytes() as usize) >> 20,
             field.chunk_count(),
@@ -235,7 +228,7 @@ impl GlyphScene {
         // Stage L (L4): create selection mask pipeline unconditionally so both
         // windowed platforms (Metal Bgra8UnormSrgb and Linux/Vulkan Rgba8UnormSrgb)
         // render selection visuals.
-        let mask_pipeline = Some(field.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
+        let mask_pipeline = Some(field_gpu.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
@@ -393,6 +386,7 @@ impl GlyphScene {
                 backdrops,
                 face_instances,
                 regions: regions_gpu,
+                field: field_gpu,
                 camera_buf,
                 params_buf,
                 params_uploaded: Cell::new(0),
@@ -495,7 +489,7 @@ mod tests {
         let mut scene = GlyphScene::new(ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
         scene.set_viewport(crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
 
-        let held: Vec<Arc<[u32]>> = scene.field.host_slots().expect("a Derived field keeps host blocks").blocks().to_vec();
+        let held: Vec<Arc<[u32]>> = scene.field.host_slots().blocks().to_vec();
         assert!(held.len() >= 2, "g-pick-repo spans more than one block");
 
         let pick = SceneLike::apply_pick(&mut scene, ctx, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
@@ -509,48 +503,49 @@ mod tests {
         (scene, held)
     }
 
-    /// The Derived field keeps its slots in host blocks (2026-10-26), and a
-    /// renderer that draws from them (makepad) sees only them: every write
-    /// must land in the block as it lands in the buffer. A load of
-    /// g-pick-repo (two blocks at the default 262144 slots) is held as a
-    /// renderer holds it, edited ([`edited_derived_scene`]), then every
-    /// block is compared with its buffer read back.
-    /// Only the edited block may change identity: an untouched one
-    /// republished would re-upload for nothing.
+    /// The Derived field keeps its slots in host blocks (2026-10-26), and
+    /// since 2026-10-31 its edits land there alone: the wgpu draw's device
+    /// copy follows at the frame's sync, block by block. A load of
+    /// g-pick-repo (two blocks at the default 262144 slots) is edited
+    /// ([`edited_derived_scene`]); before the sync the edited block's buffer
+    /// still holds the load and the other's equals its block, and after it
+    /// every buffer equals its block.
     #[test]
     fn derived_host_blocks_follow_every_slot_write() {
         let ctx = pollster::block_on(crate::gpu::init(None));
-        let (scene, held) = edited_derived_scene(&ctx);
-        let host = scene.field.host_slots().expect("a Derived field keeps host blocks");
-        let mut changed = 0;
-        for (k, block) in host.blocks().iter().enumerate() {
-            let mut gpu = vec![0u32; block.len()];
-            scene.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
-            assert!(gpu[..] == block[..], "block {k}: the host block and its buffer differ after the edits");
-            if !Arc::ptr_eq(block, &held[k]) {
-                changed += 1;
-                assert!(block[..] != held[k][..], "block {k} changed identity with no change of content");
-            }
+        let (scene, _held) = edited_derived_scene(&ctx);
+        let device_copy = |k: usize| {
+            let host = scene.field.host_slots();
+            let mut gpu = vec![0u32; host.blocks()[k].len()];
+            scene.gpu.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
+            gpu
+        };
+        let blocks = scene.field.host_slots().blocks().len();
+        let stale: Vec<usize> = (0..blocks).filter(|&k| device_copy(k)[..] != scene.field.host_slots().blocks()[k][..]).collect();
+        assert_eq!(stale, [0], "before the sync only the edited block (alpha.rs's, block 0) differs on the device");
+        scene.gpu.field.sync(&ctx.queue, &*scene.field);
+        for k in 0..blocks {
+            assert!(device_copy(k)[..] == scene.field.host_slots().blocks()[k][..], "block {k}: the host block and its buffer differ after the sync");
         }
-        assert_eq!(changed, 1, "the edits are all in alpha.rs, one block: only it is a fresh allocation");
     }
 
-    /// A field built for a host renderer (`GpuContext::host_draws_glyphs`)
-    /// holds no device copy of its slots, and the same edits leave its
-    /// blocks exactly where the device field's are.
+    /// The edits touch one block (all are in alpha.rs), and only it moves:
+    /// its version, and, held as a makepad host holds the blocks, its
+    /// identity (a fresh allocation, copy-on-write). An untouched block
+    /// republished or re-uploaded would go up for nothing.
     #[test]
-    fn a_host_drawn_field_keeps_blocks_alone_and_edits_them_alike() {
+    fn edits_move_only_the_block_they_touch() {
         let ctx = pollster::block_on(crate::gpu::init(None));
-        let (device_scene, _) = edited_derived_scene(&ctx);
-        let mut host_ctx = pollster::block_on(crate::gpu::init(None));
-        host_ctx.host_draws_glyphs = true;
-        let (host_scene, _) = edited_derived_scene(&host_ctx);
-        assert!(device_scene.field.slots_on_device(), "this crate's renderer draws from the device");
-        assert!(!host_scene.field.slots_on_device(), "a host-drawn field gives the device no copy");
-        let (device, host) = (device_scene.field.host_slots().unwrap(), host_scene.field.host_slots().unwrap());
-        assert_eq!(device.blocks().len(), host.blocks().len());
-        for (k, (d, h)) in device.blocks().iter().zip(host.blocks()).enumerate() {
-            assert!(d[..] == h[..], "block {k}: the host-drawn field's edits differ from the device field's");
+        let (scene, held) = edited_derived_scene(&ctx);
+        let host = scene.field.host_slots();
+        let moved: Vec<usize> = (0..host.blocks().len()).filter(|&k| host.version(k) != 0).collect();
+        assert_eq!(moved, [0], "only alpha.rs's block has a new version");
+        for (k, block) in host.blocks().iter().enumerate() {
+            let fresh = !Arc::ptr_eq(block, &held[k]);
+            assert_eq!(fresh, k == 0, "block {k}: identity moved {fresh}");
+            if fresh {
+                assert!(block[..] != held[k][..], "block {k} changed identity with no change of content");
+            }
         }
     }
 }

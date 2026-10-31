@@ -110,6 +110,9 @@ pub(super) fn encode_frame(
     if let Some(meshes) = scene_meshes {
         scene.gpu.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
     }
+    // The field's device copy up to its host blocks and overrides (the
+    // blocks an edit touched since the last frame; nothing when none).
+    scene.gpu.field.sync(&ctx.queue, &*scene.field);
     let glyph_ranges = frame.glyph_ranges.pairs();
 
     // Stage H: pass-level GPU timer (TIMESTAMP_QUERY; pass-boundary writes,
@@ -220,8 +223,8 @@ pub(super) fn encode_frame(
                     .profiler
                     .as_ref()
                     .map(|p| p.borrow().begin_query("glyph stream", &mut pass));
-                pass.set_pipeline(scene.field.glyph_pipeline());
-                scene.field.record_draws(&mut pass, &glyph_ranges);
+                pass.set_pipeline(scene.gpu.field.glyph_pipeline());
+                scene.gpu.field.record_draws(&mut pass, &glyph_ranges);
                 if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                     p.borrow().end_query(&mut pass, q);
                 }
@@ -276,7 +279,7 @@ pub(super) fn encode_frame(
                 ..Default::default()
             });
             pass.set_pipeline(&fx.mask_pipeline);
-            scene.field.record_draws(&mut pass, &sel.ranges.pairs());
+            scene.gpu.field.record_draws(&mut pass, &sel.ranges.pairs());
         }
         if let (Some(p), Some(q)) = (&ctx.profiler, mask_query) {
             p.borrow().end_query(encoder, q);

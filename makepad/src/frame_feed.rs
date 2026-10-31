@@ -105,7 +105,7 @@ impl FrameFeed {
             AtlasStatics { atlas, emoji, emoji_rgba }
         });
 
-        let overrides = frame.group_overrides.as_deref().unwrap_or(&[0]);
+        let overrides: &[u32] = &frame.group_overrides;
         let rows = &frame.group_rows[..];
         let tables = match &mut self.scene {
             Some(t) if t.scene == scene_generation => {
@@ -143,9 +143,7 @@ impl FrameFeed {
         };
 
         self.blocks.clear();
-        if let Some(slots) = &frame.slots {
-            self.blocks.extend(slots.blocks().iter().map(words_as_f32));
-        }
+        self.blocks.extend(frame.slots.blocks().iter().map(words_as_f32));
         let statics_view = G3StaticTables {
             glyphmap: &statics.atlas.glyphmap,
             curves: &statics.atlas.curves,

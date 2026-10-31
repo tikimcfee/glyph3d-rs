@@ -25,6 +25,9 @@ pub(crate) struct SceneGpu {
     pub(super) face_instances: Option<wgpu::Buffer>,
     /// The library's bounding regions (None without them).
     pub(super) regions: Option<RegionsGpu>,
+    /// The glyph field's draw: the device copy of its host blocks and
+    /// tables, synced before every frame's passes.
+    pub(super) field: Box<dyn glyph_field::GlyphFieldGpu>,
     /// The frame uniform (`FrameData::uniform`), written every frame.
     pub(super) camera_buf: wgpu::Buffer,
     /// The glyph params (`FrameData::params`) and the generation it holds.

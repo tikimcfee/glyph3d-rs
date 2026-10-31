@@ -1,24 +1,32 @@
-//! The chunked slot buffers and per-slot byte addressing, for any slot record.
+//! The chunked slot buffers on a wgpu device and per-slot byte addressing,
+//! for any slot record.
 //!
 //! Hoisted from the two mode crates (C1, 2026-10-09), which carried this
-//! twice with only the slot type renamed. A storage built from host blocks
-//! ([`SlotSource::Blocks`], the Derived field since 2026-10-26) also keeps
-//! the blocks, and every slot write patches the block as well as the
-//! buffer, so the host copy a makepad renderer draws from stays current.
+//! twice with only the slot type renamed. Since 2026-10-31 it is the
+//! device copy of a field's host blocks alone: one buffer per block,
+//! uploaded whole at build and again whenever a block's version moves
+//! ([`SlotStorage::sync`]). The field's writes land in the blocks; nothing
+//! writes these buffers but the sync.
 
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 
-use crate::upload::{upload_host_slots, HostUpload, Transcode, UploadLabels, SLOT_USAGE, UPLOAD_BATCH_BYTES};
-use crate::{split_at_chunks, HostSlots, SlotChunk, SlotSource};
+use crate::{HostSlots, SlotChunk, SlotRecord};
 
-/// A mode's per-glyph record, as the shared storage and upload see it.
-///
-/// The record is the binding's element: `size_of::<Self>()` is the slot
-/// stride every address is computed with.
-pub trait SlotRecord: bytemuck::Pod + Send + Sync {
-    /// Byte offset of the record's packed RGBA8 `u32` colour.
-    const COLOR_OFFSET: u64;
+/// A mode's buffer labels, so captures and validation errors name the mode.
+pub struct UploadLabels {
+    /// The slot buffers: this, or `"{buffers} {i}/{n}"` when chunked.
+    pub buffers: &'static str,
 }
+
+/// COPY_DST for the block uploads; COPY_SRC for the slot-dump verification
+/// readback.
+pub(crate) const SLOT_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_DST)
+    .union(wgpu::BufferUsages::COPY_SRC);
+
+/// The host-block upload's batch: the staging wgpu holds for an upload
+/// in flight is at most two of these (`SlotStorage::from_host_slots`).
+pub const UPLOAD_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// A queued write's staging range, handed to the rayon worker that fills
 /// it. wgpu-types 30 makes `WriteOnly<T>` `Send` for a sized `T` only, so a
@@ -31,23 +39,21 @@ struct StagingRange<'a>(wgpu::WriteOnly<'a, [u8]>);
 // thread is moving a `&mut [u8]`.
 unsafe impl Send for StagingRange<'_> {}
 
-/// Where a field's slots live: one buffer range per chunk.
+/// Where a field's slots live on the device: one buffer per host block.
 ///
-/// The buffers are the upload buffers, one per chunk; `chunks[k].offset` is
-/// slot 0's byte address in `chunks[k].buffer`. (A device slot source, the
-/// Instanced emitter's own buffers bound as-is, was retired 2026-10-31.)
+/// `chunks[k].offset` is slot 0's byte address in `chunks[k].buffer` (0).
+/// (A device slot source, the Instanced emitter's own buffers bound as-is,
+/// was retired 2026-10-31.)
 pub struct SlotStorage<S: SlotRecord> {
     chunks: Vec<SlotChunk>,
-    /// Live slots per chunk, mirrored out of `chunks` for the trait's slice
-    /// accessor.
+    /// Live slots per chunk, mirrored out of `chunks`.
     chunk_counts: Vec<u32>,
     /// Slots per chunk (the cull/pick slot math keys on it, so the
     /// renderer's chunking and the producer's must agree).
     chunk_capacity: u32,
     glyph_count: u32,
-    /// The host blocks the buffers were uploaded from, one per chunk, kept
-    /// current by every write (None unless built from them).
-    host: Option<RefCell<HostSlots>>,
+    /// Per block, the host version the buffer holds.
+    uploaded: RefCell<Vec<u64>>,
     _slot: std::marker::PhantomData<S>,
 }
 
@@ -55,23 +61,7 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// The slot stride in bytes.
     pub const SLOT_BYTES: u64 = std::mem::size_of::<S>() as u64;
 
-    pub fn new(
-        chunks: Vec<SlotChunk>,
-        chunk_capacity: usize,
-        glyph_count: usize,
-    ) -> Self {
-        let chunk_counts = chunks.iter().map(|c| c.slots).collect();
-        Self {
-            chunks,
-            chunk_counts,
-            chunk_capacity: chunk_capacity as u32,
-            glyph_count: glyph_count as u32,
-            host: None,
-            _slot: std::marker::PhantomData,
-        }
-    }
-
-    /// One buffer per host block, uploaded from it; the blocks are kept.
+    /// One buffer per host block, uploaded from it.
     ///
     /// In batches of 256 MiB (`UPLOAD_BATCH_BYTES`), at most two in flight
     /// (2026-10-26): a block is written through a staging buffer wgpu keeps
@@ -91,7 +81,7 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// created mapped: wgpu zero-fills the latter's on the creating thread,
     /// which made this thread's share 0.21 s of drivers/net's 535 blocks
     /// (field build 0.23 s before, 0.34 s mapped, 0.17 s queued).
-    pub fn from_host_slots(device: &wgpu::Device, queue: &wgpu::Queue, slots: HostSlots, labels: &UploadLabels) -> Self {
+    pub fn from_host_slots(device: &wgpu::Device, queue: &wgpu::Queue, slots: &HostSlots, labels: &UploadLabels) -> Self {
         assert_eq!(
             slots.slot_words() * 4,
             std::mem::size_of::<S>(),
@@ -146,47 +136,30 @@ impl<S: SlotRecord> SlotStorage<S> {
                     .expect("the host-block upload's previous batch completes");
             }
         }
-        let mut storage = Self::new(chunks, slots.block_slots(), slots.len());
-        storage.host = Some(RefCell::new(slots));
-        storage
-    }
-
-    /// The host blocks alone, no device copy: for a field a host renderer
-    /// draws from its blocks (`FieldResources::slots_on_device`). The chunk
-    /// counts are the blocks'; there are no chunk buffers.
-    pub fn host_only(slots: HostSlots) -> Self {
-        let chunk_counts = (0..slots.blocks().len()).map(|k| slots.block_len(k) as u32).collect();
+        let chunk_counts = chunks.iter().map(|c| c.slots).collect();
+        let uploaded = RefCell::new((0..slots.blocks().len()).map(|k| slots.version(k)).collect());
         Self {
-            chunks: Vec::new(),
+            chunks,
             chunk_counts,
             chunk_capacity: slots.block_slots() as u32,
             glyph_count: slots.len() as u32,
-            host: Some(RefCell::new(slots)),
+            uploaded,
             _slot: std::marker::PhantomData,
         }
     }
 
-    /// The storage `source` describes: host blocks uploaded one buffer per
-    /// block, or a Host source's records transcoded by `transcode` and
-    /// uploaded.
-    pub fn from_source<T: Transcode<Slot = S>>(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        source: SlotSource<'_>,
-        transcode: &T,
-        labels: &UploadLabels,
-    ) -> Self {
-        match source {
-            SlotSource::Blocks(slots) => Self::from_host_slots(device, queue, slots, labels),
-            SlotSource::Host { slices, glyph_count, direct_host_upload } => {
-                let HostUpload { chunk_capacity, chunk_counts, buffers } =
-                    upload_host_slots(device, queue, &slices, glyph_count, direct_host_upload, transcode, labels);
-                let chunks = buffers
-                    .into_iter()
-                    .zip(chunk_counts.iter())
-                    .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
-                    .collect();
-                Self::new(chunks, chunk_capacity, glyph_count)
+    /// Bring the buffers up to `slots`: every block whose version moved
+    /// since its last upload goes up whole (the unit a field edit changes,
+    /// as for the makepad host, whose publications re-upload whole). Same
+    /// blocks, same shape: the field never resizes.
+    pub fn sync(&self, queue: &wgpu::Queue, slots: &HostSlots) {
+        let mut uploaded = self.uploaded.borrow_mut();
+        assert_eq!(uploaded.len(), slots.blocks().len(), "the host blocks are the ones the buffers were built from");
+        for (k, done) in uploaded.iter_mut().enumerate() {
+            let now = slots.version(k);
+            if *done != now {
+                queue.write_buffer(&self.chunks[k].buffer, 0, bytemuck::cast_slice(&slots.blocks()[k]));
+                *done = now;
             }
         }
     }
@@ -207,69 +180,11 @@ impl<S: SlotRecord> SlotStorage<S> {
         self.glyph_count
     }
 
-    /// Whether the slots have a device copy (every storage but
-    /// [`Self::host_only`]).
-    pub fn on_device(&self) -> bool {
-        !self.chunks.is_empty()
-    }
-
-    /// The host blocks, when the storage keeps them.
-    pub fn host_slots(&self) -> Option<Ref<'_, HostSlots>> {
-        self.host.as_ref().map(RefCell::borrow)
-    }
-
-    /// Patch the host block too (when kept): `data` at byte `field_offset`
-    /// of `slot`, whole words.
-    fn patch_host(&self, slot: u32, field_offset: u64, data: &[u8]) {
-        if let Some(host) = &self.host {
-            let (whole, _) = data.as_chunks::<4>();
-            let words: Vec<u32> = whole.iter().map(|w| u32::from_le_bytes(*w)).collect();
-            host.borrow_mut().write(slot, (field_offset / 4) as usize, &words);
-        }
-    }
-
     /// The buffer holding `slot` and the byte address of `slot`'s first byte
     /// plus `field_offset` within it.
     pub fn address(&self, slot: u32, field_offset: u64) -> (&wgpu::Buffer, u64) {
-        assert!(self.on_device(), "a host-only field has no device copy of slot {slot}");
         let chunk = &self.chunks[(slot / self.chunk_capacity) as usize];
         let local = (slot % self.chunk_capacity) as u64;
         (&chunk.buffer, chunk.offset + local * Self::SLOT_BYTES + field_offset)
-    }
-
-    /// Partial slot upload: `data` at byte `field_offset` within a slot
-    /// (4-aligned offsets — write_buffer's requirement).
-    pub fn write_field(&self, queue: &wgpu::Queue, slot: u32, field_offset: u64, data: &[u8]) {
-        self.patch_host(slot, field_offset, data);
-        if self.on_device() {
-            let (buffer, offset) = self.address(slot, field_offset);
-            queue.write_buffer(buffer, offset, data);
-        }
-    }
-
-    /// Whole-slot upload of a contiguous run, one write per chunk it touches.
-    pub fn write_slots(&self, queue: &wgpu::Queue, first_slot: u32, slots: &[S]) {
-        for (_chunk, local, run_offset) in split_at_chunks(first_slot, slots.len() as u32, self.chunk_capacity) {
-            let piece = &slots[run_offset as usize..(run_offset + local.len() as u32) as usize];
-            for (i, slot) in piece.iter().enumerate() {
-                self.patch_host(first_slot + run_offset + i as u32, 0, bytemuck::bytes_of(slot));
-            }
-            if self.on_device() {
-                let (buffer, offset) = self.address(first_slot + run_offset, 0);
-                queue.write_buffer(buffer, offset, bytemuck::cast_slice(piece));
-            }
-        }
-    }
-
-    /// Bulk color write: one 4 B write per slot, into the host block and,
-    /// when the device holds a copy, through the queue.
-    pub fn write_colors(&self, queue: &wgpu::Queue, first_slot: u32, colors: &[u32]) {
-        for (i, &color) in colors.iter().enumerate() {
-            let slot = first_slot + i as u32;
-            if slot >= self.glyph_count {
-                break;
-            }
-            self.write_field(queue, slot, S::COLOR_OFFSET, bytemuck::bytes_of(&color));
-        }
     }
 }

@@ -18,7 +18,6 @@
 //! | 6       | emoji sheet (filterable 2D array)| fragment          |
 //! | 7       | emoji sampler                    | fragment          |
 
-use crate::{GlyphInstance, ItemParamsGpu};
 
 /// The frame uniform's binding (the camera block).
 pub const BINDING_FRAME_UNIFORM: u32 = 0;
@@ -36,23 +35,6 @@ pub struct FieldResources<'a> {
     pub emoji_sheet: &'a wgpu::TextureView,
     pub emoji_sampler: &'a wgpu::Sampler,
     pub glyph_advances: &'a wgpu::Buffer,
-    /// The item table, one row per item (the scene's views).
-    pub item_params: &'a [ItemParamsGpu],
-    /// Per group row, the item a host record (`GlyphInstance`, which names
-    /// its group and not its item) belongs to; [`crate::NO_ITEM`] for a row
-    /// no single item draws with. Read by the Derived field's host transcode
-    /// only.
-    pub item_of_group: &'a [u32],
-    /// Slots per host block for a field that keeps its slots on the host
-    /// (Derived: `[glyph_scene] derived_block_slots`), when it builds its
-    /// blocks itself from host records. The other modes ignore it.
-    pub block_slots: usize,
-    /// Whether a field that keeps host blocks also uploads them, one buffer
-    /// per block, for this device to draw. False when a host renderer draws
-    /// from the blocks itself (the makepad port, 2026-10-26): the field then
-    /// holds no device copy, its writes patch the blocks alone, and its
-    /// wgpu draw has no chunks to draw. The other modes ignore it.
-    pub slots_on_device: bool,
 }
 
 /// The targets the field's main pipeline renders into.
@@ -66,32 +48,13 @@ pub struct FieldTargets {
 }
 
 /// One device buffer range holding a run of a mode's slots: slot 0 starts at
-/// byte `offset` of `buffer`, `slots` slots follow. Produced on device by the
-/// GPU emitter (HyperLayout's device Pass 2) in the format of
-/// the mode they emit for.
+/// byte `offset` of `buffer`, `slots` slots follow: one host block's upload
+/// (`SlotStorage`).
 #[derive(Clone, Debug)]
 pub struct SlotChunk {
     pub buffer: wgpu::Buffer,
     pub offset: u64,
     pub slots: u32,
-}
-
-/// Where a field's slots come from at construction.
-pub enum SlotSource<'a> {
-    /// Already on the host in the mode's own slot format, in blocks that are
-    /// the field's chunks ([`crate::HostSlots`]; the Derived field's form
-    /// since 2026-10-26). The storage keeps them, uploads one buffer per
-    /// block, and patches the block with every slot write.
-    Blocks(crate::HostSlots),
-    /// The engine's neutral records on the host, possibly in several slices
-    /// that concatenate to the glyph sequence. The mode converts and uploads.
-    Host {
-        slices: Vec<&'a [GlyphInstance]>,
-        glyph_count: usize,
-        /// Create storage mapped and write it in place (unified memory)
-        /// instead of staging + copy. The caller decides from the adapter.
-        direct_host_upload: bool,
-    },
 }
 
 fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {

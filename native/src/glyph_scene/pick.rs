@@ -814,7 +814,7 @@ impl GlyphScene {
                 let Some(slot) = g.slot else {
                     return format!("verb recolor-glyph: {rel} '{}' is blank (no instance)", g.ch);
                 };
-                self.field.write_color(&ctx.queue, slot, pack(*rgb));
+                self.field.write_color(slot, pack(*rgb));
                 format!(
                     "verb recolor-glyph: {rel} row {} col {} slot {slot} -> #{:02x}{:02x}{:02x} (4 B)",
                     g.row, g.col, rgb[0], rgb[1], rgb[2]
@@ -878,7 +878,7 @@ impl GlyphScene {
                 }
                 let mut bytes = 0u64;
                 for (start, insts) in &runs {
-                    self.field.write_placements(&ctx.queue, *start, insts);
+                    self.field.write_placements(*start, insts);
                     bytes += insts.len() as u64 * u64::from(self.field.slot_bytes());
                 }
                 format!(
@@ -903,7 +903,7 @@ impl GlyphScene {
                 } else {
                     [g.pos[0] + d[0], g.pos[1] + d[1], g.pos[2] + d[2]]
                 };
-                self.field.write_position(&ctx.queue, slot, new);
+                self.field.write_position(slot, new);
                 self.geom_overrides
                     .entry(slot)
                     .or_insert((new, g.advance, g.height))
@@ -943,7 +943,7 @@ impl GlyphScene {
                     );
                 }
                 let new_ah = [g.advance * f, g.height * f];
-                self.field.write_extent(&ctx.queue, slot, new_ah[0], new_ah[1]);
+                self.field.write_extent(slot, new_ah[0], new_ah[1]);
                 let ov = self
                     .geom_overrides
                     .entry(slot)
@@ -1015,7 +1015,7 @@ impl GlyphScene {
                 row.cols[5] = *bg_rgba; // Set background color
                 
                 if let Some(new_group_row) = self.allocate_group_row(row) {
-                    self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
+                    self.field.write_group_id(slot, view, new_group_row);
                     format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-background: {rel} out of groups (max {})", self.params.get().max_groups)
@@ -1034,7 +1034,7 @@ impl GlyphScene {
                 row.cols[3] = [s[0], s[1], s[2], row.cols[3][3]];
                 
                 if let Some(new_group_row) = self.allocate_group_row(row) {
-                    self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
+                    self.field.write_group_id(slot, view, new_group_row);
                     format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
                     format!("verb set-glyph-transform: {rel} out of groups (max {})", self.params.get().max_groups)
@@ -1048,7 +1048,7 @@ impl GlyphScene {
                     return format!("verb reset-glyph-group: {rel} '{}' is blank (no instance)", g.ch);
                 };
                 // Back to the group row the view draws with.
-                self.field.write_group_id(&ctx.queue, slot, view, group_row);
+                self.field.write_group_id(slot, view, group_row);
                 format!("verb reset-glyph-group: {rel} row {} col {} slot {slot} -> group {group_row}", g.row, g.col)
             }
             Verb::Library(_) => unreachable!("apply_verb answers the library verbs before the pick check"),

@@ -48,7 +48,9 @@
 # deleted with the device slot emission it tested (Instanced retirement).
 # 349 -> 345 (2026-10-31): the glyph-field-instanced crate's four tests (three
 # RenderSlot layout pins, one naga validation of its shader) went with it.
-test_floor = 345
+# 345 -> 343 (2026-10-31): copy.rs's two copy_split tests, deleted with the
+# host-record upload path it served.
+test_floor = 343
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -700,8 +702,8 @@ gate = "pixel-ab"
 why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load"
 file = "crates/glyph-field-derived/src/field.rs"
 op = "replace"
-find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
-with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
+find = "self.write_field(slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
+with = "self.write_field(slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
 
 [[mutation]]
@@ -973,12 +975,12 @@ with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
 
 [[mutation]]
-name = "host-block-write-dropped"
+name = "host-block-version-unbumped"
 gate = "cargo-test"
-why = "2026-10-26: the Derived field keeps its slots in host blocks a makepad renderer draws from, so a slot write that reaches the buffer and not the block leaves that renderer drawing the glyph as loaded. CONSUMED BY: SlotStorage::write_field, which every Derived verb goes through, via derived_host_blocks_follow_every_slot_write (verbs and a sidecar on g-pick-repo, blocks compared with their buffers)"
-file = "crates/glyph-field/src/storage.rs"
+why = "2026-10-31: the Derived field's edits land in its host blocks alone, and the wgpu draw uploads a block when its version moved (SlotStorage::sync), so a write that does not bump its block's version leaves the device drawing the glyph as loaded. (It replaces host-block-write-dropped, 2026-10-26: a write reaching the buffer and not the block, which cannot happen since nothing writes the buffer but the sync.) CONSUMED BY: HostSlots::write, which every Derived verb goes through, via derived_host_blocks_follow_every_slot_write (verbs and a sidecar on g-pick-repo; after the sync every block is compared with its buffer). Blind to a consumer that reads Arc identity instead (the makepad host): edits_move_only_the_block_they_touch holds that"
+file = "crates/glyph-field/src/host_slots.rs"
 op = "replace"
-find = "        self.patch_host(slot, field_offset, data);\n"
+find = "        self.versions[k] += 1;\n"
 with = ""
 expect = "derived_host_blocks_follow_every_slot_write"
 
@@ -1020,16 +1022,6 @@ file = "native/Cargo.toml"
 op = "append"
 arg = "\n[target.'cfg(all())'.dependencies]\nwinit = \"0.30\"\n"
 expect = "winit v0.30"
-
-[[mutation]]
-name = "copy-split-body-unaligned"
-gate = "cargo-test"
-why = "C16 (2026-10-09): a slot-buffer copy whose size is off 16 B runs whole at about half speed on the discrete path (RTX 5090/Vulkan measured; wgpu only asks for 4), so an odd Derived survivor count cost ~+20 ms of backend on the 94 MB tree across its two staging copies. Copying the whole size as the 'body' restores exactly that shape. Invisible to every byte and pixel gate BY DESIGN — the bytes that land are the same, only the speed moves — so the reddening witness is the helper's own unit test. CONSUMED BY: glyph_field::copy_split, called by the discrete staging copies in layout_hyper/device_alloc.rs and glyph_field::upload_host_slots (both modes' host upload since C1)"
-file = "crates/glyph-field/src/copy.rs"
-op = "replace"
-find = "    let body = size - size % FAST_COPY_ALIGN;"
-with = "    let body = size;"
-expect = "split_body_is_fast_aligned_and_covers_the_size"
 
 [[mutation]]
 name = "derived-curve-cap-128"
