@@ -174,9 +174,10 @@ pub fn rebuild_for_relayout(
     } else {
         (crate::build_scene_with_options(ctx, color_format, choice, CameraMode::Fly, live_cull_opts), None)
     };
-    // The mode the scene BUILT may not be the one asked for (a load past the
-    // Derived lanes falls back to Instanced, loudly — `layout_hyper::
-    // derived_lane_limits`); the options follow the build, so the panel's
+    // The mode the scene BUILT is the one asked for since 2026-10-31 (a file
+    // past the Derived lanes is laid out empty, `layout_hyper::
+    // derived_lane_overflow`, where the whole load once fell back to
+    // Instanced); the options follow the build all the same, so the panel's
     // selector and the next request start from what is actually drawn.
     if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
         if built != cull_opts.field_mode {

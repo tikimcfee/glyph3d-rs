@@ -187,7 +187,19 @@ impl GlyphScene {
                 k += 1;
             }
         }
-        debug_assert_eq!(k, slots.end);
+        // The bytes must re-derive the slots the layout placed, or a verb on
+        // this file would write into the next file's slots: a file laid out
+        // empty past a Derived lane (`layout_hyper::derived_lane_overflow`)
+        // keeps its bytes but owns none (2026-10-31; a debug assert until then).
+        if k != slots.end {
+            log::warn!(
+                "pick: {} re-derives {} glyph slots but the layout placed {}: not pickable",
+                info.rel_path,
+                k - slots.start,
+                slots.end - slots.start
+            );
+            return false;
+        }
         log::info!(
             "pick cache: {} — {} records re-derived in {:.1?} ({} B) | fold cross-check: {} ({} mismatch)",
             info.rel_path,
