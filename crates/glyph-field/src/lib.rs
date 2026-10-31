@@ -22,13 +22,16 @@
 //! - [`GlyphPlacement`]: the mode-neutral edit record (what a verb writes).
 //! - [`GlyphInstance`] / [`GroupRow`]: the engine's neutral glyph record and
 //!   the group table row every mode's shader reads.
-//! - [`FieldResources`] / [`FieldTargets`] / [`SlotSource`] / [`SlotChunk`]:
-//!   what a mode is built from.
-//! - [`SlotStorage`] / [`upload_host_slots`]: the chunked slot buffers and the
-//!   host upload, generic over a mode's [`SlotRecord`] and its [`Transcode`].
+//! - [`GlyphFieldGpu`]: a field's draw on a wgpu device, built from the
+//!   field by its mode (2026-10-31: the two were one object until then).
+//! - [`SlotSource`] / [`transcode_host_slots`]: what a mode's slots are
+//!   built from, and the host records' transcode into a mode's
+//!   [`SlotRecord`] by its [`Transcode`].
 //! - [`HostSlots`]: a field's slots kept on the host in blocks that are its
-//!   chunks, which the storage uploads from and patches (the Derived field,
-//!   2026-10-26).
+//!   chunks (the Derived field, 2026-10-26); every write lands there.
+//! - [`FieldResources`] / [`FieldTargets`] / [`SlotChunk`] / [`SlotStorage`]:
+//!   what a field's draw binds, and the device copy of its blocks, synced
+//!   by block version.
 //! - [`FieldCore`]: the glyph and mask pipelines, the per-chunk bind groups,
 //!   draw recording and the slot dump; a mode adds its WGSL and any extra
 //!   bindings through a [`FieldShape`].
@@ -37,7 +40,6 @@
 //! addressable** — its color and its placement can be edited without
 //! touching any other glyph. Both modes address it by slot.
 
-mod copy;
 mod field;
 mod field_core;
 mod host_slots;
@@ -45,19 +47,18 @@ mod mode;
 mod records;
 mod resources;
 mod storage;
-mod upload;
+mod transcode;
 
-pub use copy::{copy_split, padded_staging_size, split_copy_size, FAST_COPY_ALIGN};
-pub use field::{split_at_chunks, GlyphField};
+pub use field::{split_at_chunks, GlyphField, GlyphFieldGpu};
 pub use field_core::{FieldCore, FieldShape};
 pub use host_slots::HostSlots;
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 pub use resources::{
     shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, SlotChunk,
-    SlotSource, BINDING_FRAME_UNIFORM, BINDING_SLOTS,
+    BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
-pub use storage::{SlotRecord, SlotStorage};
-pub use upload::{transcode_host_slots, upload_host_slots, HostUpload, Transcode, UploadLabels, UPLOAD_BATCH_BYTES};
+pub use storage::{SlotStorage, UploadLabels, UPLOAD_BATCH_BYTES};
+pub use transcode::{transcode_host_slots, SlotRecord, SlotSource, Transcode};
 #[cfg(target_os = "macos")]
 pub use upload::create_mapped_slot_buffer;

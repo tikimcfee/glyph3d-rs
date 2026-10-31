@@ -12,8 +12,8 @@ impl GlyphScene {
     /// path where it has one: with direct-mapped GPU memory (e.g. Apple
     /// Silicon Metal) it writes host-visible slots without queue uploads;
     /// otherwise it issues queue write_buffer commands.
-    pub fn write_slot_colors(&self, ctx: &GpuContext, slot_base: u32, colors: &[u32]) {
-        self.field.write_colors(&ctx.queue, slot_base, colors);
+    pub fn write_slot_colors(&self, _ctx: &GpuContext, slot_base: u32, colors: &[u32]) {
+        self.field.write_colors(slot_base, colors);
     }
 
     /// Recolors a view in-place given its source bytes and AST/LSP byte spans.
@@ -141,7 +141,7 @@ impl GlyphScene {
     /// no slot, exactly as `ensure_pick_cache` skips them.
     fn style_file(
         &self,
-        ctx: &GpuContext,
+        _ctx: &GpuContext,
         view: u32,
         runs: &[crate::seam::StyleRun],
         expected: Option<crate::seam::BufferVersion>,
@@ -301,7 +301,7 @@ impl GlyphScene {
             slot += 1;
         }
         for (start, insts) in &batches {
-            self.field.write_placements(&ctx.queue, *start, insts);
+            self.field.write_placements(*start, insts);
         }
         FileStyle::Ok { colored, unstyled }
     }

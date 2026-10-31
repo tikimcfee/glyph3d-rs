@@ -463,7 +463,7 @@ impl SceneLike for GlyphScene {
     }
 
     fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
-        self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
+        self.gpu.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
     }
 
     fn tick(&mut self, dt: f32) {
