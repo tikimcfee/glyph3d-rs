@@ -37,9 +37,12 @@ pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
-    device: Option<crate::gpu::SharedDevice>,
-    /// Whose slot format the device path emits. Host (no-device) runs
-    /// always produce the neutral 48 B records regardless.
+    /// Where the emitted slots will live: a load for a field (Some) emits
+    /// the field's slots into host blocks and checks them against the
+    /// machine; one without (the oracle's and the tests' host runs)
+    /// produces the neutral 48 B records.
+    home: Option<crate::budget::SlotHome>,
+    /// Whose slot format a field load emits.
     field_mode: GlyphFieldMode,
     pub(crate) prefetched_data: Option<PrefetchedHyperData>,
 }
@@ -54,16 +57,16 @@ impl HyperLayout {
     pub fn new() -> Self {
         Self {
             trie: None,
-            device: None,
+            home: None,
             field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
     }
 
-    pub(crate) fn with_device(device: crate::gpu::SharedDevice, field_mode: GlyphFieldMode) -> Self {
+    pub(crate) fn for_field(home: crate::budget::SlotHome, field_mode: GlyphFieldMode) -> Self {
         Self {
             trie: None,
-            device: Some(device),
+            home: Some(home),
             field_mode,
             prefetched_data: None,
         }
@@ -72,7 +75,7 @@ impl HyperLayout {
     pub fn with_trie(trie: Arc<TrieTable>) -> Self {
         Self {
             trie: Some(trie),
-            device: None,
+            home: None,
             field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
@@ -155,7 +158,7 @@ impl HyperLayout {
         // Derived slots are packed: the host instances a device-less load
         // emits carry absolute positions and no lane (hyper-oracle's host
         // tier lays out items past every lane on purpose).
-        if allow_device && self.device.is_some() && self.field_mode == GlyphFieldMode::Derived {
+        if allow_device && self.home.is_some() && self.field_mode == GlyphFieldMode::Derived {
             let params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
             let over = derived_lane_overflow(&agg.prepasses, &params);
             if !over.is_empty() {
@@ -187,14 +190,12 @@ impl HyperLayout {
             slot_bases.push(chunk_slot_bases[range.start]);
         }
 
-        // With a device, Derived slots are emitted into host blocks that are
-        // the field's chunks. Instanced, being retired, lays out host
-        // instances its field uploads (2026-10-31: its slots were emitted
-        // to the device directly until then).
-        let emit_slots = allow_device && self.device.is_some() && total_survivors > 0 && field_mode == GlyphFieldMode::Derived;
+        // A load for a field emits its Derived slots into host blocks that
+        // are the field's chunks (with or without a device: 2026-10-31).
+        let emit_slots = allow_device && self.home.is_some() && total_survivors > 0 && field_mode == GlyphFieldMode::Derived;
 
         if emit_slots {
-            let dev = self.device.as_ref().unwrap();
+            let home = self.home.as_ref().unwrap();
 
             // What the slots will ask of the machine, refused here if it is
             // more than it has: nothing is allocated yet.
@@ -203,10 +204,10 @@ impl HyperLayout {
                 slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
                 block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
                 host_blocks: true,
-                device: !dev.host_draws_glyphs,
+                device: home.device_copy,
                 staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
             };
-            match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter, dev.is_unified())) {
+            match crate::budget::check(&demand, &home.machine) {
                 Ok(line) => println!("slots: {line}"),
                 Err(why) => {
                     return Err(LayoutError { backend: "hyper", status: crate::layout::LAYOUT_PAST_BUDGET, what: why });
@@ -1738,18 +1739,18 @@ mod tests {
     /// rule — a limit drops its component, never the load). Item 1's line
     /// reaches a column page past `X_PAGE_MAX`; it is laid out empty, and
     /// items 0 and 2 land exactly where a load without it puts them: the
-    /// same placements, the same Derived slots in the host blocks.
+    /// same placements, the same Derived slots in the host blocks. No
+    /// device: a field load emits its host blocks without one (2026-10-31).
     #[test]
     fn an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched() {
         use crate::layout::{GlyphArena, LayoutGlyphs, LayoutItem, DEFAULT_COLOR_PACKED};
-        let ctx = pollster::block_on(crate::gpu::init(None));
         let plain = ItemParams { line_height: 1.25, ..ItemParams::default() };
         let paged = ItemParams { has_page: true, page_cols: 1, page_rows: 4, ..plain };
         let wide = "x".repeat(glyph_field_derived::X_PAGE_MAX as usize + 2);
         let item = |bytes, params, group_id| LayoutItem { bytes, params, group_id, paint: Paint::Flat(DEFAULT_COLOR_PACKED) };
         let run = |items: &[LayoutItem<'_>]| {
             let mut arena = GlyphArena::new();
-            let mut engine = HyperLayout::with_device(crate::gpu::SharedDevice::from_ctx(&ctx), GlyphFieldMode::Derived);
+            let mut engine = HyperLayout::for_field(crate::budget::SlotHome::host(), GlyphFieldMode::Derived);
             let placements = engine.layout_items(items, &mut arena).expect("layout");
             let slots = arena.take_emitted().expect("a Derived load with a device emits host blocks").slots;
             let words: Vec<u32> = (0..slots.len() as u32).flat_map(|k| slots.slot(k).to_vec()).collect();

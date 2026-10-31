@@ -10,7 +10,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::cell::Cell;
 
-use super::{GroupRow, SCENE_SAMPLE_COUNT};
+use super::{target::SCENE_SAMPLE_COUNT, GroupRow};
 
 // The LOD threshold and backdrop gain are settings: `[lod] min_px` and
 // `[lod] backdrop_gain` in config/defaults.toml, which carries their

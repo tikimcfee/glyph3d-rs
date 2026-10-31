@@ -108,6 +108,33 @@ pub struct Machine {
     pub unified: bool,
 }
 
+/// Where a load's slots will live (2026-10-31: what layout needs of the
+/// machine, in place of the GPU context it took): the machine's memory, and
+/// whether a device copy will be made of them (a wgpu renderer's; a host
+/// renderer that publishes the blocks itself makes none here).
+#[derive(Clone, Debug)]
+pub struct SlotHome {
+    pub machine: Machine,
+    pub device_copy: bool,
+}
+
+impl SlotHome {
+    /// The host alone: no device to check, none to copy to.
+    pub fn host() -> Self {
+        Self {
+            machine: Machine { host_available: host_available_bytes(), device_name: "none".into(), device: None, unified: false },
+            device_copy: false,
+        }
+    }
+
+    /// A wgpu renderer's: the context's adapter, and the device copy its
+    /// field draw uploads.
+    pub fn of(ctx: &crate::gpu::GpuContext) -> Self {
+        let unified = ctx.profile.memory_architecture() == crate::gpu::MemoryArchitecture::Unified;
+        Self { machine: Machine::of(&ctx.adapter, unified), device_copy: true }
+    }
+}
+
 impl Machine {
     pub fn of(adapter: &wgpu::Adapter, unified: bool) -> Self {
         Self {

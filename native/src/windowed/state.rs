@@ -31,6 +31,8 @@ pub(super) struct WindowState {
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) depth: wgpu::TextureView,
     pub(super) scene: Box<dyn SceneLike>,
+    /// The scene's draw: built with each scene (`SceneLike::make_renderer`).
+    pub(super) renderer: Box<dyn crate::scene::SceneRenderer>,
     pub(super) start: Instant,
     /// Stage F/G: mouse-look is active only while the pointer is grabbed
     /// (right button held, or backquote toggle).
@@ -168,7 +170,7 @@ impl WindowState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&ctx.device, &self.config);
-        self.depth = scene::create_depth(&ctx.device, self.scene.depth_format(), width, height);
+        self.depth = scene::create_depth(&ctx.device, self.renderer.depth_format(), width, height);
     }
 
     /// Stage F: grab the pointer for mouse-look (confined to the window —
@@ -453,25 +455,25 @@ impl WindowState {
             match step {
                 1 => {
                     let cmd = crate::glyph_scene::PickCommand::RowCol { file, row: 0, col: 0 };
-                    let line = self.scene.apply_pick(ctx, &cmd).unwrap_or_else(|| "scene does not support picks".to_string());
+                    let line = self.scene.apply_pick(&cmd).unwrap_or_else(|| "scene does not support picks".to_string());
                     println!("GRAB-SELFTEST step 1 (pick {cmd:?}): {line}");
                     // Park the cursor before grabbing: a drag's delta is
                     // measured from wherever the cursor last was.
-                    self.scene.on_cursor(ctx, cx, cy);
+                    self.scene.on_cursor(cx, cy);
                 }
                 2 => {
-                    self.scene.on_key(ctx, SceneKey::G, true);
+                    self.scene.on_key(SceneKey::G, true);
                     println!("GRAB-SELFTEST step 2 (g, grabbed): hud {}", hud(self));
                 }
                 s if s < 3 + DRAG_STEPS => {
                     let k = f32::from(s - 2) / f32::from(DRAG_STEPS);
-                    self.scene.on_cursor(ctx, cx + dx * k, cy + dy * k);
+                    self.scene.on_cursor(cx + dx * k, cy + dy * k);
                     println!("GRAB-SELFTEST step {s} (drag to {:+.0},{:+.0} px): hud {}", dx * k, dy * k, hud(self));
                 }
                 s if s == 3 + DRAG_STEPS => {
-                    self.scene.on_key(ctx, SceneKey::G, true);
+                    self.scene.on_key(SceneKey::G, true);
                     let verb = crate::parse_verb("move-group 0 0 0").expect("selftest verb literal must parse like the CLI");
-                    let line = self.scene.apply_verb(ctx, &verb).unwrap_or_default();
+                    let line = self.scene.apply_verb(&verb).unwrap_or_default();
                     println!("GRAB-SELFTEST step {s} (g, released): {line}");
                 }
                 _ => {
@@ -511,7 +513,7 @@ impl WindowState {
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("windowed frame"), // Stage L (O2)
         });
-        self.scene.render(
+        self.renderer.render(
             ctx,
             &mut encoder,
             &crate::scene::FrameTarget {
@@ -524,6 +526,7 @@ impl WindowState {
                 width: self.config.width,
                 height: self.config.height,
             },
+            &*self.scene,
             self.time(),
         );
 
@@ -696,22 +699,22 @@ impl WindowState {
                                 ui.horizontal(|ui| {
                                     if let Some(z) = &snap.grabbed_zone {
                                         if ui.button(format!("Release Carrel '{z}' (C)")).clicked() {
-                                            self.scene.on_key(ctx, SceneKey::C, true);
+                                            self.scene.on_key(SceneKey::C, true);
                                         }
                                     } else if snap.active_zone.is_some()
                                         && ui.button("Grab Entire Carrel (C)").clicked()
                                     {
-                                        self.scene.on_key(ctx, SceneKey::C, true);
+                                        self.scene.on_key(SceneKey::C, true);
                                     }
 
                                     if let Some(g) = snap.grabbed_group {
                                         if ui.button(format!("Release File #{g} (G)")).clicked() {
-                                            self.scene.on_key(ctx, SceneKey::G, true);
+                                            self.scene.on_key(SceneKey::G, true);
                                         }
                                     } else if snap.last_pick.is_some()
                                         && ui.button("Grab File (G)").clicked()
                                     {
-                                        self.scene.on_key(ctx, SceneKey::G, true);
+                                        self.scene.on_key(SceneKey::G, true);
                                     }
                                 });
                             }
@@ -726,7 +729,7 @@ impl WindowState {
                                 if ui.button(*spec).clicked() {
                                     let verb = crate::parse_verb(spec)
                                         .expect("panel verb literal must parse like the CLI");
-                                    if let Some(line) = self.scene.apply_verb(ctx, &verb) {
+                                    if let Some(line) = self.scene.apply_verb(&verb) {
                                         println!("{line}");
                                     }
                                 }
@@ -996,15 +999,11 @@ impl WindowState {
                                                 if resp.clicked() {
                                                     if *selected_group == Some(row.group_id) {
                                                         *selected_group = None;
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Clear,
+                                                        self.scene.apply_pick(&crate::glyph_scene::PickCommand::Clear,
                                                         );
                                                     } else {
                                                         *selected_group = Some(row.group_id);
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Group(
+                                                        self.scene.apply_pick(&crate::glyph_scene::PickCommand::Group(
                                                                 row.group_id,
                                                             ),
                                                         );
@@ -1048,13 +1047,13 @@ impl WindowState {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("⏮ Oldest (End)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::End, true);
+                                    self.scene.on_key(SceneKey::End, true);
                                 }
 
                                 let total_beats = carrel.beat_count.max(carrel.turn_count);
 
                                 if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, SceneKey::BracketLeft, true);
+                                    self.scene.on_key(SceneKey::BracketLeft, true);
                                 }
 
                                 if carrel.beat_count > 0 {
@@ -1069,16 +1068,16 @@ impl WindowState {
                                 }
 
                                 if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, SceneKey::BracketRight, true);
+                                    self.scene.on_key(SceneKey::BracketRight, true);
                                 }
 
                                 if ui.button("Latest ⏭ (Home)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::Home, true);
+                                    self.scene.on_key(SceneKey::Home, true);
                                 }
 
                                 ui.separator();
                                 if ui.button("Mode (V)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::V, true);
+                                    self.scene.on_key(SceneKey::V, true);
                                 }
                                 ui.separator();
                                 if ui.button("Sessions (F7) 📂").clicked() {

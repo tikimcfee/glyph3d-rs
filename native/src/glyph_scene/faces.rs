@@ -21,7 +21,7 @@ use bytemuck::Zeroable;
 use glyph_scene_graph::{FramePlan, NodeTables, NONE};
 
 use super::mesh::MeshInstance;
-use super::nodes::{run_rows, upload_runs, write_runs, UploadCost};
+use super::nodes::{run_rows, upload_runs, UploadCost};
 use crate::library::FaceSpec;
 
 /// The face of a sheet whose world is `sheet`: bevy's extraction of the
@@ -99,10 +99,6 @@ impl LibraryFaces {
         }
     }
 
-    pub(crate) fn count(&self) -> u32 {
-        self.sheets.len() as u32
-    }
-
     /// The GPU instance buffer the faces are drawn from, zeroed, sized for
     /// every face (the renderer's; `upload` writes it).
     pub(crate) fn buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
@@ -146,18 +142,6 @@ impl LibraryFaces {
         runs
     }
 
-    /// The wgpu half: write `runs` (`prepare`'s) into the instance buffer.
-    pub(crate) fn upload(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, runs: &[Range<u32>]) {
-        if runs.is_empty() {
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        write_runs(queue, buffer, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<MeshInstance>(), runs);
-        let mut cost = self.last.get();
-        cost.ms += t0.elapsed().as_secs_f64() * 1e3;
-        self.last.set(cost);
-    }
-
     /// Every face as the host last built it (what the GPU holds once the
     /// frame's runs are written).
     pub(crate) fn image(&self) -> Ref<'_, Vec<MeshInstance>> {
@@ -180,7 +164,7 @@ mod tests {
     use glyph_scene_graph::{NodeHandle, Similarity};
 
     use super::{face_instance, LibraryFaces, MeshInstance};
-    use crate::glyph_scene::nodes::{read_buffer, GroupNodes};
+    use crate::glyph_scene::nodes::{read_buffer, write_runs, GroupNodes};
     use crate::glyph_scene::GroupRow;
     use crate::library::plan::LibFile;
     use crate::library::{Form, FormCmd, Library, Page};
@@ -230,9 +214,9 @@ mod tests {
 
         let frame = |g: &GroupNodes| {
             let (plan, rows) = g.prepare();
-            g.upload(&ctx.queue, &table, &rows);
+            write_runs(&ctx.queue, &table, bytemuck::cast_slice(&g.rows()), std::mem::size_of::<GroupRow>(), &rows);
             let runs = faces.prepare(&g.tables(), &plan);
-            faces.upload(&ctx.queue, &face_buf, &runs);
+            write_runs(&ctx.queue, &face_buf, bytemuck::cast_slice(&faces.image()), std::mem::size_of::<MeshInstance>(), &runs);
             (g.last_flush().0.bytes, faces.last_update().bytes * usize::from(!runs.is_empty()))
         };
         let check = |g: &GroupNodes, what: &str| {

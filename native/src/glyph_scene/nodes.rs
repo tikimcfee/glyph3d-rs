@@ -348,18 +348,6 @@ impl GroupNodes {
         (plan, runs)
     }
 
-    /// The wgpu half of the flush: write `runs` (`prepare`'s) into the GPU
-    /// group table `buffer`, before any pass reads a row (the writes land
-    /// at the frame's submit, ahead of its passes). Its time joins the
-    /// flush's.
-    pub(crate) fn upload(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, runs: &[Range<u32>]) {
-        let t0 = Instant::now();
-        write_runs(queue, buffer, bytemuck::cast_slice(&self.rows.borrow()), std::mem::size_of::<GroupRow>(), runs);
-        let (mut cost, resolved) = self.last_flush.get();
-        cost.ms += t0.elapsed().as_secs_f64() * 1e3;
-        self.last_flush.set((cost, resolved));
-    }
-
     /// The flush generation: bumped whenever a flush planned any run.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.get()
@@ -572,7 +560,7 @@ mod tests {
         let mut n = GroupNodes::new(&rows);
         let flush = |n: &GroupNodes| {
             let (plan, runs) = n.prepare();
-            n.upload(&ctx.queue, &buf, &runs);
+            write_runs(&ctx.queue, &buf, bytemuck::cast_slice(&n.rows()), std::mem::size_of::<GroupRow>(), &runs);
             (plan.resolved, n.last_flush().0)
         };
         let (resolved, up) = flush(&n);

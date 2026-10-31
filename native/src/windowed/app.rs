@@ -74,7 +74,9 @@ fn relayout(
 ) {
     let viewport = (state.config.width, state.config.height);
     let live = state.ui_probe.as_ref();
-    if let Some((scene, probe)) = rebuild_for_relayout(ctx, state.config.format, viewport, choice, cull_opts, live, ui, req) {
+    if let Some((scene, probe)) = rebuild_for_relayout(&crate::SceneLoad::of(ctx), viewport, choice, cull_opts, live, ui, req) {
+        // A new scene, a new draw of it.
+        state.renderer = scene.make_renderer(ctx, state.config.format);
         state.scene = scene;
         state.ui_probe = probe;
     }
@@ -289,19 +291,20 @@ impl App<'_> {
         // concrete GlyphScene BEFORE type erasure (see build_scene_probed).
         #[cfg(feature = "egui-ui")]
         let (mut scene, ui_probe) = if self.ui {
-            crate::build_scene_probed(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts)
+            crate::build_scene_probed(&crate::SceneLoad::of(&self.ctx), &self.choice, CameraMode::Fly, self.cull_opts)
         } else {
-            (crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts), None)
+            (crate::build_scene_with_options(&crate::SceneLoad::of(&self.ctx), &self.choice, CameraMode::Fly, self.cull_opts), None)
         };
         #[cfg(not(feature = "egui-ui"))]
-        let mut scene = crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts);
+        let mut scene = crate::build_scene_with_options(&crate::SceneLoad::of(&self.ctx), &self.choice, CameraMode::Fly, self.cull_opts);
         // The options follow the mode the scene BUILT, as the relayout arm
         // does (a lane-limit fallback built Instanced until 2026-10-31).
         #[cfg(feature = "egui-ui")]
         if let Some(built) = ui_probe.as_ref().and_then(|p| p.borrow().field_mode) {
             self.cull_opts.field_mode = built;
         }
-        let depth = scene::create_depth(&self.ctx.device, scene.depth_format(), config.width, config.height);
+        let renderer = scene.make_renderer(&self.ctx, format);
+        let depth = scene::create_depth(&self.ctx.device, renderer.depth_format(), config.width, config.height);
         log::info!(
             "surface: {}x{} {:?} present={:?}",
             config.width,
@@ -327,13 +330,13 @@ impl App<'_> {
         scene.set_viewport(config.width, config.height);
         for op in self.ops {
             let line = match op {
-                Op::Pick(p) => scene.apply_pick(&self.ctx, p),
-                Op::Verb(v) => scene.apply_verb(&self.ctx, v),
+                Op::Pick(p) => scene.apply_pick(p),
+                Op::Verb(v) => scene.apply_verb(v),
                 Op::CamPose(eye, yaw, pitch) => {
                     scene.set_cam_pose(*eye, *yaw, *pitch);
                     None
                 }
-                Op::Highlight(p) => scene.apply_highlight_sidecar(&self.ctx, p),
+                Op::Highlight(p) => scene.apply_highlight_sidecar(p),
             };
             if let Some(line) = line {
                 println!("{line}");
@@ -341,6 +344,7 @@ impl App<'_> {
         }
 
         self.state = Some(WindowState {
+            renderer,
             window,
             surface,
             config,
@@ -568,7 +572,7 @@ impl App<'_> {
                         }
                     } else {
                         if let Some(key) = scene_key(code) {
-                            state.scene.on_key(&self.ctx, key, pressed);
+                            state.scene.on_key(key, pressed);
                         }
                         state.window.request_redraw();
                     }
@@ -583,7 +587,7 @@ impl App<'_> {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if !state.grabbed {
                     let (x, y) = state.cursor;
-                    state.scene.on_click(&self.ctx, x, y);
+                    state.scene.on_click(x, y);
                     state.window.request_redraw();
                 }
             }
@@ -604,12 +608,12 @@ impl App<'_> {
                 if route_to_scene && state.grabbed && !state.saw_device_delta {
                     let (dx, dy) = (px - state.cursor.0, py - state.cursor.1);
                     if dx != 0.0 || dy != 0.0 {
-                        state.scene.on_mouse_look(&self.ctx, dx, dy);
+                        state.scene.on_mouse_look(dx, dy);
                     }
                 }
                 state.cursor = (px, py);
                 if route_to_scene {
-                    state.scene.on_cursor(&self.ctx, px, py);
+                    state.scene.on_cursor(px, py);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -618,7 +622,7 @@ impl App<'_> {
                     // Pixel deltas (macOS trackpads): ~53 px per notch.
                     MouseScrollDelta::PixelDelta(p) => (p.y / 53.0) as f32,
                 };
-                state.scene.on_scroll(&self.ctx, lines);
+                state.scene.on_scroll(lines);
             }
             _ => {}
         }
@@ -631,7 +635,7 @@ impl App<'_> {
             if let Some(state) = self.state.as_mut() {
                 if state.grabbed {
                     state.saw_device_delta = true;
-                    state.scene.on_mouse_look(&self.ctx, dx as f32, dy as f32);
+                    state.scene.on_mouse_look(dx as f32, dy as f32);
                 }
             }
         }
@@ -671,7 +675,7 @@ impl App<'_> {
             let dt = state.last_frame.elapsed().as_secs_f32().min(0.1);
             state.last_frame = Instant::now();
             state.scene.tick(dt);
-            state.scene.animate(&self.ctx, dt);
+            state.scene.animate(dt);
             state.window.request_redraw(); // continuous render loop
         }
     }
@@ -775,9 +779,7 @@ fn poll_live(
     let t = Instant::now();
     let (mut scene, probe) = if ui {
         crate::build_scene_from_staged_probed(
-            ctx,
-            state.config.format,
-            atlas,
+            src.atlas.clone(),
             staged,
             CameraMode::Fly,
             cull,
@@ -786,9 +788,7 @@ fn poll_live(
     } else {
         (
             crate::build_scene_from_staged_mode(
-                ctx,
-                state.config.format,
-                atlas,
+                src.atlas.clone(),
                 staged,
                 CameraMode::Fly,
                 cull,
@@ -804,7 +804,7 @@ fn poll_live(
     let t_scene = t.elapsed();
     let t = Instant::now();
     for update in src.last_style.values() {
-        if let Some(line) = scene.apply_surface_updates(ctx, std::slice::from_ref(update)) {
+        if let Some(line) = scene.apply_surface_updates(std::slice::from_ref(update)) {
             log::debug!("{line}");
         }
     }
@@ -820,6 +820,7 @@ fn poll_live(
         t_restyle,
         arrived.len(),
     );
+    state.renderer = scene.make_renderer(ctx, state.config.format);
     state.scene = scene;
     #[cfg(feature = "egui-ui")]
     {

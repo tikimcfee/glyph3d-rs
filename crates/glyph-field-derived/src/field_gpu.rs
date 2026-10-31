@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 
-use glyph_field::{FieldCore, FieldResources, FieldShape, FieldTargets, GlyphField, GlyphFieldGpu, SlotStorage};
+use glyph_field::{FieldCore, FieldResources, FieldShape, FieldTargets, GlyphField, GlyphFieldGpu, HostSlots, SlotStorage};
 use wgpu::util::DeviceExt;
 
 use crate::pipeline::{BINDING_GLYPH_ADVANCES, BINDING_GROUP_OVERRIDES, BINDING_ITEM_TABLE, EXTRA_LAYOUT};
@@ -62,12 +62,11 @@ impl DerivedFieldGpu {
 }
 
 impl GlyphFieldGpu for DerivedFieldGpu {
-    fn sync(&self, queue: &wgpu::Queue, field: &dyn GlyphField) {
-        self.core.storage().sync(queue, &field.host_slots());
-        let version = field.group_overrides_version();
-        if version != self.overrides_uploaded.get() {
-            queue.write_buffer(&self.group_overrides, 0, bytemuck::cast_slice(&field.group_overrides()));
-            self.overrides_uploaded.set(version);
+    fn sync(&self, queue: &wgpu::Queue, slots: &HostSlots, overrides: &[u32], overrides_version: u64) {
+        self.core.storage().sync(queue, slots);
+        if overrides_version != self.overrides_uploaded.get() {
+            queue.write_buffer(&self.group_overrides, 0, bytemuck::cast_slice(overrides));
+            self.overrides_uploaded.set(overrides_version);
         }
     }
 

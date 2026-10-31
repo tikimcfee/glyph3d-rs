@@ -114,6 +114,9 @@ pub struct FrameCosts {
     pub regions: RegionCost,
     /// The CPU cull, when the scene culls (0 under --no-cull).
     pub cull_ms: f32,
+    /// The library animation's last step before this frame: its ease and
+    /// its move notes, ms (0, 0 when nothing animated).
+    pub library: (f64, f64),
 }
 
 /// One frame, prepared: see the module header.
@@ -166,8 +169,10 @@ pub struct FrameData<'a> {
     /// consumer holding the blocks' `Arc`s sees a written block as a new
     /// one; one holding none reads `HostSlots::version`.
     pub slots: Ref<'a, glyph_field::HostSlots>,
-    /// The Derived field's group overrides table (index 0 unused).
+    /// The Derived field's group overrides table (index 0 unused), and its
+    /// version, bumped by every write to it.
     pub group_overrides: Ref<'a, [u32]>,
+    pub group_overrides_version: u64,
     /// The item table the Derived shader reads, fixed for the scene's life.
     pub item_table: &'a [glyph_field::ItemParamsGpu],
     // ── for the wgpu half only ──
@@ -312,6 +317,7 @@ impl GlyphScene {
             faces: if face_runs.is_empty() { UploadCost::default() } else { self.library_faces.as_ref().map(|f| f.last_update()).unwrap_or_default() },
             regions: region_cost,
             cull_ms,
+            library: self.library_tick_ms.replace((0.0, 0.0)),
         };
         FrameData {
             viewport: [width, height],
@@ -341,6 +347,7 @@ impl GlyphScene {
             cubes: meshes.map_or(&[], |m| &m.cubes),
             slots: self.field.host_slots(),
             group_overrides: self.field.group_overrides(),
+            group_overrides_version: self.field.group_overrides_version(),
             item_table: &self.item_table,
             costs,
             uniform,

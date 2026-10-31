@@ -724,15 +724,11 @@ impl LayoutEngine {
         Self::Hyper(crate::layout_hyper::HyperLayout::new())
     }
 
-    /// Constructs a HyperLayout engine sharing a GPU context device. The
-    /// device path emits `field_mode`'s own slot format directly (20 B
-    /// `DerivedSlot`s in host blocks) — the field then keeps them with no
-    /// transcode.
-    pub fn hyper_with_device(
-        device: crate::gpu::SharedDevice,
-        field_mode: glyph_field::GlyphFieldMode,
-    ) -> Self {
-        Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
+    /// A HyperLayout engine laying out for a field: it emits `field_mode`'s
+    /// own slot format directly (20 B `DerivedSlot`s in host blocks), which
+    /// the field then keeps with no transcode, checked against `home`.
+    pub fn hyper_for_field(home: crate::budget::SlotHome, field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::for_field(home, field_mode))
     }
 
     /// Sets prefetched inputs from the background prefetch thread for HyperLayout.

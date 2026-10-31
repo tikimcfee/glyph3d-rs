@@ -83,7 +83,7 @@ pub struct LiveSource {
     pub content: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
     pub params: crate::repo::RepoParams,
     pub emoji_sheet: std::path::PathBuf,
-    pub atlas: crate::atlas::Atlas,
+    pub atlas: std::sync::Arc<crate::atlas::Atlas>,
     pub last_style: std::collections::HashMap<String, crate::seam::SurfaceUpdate>,
     pub backlog: Vec<crate::seam::SurfaceUpdate>,
     pub step: Option<std::sync::mpsc::Sender<LiveStep>>,
