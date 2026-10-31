@@ -213,7 +213,9 @@ Derived's default item table).
     saturate silently); wrap_segment and glyph_id (16 bits each) are not in
     `derived_lane_limits`; `derived_vertex_stage_agrees_with_instanced` and
     `block_cull_bounds_enclose_all_slots` use `RenderEmit` as their reference
-    and must move onto the oracle's reference instances before step 3; the
+    and must move onto the oracle's reference instances before step 3 (done
+    2026-10-31: both read `hyper_oracle::reference_item`'s instances, the first
+    renamed `derived_vertex_stage_agrees_with_the_reference`); the
     shaders' greeking gate differs (Instanced greeks a blank glyph with a
     background, Derived does not).
 

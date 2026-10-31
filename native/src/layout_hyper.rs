@@ -1190,7 +1190,6 @@ pub use rederive::{rederive_item_records, resolve_spans_to_slot_colors};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glyph_scene::RenderSlot;
     use crate::layout::{ItemParams, Paint};
     use glyph_field_derived::DerivedSlot;
 
@@ -1640,7 +1639,18 @@ mod tests {
             slot_bases.push(slots_acc);
             slots_acc += p.survivor_count;
         }
-        let mut direct: Vec<RenderSlot> = vec![bytemuck::Zeroable::zeroed(); slots_acc as usize];
+        // The blocks come from the production emitter; the positions they
+        // must enclose from the oracle-backed reference, which every slot
+        // the emitter writes is held to (hyper-oracle). Until 2026-10-31
+        // the positions were the Instanced emitter's own RenderSlots.
+        let mut direct: Vec<glyph_field_derived::DerivedSlot> = vec![bytemuck::Zeroable::zeroed(); slots_acc as usize];
+        let reference = {
+            let r = crate::hyper_oracle::reference_item(bytes, &items[0].params, &trie);
+            let mut arena = crate::layout::GlyphArena::new();
+            crate::layout::compact_records_into(&r.records, Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED), 0, &mut arena);
+            arena.instances().to_vec()
+        };
+        assert_eq!(reference.len(), slots_acc as usize, "the reference places every survivor");
         let inputs = EmitInputs {
             items: &items,
             chunks: &chunks,
@@ -1657,7 +1667,7 @@ mod tests {
             bitmap_adv,
             em_height_fu,
         };
-        let (out, _pairs) = inputs.run::<RenderEmit>(direct.as_mut_ptr() as usize);
+        let (out, _pairs) = inputs.run::<DerivedEmit>(direct.as_mut_ptr() as usize);
         assert!(!out.file_blocks.is_empty());
         let blocks = &out.file_blocks[0];
         assert!(blocks.len() >= 2, "must have multiple blocks for > 512 survivors, got {}", blocks.len());
@@ -1684,7 +1694,7 @@ mod tests {
 
             let start = block.slot_base as usize;
             let end = (block.slot_base + block.slot_count) as usize;
-            for (slot_idx, slot) in direct[start..end].iter().enumerate() {
+            for (slot_idx, slot) in reference[start..end].iter().enumerate() {
                 assert!(
                     slot.pos[0] >= block.min[0] - 1e-4,
                     "block {block_index}, slot {slot_idx}: x {} < min_x {}",
