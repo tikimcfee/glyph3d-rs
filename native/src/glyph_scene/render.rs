@@ -43,7 +43,7 @@ pub(super) fn encode_frame(
     // The tables first: the group rows the resolve changed go up before any
     // pass reads a row (the glyph pass);
     // the page faces and regions with them. Nothing moved, nothing written.
-    scene.nodes.upload(&ctx.queue, &frame.group_runs);
+    scene.nodes.upload(&ctx.queue, &scene.gpu.group_buf, &frame.group_runs);
     if let Some(faces) = &scene.library_faces {
         faces.upload(&ctx.queue, &frame.face_runs);
     }
@@ -76,7 +76,7 @@ pub(super) fn encode_frame(
     // Stage L (L3): the phase lists draw into the pooled view target
     // (ping-pong slot selected here) and composite into the driver's
     // view at the end of render.
-    let comp = &scene.composite;
+    let comp = &scene.gpu.composite;
     let vt = comp
         .target
         .as_ref()
@@ -89,13 +89,13 @@ pub(super) fn encode_frame(
     let pool_slot = (comp.parity.get() % 2) as usize;
     comp.parity.set(comp.parity.get() + 1);
 
-    ctx.queue.write_buffer(&scene.camera_buf, 0, bytemuck::bytes_of(&frame.uniform));
-    if scene.params_uploaded.get() != frame.params_generation {
-        ctx.queue.write_buffer(&scene.params_buf, 0, bytemuck::bytes_of(&frame.params));
-        scene.params_uploaded.set(frame.params_generation);
+    ctx.queue.write_buffer(&scene.gpu.camera_buf, 0, bytemuck::bytes_of(&frame.uniform));
+    if scene.gpu.params_uploaded.get() != frame.params_generation {
+        ctx.queue.write_buffer(&scene.gpu.params_buf, 0, bytemuck::bytes_of(&frame.params));
+        scene.gpu.params_uploaded.set(frame.params_generation);
     }
     if let Some(env) = &frame.env {
-        scene.environment.write(&ctx.queue, env);
+        scene.gpu.environment.write(&ctx.queue, env);
     }
     // The CPU cull's backdrop survivors, up to the buffer's capacity.
     if let Some(cull) = &scene.cull {
@@ -108,7 +108,7 @@ pub(super) fn encode_frame(
 
     let scene_meshes = scene.controller.as_ref().map(|ctrl| ctrl.scene.mesh_draws());
     if let Some(meshes) = scene_meshes {
-        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
+        scene.gpu.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
     }
     let glyph_ranges = frame.glyph_ranges.pairs();
 
@@ -124,7 +124,7 @@ pub(super) fn encode_frame(
     let draw_depth_view = &vt.depth;
     let draw_color_view = &vt.color_views[pool_slot];
     
-    let mp_ref = scene.mesh_pipeline.borrow();
+    let mp_ref = scene.gpu.mesh_pipeline.borrow();
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("glyph field pass"),
@@ -153,7 +153,7 @@ pub(super) fn encode_frame(
     // The environment (ground/sky) goes down first, opaque, writing depth;
     // everything after sorts against it. Off: nothing recorded.
     if frame.env.is_some() {
-        scene.environment.draw(&mut pass);
+        scene.gpu.environment.draw(&mut pass);
     }
     // Stage L (L2): record the phase lists in phase order — Backdrop
     // first, Glyphs second, exactly the Stage F order. Empty phases
@@ -191,7 +191,7 @@ pub(super) fn encode_frame(
                 // library load has no other scene mesh): same pipeline,
                 // same position in the phase.
                 if let Some(faces) = &scene.library_faces {
-                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.mesh_frame_bg, &faces.instances);
+                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.gpu.mesh_frame_bg, &faces.instances);
                 }
                 // The regions after the faces (a page hides the walls
                 // behind it), before the glyphs (which read over them).
@@ -202,10 +202,10 @@ pub(super) fn encode_frame(
                     let q_len = meshes.quads.len() as u32;
                     let c_len = meshes.cubes.len() as u32;
                     if q_len > 0 {
-                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..q_len, &scene.mesh_frame_bg);
+                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..q_len, &scene.gpu.mesh_frame_bg);
                     }
                     if c_len > 0 {
-                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Cube, q_len..(q_len + c_len), &scene.mesh_frame_bg);
+                        mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Cube, q_len..(q_len + c_len), &scene.gpu.mesh_frame_bg);
                     }
                 }
             }

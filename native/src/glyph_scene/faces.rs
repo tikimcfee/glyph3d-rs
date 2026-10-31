@@ -214,7 +214,7 @@ mod tests {
         });
         let start: Vec<GroupRow> = tints.iter().map(|t| GroupRow::tinted([0.0; 3], *t)).collect();
         ctx.queue.write_buffer(&table, 0, bytemuck::cast_slice(&start));
-        let mut g = GroupNodes::new(&table, &start);
+        let mut g = GroupNodes::new(&start);
         let file_nodes: Vec<NodeHandle> = (0..n as u32).map(|i| g.node(i).unwrap()).collect();
         let root = g.root();
         lib.attach(g.tables_mut(), Some(root), &file_nodes);
@@ -225,7 +225,7 @@ mod tests {
 
         let frame = |g: &GroupNodes| {
             let (plan, rows) = g.prepare();
-            g.upload(&ctx.queue, &rows);
+            g.upload(&ctx.queue, &table, &rows);
             let runs = faces.prepare(&g.tables(), &plan);
             faces.upload(&ctx.queue, &runs);
             (g.last_flush().0.bytes, faces.last_update().bytes * usize::from(!runs.is_empty()))

@@ -56,15 +56,22 @@ pub(super) struct EnvCamera {
     pub(super) fit: f32,
 }
 
+/// The environment's state on the scene: whether it is on, and the ground
+/// height asked for. No device type (2026-10-31): the draw is
+/// [`EnvironmentGpu`]'s.
 pub(super) struct Environment {
-    pipeline: wgpu::RenderPipeline,
-    uniform_buf: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
     pub(super) mode: Cell<EnvironmentMode>,
     pub(super) ground_y_override: Cell<Option<f32>>,
 }
 
-impl Environment {
+/// The environment pass on a wgpu device: its pipeline and uniform.
+pub(super) struct EnvironmentGpu {
+    pipeline: wgpu::RenderPipeline,
+    uniform_buf: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl EnvironmentGpu {
     pub(super) fn new(device: &wgpu::Device, depth_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("environment.wgsl"),
@@ -137,13 +144,25 @@ impl Environment {
                 resource: uniform_buf.as_entire_binding(),
             }],
         });
-        Self {
-            pipeline,
-            uniform_buf,
-            bind_group,
-            mode: Cell::new(EnvironmentMode::Off),
-            ground_y_override: Cell::new(None),
-        }
+        Self { pipeline, uniform_buf, bind_group }
+    }
+
+    /// Upload a frame's uniform. Call only when on.
+    pub(super) fn write(&self, queue: &wgpu::Queue, u: &EnvUniform) {
+        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
+    }
+
+    /// Record the draw. Call first in the glyph field pass, only when on.
+    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+impl Environment {
+    pub(super) fn new() -> Self {
+        Self { mode: Cell::new(EnvironmentMode::Off), ground_y_override: Cell::new(None) }
     }
 
     pub(super) fn is_on(&self) -> bool {
@@ -167,21 +186,10 @@ impl Environment {
             .unwrap_or_else(|| scene_min_y - crate::config::settings().environment.ground_gap)
     }
 
-    /// This frame's uniform (the CPU half; `write` uploads it).
+    /// This frame's uniform (the CPU half; [`EnvironmentGpu::write`]
+    /// uploads it).
     pub(super) fn frame_uniform(&self, cam: &EnvCamera, ground_y: f32) -> EnvUniform {
         uniform(cam, ground_y)
-    }
-
-    /// Upload a frame's uniform. Call only when on.
-    pub(super) fn write(&self, queue: &wgpu::Queue, u: &EnvUniform) {
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
-    }
-
-    /// Record the draw. Call first in the glyph field pass, only when on.
-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
     }
 }
 

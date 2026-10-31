@@ -688,7 +688,7 @@ impl GlyphScene {
 
     /// Find an existing matching group row or allocate a new one (up to max_groups).
     pub(super) fn allocate_group_row(&mut self, row: crate::glyph_scene::GroupRow) -> Option<u32> {
-        let max_groups = (self.group_buf.size() / 96) as u32;
+        let max_groups = self.params.get().max_groups;
         if let Some(i) = self.nodes.rows().iter().position(|r| bytemuck::bytes_of(r) == bytemuck::bytes_of(&row)) {
             return Some(i as u32);
         }
@@ -1018,7 +1018,7 @@ impl GlyphScene {
                     self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
                     format!("verb set-glyph-background: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
-                    format!("verb set-glyph-background: {rel} out of groups (max {})", self.group_buf.size() / 96)
+                    format!("verb set-glyph-background: {rel} out of groups (max {})", self.params.get().max_groups)
                 }
             }
             Verb::SetGlyphTransform(t, q, s) => {
@@ -1037,7 +1037,7 @@ impl GlyphScene {
                     self.field.write_group_id(&ctx.queue, slot, view, new_group_row);
                     format!("verb set-glyph-transform: {rel} row {} col {} slot {slot} -> group {new_group_row}", g.row, g.col)
                 } else {
-                    format!("verb set-glyph-transform: {rel} out of groups (max {})", self.group_buf.size() / 96)
+                    format!("verb set-glyph-transform: {rel} out of groups (max {})", self.params.get().max_groups)
                 }
             }
             Verb::ResetGlyphGroup => {

@@ -97,12 +97,13 @@ pub use instance::Params;
 pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};
 
 mod target;
-use target::{CompositeState, Selection, ViewTarget, SCENE_SAMPLE_COUNT};
+use target::{Selection, ViewTarget, SCENE_SAMPLE_COUNT};
 
 mod ui_probe;
 pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
+mod renderer;
 mod interaction;
 mod nodes;
 mod tree_cull;
@@ -128,10 +129,6 @@ pub struct GlyphScene {
     /// chunked (a repo-scale field exceeds one storage binding); the cull and
     /// pick slot math key on `field.chunk_capacity()`.
     pub(crate) field: Box<dyn GlyphField>,
-    /// The colour-emoji sheet's view, held so the texture outlives the bind
-    /// groups that sample it (binding 6 of every chunk's bind group).
-    pub(crate) _emoji_view: wgpu::TextureView,
-    pub(crate) camera_buf: wgpu::Buffer,
     pub(crate) depth_format: wgpu::TextureFormat,
     pub(crate) center: Vec3,
     pub(crate) half_w: f32,
@@ -145,10 +142,6 @@ pub struct GlyphScene {
     /// the legacy per-chunk draws.
     pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
-    /// Group table buffer (96 B rows): written by the load, then by the
-    /// group nodes' flush (each row whose bytes changed, a verb's new row
-    /// whole).
-    pub(crate) group_buf: wgpu::Buffer,
     /// Every group row as a node of the transform tree (2026-10-10,
     /// `nodes.rs`), and the group table itself (`GroupNodes::rows`, the one
     /// host copy: pick, cull and the HUD read the live TRS there): the group
@@ -205,21 +198,9 @@ pub struct GlyphScene {
     pub(crate) tint_step: Vec<u32>,
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
     pub(crate) ui_probe: Option<UiProbe>,
-    /// Stage L (L3): device handle for pool (re)creation in set_viewport
-    /// (which has no ctx param — the trait shape is fenced).
-    pub(crate) device: wgpu::Device,
-    /// Stage L (L3): composite machinery — the ONLY release path (the
-    /// --no-composite A/B escape hatch proved neutrality and was removed at
-    /// stage end; see out/history/STAGE_L_REPORT.md).
-    pub(in crate::glyph_scene) composite: CompositeState,
-    pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
     pub(in crate::glyph_scene) params: Cell<Params>,
-    /// Bumped by every Params setter (`FrameData::params_generation`), and
-    /// the generation `params_buf` holds.
+    /// Bumped by every Params setter (`FrameData::params_generation`).
     pub(in crate::glyph_scene) params_generation: Cell<u64>,
-    pub(in crate::glyph_scene) params_uploaded: Cell<u64>,
-    pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
-    pub(crate) mesh_frame_bg: wgpu::BindGroup,
     /// A library load's page faces, built on the host from the sheets'
     /// resolved worlds and uploaded where they changed (`faces.rs`); None
     /// in every other scene.
@@ -236,6 +217,8 @@ pub struct GlyphScene {
     pub(in crate::glyph_scene) scene_min_y: f32,
     /// The ground/sky pass; off unless asked for (records nothing when off).
     pub(in crate::glyph_scene) environment: environment::Environment,
+    /// Every wgpu object the scene draws with (`renderer.rs`).
+    pub(in crate::glyph_scene) gpu: renderer::SceneGpu,
     /// The item table, one row per view (`Views::item_table`), as the
     /// Derived field's shader reads it: kept for a host renderer that
     /// uploads it itself (`FrameData::item_table`). Fixed for the scene's
@@ -425,14 +408,14 @@ impl SceneLike for GlyphScene {
         // Stage L (L3): (re)size the pooled view target to the viewport.
         // Both drivers call set_viewport before the first render (windowed:
         // on window creation and every resize; offscreen: once at startup).
-        let comp = &mut self.composite;
+        let comp = &mut self.gpu.composite;
         let stale = comp
             .target
             .as_ref()
             .is_none_or(|t| t.width != w || t.height != h);
         if stale && w > 0 && h > 0 {
             let target = ViewTarget::new(
-                &self.device,
+                &self.gpu.device,
                 w,
                 h,
                 &comp.bind_group_layout,
