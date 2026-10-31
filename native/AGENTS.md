@@ -202,18 +202,16 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
 This section is the one copy of these facts (the testing skill points here;
 `research/desktop-platform-audit.md` is the 2026-10 survey behind it, and
 its staging text predates C22). Key touchpoints:
-- **Unified vs. Discrete Slot Buffers (`native/src/layout_hyper/device_alloc.rs`)**:
-  - `#[cfg(target_os = "macos")]` allocates Metal `MTLStorageModeShared` memory and maps it (`mapped_base: Some(addr)`). Pass 2 writes directly to device memory with zero copies.
-  - On non-macOS/desktop (`mapped_base: None`), the default is WINDOWED emission (C22): Pass 2 writes each 64 MiB window of the slot stream into one of two mapped staging buffers, copied to VRAM while the next fills (`GLYPH_STAGING` below names the fallbacks).
-  - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field/src/storage.rs` `SlotStorage::write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
+- **Slot emission (`native/src/layout_hyper/emit.rs`)**: Pass 2 writes the Derived slots into HOST blocks that are the field's chunks, window by window through host scratch, on every machine; the wgpu field uploads one buffer per block (`crates/glyph-field/src/storage.rs`). Until 2026-10-31 the Instanced field's slots were emitted to the device directly (Metal shared memory on macOS; on discrete GPUs C22's windowed staging, with `GLYPH_STAGING` fallbacks); that path went with the Instanced field (`device_alloc.rs`, now `emit.rs`).
+  - ⚠️ **Dynamic Color Writes**: `SlotStorage::write_colors` writes each slot's colour into its host block and, when the device holds a copy, one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
 - **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
   - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
   - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.
   - A line with no newline near the threshold is cut INSIDE the line, and only before an ASCII byte (C15): no cluster sequence has an ASCII member after its first (asserted at atlas load), so every chunk resolves as the whole item does. The chunk after such a cut inherits the line's column, line advance and segment advance from Pass 1's aggregation, which computes the segment advance as the fold's running f32 sum. Changing the threshold moves `native/fixtures/chunk-cut.txt`'s cuts off the sequences it plants: re-prove its mutations.
 - **Cache Lines & Burst Stores (`native/src/layout_hyper/pass2_device.rs`)**:
-  - `emit_burst8` writes 8 `DerivedSlot`s (160 B) or 4 `RenderSlot`s (128 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
+  - `emit_burst8` writes 8 `DerivedSlot`s (160 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
 - **Copy sizes (`crates/glyph-field/src/copy.rs`, C16, measured 2026-10-09 on an RTX 5090)**:
-  - A `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed; wgpu only asks for 4. A 20 B `DerivedSlot` stream is 16-aligned only at counts ≡ 0 mod 4, so an odd count cost ~+20 ms of backend on a 94 MB tree. Discrete staging buffers are padded with `padded_staging_size` and slot copies go through `copy_split` (16-aligned body + small tail). Same bytes, same buffer sizes; the unified single-chunk path makes no copy and is untouched.
+  - A `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed; wgpu only asks for 4. A 20 B `DerivedSlot` stream is 16-aligned only at counts ≡ 0 mod 4, so an odd count cost ~+20 ms of backend on a 94 MB tree. Upload staging buffers are padded with `padded_staging_size` and slot copies go through `copy_split` (16-aligned body + small tail). Same bytes, same buffer sizes.
   - An off-16 source OFFSET also costs; chunked Derived buffers start chunk k at `k x chunk_cap x 20` B (≡ 8 mod 16 at the 2 GiB binding limit; a forced two-chunk split of the 94 MB tree measured ~+1 ms at 8 mod 16, ~+5 ms at 4 mod 16). Left as is: moving it would move which slot lives in which chunk.
 - **Golden Pixel Keys**:
   - Golden baselines are keyed per rasterizer in `out/tooling-ab/baseline/<key>/`; sets exist for `metal-apple` and `vulkan-nvidia`. Any other key (e.g. `vulkan-amd`) is red until a human adopts its set.
@@ -226,21 +224,15 @@ its staging text predates C22). Key touchpoints:
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument: `repo.{walk,backend,verify,views,layout,staged,segments}` and
-  `hyper.{pass1,pass2,emoji_tints,pass2.windowed,staging.stream}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
+  `hyper.{pass1,pass2,emoji_tints,pass2.blocks}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
   is the useful setting — a bare `info` also admits wgpu's own
   tracing records, which is loud. The spans mirror the
   LoadStats Instant boundaries exactly so the two can be
   cross-checked; the prints stay the presentation contract.
-- `GLYPH_STAGING=host|single` — discrete GPUs only. The default is WINDOWED
-  emission (C22): Pass 2 writes each 64 MiB window of the slot stream straight
-  into one of two mapped staging buffers, uploaded while the next fills; the
-  chunks of emoji-holding items detour through host scratch for their tint
-  pairs. `host` writes host memory and streams it through one 64 MiB buffer
-  (a full extra copy); `single` is one mapped-at-creation buffer, which
-  wgpu-core zero-fills and copies. On the measured NVIDIA box (derived, 102 MB
-  tree): windowed 121 ms, host 194, single 482. The fallbacks stay for
-  hardware nobody has measured.
+- (`GLYPH_STAGING=host|single`, the discrete-GPU fallbacks of C22's windowed
+  device emission, went with that path on 2026-10-31: the slots land in host
+  blocks on every machine.)
 - `GLYPH_HYPER_ORACLE_STRICT=1` — the hyper-oracle gate's form: besides
   refusing zero records, refuse a corpus in which the reference resolved no
   sequence or no ASCII-led one.

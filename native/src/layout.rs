@@ -475,8 +475,11 @@ pub struct FileTintAccum {
 /// by `chunk_slots`, and computed each item's tint inputs and sub-file
 /// blocks on the way (so nothing reads the slots back for them).
 pub struct EmittedSlots {
-    /// Where the slots are.
-    pub residence: SlotResidence,
+    /// The slots, on the host in blocks that are the chunks: the Derived
+    /// field's form since 2026-10-26, the one host copy a makepad renderer
+    /// publishes and the wgpu field uploads from. (Instanced slots were
+    /// emitted to the device directly until 2026-10-31.)
+    pub slots: glyph_field::HostSlots,
     /// Slots per chunk (uniform; the last chunk may hold fewer).
     pub chunk_slots: usize,
     pub len: usize,
@@ -489,44 +492,9 @@ pub struct EmittedSlots {
     pub format: glyph_field::GlyphFieldMode,
     /// Per item: `(glyph_id, color)` pairs captured at emission for items
     /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
-    /// tint fold never reads device slots back. Empty when not produced.
+    /// tint fold never reads the slots back. Empty when not produced.
     pub emoji_tint_pairs: Vec<Vec<u32>>,
 }
-
-/// Where emitted slots live.
-pub enum SlotResidence {
-    /// On the host, in blocks that are the chunks: the Derived field's form
-    /// since 2026-10-26, the one host copy a makepad renderer publishes and
-    /// the wgpu field uploads from.
-    Host(glyph_field::HostSlots),
-    /// On the device, written there directly (mapped unified memory, or
-    /// staged windows): the Instanced field's form. It stays device-direct
-    /// only because Instanced is being retired (step 3 deletes it); it is
-    /// not a second Derived path (2026-10-26).
-    Device {
-        /// One entry per chunk buffer. `offset` is slot 0's byte address in
-        /// the buffer.
-        chunks: Vec<DeviceSlotChunk>,
-        /// When the chunks are one host-visible mapping (unified memory),
-        /// the base address of its `RenderSlot` slice.
-        mapped_slots: Option<usize>,
-    },
-}
-
-impl EmittedSlots {
-    /// The `RenderSlot` mapping, when the slots are one (Instanced on
-    /// unified memory).
-    pub fn mapped_slots(&self) -> Option<usize> {
-        match &self.residence {
-            SlotResidence::Device { mapped_slots, .. } => *mapped_slots,
-            SlotResidence::Host(_) => None,
-        }
-    }
-}
-
-/// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
-/// (buffer, slot-0 byte offset, live slots), named for its producer role here.
-pub use glyph_field::SlotChunk as DeviceSlotChunk;
 
 impl GlyphArena {
     pub fn new() -> Self {
@@ -605,36 +573,18 @@ impl GlyphArena {
         self.instances
     }
 
-    /// Update slot colors in-place for host or direct-mapped device slots.
-    /// Returns the number of slots updated.
+    /// Update the host form's slot colors in place; an emitted arena's
+    /// slots are the field's to write (none updated here). Returns the
+    /// number of slots updated.
     pub fn update_slot_colors(&mut self, slot_base: usize, colors: &[u32]) -> usize {
-        if colors.is_empty() {
+        if colors.is_empty() || self.emitted.is_some() {
             return 0;
         }
-        if let Some(d) = &self.emitted {
-            if let Some(addr) = d.mapped_slots() {
-                let count = colors.len().min(d.len.saturating_sub(slot_base));
-                let ptr = addr as *mut crate::glyph_scene::RenderSlot;
-                // SAFETY: `mapped_slots` is set only for RenderSlot arenas, never
-                // Derived (its doc; layout_hyper builds it so), and maps `d.len` slots
-                // the arena's buffers keep alive; `count` clamps every write below
-                // `d.len`.
-                unsafe {
-                    for (i, &c) in colors.iter().take(count).enumerate() {
-                        (*ptr.add(slot_base + i)).color = c;
-                    }
-                }
-                count
-            } else {
-                0
-            }
-        } else {
-            let count = colors.len().min(self.instances.len().saturating_sub(slot_base));
-            for (i, &c) in colors.iter().take(count).enumerate() {
-                self.instances[slot_base + i].color = c;
-            }
-            count
+        let count = colors.len().min(self.instances.len().saturating_sub(slot_base));
+        for (i, &c) in colors.iter().take(count).enumerate() {
+            self.instances[slot_base + i].color = c;
         }
+        count
     }
 
     /// Hint the upper bound on slots still to come (records, before blanks are

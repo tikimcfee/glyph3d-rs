@@ -62,9 +62,6 @@ impl DerivedField {
             SlotSource::Host { slices, glyph_count, .. } => {
                 glyph_field::transcode_host_slots(&slices, glyph_count, resources.block_slots, &transcode)
             }
-            SlotSource::Device { .. } => panic!(
-                "the Derived field keeps its slots on the host (2026-10-26): a device slot source is the Instanced field's"
-            ),
         };
         let storage = if resources.slots_on_device {
             SlotStorage::from_source(device, queue, SlotSource::Blocks(slots), &transcode, &LABELS)
