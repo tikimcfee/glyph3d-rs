@@ -98,11 +98,11 @@ pub(super) fn encode_frame(
         scene.gpu.environment.write(&ctx.queue, env);
     }
     // The CPU cull's backdrop survivors, up to the buffer's capacity.
-    if let Some(cull) = &scene.cull {
+    if let Some(bd) = &scene.gpu.backdrops {
         if !frame.backdrops.is_empty() {
-            let max_cap = (cull.backdrop_insts_buf.size() / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64) as usize;
+            let max_cap = (bd.insts_buf.size() / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64) as usize;
             let n = frame.backdrops.len().min(max_cap);
-            ctx.queue.write_buffer(&cull.backdrop_insts_buf, 0, bytemuck::cast_slice(&frame.backdrops[..n]));
+            ctx.queue.write_buffer(&bd.insts_buf, 0, bytemuck::cast_slice(&frame.backdrops[..n]));
         }
     }
 
@@ -172,14 +172,14 @@ pub(super) fn encode_frame(
                 // machinery, see the module header). The pipeline lives
                 // in CullState; the legacy branch never reaches in here
                 // (its backdrops list is empty).
-                if let Some(cull) = &scene.cull {
+                if let Some(bd) = &scene.gpu.backdrops {
                     if !frame.backdrops.is_empty() {
                         let q = ctx
                             .profiler
                             .as_ref()
                             .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
-                        pass.set_pipeline(&cull.backdrop_pipeline);
-                        pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
+                        pass.set_pipeline(&bd.pipeline);
+                        pass.set_bind_group(0, &bd.bind_group, &[]);
                         pass.draw(0..6, 0..frame.backdrops.len() as u32);
                         if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                             p.borrow().end_query(&mut pass, q);
