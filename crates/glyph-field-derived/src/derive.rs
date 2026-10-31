@@ -1,8 +1,9 @@
 //! The vertex stage's Y/Z derivation, transcribed: what
 //! `glyph_field_derived.wgsl`'s `derive_yz` computes from a slot's row lane,
 //! its wrap segment and its item's [`ItemParamsGpu`], written once more in
-//! Rust so a test can hold it to the Instanced emitter's positions — the
-//! Derived field's one lane no oracle sees (the slot carries no Y or Z).
+//! Rust so a test can hold it to the oracle-backed reference's positions
+//! (the Instanced emitter's until 2026-10-31) — the Derived field's one
+//! lane no oracle sees directly (the slot carries no Y or Z).
 //!
 //! Keep the two in step by hand: the shader is the contract, this is its
 //! witness, and a fault both share is invisible here (the same shape as

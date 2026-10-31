@@ -87,9 +87,9 @@ caller; the short version:
   `Derived` mode into HOST blocks that are the field's chunks (2026-10-26;
   `[glyph_scene] derived_block_slots`, `glyph_field::HostSlots`): the one host
   copy a makepad renderer publishes and the wgpu field uploads from, kept current
-  by every slot write. 32-byte `RenderSlot`s in `Instanced` mode go straight
-  into mapped GPU unified memory or staged windows, device-direct only because
-  Instanced is being retired.
+  by every slot write. (32-byte `RenderSlot`s for the Instanced mode went
+  straight into mapped device memory or staged windows until that mode was
+  retired, 2026-10-31.)
 - **Paint is flat at load, colour arrives as spans** (2026-10-11). Every load
   paints `Paint::Flat`; per-glyph colour comes afterwards as byte spans (the
   `--highlight` sidecar and the seam's style runs: `style_file`). `Paint::PerRecord`
@@ -108,8 +108,9 @@ caller; the short version:
   - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
     background prefetch; the stats line prints `batch`/`naive`'s
     readback/compaction phases.
-- `--field-mode derived|instanced` selects the glyph field mode (a third,
-  `visible`, was deleted on 2026-10-26; `out/history/VISIBLE-MODE.md`):
+- `--field-mode derived` selects the glyph field mode, of which one remains
+  (`visible` was deleted on 2026-10-26, `out/history/VISIBLE-MODE.md`;
+  `instanced` on 2026-10-31, and is refused):
   - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
     retirement step 1 — no golden pixel moved): compact word layout, x stored,
     Y/Z derived in the vertex stage from the item table. Host-staged scenes
@@ -119,9 +120,9 @@ caller; the short version:
     block (`agent_transcript::staging::block_item`) so derived y/z equal the
     absolute ones bit for bit. `nudge-glyph` y/z and `scale-glyph` have no
     lane here and reply "not representable" (x nudges apply).
-  - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
-    held byte-equal to every golden by the `--field-mode instanced`
-    equivalent until step 3 deletes its crate.
+  - (`instanced`, 32 B per glyph with precomputed 3D coordinates, held
+    byte-equal to every golden by the `--field-mode instanced` equivalent
+    from 2026-10-11, was retired on 2026-10-31: step 3 deleted its crate.)
   - **The Derived lanes are a load-time limit, per file** (`layout_hyper::derived_lane_overflow`,
     2026-10-10; per file since 2026-10-31): rows per item vs `ROW_MAX`, column pages
     vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), and items with a glyph past
@@ -307,10 +308,9 @@ its staging text predates C22). Key touchpoints:
   345; on fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801).
   The button shows on repo and text scenes; demo and agent-session scenes carry
   no mode and hide it.
-- `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
-  cycles the field mode Instanced → Derived through the SAME
-  rebuild arm the Debug panel's selector fires, printing the F8 HUD line
-  (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild.
+- (`GLYPH_FIELDMODE_SELFTEST=1`, which cycled the field mode Instanced →
+  Derived through the Debug panel's selector, went with the Instanced field
+  and the selector on 2026-10-31.)
 - `GLYPH_GRAB_SELFTEST=file[:dx:dy]` — windowed, dev-only (C29, 2026-10-10):
   the GRAB path through the window's own entry points — `apply_pick` on
   `file` (row 0 col 0), `on_cursor` to park the cursor at the centre,

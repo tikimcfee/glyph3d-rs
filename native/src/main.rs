@@ -7,8 +7,8 @@
 //!                    the terminal launcher (`launcher/`): pick a scene and
 //!                    its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
-//!                    `--field-mode derived|instanced`, derived the
-//!                    default since 2026-10-11).
+//!                    `--field-mode derived`, the one field mode since
+//!                    2026-10-31).
 //!   `--render-file P`  one text file; `--agent-session P` an agent transcript;
 //!                    `--demo` the quad-field stress demo.
 //!   `--screenshot PATH [--frames N]`

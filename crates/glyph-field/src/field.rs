@@ -69,7 +69,7 @@ pub trait GlyphField {
     /// Change the group ID for one glyph. `item` is the glyph's item (file)
     /// index: a mode whose slot derives its placement from the item table
     /// (Derived) keeps the item in the same lane as the group and must
-    /// rewrite both; Instanced ignores it.
+    /// rewrite both.
     fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, item: u32, group_id: u32);
 
     // ── bulk verbs ─────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ pub trait GlyphField {
 
     /// The slots on the host, in blocks that are this field's chunks, kept
     /// current by every write above (Derived). None for a field whose slots
-    /// live on the device alone (Instanced).
+    /// live on the device alone (the retired Instanced field's were).
     fn host_slots(&self) -> Option<std::cell::Ref<'_, crate::HostSlots>> {
         None
     }

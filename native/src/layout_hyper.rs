@@ -244,7 +244,6 @@ impl HyperLayout {
                 len: total_survivors,
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
-                format: field_mode,
                 emoji_tint_pairs,
             };
             *arena = GlyphArena::from_emitted(emitted);

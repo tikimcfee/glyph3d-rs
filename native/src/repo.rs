@@ -163,10 +163,9 @@ pub struct RepoParams {
     pub tab_width: crate::fold::TabWidth,
     /// Spatial arrangement mode for the repository files across the canvas.
     pub layout_mode: RepoLayoutMode,
-    /// The glyph field the device layout emits for: `Instanced` (32 B
-    /// `RenderSlot`) or `Derived` (20 B `DerivedSlot` + line table). The
-    /// HyperLayout device path writes the chosen format straight into the
-    /// GPU arena — no host transcode between layout and field.
+    /// The glyph field the layout emits for: `Derived` (20 B `DerivedSlot`),
+    /// written by HyperLayout's Pass 2 straight into the field's host
+    /// blocks — no transcode between layout and field.
     pub field_mode: glyph_field::GlyphFieldMode,
 }
 
@@ -583,8 +582,8 @@ fn load_views(
     let paint_mode = Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED);
 
     // Each view's group row: its own index, unless the permutation witness
-    // asks otherwise (`group_rows_of_views`). The layout writes it into the
-    // Instanced slots' group lane; the view registry carries it from here on.
+    // asks otherwise (`group_rows_of_views`). The layout writes it into each
+    // record's group lane; the view registry carries it from here on.
     // One layout item per VIEW: copies of one buffer are laid out once each
     // (every stored slot names its item, so views cannot share slots).
     let group_rows = group_rows_of_views(view_count);

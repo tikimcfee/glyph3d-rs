@@ -46,25 +46,28 @@
 # 349 -> 350: on unified memory the host blocks and device copy are one demand.
 # 350 -> 349 (2026-10-31): hyper_device_chunking_splits_and_binds_across_limits
 # deleted with the device slot emission it tested (Instanced retirement).
-test_floor = 349
+# 349 -> 345 (2026-10-31): the glyph-field-instanced crate's four tests (three
+# RenderSlot layout pins, one naga validation of its shader) went with it.
+test_floor = 345
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
 # until then they rendered Instanced and the Derived field was held here as
 # `--field-mode derived` — the two render every golden frame identically
 # (measured on vulkan-nvidia and metal-apple), which is why the default could
-# move with no pixel moving. `--field-mode instanced` (2026-10-11) holds the
-# Instanced field byte-equal to the same frames until step 3 deletes it.
-# `--field-mode visible` was the second entry from 2026-10-10 until the
-# Visible field was deleted (2026-10-26). A view can be exempted from an
-# equivalent (`[[golden_view.exempt]]`, rendered and reported, never judged)
-# for a variant that legitimately differs; none is today.
-golden_equivalents = ["--field-mode instanced"]
+# move with no pixel moving. `--field-mode instanced` held the Instanced field
+# byte-equal to the same frames from 2026-10-11 until its retirement
+# (2026-10-31). `--field-mode visible` was an entry from 2026-10-10 until the
+# Visible field was deleted (2026-10-26). None is declared today; a variant
+# that must render the same frames lands here, and a view can be exempted
+# from one (`[[golden_view.exempt]]`, rendered and reported, never judged)
+# where it legitimately differs.
+golden_equivalents = []
 # The golden equivalents that run in the merge tier only (2026-10-26, test
-# diet step 6): a field the makepad port does not have, held byte-equal
-# before every landing, not after every change. Each names a declared
-# equivalent exactly; `glyph test --inner` prints each one it skips.
-golden_equivalents_merge = ["--field-mode instanced"]
+# diet step 6): held byte-equal before every landing, not after every change.
+# Each names a declared equivalent exactly; `glyph test --inner` prints each
+# one it skips.
+golden_equivalents_merge = []
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -513,7 +516,7 @@ apart_from = ["cargo-test"]
 kind = "golden-verify"
 relax = "renderer"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (none since the Instanced field's retirement, 2026-10-31) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
 blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — none today"
 
 # ── Declared mutations ───────────────────────────────────────────────────
@@ -672,7 +675,7 @@ expect = "native/src/agent_transcript/tests.rs"
 [[mutation]]
 name = "coverage-scale"
 gate = "pixel-ab"
-why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other. Targets the Derived field's shader since 2026-10-11, when Derived became the default and so the plain frames' field; the Instanced shader is held by the --field-mode instanced equivalent alone until step 3 deletes it"
+why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other. Targets the Derived field's shader since 2026-10-11, when Derived became the default and so the plain frames' field; the Instanced shader it once shared the constant with went with that field, 2026-10-31"
 file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
@@ -694,7 +697,7 @@ expect = "repo-back-oblique.png diverges from baseline"
 [[mutation]]
 name = "derived-placement-row-zeroed"
 gate = "pixel-ab"
-why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load, and the --field-mode instanced equivalent runs the other field"
+why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load"
 file = "crates/glyph-field-derived/src/field.rs"
 op = "replace"
 find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
@@ -714,7 +717,7 @@ expect = "repo-highlight.png diverges from baseline — the renderer changed"
 [[mutation]]
 name = "emoji-uv-flip"
 gate = "pixel-ab"
-why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet. Targets the Derived field's shader since 2026-10-11 (the default, so the plain frame's field); the Instanced copy is held by the --field-mode instanced equivalent until step 3"
+why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet. Targets the Derived field's shader since 2026-10-11 (the default, so the plain frame's field); the Instanced copy went with that field, 2026-10-31"
 file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
@@ -1057,16 +1060,6 @@ op = "replace"
 find = "+ if newline_ended { line_height } else { 0.0 });"
 with = "+ if newline_ended { 0.0 } else { 0.0 });"
 expect = "tile_views_frame_copies_as_the_text_stager_did"
-
-[[mutation]]
-name = "instanced-coverage-scale"
-gate = "pixel-ab"
-why = "proves the `--field-mode instanced` golden equivalent renders Instanced: since Derived became the default (2026-10-11) every other pixel mutation targets Derived or shared code, so an equivalent whose argument stopped reaching the field would compare Derived with Derived and stay green. CONSUMED BY: every golden view under the instanced equivalent; the plain frames stay byte-equal"
-file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
-op = "replace"
-find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
-with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
-expect = "text.png diverges from baseline under --field-mode instanced"
 
 [[mutation]]
 name = "prove-ambiguous-find-accepted"

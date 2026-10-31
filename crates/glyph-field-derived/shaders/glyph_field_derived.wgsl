@@ -10,12 +10,29 @@
 // Y and Z coordinates are derived in the vertex stage from the item table:
 //   item = item_table[inst.item_and_group & 0xFFFFF]   // ItemParamsGpu (64 B); group = item.group or group_overrides[lane >> 20]
 //   yz   = derive_yz(inst.row, wrap_segment, item)   // row lane: row:24 | x_page:8
-// (`derive.rs` carries the same function in Rust, held to the Instanced
-// emitter's positions by `hyper_oracle::tests::derived_vertex_stage_agrees_with_instanced`.)
+// (`derive.rs` carries the same function in Rust, held to the oracle-backed
+// reference's positions by `hyper_oracle::tests::derived_vertex_stage_agrees_with_the_reference`.)
 //
 // Advance is looked up from the resident atlas table:
 //   advance = glyph_advances[glyph_id]
 // Cell height is constant 1.0.
+//
+// Colour emoji (2026-09-10, out/EMOJI.md): mode==1 samples the emoji sheet —
+// an Rgba8UnormSrgb 2D-array texture of STRAIGHT-alpha cells (atlas.rs). The
+// alpha contract, stated once so another platform can check its own product
+// (moved here from the Instanced shader, glyph_field.wgsl, when that field
+// was retired on 2026-10-31; this shader implemented the same branch):
+//   1. the sampler returns LINEAR rgb (the sRGB decode is the format's) and
+//      straight alpha, mip-filtered from levels that were box-filtered in
+//      PREMULTIPLIED space and stored straight (atlas.rs box_down_straight);
+//   2. the group tint is authored sRGB, decoded here with the same pow(2.2)
+//      the outline path uses, and multiplied in — identity for a white group;
+//   3. output is PREMULTIPLIED, rgb * alpha, into the same ONE/ONE_MINUS_SRC
+//      blend as the outline path. Premultiplying BEFORE the sRGB decode would
+//      be a different product; that is the mistake to look for if emoji edges
+//      differ across platforms while text does not.
+// The per-instance colour is not applied: it is the slot's paint colour, and
+// an image has its own. Group alpha and the clip/cull rules apply as for text.
 
 const TEX_W: i32 = 1024;
 // A safety bound on the per-fragment curve loop, not a budget: it must cover

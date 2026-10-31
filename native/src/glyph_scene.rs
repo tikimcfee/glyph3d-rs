@@ -91,7 +91,7 @@ mod tint;
 pub use tint::{SegTintAccum, seg_tint, srgb_to_linear_table};
 
 mod instance;
-pub use instance::{GlyphInstance, GroupRow, RenderSlot};
+pub use instance::{GlyphInstance, GroupRow};
 pub use instance::Params;
 
 pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};

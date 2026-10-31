@@ -15,7 +15,7 @@ fn an_empty_repo_load_renders_in_every_field() {
     let dir = std::env::temp_dir().join(format!("glyph-empty-load-{}", std::process::id()));
     let repo = dir.join("empty-repo");
     std::fs::create_dir_all(&repo).expect("create the empty repo");
-    for field in ["derived", "instanced"] {
+    for field in glyph_field::GlyphFieldMode::ALL.map(|m| m.as_str()) {
         let out = dir.join(format!("{field}.png"));
         let output = Command::new(env!("CARGO_BIN_EXE_glyph3d-native"))
             .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))

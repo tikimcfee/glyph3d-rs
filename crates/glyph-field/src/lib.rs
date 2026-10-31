@@ -4,11 +4,13 @@
 //! it. There is more than one way to lay that storage out, and they trade
 //! memory and load time against how much the vertex stage has to derive:
 //!
-//! - [`GlyphFieldMode::Instanced`] stores every glyph's full placement
-//!   (position, extent, glyph, color, group) — 32 B per glyph — and the
-//!   vertex stage reads it as-is.
 //! - [`GlyphFieldMode::Derived`] stores a compact record (20 B) and derives
 //!   Y/Z in the vertex stage from per-item tables.
+//!
+//! One mode remains: the Instanced field, which stored every glyph's full
+//! placement (32 B) for the vertex stage to read as-is, was retired on
+//! 2026-10-31 (`glyph-field-instanced`, deleted). The contract stays a
+//! contract, the seam a next mode lands in.
 //!
 //! Each mode is its own crate with its own slot record, transcode, WGSL and
 //! pipelines — no shader branches on the mode, and the modes' load flows never

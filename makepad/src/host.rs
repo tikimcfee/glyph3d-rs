@@ -149,8 +149,8 @@ impl EngineHost {
         ctx.host_draws_glyphs = true;
         let (mut scene, probe) =
             glyph3d_native::build_scene_probed(&ctx, COLOR_FORMAT, &choice, CameraMode::Fly, cull_opts);
-        // The options follow the mode the scene BUILT (a load past the
-        // Derived lanes falls back to Instanced, loudly).
+        // The options follow the mode the scene BUILT (until 2026-10-31 a
+        // load past the Derived lanes fell back to Instanced).
         if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
             cull_opts.field_mode = built;
         }

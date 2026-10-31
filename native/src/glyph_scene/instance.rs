@@ -7,22 +7,18 @@
 //! Since the 2026-10 field-mode split the glyph RECORDS live in their crates
 //! and are re-exported here under their old paths, so every producer keeps
 //! compiling unchanged: the 48 B `GlyphInstance` and 80 B `GroupRow` in the
-//! mode-neutral contract (`glyph-field`), the 32 B `RenderSlot` in the
-//! Instanced mode (`glyph-field-instanced`), each with its layout pins.
+//! mode-neutral contract (`glyph-field`), with their layout pins. (The 32 B
+//! `RenderSlot` was re-exported here from the Instanced mode until that
+//! field was retired, 2026-10-31.)
 //!
-//! Since E2a (note 23) the SHADER binds the 32 B `RenderSlot`, not the 48 B
-//! `GlyphInstance`: row/col, flags and _pad have no live readers (note 22's
-//! sweep — the shader never read them, pick/verbs ride the engine cache,
-//! seg_tint wants glyph_id+color only). HyperLayout's host path and the
-//! agent-session staging still produce `GlyphInstance` (`text::stage_file`
-//! did too until 2026-10-11); staging transcodes
-//! field-wise, so the vertex math reads the same values and the goldens stay
-//! byte-equal by construction.
+//! No shader binds the 48 B `GlyphInstance`: HyperLayout's host path and
+//! the agent-session staging produce it, and the field transcodes it into
+//! its own slot field-wise, so the vertex math reads the same values and
+//! the goldens stay byte-equal by construction.
 
 use bytemuck::{Pod, Zeroable};
 
 pub use glyph_field::{GlyphInstance, GroupRow};
-pub use glyph_field_instanced::RenderSlot;
 
 /// Stage L (L1): the frame uniform — was CameraUniform (just view_proj).
 /// re_renderer's FrameUniformBuffer borrow: everything a frame needs behind

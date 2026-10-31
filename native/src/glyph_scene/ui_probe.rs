@@ -145,7 +145,7 @@ pub struct UiProbeState {
     pub layout_mode: Option<crate::repo::RepoLayoutMode>,
     /// Layout engine strategy (repo scenes): Hyper vs Direct vs Batch vs Naive.
     pub strategy: Option<crate::repo::Strategy>,
-    /// Glyph field render mode: Instanced (32B) vs Derived (20B).
+    /// Glyph field render mode (Derived, 20 B, the one mode since 2026-10-31).
     pub field_mode: Option<glyph_field::GlyphFieldMode>,
     /// Currently grabbed group ID (file grab via `KeyG`).
     pub grabbed_group: Option<u32>,

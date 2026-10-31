@@ -1,6 +1,7 @@
 //! Host records → device slots: the Derived transcode, 48 B `GlyphInstance`
 //! → 20 B `DerivedSlot`. The chunking, staging and upload paths are
-//! `glyph_field::upload_host_slots`, shared with the Instanced mode (C1).
+//! `glyph_field::upload_host_slots`, generic over the mode's slot (C1; shared
+//! with the Instanced mode until its retirement, 2026-10-31).
 
 use glyph_field::{GlyphInstance, ItemParamsGpu, SlotRecord, Transcode, UploadLabels};
 

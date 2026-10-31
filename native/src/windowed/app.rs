@@ -295,8 +295,8 @@ impl App<'_> {
         };
         #[cfg(not(feature = "egui-ui"))]
         let mut scene = crate::build_scene_with_options(&self.ctx, format, &self.choice, CameraMode::Fly, self.cull_opts);
-        // The options follow the mode the scene BUILT (a lane-limit fallback
-        // emits Instanced and says so), as the relayout arm does.
+        // The options follow the mode the scene BUILT, as the relayout arm
+        // does (a lane-limit fallback built Instanced until 2026-10-31).
         #[cfg(feature = "egui-ui")]
         if let Some(built) = ui_probe.as_ref().and_then(|p| p.borrow().field_mode) {
             self.cull_opts.field_mode = built;
@@ -374,7 +374,6 @@ impl App<'_> {
             #[cfg(feature = "egui-ui")]
             cluster_selftest: u8::from(std::env::var_os("GLYPH_CLUSTER_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
-            fieldmode_selftest: u8::from(std::env::var_os("GLYPH_FIELDMODE_SELFTEST").is_some()),
             #[cfg(feature = "egui-ui")]
             grab_selftest: u8::from(std::env::var_os("GLYPH_GRAB_SELFTEST").is_some()),
         });

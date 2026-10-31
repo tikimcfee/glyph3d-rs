@@ -18,7 +18,6 @@ wgpu = "30"
 # (GlyphField trait, field mode, shared records) and one crate per mode, each
 # owning its slot format, upload, WGSL and pipelines.
 glyph-field = { path = "../crates/glyph-field", features = ["clap"] }
-glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
 glyph-field-derived = { path = "../crates/glyph-field-derived" }
 # The transform tree (2026-10-10): every group row a node, resolved on
 # the CPU into the group table, whose changed rows are uploaded
