@@ -97,7 +97,7 @@ def main():
                         help="Path to repo (default: $GLYPH_FLAGSHIP_REPO, else this repo)")
     parser.add_argument("--bin", default="./target/release/glyph3d-native", help="Path to binary")
     parser.add_argument("-n", "--runs", type=int, default=5, help="Total number of runs (1 cold + N-1 warm)")
-    parser.add_argument("--field-mode", default="derived", choices=["derived", "instanced"])
+    parser.add_argument("--field-mode", default="derived", choices=["derived"])
     args, extra = parser.parse_known_args()
 
     bin_path = Path(args.bin).resolve()

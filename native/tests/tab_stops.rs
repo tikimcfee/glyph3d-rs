@@ -1,13 +1,14 @@
 //! Tab stops through the renderer (2026-10-11; the rule is
-//! `fold::TabWidth`): both glyph fields draw the same frame at every tab
-//! width.
+//! `fold::TabWidth`): every glyph field draws the same frame at every tab
+//! width (one field since the Instanced field's retirement, 2026-10-31,
+//! when the cross-field comparison below became a loop of one).
 //!
 //! `fixtures/tab-stops` (tabs at a line's start, after ASCII, after
 //! non-ASCII and double-width glyphs, back to back, inside wrapped rows, and
 //! one long line) is rendered through the release binary exactly as the
-//! golden runner drives it, under `--field-mode derived` and `instanced`,
-//! each drawing the slots the device Pass 2 placed. The frames must be byte-equal
-//! at widths 1, 4 and 8; the default (no flag, the `[layout]
+//! golden runner drives it, under each `--field-mode`, drawing the slots the
+//! device Pass 2 placed. The fields' frames must be byte-equal at widths 1,
+//! 4 and 8; the default (no flag, the `[layout]
 //! tab_width_cells` setting) must equal `--tab-width 1`, which is the layout
 //! before tab stops; and each wider width must move pixels, or the fixture
 //! has stopped exercising tabs. The repo load is flat paint (every load is,
@@ -62,7 +63,7 @@ fn every_field_draws_the_same_frame_at_every_tab_width() {
     for width in [1u32, 4, 8] {
         let w = width.to_string();
         let mut frames: Vec<(&str, image::RgbaImage)> = Vec::new();
-        for field in ["derived", "instanced"] {
+        for field in glyph_field::GlyphFieldMode::ALL.map(|m| m.as_str()) {
             let out = dir.join(format!("{field}-{width}.png"));
             frames.push((field, render(&out, &["--field-mode", field, "--tab-width", &w])));
         }

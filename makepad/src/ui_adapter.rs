@@ -27,10 +27,9 @@ const PANEL_VERBS: &[&str] = &["recolor-glyph", "recolor-line", "tint-cycle", "h
 /// The layout engines the panel offers (`naive` is the CLI's alone).
 const STRATEGIES: &[(Strategy, &str)] = &[(Strategy::Hyper, "Hyper (CPU)"), (Strategy::Direct, "Direct"), (Strategy::Batched, "Batch")];
 
-const FIELD_MODES: &[(GlyphFieldMode, &str)] = &[
-    (GlyphFieldMode::Derived, "Derived (20B)"),
-    (GlyphFieldMode::Instanced, "Instanced (32B)"),
-];
+/// The glyph field modes the panel offers: one since the Instanced field's
+/// retirement (2026-10-31).
+const FIELD_MODES: &[(GlyphFieldMode, &str)] = &[(GlyphFieldMode::Derived, "Derived (20B)")];
 
 /// The camera as the `--cam-pose` argument that reproduces it (degrees).
 pub fn cam_pose_arg(eye: [f32; 3], yaw: f32, pitch: f32) -> String {

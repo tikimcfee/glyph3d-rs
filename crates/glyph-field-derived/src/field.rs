@@ -54,8 +54,7 @@ impl DerivedField {
         // chunks (2026-10-26): the producer's Derived emission arrives as
         // those blocks (HyperLayout's Pass 2 writes them), host records are
         // transcoded into them against the same item table, and the storage
-        // uploads one buffer per block from them. Instanced is the field
-        // whose slots are emitted straight to the device.
+        // uploads one buffer per block from them.
         let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group, no_items: resources.item_params.is_empty() };
         let slots = match source {
             SlotSource::Blocks(slots) => slots,

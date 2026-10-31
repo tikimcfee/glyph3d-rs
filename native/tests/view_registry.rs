@@ -110,7 +110,9 @@ struct Case {
     fields: &'static [&'static str],
 }
 
-const ALL_FIELDS: &[&str] = &["derived", "instanced"];
+/// Every field (the Instanced field ran here too until its retirement,
+/// 2026-10-31; the counts in the header are from when it did).
+const ALL_FIELDS: &[&str] = &["derived"];
 
 const CASES: &[Case] = &[
     Case { name: "repo-wide", args: &[], fields: ALL_FIELDS },

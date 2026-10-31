@@ -451,8 +451,7 @@ impl ItemPlacement {
 ///
 /// Two forms: a host `Vec<GlyphInstance>` (the engine's neutral 48 B
 /// records), and the EMITTED form, slots already in the field's own format
-/// ([`EmittedSlots`]: Derived blocks on the host, Instanced slots on the
-/// device).
+/// ([`EmittedSlots`]: Derived blocks on the host).
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
@@ -487,9 +486,6 @@ pub struct EmittedSlots {
     pub file_tints: Vec<FileTintAccum>,
     /// Precomputed in-flight local block bounds per item, avoiding 3 GB mapped memory readback in build_file_blocks.
     pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
-    /// Which field's slot format the chunks hold. A field binds only its own
-    /// format; setup refuses a mismatch rather than drawing garbage.
-    pub format: glyph_field::GlyphFieldMode,
     /// Per item: `(glyph_id, color)` pairs captured at emission for items
     /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
     /// tint fold never reads the slots back. Empty when not produced.
@@ -517,8 +513,8 @@ impl GlyphArena {
         self.emitted.is_some()
     }
 
-    /// The emitted slots, for the field to bind (Instanced) or keep and
-    /// upload (Derived). None on the host form.
+    /// The emitted slots, for the field to keep and upload. None on the
+    /// host form.
     pub fn emitted_slots(&self) -> Option<&EmittedSlots> {
         self.emitted.as_ref()
     }
@@ -729,9 +725,9 @@ impl LayoutEngine {
     }
 
     /// Constructs a HyperLayout engine sharing a GPU context device. The
-    /// device path emits `field_mode`'s own slot format directly (32 B
-    /// `RenderSlot` for Instanced, 20 B `DerivedSlot` + line table for
-    /// Derived) — the renderer then binds it with no transcode.
+    /// device path emits `field_mode`'s own slot format directly (20 B
+    /// `DerivedSlot`s in host blocks) — the field then keeps them with no
+    /// transcode.
     pub fn hyper_with_device(
         device: crate::gpu::SharedDevice,
         field_mode: glyph_field::GlyphFieldMode,

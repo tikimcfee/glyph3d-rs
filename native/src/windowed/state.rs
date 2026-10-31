@@ -101,13 +101,6 @@ pub(super) struct WindowState {
     /// the same pending_relayout arm the panel's button uses.
     #[cfg(feature = "egui-ui")]
     pub(super) cluster_selftest: u8,
-    /// Dev-only verification hook state (GLYPH_FIELDMODE_SELFTEST=1): at
-    /// t≈3 s cycles the field mode Instanced → Derived through the
-    /// same pending_relayout arm the panel's selector fires, printing the
-    /// HUD line after each rebuild. 0 = off/done; odd states fire, even
-    /// states are the quiet frame after a rebuild (see `render`).
-    #[cfg(feature = "egui-ui")]
-    pub(super) fieldmode_selftest: u8,
     /// Dev-only verification hook state (GLYPH_GRAB_SELFTEST=file[:dx:dy],
     /// C29): the windowed GRAB path — `g` on a picked file, cursor drags
     /// through `SceneLike::on_cursor`, `g` again — printing the HUD line
@@ -436,48 +429,6 @@ impl WindowState {
                 self.cluster_selftest = 0;
             }
             _ => {}
-        }
-        // Dev-only verification hook (GLYPH_FIELDMODE_SELFTEST=1): cycle the
-        // field mode Instanced → Derived through the SAME pending_relayout
-        // arm the panel's selector fires, printing the HUD line after each
-        // rebuild. Odd states fire a request (consumed after this render),
-        // even states are the quiet frame whose render fills the new probe;
-        // the print reads that.
-        #[cfg(feature = "egui-ui")]
-        {
-            let step_mode = |s: u8| match s {
-                1 => Some(glyph_field::GlyphFieldMode::Instanced),
-                3 => Some(glyph_field::GlyphFieldMode::Derived),
-                _ => None,
-            };
-            match self.fieldmode_selftest {
-                s @ (1 | 3) if s > 1 || self.time() > 3.0 => {
-                    let has_mode = self.ui_probe.as_ref().and_then(|p| p.borrow().field_mode);
-                    match (has_mode, step_mode(s)) {
-                        (Some(_), Some(mode)) => {
-                            if let Some(probe) = &self.ui_probe {
-                                println!("FIELDMODE-SELFTEST before step {}: {}", s.div_ceil(2), hud_line(&probe.borrow(), self.ui_fps));
-                            }
-                            self.pending_relayout = Some(RelayoutRequest {
-                                set_field_mode: Some(mode),
-                                ..Default::default()
-                            });
-                            self.fieldmode_selftest = s + 1;
-                        }
-                        _ => {
-                            println!("FIELDMODE-SELFTEST: scene carries no field mode (no probe) — skipping");
-                            self.fieldmode_selftest = 0;
-                        }
-                    }
-                }
-                s @ (2 | 4) => {
-                    if let Some(probe) = &self.ui_probe {
-                        println!("FIELDMODE-SELFTEST after step {}:  {}", s / 2, hud_line(&probe.borrow(), self.ui_fps));
-                    }
-                    self.fieldmode_selftest = if s == 4 { 0 } else { s + 1 };
-                }
-                _ => {}
-            }
         }
         // Dev-only verification hook (GLYPH_GRAB_SELFTEST=file[:dx:dy], C29,
         // 2026-10-10): the windowed GRAB path, through the SAME entry points
@@ -913,34 +864,6 @@ impl WindowState {
                                             set_strategy: Some(crate::repo::Strategy::Batched),
                                             ..Default::default()
                                         });
-                                    }
-                                });
-                            }
-                        }
-
-                        // Glyph field mode selection: the two stored formats.
-                        // The highlighted label is the mode actually BUILT
-                        // (the probe reads `field.mode()`), so a lane-limit
-                        // fallback shows as Instanced here.
-                        if let Some(snap) = &probe_snap {
-                            if let Some(current_mode) = snap.field_mode {
-                                ui.separator();
-                                ui.label(
-                                    "glyph field mode — click switches the field & rebuilds:",
-                                );
-                                ui.horizontal(|ui| {
-                                    for (mode, label) in [
-                                        (glyph_field::GlyphFieldMode::Derived, "Derived (20B)"),
-                                        (glyph_field::GlyphFieldMode::Instanced, "Instanced (32B)"),
-                                    ] {
-                                        if ui.selectable_label(current_mode == mode, label).clicked()
-                                            && current_mode != mode
-                                        {
-                                            *pending_relayout = Some(RelayoutRequest {
-                                                set_field_mode: Some(mode),
-                                                ..Default::default()
-                                            });
-                                        }
                                     }
                                 });
                             }

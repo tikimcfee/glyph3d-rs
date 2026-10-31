@@ -120,7 +120,7 @@ pub fn normalize_multiline_text(text: &str) -> std::borrow::Cow<'_, str> {
 /// One item per block (2026-10-11), so the Derived field — which keeps each
 /// glyph's x and derives y and z in the vertex stage from `item_table[item]`
 /// (`glyph_field_derived::derive::derive_yz`) — lands every glyph where the
-/// Instanced field's absolute position puts it. With `line_height_lo` 0 and
+/// record's absolute position puts it. With `line_height_lo` 0 and
 /// a row count whose product with the line height is exact, the shader's
 /// `fma` and the stager's `start_y - row * line_h` round the same exact
 /// value once each, so the two agree bit for bit

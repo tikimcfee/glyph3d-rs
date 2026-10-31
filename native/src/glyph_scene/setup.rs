@@ -7,7 +7,6 @@ use crate::gpu::GpuContext;
 use crate::layout::EmittedSlots;
 use crate::text::StagedText;
 use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
-use glyph_field_instanced::InstancedField;
 use glyph_field_derived::DerivedField;
 use super::{
     CameraMode, CullState, FlyCamera, GlyphScene,
@@ -199,30 +198,14 @@ impl GlyphScene {
             sample_count: SCENE_SAMPLE_COUNT,
         };
         // The arena's forms map onto the field's sources. An EMITTED arena is
-        // already slots in the field's OWN format (the producer was told the
-        // mode), chunked by its producer: 20 B DerivedSlots in host blocks
-        // the Derived field keeps, or 32 B RenderSlots on the device for
-        // Instanced. A HOST arena is the engine's neutral records, which the
-        // mode converts and uploads. Unified-memory direct upload is a property of the adapter,
-        // decided here (Metal + MAPPABLE_PRIMARY_BUFFERS — see
-        // glyph_field::upload_host_slots).
-        // The field the scene BUILDS follows the arena, not the request: the
-        // layout may have fallen back (a Derived load past the slot lanes —
-        // `layout_hyper::derived_lane_overflow`, before 2026-10-31 — emitted Instanced and said
-        // so). The probe reads `field.mode()`, so the panel and the HUD show
-        // what was built.
-        let built_mode = match arena.emitted_slots() {
-            Some(dev) if dev.format != field_mode => {
-                log::warn!(
-                    "field mode {field_mode} requested, but the layout emitted {} slots — building a {} field",
-                    dev.format, dev.format
-                );
-                dev.format
-            }
-            _ => field_mode,
-        };
-        // The field takes the emitted slots: host blocks move into the
-        // Derived field, which keeps them.
+        // already the field's own slots: 20 B DerivedSlots in host blocks the
+        // Derived field keeps. A HOST arena is the engine's neutral records,
+        // which the field transcodes and uploads. Unified-memory direct upload
+        // is a property of the adapter, decided here (Metal +
+        // MAPPABLE_PRIMARY_BUFFERS — see glyph_field::upload_host_slots).
+        // (Until 2026-10-31 a load past the Derived lanes fell back to the
+        // Instanced field, and the field built here followed the arena; a
+        // file past a lane is now laid out empty instead.)
         let source = match arena.take_emitted() {
             Some(EmittedSlots { slots, .. }) => SlotSource::Blocks(slots),
             None => SlotSource::Host {
@@ -232,13 +215,8 @@ impl GlyphScene {
                     && ctx.profile.mappable_primary_buffers,
             },
         };
-        let field: Box<dyn GlyphField> = match built_mode {
-            GlyphFieldMode::Instanced => {
-                Box::new(InstancedField::new(device, &ctx.queue, source, &resources, targets))
-            }
-            GlyphFieldMode::Derived => {
-                Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets))
-            }
+        let field: Box<dyn GlyphField> = match field_mode {
+            GlyphFieldMode::Derived => Box::new(DerivedField::new(device, &ctx.queue, source, &resources, targets)),
         };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
