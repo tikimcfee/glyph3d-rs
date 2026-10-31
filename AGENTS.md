@@ -18,40 +18,47 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
-  The window (`native/src/windowed/`, winit) is the `windowed` cargo feature
-  (2026-10-26), which `egui-ui` and `launcher` imply; all three are default.
-  `--no-default-features` is the engine alone, no winit or egui in its tree,
-  for a host that brings its own window (the makepad port): it drives a
-  scene through `SceneLike` with `scene::SceneKey` for keys, and rebuilds
-  one for a layout change with `relayout::rebuild_for_relayout`.
+  The wgpu renderer is the `wgpu` cargo feature (2026-10-31) and the window
+  (`native/src/windowed/`, winit) the `windowed` one (2026-10-26), which
+  implies it, as `egui-ui` and `launcher` imply `windowed`; all four are
+  default. `--no-default-features` is the engine's host side alone, no
+  wgpu, winit or egui in its tree, for a host that brings its own window
+  and renderer (the makepad port): it builds a scene with
+  `SceneLoad::host()`, drives it through `SceneLike` with `scene::SceneKey`
+  for keys, draws its `FrameData` (the field's host blocks, the tables, the
+  atlas), and rebuilds one for a layout change with
+  `relayout::rebuild_for_relayout`. A scene holds no device type; the wgpu
+  drivers build its `SceneRenderer` from it (`SceneLike::make_renderer`).
 - `glyph/` — the build/verify tool: gate runner, mutation prover. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
-  binding map); `glyph-field-instanced` is the Instanced mode (32 B `RenderSlot`, its
-  upload path, pipelines and `glyph_field.wgsl`); `glyph-field-derived` is the Derived mode
+  binding map); `glyph-field-derived` is the Derived mode
   (20 B `DerivedSlot`, GPU vertex-stage Y/Z derivation, and `glyph_field_derived.wgsl`;
   its slots live in host blocks that are its chunks, 2026-10-26, so a makepad
   renderer draws from the same copy the wgpu field uploads from; for a host
   that draws them itself, `GpuContext::host_draws_glyphs`, the field uploads
   nothing).
-  Chosen at load with `--field-mode derived|instanced`, switchable live from
-  the Debug panel. A third mode, Visible (`glyph-field-visible`: no slot per
-  glyph, the lines in view laid out per frame by a GPU compute kernel;
-  `out/history/VISIBLE-MODE.md`), was deleted on 2026-10-26: the makepad
-  port has no compute and targets Derived alone.
-  **Derived is the default since 2026-10-11** (Instanced retirement, step 1 of
-  three: no pixel moved — the plain golden frames now render Derived, byte-equal
-  to the baselines they always had). Step 2 (2026-10-11) made `--render-file`
-  a one-item repo load (`repo::load_file`: HyperLayout, the shared
-  colourisers and every field, with `--copies N` as N
-  views over the one buffer, tiled); it moved the pixels of `text`, `emoji`
-  and `emoji-cluster`, which await adoption (pixel-ab, below). Step 3 deletes
-  `glyph-field-instanced`. Until then Instanced stays
-  a mode, held byte-equal by the `--field-mode instanced` golden equivalent, and
-  is still the fall-back for a load past the Derived lanes. The agent-session
-  Carrel stages one item per text block (`agent_transcript::staging::block_item`)
-  so Derived lands its glyphs where Instanced's absolute positions do.
+  **Derived is the one mode since 2026-10-31** (`--field-mode derived`, the
+  default; `GlyphFieldMode` stays the seam a next mode lands in). Two others
+  were deleted: Visible (`glyph-field-visible`: no slot per glyph, the lines
+  in view laid out per frame by a GPU compute kernel;
+  `out/history/VISIBLE-MODE.md`) on 2026-10-26, because the makepad port has
+  no compute; and Instanced (`glyph-field-instanced`: one full 32 B
+  `RenderSlot` per glyph, read by the vertex stage as-is) on 2026-10-31, in
+  three steps. Step 1 (2026-10-11) made Derived the default: no pixel moved,
+  the plain golden frames rendering Derived byte-equal to the baselines they
+  always had. Step 2 (2026-10-11) made `--render-file` a one-item repo load
+  (`repo::load_file`: HyperLayout, the shared colourisers, with `--copies
+  N` as N views over the one buffer, tiled); it moved the pixels of `text`,
+  `emoji` and `emoji-cluster`, adopted on vulkan-nvidia (pixel-ab, below).
+  Step 3 (2026-10-31) deleted the crate, layout's device-direct slot
+  emission and the `--field-mode instanced` golden equivalent, and turned
+  the whole-load fall-back past the Derived lanes into a per-file drop (a
+  file past a lane is laid out empty and named; torvalds/linux must always
+  load). The agent-session Carrel stages one item per text block
+  (`agent_transcript::staging::block_item`) so Derived lands its glyphs
+  where the absolute positions put them.
   `crates/glyph-scene-graph` (2026-10-10) is the transform tree: pooled nodes
   behind generation handles, CPU depth-first topology, dirty marks, and a
   CPU resolve of world transforms over the dirty depth-first ranges; every
@@ -103,8 +110,9 @@ cargo run -p glyph -- validate            # build.toml against its schema
 ```
 
 The layout engine is `HyperLayout` (`native/src/layout_hyper.rs`): a parallel,
-cache-blocked CPU layout written with Rayon, writing into unified-memory mapped
-buffers where the GPU allows it and staging otherwise.
+cache-blocked CPU layout written with Rayon, writing the Derived field's
+slots into host blocks that are the field's chunks (device-direct emission,
+the Instanced field's, was retired with it on 2026-10-31).
 
 **Performance characteristics:**
 - Flagship corpus: the retired JS repo, glyph3d-js (1,306 files, 97.0 MB source,
@@ -215,10 +223,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   no-default-features builds, orphan modules: they judge the code's form,
   not what it computes — and the corpus checks (committed artifacts, the
   atlas, vendored hashes), whose inputs a renderer change does not touch.
-  Inside pixel-ab, `[settings] golden_equivalents_merge` puts the
-  `--field-mode instanced` equivalent in the merge tier too: a field the
-  makepad port does not have (test diet step 6, 2026-10-26). An `--inner`
-  verdict says "not a landing run"; land on a full one.
+  Inside pixel-ab, `[settings] golden_equivalents_merge` can put a golden
+  equivalent in the merge tier too (test diet step 6, 2026-10-26: the
+  `--field-mode instanced` one, until that field's retirement on
+  2026-10-31; none today). An `--inner` verdict says "not a landing run";
+  land on a full one.
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
@@ -279,7 +288,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   the diff (it once caught a gate whose PASS line was a log line). What the
   route proves is the mutation's claim: the test its `expect` names (the
   whole suite under relax, judged by the floor, when it names none), the
-  golden view it names. A renderer gate's mutation of a file the renderer
+  golden view it names. The suite is the root manifest's `[workspace].members`
+  (not every `Cargo.toml`: the excluded makepad host made it red on every
+  tree until 2026-10-31), and each member's run is overlaid with only the
+  files it reads, since relax refuses a run whose overlaid file was never
+  read. A renderer gate's mutation of a file the renderer
   reads at run time (a fixture) is applied on disk, last and one at a
   time. Gates with no declaration (the compiler's
   diagnostics, the corpus gates) are proven on cargo: their Rust mutations
@@ -460,14 +473,17 @@ being met is itself a warning, so a silence cannot outlive its cause).
 `target/no-ui` so the changed feature sets never invalidate the main build:
 with `--features windowed` (the window without the egui overlay) and bare
 (since 2026-10-26: the engine with no window, what a host that owns its
-window and event loop links). The bare build's `cargo tree` must hold the
-renderer and no `winit` or `egui` crate. It exists because these builds are
-supported and nothing compiled the first: an `egui` use outside the `egui-ui`
-gate broke it unnoticed (C24, found by the GPU research agent).
-`egui-use-ungated` proves the windowed half, `windowed-module-ungated` the bare
-compile and `winit-unconditional` the tree. Blind to whether either build
-RUNS correctly — they are checked, not executed — and to a windowing crate in
-the bare tree whose name starts with neither.
+window and event loop links; since 2026-10-31 with no wgpu either, the
+`wgpu` feature off: the scene, layout, picks, verbs and frames, drawn by
+the host's own renderer). The bare build's `cargo tree` must hold the
+renderer and no `winit`, `egui` or `wgpu` crate. It exists because these
+builds are supported and nothing compiled the first: an `egui` use outside
+the `egui-ui` gate broke it unnoticed (C24, found by the GPU research agent).
+`egui-use-ungated` proves the windowed half, `windowed-module-ungated` and
+`renderer-module-ungated` the bare compile, `winit-unconditional` and
+`wgpu-unconditional` the tree. Blind to whether either build RUNS correctly
+— they are checked, not executed — and to a windowing or GPU crate in the
+bare tree whose name starts with none of the three.
 
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:
@@ -592,11 +608,11 @@ reference-port holds bit-exact to the oracle), its records compacted by
 plus a per-record tally that names the byte and both glyph ids. Four tiers:
 records (HyperLayout's recording path), host instances and placements (its
 host Pass 2, what a device-less load runs), and the DEVICE Pass 2
-(`pass2_device.rs`, what every GPU load runs) in both slot formats plus its
-placements. The device tier runs the production emitter into host memory:
-the unified, discrete and host-staging paths all hand the same
-`EmitInputs::run` a raw address of writable memory, so only where the bytes
-land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
+(`pass2_device.rs`, what every GPU load runs) in the Derived slot format
+plus its placements (in both formats until the Instanced field's RenderSlot
+went, 2026-10-31). The device tier runs the production emitter into host
+memory: every destination hands the same `EmitInputs::run` a raw address of
+writable memory, so only where the bytes land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
 its own buffer, as a repo file is, in its own cluster mode; `paged-rows`,
 `paged-cols` and `scroll-only` carry the `page_rows`/`page_cols`/`scroll_rows`
 classes), the IMMUTABLE
@@ -698,8 +714,8 @@ into chunks reaches no gate corpus; `hyper_oracle::tests::tab_stops_agree_on_eve
 stop. Mutations: `hyper-device-tab-stop-ignored` here;
 `hyper-tab-chunk-rewalk-skipped`, `fold-tab-line-advance-rounded` and
 `tab-cells-always-a-whole-stop` on cargo-test. `native/tests/tab_stops.rs`
-holds Derived and Instanced to the same `tab-stops` frame at widths 1, 4
-and 8. `--render-file` is a one-item
+renders the `tab-stops` frame at widths 1, 4 and 8 in every field (Derived
+and Instanced, held to the same frame, until 2026-10-31). `--render-file` is a one-item
 repo load since 2026-10-11 and lays its tabs out by this same rule, at its
 own default `[layout] render_file_tab_width_cells = 4` (the stops its
 retired CPU stager had; `text.png` has tabs), `--tab-width` overriding it.
@@ -791,7 +807,7 @@ not keyed.
 `build.toml [settings] golden_equivalents` lists argument lists under which
 every golden view must render its baseline's exact bytes; the gate renders
 each view again with each list appended and compares against the SAME PNG
-(`PASS  text.png BYTE-EQUAL under --field-mode instanced`). Its first entry was
+(`PASS  text.png BYTE-EQUAL under <args>`). Its first entry was
 `--field-mode derived`: the Derived field renders every golden frame
 identically to Instanced on both sets (measured when it was added), so its
 upload, storage, vertex-stage Y/Z and edit paths were covered with nothing new
@@ -799,8 +815,9 @@ to adopt. Before it, no golden rendered Derived at all, and a Derived edit
 defect that emptied a frame (C19, below) was invisible. **Since 2026-10-11 the
 plain frames ARE Derived** (the default), so that entry became
 `--field-mode instanced`, holding the Instanced field to the same frames until
-its crate is deleted (step 3). A divergence under an equivalent with the
-plain frame equal is the VARIANT breaking — never a reason to re-baseline.
+its crate was deleted (step 3, 2026-10-31). No equivalent is declared today.
+A divergence under an equivalent with the plain frame equal is the VARIANT
+breaking — never a reason to re-baseline.
 `drift` compares the plain frames only.
 
 **Exemptions.** An equivalent that legitimately differs on a frame can
@@ -840,10 +857,9 @@ untouched. `emoji-uv-flip` proves it reddens. Expect MORE cross-vendor drift
 on it than on text: filtered sampling of a mipmapped sRGB texture is not
 analytic coverage, and two rasterizers' filters need not agree to the bit.
 The alpha contract those pixels rest on is stated once, in the shader header
-of `glyph_field.wgsl` (the Instanced shader; the Derived shader the plain
-frames draw through since 2026-10-11 implements the same emoji branch, and
-the statement moves with step 3), so a platform whose emoji edges differ
-while its text does not has a checklist.
+of `glyph_field_derived.wgsl` (moved there from the Instanced shader,
+`glyph_field.wgsl`, when that field was retired on 2026-10-31), so a
+platform whose emoji edges differ while its text does not has a checklist.
 `emoji-cluster` and `repo-cluster` (2026-09-20) pin the SEQUENCE PASS — one
 frame per path: the former through `--render-file`, the latter through
 `--load-repo` (the repo load end to end). Until 2026-10-11 the former was
@@ -1005,7 +1021,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `engine/glyph_schema.mjs` | generated | `tools/gen_schema.py` from `schema/glyph-identity.json`; the fixture generators read it, so editing the schema invalidates the corpus |
 | `tools/vendor/` | vendored, hash-pinned | `vendor-manifest.py --check`; upstream drift is information, not failure |
 | `schema/glyph-identity.json` | vendored verbatim | drift means an upstream refresh, not a local edit |
-| `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. `glyph_field.wgsl` moved byte-identically (git mv) into `crates/glyph-field-instanced/shaders/` on 2026-10-05 when the glyph field split into render modes; a move is not an edit, and the goldens are the proof |
+| `native/src/shaders/*.wgsl`, `crates/*/shaders/*.wgsl` | fenced | the naga tests (`native/tests/wgsl.rs`, and each field-mode crate's own `tests/wgsl.rs`) pin the shader *set* — that it compiles and exists, not what it draws. The only thing that sees a pixel change is the golden-view A/B, whose blind spots are above. That gap is why edits here need their own re-baselined change rather than an ordinary commit. (`glyph_field.wgsl`, the Instanced shader, went with that field on 2026-10-31; its emoji alpha contract moved into `glyph_field_derived.wgsl`'s header, a comment-only edit the goldens prove) |
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |

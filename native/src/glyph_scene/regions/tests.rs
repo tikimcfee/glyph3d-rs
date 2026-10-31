@@ -5,8 +5,11 @@
 use glam::DVec3;
 use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
-use super::{ray_to_local, region_box, region_instance, LibraryRegions, RegionInstance, RegionSpec, RegionTable};
+use super::{ray_to_local, region_box, RegionSpec, RegionTable};
+#[cfg(feature = "wgpu")]
+use super::{region_instance, LibraryRegions, RegionInstance, RegionsGpu};
 use crate::glyph_scene::cull::{CullState, SegCull};
+#[cfg(feature = "wgpu")]
 use crate::glyph_scene::nodes::read_buffer;
 use crate::glyph_scene::tree_cull::{Aabb, TreeCull};
 use crate::library::plan::LibFile;
@@ -36,7 +39,7 @@ struct Fixture {
 /// The library attached to `t`, staged as a load stages it, with the tree
 /// cull setup.rs builds for a library with regions (page faces in the
 /// sheets' boxes, refits logged).
-fn fixture(ctx: &crate::gpu::GpuContext, t: &mut NodeTables) -> Fixture {
+fn fixture(t: &mut NodeTables) -> Fixture {
     let s = &crate::config::settings().library;
     let files = files();
     let mut lib = Library::new(files.clone(), s);
@@ -66,15 +69,9 @@ fn fixture(ctx: &crate::gpu::GpuContext, t: &mut NodeTables) -> Fixture {
             }
         })
         .collect();
-    let camera_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("test camera"),
-        size: 256,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     // Segment i is file i's, drawn with group row i.
     let segment_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(Some).collect();
-    let cull = CullState::new(ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups, &segment_rows);
+    let cull = CullState::new(&segments, &groups, &segment_rows);
     let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
     let f = lib.face.expect("the default settings draw page faces");
     let face = [[-f.size[0] / 2.0, -f.size[1] / 2.0, -f.gap], [f.size[0] / 2.0, f.size[1] / 2.0, -f.gap]];
@@ -166,10 +163,9 @@ fn check(fx: &Fixture, table: &RegionTable, t: &mut NodeTables, spec: &RegionSpe
 /// only the refit log, so a refit the log missed is a stale region.
 #[test]
 fn region_boxes_are_the_tree_bounds_padded_through_drags_and_eases() {
-    let ctx = pollster::block_on(crate::gpu::init(None));
     let spec = spec();
     let mut t = NodeTables::default();
-    let mut fx = fixture(&ctx, &mut t);
+    let mut fx = fixture(&mut t);
     let mut table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
     check(&fx, &table, &mut t, &spec, "seated");
     let h = fx.lib.move_zone(&mut t, "dir:src/core/deep", [60.0, -45.0, 7.0]).unwrap();
@@ -223,10 +219,9 @@ fn brute_pick(table: &RegionTable, t: &NodeTables, nodes: &crate::library::LibNo
 /// walk's one documented blind spot.)
 #[test]
 fn the_region_pick_is_the_innermost_region_the_ray_enters() {
-    let ctx = pollster::block_on(crate::gpu::init(None));
     let spec = RegionSpec { min_thickness: 0.0, ..spec() };
     let mut t = NodeTables::default();
-    let mut fx = fixture(&ctx, &mut t);
+    let mut fx = fixture(&mut t);
     let mut table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
     let nodes = fx.lib.nodes.clone().unwrap();
     let sweep = |t: &NodeTables, table: &RegionTable, what: &str| {
@@ -258,6 +253,7 @@ fn the_region_pick_is_the_innermost_region_the_ray_enters() {
     sweep(&t, &table, "after a drag");
 }
 
+#[cfg(feature = "wgpu")]
 /// What reaches the GPU (2026-10-26, the host composes the regions): after
 /// each frame's resolve and `prepare`, the instance buffer read back is
 /// `region_instance` of every region's box under its directory's
@@ -272,7 +268,7 @@ fn the_gpu_draws_the_regions_the_tree_composes() {
     let ctx = pollster::block_on(crate::gpu::init(None));
     let spec = spec();
     let mut t = NodeTables::default();
-    let mut fx = fixture(&ctx, &mut t);
+    let mut fx = fixture(&mut t);
     let camera_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test camera"),
         size: 256,
@@ -280,20 +276,21 @@ fn the_gpu_draws_the_regions_the_tree_composes() {
         mapped_at_creation: false,
     });
     let table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
-    let regions = LibraryRegions::new(&ctx.device, &camera_buf, crate::glyph_scene::target::POOL_FORMAT, table);
+    let regions = LibraryRegions::new(table);
+    let gpu = RegionsGpu::new(&ctx.device, &camera_buf, crate::glyph_scene::target::POOL_FORMAT, &regions);
     let nodes = fx.lib.nodes.clone().unwrap();
     let frame = |t: &mut NodeTables, fx: &mut Fixture| {
         let plan = t.resolve_frame();
         fx.tree.refit(t, &fx.cull);
         let (cost, runs) = regions.prepare(&mut fx.tree, t, Some(&plan));
-        regions.upload(&ctx.queue, &runs);
+        gpu.upload(&ctx.queue, &regions.image(), regions.picked().map(|r| r as usize), &runs);
         cost
     };
     let check = |t: &mut NodeTables, fx: &mut Fixture, what: &str| {
         let cost = frame(t, fx);
         assert!(cost.uploaded > 0, "{what}: something moved ({cost:?})");
         let count = regions.table.borrow().len();
-        let got: Vec<RegionInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &regions.instances, (count * 64) as u64)).to_vec();
+        let got: Vec<RegionInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &gpu.instances, (count * 64) as u64)).to_vec();
         let table = regions.table.borrow();
         for (r, a) in got.iter().enumerate() {
             let (d, _) = table.dir_of(r as u32);
@@ -335,10 +332,9 @@ fn the_gpu_draws_the_regions_the_tree_composes() {
 #[test]
 fn a_region_drag_moves_its_subtree_and_sticks() {
     use crate::glyph_scene::interaction::grab_target;
-    let ctx = pollster::block_on(crate::gpu::init(None));
     let spec = spec();
     let mut t = NodeTables::default();
-    let mut fx = fixture(&ctx, &mut t);
+    let mut fx = fixture(&mut t);
     let mut table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
     let nodes = fx.lib.nodes.clone().unwrap();
     // Pick through a corner of src/core's head page: inside src/core's
@@ -374,7 +370,7 @@ fn a_region_drag_moves_its_subtree_and_sticks() {
     assert!(moved >= 8, "the region carries its subtree ({moved} files)");
     // Through a page turn, settled, against a twin that was never dragged.
     let mut tt = NodeTables::default();
-    let mut twin = fixture(&ctx, &mut tt).lib;
+    let mut twin = fixture(&mut tt).lib;
     for (lib, t) in [(&mut fx.lib, &mut t), (&mut twin, &mut tt)] {
         lib.page(t, None, Page::Next);
         let mut frames = 0;

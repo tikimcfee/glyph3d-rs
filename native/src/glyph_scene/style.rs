@@ -1,4 +1,3 @@
-use crate::gpu::GpuContext;
 use super::{GlyphPlacement, GlyphScene};
 
 pub enum FileStyle {
@@ -12,8 +11,8 @@ impl GlyphScene {
     /// path where it has one: with direct-mapped GPU memory (e.g. Apple
     /// Silicon Metal) it writes host-visible slots without queue uploads;
     /// otherwise it issues queue write_buffer commands.
-    pub fn write_slot_colors(&self, ctx: &GpuContext, slot_base: u32, colors: &[u32]) {
-        self.field.write_colors(&ctx.queue, slot_base, colors);
+    pub fn write_slot_colors(&self, slot_base: u32, colors: &[u32]) {
+        self.field.write_colors(slot_base, colors);
     }
 
     /// Recolors a view in-place given its source bytes and AST/LSP byte spans.
@@ -22,7 +21,6 @@ impl GlyphScene {
     /// Returns the number of slots recolored.
     pub fn apply_file_spans(
         &self,
-        ctx: &GpuContext,
         view: u32,
         file_bytes: &[u8],
         spans: &[crate::layout::ByteSpan],
@@ -51,14 +49,14 @@ impl GlyphScene {
 
         let colors = crate::layout_hyper::resolve_spans_to_slot_colors(file_bytes, spans, trie, cluster_mode);
         let to_write = colors.len().min(slot_count as usize);
-        self.write_slot_colors(ctx, slot_base, &colors[..to_write]);
+        self.write_slot_colors(slot_base, &colors[..to_write]);
         to_write
     }
 
     /// Camera eye/target for the mode at time `t` — the SINGLE source both
     /// the render frame and the pick ray derive from, so they always see the
     /// same camera.
-    pub fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> String {
+    pub fn apply_highlight_sidecar(&self, path: &std::path::Path) -> String {
         let map = match parse_highlight_sidecar(path) {
             Ok(map) => map,
             Err(e) => return format!("highlight: {e}"),
@@ -73,7 +71,7 @@ impl GlyphScene {
             if let Some(runs) = map.get(&info.rel_path) {
                 files += 1;
                 if let FileStyle::Ok { colored: c, unstyled: u } =
-                    self.style_file(ctx, view as u32, runs, None)
+                    self.style_file(view as u32, runs, None)
                 {
                     colored += c;
                     unstyled += u;
@@ -98,7 +96,6 @@ impl GlyphScene {
     /// their stages ship (the anti-sprawl law: one walk, fields arrive later).
     pub fn apply_surface_updates(
         &self,
-        ctx: &GpuContext,
         updates: &[crate::seam::SurfaceUpdate],
     ) -> String {
         let Some(pctx) = &self.pick else {
@@ -114,7 +111,7 @@ impl GlyphScene {
                 continue;
             };
             files += 1;
-            match self.style_file(ctx, view as u32, &update.style, Some(update.version)) {
+            match self.style_file(view as u32, &update.style, Some(update.version)) {
                 FileStyle::Ok { colored: c, unstyled: u } => {
                     colored += c;
                     unstyled += u;
@@ -141,7 +138,6 @@ impl GlyphScene {
     /// no slot, exactly as `ensure_pick_cache` skips them.
     fn style_file(
         &self,
-        ctx: &GpuContext,
         view: u32,
         runs: &[crate::seam::StyleRun],
         expected: Option<crate::seam::BufferVersion>,
@@ -301,7 +297,7 @@ impl GlyphScene {
             slot += 1;
         }
         for (start, insts) in &batches {
-            self.field.write_placements(&ctx.queue, *start, insts);
+            self.field.write_placements(*start, insts);
         }
         FileStyle::Ok { colored, unstyled }
     }

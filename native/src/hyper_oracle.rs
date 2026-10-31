@@ -38,15 +38,15 @@
 //! (`pass2_host.rs`, the instances a device-less load produces), its
 //! pagination, the recording path's re-derivation (`rederive.rs`, the records
 //! tier), and, since 2026-10-09, its DEVICE Pass 2 (`pass2_device.rs`, what
-//! every GPU load runs: unified memory on the M2, the staging path on a
-//! discrete card) in BOTH slot formats. The device tier runs the production
-//! emitter into host memory (`layout_hyper::device_pass2_*_on_host`): every
-//! production destination hands that same `EmitInputs::run` a raw address of
-//! writable memory, so the only thing swapped is where the bytes land. The
-//! 32 B `RenderSlot` is compared byte-for-byte with the reference instance it
-//! must equal; the 20 B `DerivedSlot` on every lane it carries (x, row, glyph,
-//! wrap segment, colour, group), the wrap segment computed from the
-//! reference's column by the fold's own `wrap_segment_of`.
+//! every GPU load runs, into the field's host blocks). The device tier runs the production emitter into host
+//! memory (`layout_hyper::device_pass2_derived_on_host`): every production
+//! destination hands that same `EmitInputs::run` a raw address of writable
+//! memory, so the only thing swapped is where the bytes land. The 20 B
+//! `DerivedSlot` is compared on every lane it carries (x, row, glyph, wrap
+//! segment, colour, group), the wrap segment computed from the reference's
+//! column by the fold's own `wrap_segment_of`. (The Instanced field's 32 B
+//! `RenderSlot` was compared byte-for-byte too until that field was retired,
+//! 2026-10-31.)
 //!
 //! WHAT IT CANNOT SEE: the device path past the emitter (the staging copy into
 //! VRAM, the buffer chunking), the Derived field's vertex-stage Y/Z (the slot
@@ -69,14 +69,14 @@ use std::sync::Arc;
 
 use crate::atlas::TrieTable;
 use crate::fold::{self, ClusterMode, F_LEADER};
-use crate::glyph_scene::{GlyphInstance, RenderSlot};
+use crate::glyph_scene::GlyphInstance;
 use glyph_field_derived::DerivedSlot;
 use crate::layout::{
     compact_records_into, diff_backends, BackendOutput, GlyphArena, GlyphRecord, ItemParams,
     ItemPlacement, LayoutGlyphs, LayoutItem, Paint, DEFAULT_COLOR_PACKED,
 };
 use crate::layout_hyper::{
-    device_pass2_derived_on_host, device_pass2_render_on_host, rederive_item_records, HyperLayout,
+    device_pass2_derived_on_host, rederive_item_records, HyperLayout,
 };
 use crate::text::ResolveGlyph;
 
@@ -378,26 +378,13 @@ pub fn diff_item(
     d
 }
 
-/// One item's DEVICE tier: the production emitter's slots in both formats
-/// against the reference instances, and its placements.
+/// One item's DEVICE tier: the production emitter's slots against the
+/// reference instances, and its placements.
 #[derive(Default)]
 pub struct DeviceItemDiff {
-    pub render_bad: usize,
     pub derived_bad: usize,
     pub placement_bad: usize,
     pub first: Option<String>,
-}
-
-/// The Instanced slot a reference instance must be, lane for lane.
-fn render_slot_of(i: &GlyphInstance) -> RenderSlot {
-    RenderSlot {
-        pos: i.pos,
-        glyph_id: i.glyph_id,
-        color: i.color,
-        group_id: i.group_id,
-        advance: i.advance,
-        height: i.height,
-    }
 }
 
 /// The Derived slot a reference instance must be: its x, row, glyph, colour
@@ -417,15 +404,12 @@ fn derived_slot_of(i: &GlyphInstance, p: &ItemParams) -> DerivedSlot {
     )
 }
 
-#[expect(clippy::too_many_arguments, reason = "the three sides of one device-tier comparison: the reference, and both slot formats with their placements")]
 pub fn diff_device_item(
     bytes: &[u8],
     params: &ItemParams,
     reference: &Reference,
     ref_instances: &[GlyphInstance],
     ref_place: &ItemPlacement,
-    render: &[RenderSlot],
-    render_place: &ItemPlacement,
     derived: &[DerivedSlot],
     derived_place: &ItemPlacement,
 ) -> DeviceItemDiff {
@@ -442,23 +426,6 @@ pub fn diff_device_item(
         format!("reference byte {at}, {}", codepoint_at(bytes, at))
     };
     for (i, r) in ref_instances.iter().enumerate() {
-        let want = render_slot_of(r);
-        if render.get(i).is_none_or(|got| bytemuck::bytes_of(got) != bytemuck::bytes_of(&want)) {
-            d.render_bad += 1;
-            if d.first.is_none() {
-                let got = render.get(i).map_or("absent".to_string(), |s| {
-                    format!(
-                        "gi {} adv {:e} x {:e} y {:e} z {:e} rgba {:08x}",
-                        s.glyph_id, s.advance, s.pos[0], s.pos[1], s.pos[2], s.color
-                    )
-                });
-                d.first = Some(format!(
-                    "device RenderSlot {i} ({}): oracle-backed fold {} | HyperLayout device {got}",
-                    name(i),
-                    show_instance(r)
-                ));
-            }
-        }
         let want = derived_slot_of(r, params);
         if derived.get(i).is_none_or(|got| bytemuck::bytes_of(got) != bytemuck::bytes_of(&want)) {
             d.derived_bad += 1;
@@ -471,16 +438,11 @@ pub fn diff_device_item(
             }
         }
     }
-    d.render_bad += render.len().saturating_sub(ref_instances.len());
     d.derived_bad += derived.len().saturating_sub(ref_instances.len());
-    for (tier, place) in [("render", render_place), ("derived", derived_place)] {
-        if !ref_place.bit_eq(place) {
-            d.placement_bad += 1;
-            if d.first.is_none() {
-                d.first = Some(format!(
-                    "device placement ({tier}): oracle-backed fold {ref_place:?} | HyperLayout device {place:?}"
-                ));
-            }
+    if !ref_place.bit_eq(derived_place) {
+        d.placement_bad += 1;
+        if d.first.is_none() {
+            d.first = Some(format!("device placement: oracle-backed fold {ref_place:?} | HyperLayout device {derived_place:?}"));
         }
     }
     d
@@ -500,10 +462,9 @@ pub struct CorpusDiff {
     /// 2026-10-09 HyperLayout read no cluster mode), separated from the
     /// cluster-mode one.
     pub leader_mode_record_bad: usize,
-    /// The device tier: slots the production device emitter wrote (per
-    /// format), and how many of them, and of its placements, differ.
+    /// The device tier: slots the production emitter wrote, and how many of
+    /// them, and of its placements, differ.
     pub device_slots: usize,
-    pub device_render_bad: usize,
     pub device_derived_bad: usize,
     pub device_placement_bad: usize,
     /// Tabs the reference laid out wider than the one cell the trie gives
@@ -528,7 +489,6 @@ impl Default for CorpusDiff {
             ascii_heads: 0,
             leader_mode_record_bad: 0,
             device_slots: 0,
-            device_render_bad: 0,
             device_derived_bad: 0,
             device_placement_bad: 0,
             expanded_tabs: 0,
@@ -557,9 +517,8 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
     let mut hyper_arena = GlyphArena::new();
     let hyper_places = hyper.layout_items(&items, &mut hyper_arena).map_err(|e| e.to_string())?;
 
-    // HyperLayout, production DEVICE Pass 2 (what a GPU load runs), both slot
-    // formats, written into host memory (see the module header).
-    let (render_slots, render_places) = device_pass2_render_on_host(&items, trie);
+    // HyperLayout, production DEVICE Pass 2 (what a GPU load runs), written
+    // into host memory (see the module header).
     let (derived_slots, derived_places) = device_pass2_derived_on_host(&items, trie);
 
     // The reference: the fold per item, compacted by the seam.
@@ -604,7 +563,7 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
         if c.params.cluster_mode == ClusterMode::Leader {
             out.leader_mode_record_bad += d.record_bad;
         }
-        let (rdp, ddp) = (&render_places[i], &derived_places[i]);
+        let ddp = &derived_places[i];
         let span = |p: &ItemPlacement, len: usize| {
             let s = (p.slot_base as usize).min(len);
             s..(s + p.slot_count as usize).min(len)
@@ -615,19 +574,16 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
             &refs[i],
             &ref_inst,
             rp,
-            &render_slots[span(rdp, render_slots.len())],
-            rdp,
             &derived_slots[span(ddp, derived_slots.len())],
             ddp,
         );
-        out.device_render_bad += dd.render_bad;
         out.device_derived_bad += dd.derived_bad;
         out.device_placement_bad += dd.placement_bad;
         if let Some(f) = d.first.or(dd.first) {
             out.firsts.push((c.label.clone(), f));
         }
     }
-    out.device_slots = render_slots.len();
+    out.device_slots = derived_slots.len();
 
     let ref_all: Vec<GlyphRecord> = refs.iter().flat_map(|r| r.records.iter().copied()).collect();
     let hyper_all: Vec<GlyphRecord> = hyper_recs.into_iter().flatten().collect();
@@ -661,7 +617,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
                 std::process::exit(1);
             }
         };
-        let device_bad = d.device_render_bad + d.device_derived_bad + d.device_placement_bad;
+        let device_bad = d.device_derived_bad + d.device_placement_bad;
         let clean = d.record_bad == 0
             && d.instance_bad == 0
             && d.placement_bad == 0
@@ -669,13 +625,13 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             && d.seam.is_ok();
         if clean {
             println!(
-                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots x2 bit-exact ({} sequence heads, {} ASCII-led)",
+                "  PASS {:<34} {} item(s), {} records, {} instances, {} device slots bit-exact ({} sequence heads, {} ASCII-led)",
                 corpus.name, d.items, d.records, d.instances, d.device_slots, d.heads, d.ascii_heads
             );
         } else {
             failed += 1;
             println!(
-                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {}+{} slots (render+derived), {} placements ({} sequence heads, {} ASCII-led)",
+                "FAIL  {:<34} {}/{} records, {}/{} instances, {}/{} placements differ; device {} slots, {} placements ({} sequence heads, {} ASCII-led)",
                 corpus.name,
                 d.record_bad,
                 d.records,
@@ -683,7 +639,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
                 d.instances,
                 d.placement_bad,
                 d.items,
-                d.device_render_bad,
                 d.device_derived_bad,
                 d.device_placement_bad,
                 d.heads,
@@ -712,7 +667,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         total.ascii_heads += d.ascii_heads;
         total.leader_mode_record_bad += d.leader_mode_record_bad;
         total.device_slots += d.device_slots;
-        total.device_render_bad += d.device_render_bad;
         total.device_derived_bad += d.device_derived_bad;
         total.device_placement_bad += d.device_placement_bad;
         total.expanded_tabs += d.expanded_tabs;
@@ -744,7 +698,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             println!("first divergence: {label}: {f}");
         }
         eprintln!(
-            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}+{}/{} slots (render+derived), {} placements",
+            "hyper-oracle FAIL: {failed}/{} corpora differ — {}/{} records ({} in leader-mode items), {}/{} instances, {}/{} placements; device: {}/{} slots, {} placements",
             paths.len(),
             total.record_bad,
             total.records,
@@ -753,7 +707,6 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
             total.instances,
             total.placement_bad,
             total.items,
-            total.device_render_bad,
             total.device_derived_bad,
             total.device_slots,
             total.device_placement_bad,
@@ -761,7 +714,7 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         std::process::exit(1);
     }
     println!(
-        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots in both formats bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led)",
+        "hyper-oracle PASS: {} corpora, {} items, {} records, {} instances, {} placements, and the device Pass 2's {} slots bit-exact vs the oracle-backed fold ({} sequence heads, {} ASCII-led)",
         paths.len(),
         total.items,
         total.records,
@@ -804,7 +757,7 @@ mod tests {
         assert!(d.records > 0 && d.instances > 0, "compared nothing");
         assert_eq!(d.device_slots, d.instances, "the device tier emitted a different survivor count");
         assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{:?}", d.firsts);
-        assert_eq!((d.device_render_bad, d.device_derived_bad, d.device_placement_bad), (0, 0, 0), "{:?}", d.firsts);
+        assert_eq!((d.device_derived_bad, d.device_placement_bad), (0, 0), "{:?}", d.firsts);
         assert!(d.seam.is_ok(), "{:?}", d.seam);
     }
 
@@ -827,8 +780,8 @@ mod tests {
             assert!(d.records > 0 && d.device_slots == d.instances, "{mode:?}: compared nothing");
             assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{mode:?}: {:?}", d.firsts);
             assert_eq!(
-                (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
-                (0, 0, 0),
+                (d.device_derived_bad, d.device_placement_bad),
+                (0, 0),
                 "{mode:?}: {:?}",
                 d.firsts
             );
@@ -903,8 +856,8 @@ mod tests {
                 assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
-                    (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
-                    (0, 0, 0),
+                    (d.device_derived_bad, d.device_placement_bad),
+                    (0, 0),
                     "{at}: {:?}",
                     d.firsts
                 );
@@ -916,20 +869,22 @@ mod tests {
     }
 
     /// The Derived field's vertex stage, the one lane the oracle cannot see
-    /// (a `DerivedSlot` carries no Y or Z), held to the Instanced emitter:
-    /// `glyph_field_derived::derive_yz` — the shader's `derive_yz`
-    /// transcribed — over every device-emitted Derived slot of the
-    /// pagination grid must land on the `RenderSlot`'s own y and z, within
-    /// the ulps the shader's f32 fma chain is allowed against the emitter's
-    /// f64 arithmetic. Before 2026-10-10 every column-paged shape failed
+    /// (a `DerivedSlot` carries no Y or Z), held to the oracle-backed
+    /// reference's instances: `glyph_field_derived::derive_yz` — the
+    /// shader's `derive_yz` transcribed — over every device-emitted Derived
+    /// slot of the pagination grid must land on the reference instance's
+    /// own y and z, within the ulps the shader's f32 fma chain is allowed
+    /// against the fold's f64 arithmetic. (Held to the Instanced emitter's
+    /// RenderSlots until 2026-10-31, which the device tier holds bit-exact
+    /// to these instances.) Before 2026-10-10 every column-paged shape failed
     /// here: the slot had no column page and z dropped
     /// `x_page × depth_per_col` (0.75 per page in this grid, thousands of
     /// ulps). The shader and its transcription are kept in step by hand;
     /// `derive::tests::wgsl_derive_yz_carries_the_column_page_term` pins
     /// the term in the shader's text.
     #[test]
-    fn derived_vertex_stage_agrees_with_instanced() {
-        use crate::layout_hyper::{device_pass2_derived_on_host, device_pass2_render_on_host};
+    fn derived_vertex_stage_agrees_with_the_reference() {
+        use crate::layout_hyper::device_pass2_derived_on_host;
         let trie = crate::default_trie();
         let texts: [&str; 3] = [
             "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
@@ -983,12 +938,17 @@ mod tests {
                         paint: Paint::Flat(DEFAULT_COLOR_PACKED),
                     })
                     .collect();
-                let (render, _) = device_pass2_render_on_host(&items, &trie);
+                let mut arena = GlyphArena::new();
+                for (i, it) in items.iter().enumerate() {
+                    let r = reference_item(it.bytes, &it.params, &trie);
+                    compact_records_into(&r.records, Paint::Flat(DEFAULT_COLOR_PACKED), i as u32, &mut arena);
+                }
+                let reference = arena.instances();
                 let (derived, _) = device_pass2_derived_on_host(&items, &trie);
-                assert_eq!(render.len(), derived.len());
+                assert_eq!(reference.len(), derived.len());
                 let gpu = glyph_field::ItemParamsGpu::from(&params);
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
-                for (k, (r, d)) in render.iter().zip(derived.iter()).enumerate() {
+                for (k, (r, d)) in reference.iter().zip(derived.iter()).enumerate() {
                     let [y, z] = glyph_field_derived::derive_yz(d.row, d.wrap_segment() as u32, &gpu);
                     for (name, got, want) in [("y", y, r.pos[1]), ("z", z, r.pos[2])] {
                         // The shader's f32 fma chain against the emitter's f64:
@@ -997,7 +957,7 @@ mod tests {
                         let err = (got - want).abs();
                         assert!(
                             got.is_finite() && err <= 1e-4,
-                            "{at}: slot {k} {name}: shader {got} vs emitter {want} (err {err}; row lane {:#x})",
+                            "{at}: slot {k} {name}: shader {got} vs reference {want} (err {err}; row lane {:#x})",
                             d.row
                         );
                         max_err = max_err.max(err);
@@ -1023,13 +983,12 @@ mod tests {
         let mut arena = GlyphArena::new();
         let place = compact_records_into(&r.records, Paint::Flat(DEFAULT_COLOR_PACKED), 0, &mut arena);
         let inst = arena.instances().to_vec();
-        let render: Vec<RenderSlot> = inst.iter().map(render_slot_of).collect();
         let mut derived: Vec<DerivedSlot> = inst.iter().map(|i| derived_slot_of(i, &params)).collect();
-        let clean = diff_device_item(text, &params, &r, &inst, &place, &render, &place, &derived, &place);
-        assert_eq!((clean.render_bad, clean.derived_bad, clean.placement_bad), (0, 0, 0));
+        let clean = diff_device_item(text, &params, &r, &inst, &place, &derived, &place);
+        assert_eq!((clean.derived_bad, clean.placement_bad), (0, 0));
         derived[2].row += 1; // 'c', byte 3
-        let d = diff_device_item(text, &params, &r, &inst, &place, &render, &place, &derived, &place);
-        assert_eq!((d.render_bad, d.derived_bad), (0, 1));
+        let d = diff_device_item(text, &params, &r, &inst, &place, &derived, &place);
+        assert_eq!(d.derived_bad, 1);
         let first = d.first.expect("a first divergence");
         assert!(first.contains("byte 3") && first.contains("DerivedSlot"), "{first}");
     }
@@ -1180,8 +1139,8 @@ mod tests {
                 assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
-                    (d.device_render_bad, d.device_derived_bad, d.device_placement_bad),
-                    (0, 0, 0),
+                    (d.device_derived_bad, d.device_placement_bad),
+                    (0, 0),
                     "{at}: {:?}",
                     d.firsts
                 );

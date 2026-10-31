@@ -13,6 +13,7 @@ pub mod fold;
 pub mod glyph_scene;
 pub mod glyph_trie;
 pub mod hyper_oracle;
+#[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod launch_config;
 #[cfg(feature = "launcher")]
@@ -21,6 +22,7 @@ pub mod layout;
 pub mod layout_hyper;
 pub mod layout_stack;
 pub mod library;
+#[cfg(feature = "wgpu")]
 pub mod offscreen;
 pub mod relayout;
 pub mod repo;
@@ -36,9 +38,12 @@ pub mod windowed;
 pub use atlas::default_trie;
 pub use cli::{Op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
+#[cfg(feature = "wgpu")]
 pub use gpu::GpuContext;
 pub use layout::{LayoutEngine, LayoutGlyphs, VerifyLayout};
-pub use scene::{Scene, SceneLike};
+pub use scene::{DemoScene, SceneLike};
+#[cfg(feature = "wgpu")]
+pub use scene::SceneRenderer;
 
 pub const OFFSCREEN_WIDTH: u32 = 1600;
 pub const OFFSCREEN_HEIGHT: u32 = 1000;
@@ -131,31 +136,51 @@ impl Default for SceneCullOptions {
     }
 }
 
-pub fn build_scene(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
-    choice: &SceneChoice,
-    camera_mode: CameraMode,
-    cull: bool,
-) -> Box<dyn SceneLike> {
-    build_scene_impl(
-        ctx,
-        color_format,
-        choice,
-        camera_mode,
-        SceneCullOptions { cull, ..Default::default() },
-        false,
-    ).0
+/// Loads a driver starts before it builds its scene (the repo walk and the
+/// atlas, on their own threads), which the build joins instead of doing
+/// them again. Default: none started.
+#[derive(Clone, Default)]
+pub struct Prefetch {
+    pub walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<repo::PrefetchedRepo>>>>,
+    pub atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<atlas::Atlas>>>>,
+}
+
+/// What building a scene takes beyond its choice (2026-10-31: in place of
+/// the GPU context and colour format it took; a scene holds no device
+/// type, and its renderer is built from it afterwards).
+#[derive(Clone)]
+pub struct SceneLoad {
+    /// Where the scene's glyph slots will live.
+    pub home: budget::SlotHome,
+    pub prefetch: Prefetch,
+}
+
+impl SceneLoad {
+    #[cfg(feature = "wgpu")]
+    /// A wgpu driver's: its adapter's memory, a device copy of the slots,
+    /// and whatever it prefetched.
+    pub fn of(ctx: &GpuContext) -> Self {
+        Self { home: budget::SlotHome::of(ctx), prefetch: ctx.prefetch.clone() }
+    }
+
+    /// A host that draws the scene with its own renderer: the host's
+    /// memory, no device copy, nothing prefetched.
+    pub fn host() -> Self {
+        Self { home: budget::SlotHome::host(), prefetch: Prefetch::default() }
+    }
+}
+
+pub fn build_scene(load: &SceneLoad, choice: &SceneChoice, camera_mode: CameraMode, cull: bool) -> Box<dyn SceneLike> {
+    build_scene_impl(load, choice, camera_mode, SceneCullOptions { cull, ..Default::default() }, false).0
 }
 
 pub fn build_scene_with_options(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
+    load: &SceneLoad,
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull_opts: SceneCullOptions,
 ) -> Box<dyn SceneLike> {
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull_opts, false).0
+    build_scene_impl(load, choice, camera_mode, cull_opts, false).0
 }
 
 /// Build a GlyphScene from ALREADY-STAGED content — the P1-live entry for
@@ -165,31 +190,26 @@ pub fn build_scene_with_options(
 /// Builds the default field (Derived since 2026-10-11);
 /// [`build_scene_from_staged_mode`] takes the mode.
 pub fn build_scene_from_staged(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
-    atlas: &atlas::Atlas,
+    atlas: std::sync::Arc<atlas::Atlas>,
     staged: text::StagedText,
     camera_mode: CameraMode,
     cull: bool,
 ) -> Box<dyn SceneLike> {
-    build_scene_from_staged_mode(ctx, color_format, atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::default())
+    build_scene_from_staged_mode(atlas, staged, camera_mode, cull, glyph_scene::GlyphFieldMode::default())
 }
 
 /// [`build_scene_from_staged`] with the field mode threaded through: the
 /// live loop's rebuilds keep the mode the run was launched with (until
 /// 2026-10-10 they hardcoded Instanced, so a `--field-mode derived` live
-/// session silently rebuilt as Instanced on the first edit). The mode the
-/// scene BUILDS still follows the staged arena (`glyph_scene::setup`).
+/// session silently rebuilt as Instanced on the first edit).
 pub fn build_scene_from_staged_mode(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
-    atlas: &atlas::Atlas,
+    atlas: std::sync::Arc<atlas::Atlas>,
     staged: text::StagedText,
     camera_mode: CameraMode,
     cull: bool,
     field_mode: glyph_scene::GlyphFieldMode,
 ) -> Box<dyn SceneLike> {
-    Box::new(GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull, field_mode))
+    Box::new(GlyphScene::new(atlas, staged, camera_mode, cull, field_mode))
 }
 
 /// The PROBED twin of [`build_scene_from_staged_mode`] — installs the Debug
@@ -197,32 +217,28 @@ pub fn build_scene_from_staged_mode(
 /// keeps its panel (the windowed live loop's shape: rebuild + restyle while
 /// the viewer watches).
 pub fn build_scene_from_staged_probed(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
-    atlas: &atlas::Atlas,
+    atlas: std::sync::Arc<atlas::Atlas>,
     staged: text::StagedText,
     camera_mode: CameraMode,
     cull: bool,
     field_mode: glyph_scene::GlyphFieldMode,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    let mut scene = GlyphScene::new(ctx, color_format, atlas, staged, camera_mode, cull, field_mode);
+    let mut scene = GlyphScene::new(atlas, staged, camera_mode, cull, field_mode);
     let probe = scene.init_ui_probe();
     (Box::new(scene), Some(probe))
 }
 
 pub fn build_scene_probed(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
+    load: &SceneLoad,
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull_opts: SceneCullOptions,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    build_scene_impl(ctx, color_format, choice, camera_mode, cull_opts, true)
+    build_scene_impl(load, choice, camera_mode, cull_opts, true)
 }
 
 fn build_scene_impl(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
+    load: &SceneLoad,
     choice: &SceneChoice,
     camera_mode: CameraMode,
     cull_opts: SceneCullOptions,
@@ -253,7 +269,7 @@ fn build_scene_impl(
     let cull = cull_opts.cull;
     let field_mode = cull_opts.field_mode;
     match choice {
-        SceneChoice::Demo => (Box::new(Scene::new(ctx, color_format)), None),
+        SceneChoice::Demo => (Box::new(scene::DemoScene), None),
         SceneChoice::Text { file, copies, emoji_sheet, cluster_mode, tab_width, wrap_mode, z_wrap_spacing } => {
             // A one-file repo load (2026-10-11): HyperLayout, flat paint and
             // whichever field was asked for.
@@ -265,12 +281,13 @@ fn build_scene_impl(
                 field_mode,
                 ..Default::default()
             };
-            let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
-            let atlas = match prefetched_atlas_handle {
+            let prefetched_atlas_handle = load.prefetch.atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let atlas = std::sync::Arc::new(match prefetched_atlas_handle {
                 Some(handle) => handle.join().expect("prefetched atlas thread panicked"),
-                None => atlas::Atlas::load_device(&ctx.device, &ctx.queue, emoji_sheet),
-            };
-            let load = repo::load_file(file, *copies, &params, Some(ctx));
+                None => atlas::Atlas::load(emoji_sheet),
+            });
+            let home = &load.home;
+            let load = repo::load_file(file, *copies, &params, Some(home));
             log::info!(
                 "loaded {}: {} views over one buffer, {} records → {} glyph instances ({} blank/missing dropped)",
                 file.display(),
@@ -280,7 +297,7 @@ fn build_scene_impl(
                 load.stats.blanks,
             );
             let staged = load.into_staged(None, &atlas.slot_ink);
-            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
+            let mut scene = GlyphScene::new(atlas, staged, camera_mode, cull, field_mode);
             scene.set_probe_cluster_mode(matches!(cluster_mode, fold::ClusterMode::Cluster));
             glyph(scene)
         }
@@ -302,7 +319,7 @@ fn build_scene_impl(
             };
             let (session, rev_engine) = (*loaded).clone();
 
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
+            let atlas = std::sync::Arc::new(atlas::Atlas::load(emoji_sheet));
             let staged = agent_transcript::stage_agent_session_with_options(
                 Some(&atlas.trie),
                 &atlas.slot_ink,
@@ -310,7 +327,7 @@ fn build_scene_impl(
                 rev_engine,
                 *layout_options,
             );
-            let scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
+            let scene = GlyphScene::new(atlas, staged, camera_mode, cull, field_mode);
             glyph(scene)
         }
         SceneChoice::Repo {
@@ -334,9 +351,9 @@ fn build_scene_impl(
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
-            let device = &ctx.device;
-            let queue = &ctx.queue;
-            let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let prefetched_atlas_handle = load.prefetch.atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let prefetched_walk_handle = load.prefetch.walk.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let home = &load.home;
             let (load, atlas, atlas_wall) = std::thread::scope(|s| {
                 let atlas_handle = s.spawn(move || {
                     let t = std::time::Instant::now();
@@ -345,11 +362,11 @@ fn build_scene_impl(
                         log::info!("joined prefetched atlas in {:?}", t.elapsed());
                         res
                     } else {
-                        atlas::Atlas::load_device(device, queue, emoji_sheet)
+                        atlas::Atlas::load(emoji_sheet)
                     };
                     (a, t.elapsed())
                 });
-                let prefetched = if let Some(h) = ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let prefetched = if let Some(h) = prefetched_walk_handle {
                     let t_wait = std::time::Instant::now();
                     let res = h.join().unwrap_or_else(|_| repo::prefetch_repo(dir, params, *strategy));
                     log::info!("joined prefetched repo in {:?}", t_wait.elapsed());
@@ -363,7 +380,7 @@ fn build_scene_impl(
                     prefetched,
                     &params,
                     *strategy,
-                    Some(ctx),
+                    Some(home),
                     arena,
                     None,
                 );
@@ -377,7 +394,7 @@ fn build_scene_impl(
             let staged_dur = t_staged.elapsed();
 
             let t_scene = std::time::Instant::now();
-            let mut scene = GlyphScene::new(ctx, color_format, &atlas, staged, camera_mode, cull, field_mode);
+            let mut scene = GlyphScene::new(std::sync::Arc::new(atlas), staged, camera_mode, cull, field_mode);
             scene.set_probe_layout_mode(*layout_mode);
             scene.set_probe_strategy(*strategy);
             let scene_dur = t_scene.elapsed();

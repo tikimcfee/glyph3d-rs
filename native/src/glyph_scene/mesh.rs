@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "wgpu")]
 use wgpu::util::DeviceExt;
 
 /// A single vertex of a generic 3D mesh.
@@ -58,14 +59,17 @@ pub enum UnitMesh {
     Cube,
 }
 
+#[cfg(feature = "wgpu")]
 const QUAD_VERTS: &[MeshVertex] = &[
     MeshVertex { position: [-0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
     MeshVertex { position: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
     MeshVertex { position: [ 0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
     MeshVertex { position: [ 0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
 ];
+#[cfg(feature = "wgpu")]
 const QUAD_IDXS: &[u32] = &[0, 1, 2, 0, 2, 3];
 
+#[cfg(feature = "wgpu")]
 const CUBE_VERTS: &[MeshVertex] = &[
     // +Z Front
     MeshVertex { position: [-0.5,  0.5,  0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
@@ -98,6 +102,7 @@ const CUBE_VERTS: &[MeshVertex] = &[
     MeshVertex { position: [ 0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 1.0] },
     MeshVertex { position: [ 0.5, -0.5,  0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 0.0] },
 ];
+#[cfg(feature = "wgpu")]
 const CUBE_IDXS: &[u32] = &[
     0, 1, 2, 0, 2, 3,       // Front
     4, 5, 6, 4, 6, 7,       // Back
@@ -107,6 +112,7 @@ const CUBE_IDXS: &[u32] = &[
     20, 21, 22, 20, 22, 23, // Bottom
 ];
 
+#[cfg(feature = "wgpu")]
 pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -118,6 +124,7 @@ pub struct MeshPipeline {
     last_revision: u64,
 }
 
+#[cfg(feature = "wgpu")]
 impl MeshPipeline {
     pub fn new(
         device: &wgpu::Device,
@@ -264,20 +271,21 @@ impl MeshPipeline {
         });
     }
 
-    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &crate::spatial_scene::SceneMeshDraws) {
-        if self.last_revision == draws.revision && draws.revision != 0 {
+    /// The scene meshes at `revision` (`FrameData::meshes_generation`):
+    /// quads, then cubes, into the instance buffer, unless that revision is
+    /// already there.
+    pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, revision: u64, quads: &[MeshInstance], cubes: &[MeshInstance]) {
+        if self.last_revision == revision && revision != 0 {
             return;
         }
-        self.last_revision = draws.revision;
-        let quads = &draws.quads;
-        let cubes = &draws.cubes;
-        
+        self.last_revision = revision;
+
         self.ensure_instance_capacity(device, quads.len() + cubes.len());
         if !quads.is_empty() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(quads));
         }
         if !cubes.is_empty() {
-            let offset = std::mem::size_of_val(quads.as_slice()) as u64;
+            let offset = std::mem::size_of_val(quads) as u64;
             queue.write_buffer(&self.instance_buffer, offset, bytemuck::cast_slice(cubes));
         }
     }

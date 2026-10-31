@@ -33,6 +33,7 @@ impl DeviceMemory {
     }
 }
 
+#[cfg(feature = "wgpu")]
 /// `adapter`'s device-local memory, where the driver reports a budget.
 #[cfg(not(any(target_vendor = "apple", target_family = "wasm")))]
 pub fn device_memory(adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
@@ -64,6 +65,7 @@ pub fn device_memory(adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
     (memory.heap_bytes > 0).then_some(memory)
 }
 
+#[cfg(feature = "wgpu")]
 /// No backend but Vulkan reports a budget through wgpu.
 #[cfg(any(target_vendor = "apple", target_family = "wasm"))]
 pub fn device_memory(_adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
@@ -108,7 +110,36 @@ pub struct Machine {
     pub unified: bool,
 }
 
+/// Where a load's slots will live (2026-10-31: what layout needs of the
+/// machine, in place of the GPU context it took): the machine's memory, and
+/// whether a device copy will be made of them (a wgpu renderer's; a host
+/// renderer that publishes the blocks itself makes none here).
+#[derive(Clone, Debug)]
+pub struct SlotHome {
+    pub machine: Machine,
+    pub device_copy: bool,
+}
+
+impl SlotHome {
+    /// The host alone: no device to check, none to copy to.
+    pub fn host() -> Self {
+        Self {
+            machine: Machine { host_available: host_available_bytes(), device_name: "none".into(), device: None, unified: false },
+            device_copy: false,
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    /// A wgpu renderer's: the context's adapter, and the device copy its
+    /// field draw uploads.
+    pub fn of(ctx: &crate::gpu::GpuContext) -> Self {
+        let unified = ctx.profile.memory_architecture() == crate::gpu::MemoryArchitecture::Unified;
+        Self { machine: Machine::of(&ctx.adapter, unified), device_copy: true }
+    }
+}
+
 impl Machine {
+    #[cfg(feature = "wgpu")]
     pub fn of(adapter: &wgpu::Adapter, unified: bool) -> Self {
         Self {
             host_available: host_available_bytes(),

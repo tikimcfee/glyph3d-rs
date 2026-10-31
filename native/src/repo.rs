@@ -163,10 +163,9 @@ pub struct RepoParams {
     pub tab_width: crate::fold::TabWidth,
     /// Spatial arrangement mode for the repository files across the canvas.
     pub layout_mode: RepoLayoutMode,
-    /// The glyph field the device layout emits for: `Instanced` (32 B
-    /// `RenderSlot`) or `Derived` (20 B `DerivedSlot` + line table). The
-    /// HyperLayout device path writes the chosen format straight into the
-    /// GPU arena — no host transcode between layout and field.
+    /// The glyph field the layout emits for: `Derived` (20 B `DerivedSlot`),
+    /// written by HyperLayout's Pass 2 straight into the field's host
+    /// blocks — no transcode between layout and field.
     pub field_mode: glyph_field::GlyphFieldMode,
 }
 
@@ -437,15 +436,16 @@ pub fn prefetch_repo(
 /// first so it can size the arena to the byte count (the render path's
 /// device-mapped arena exists because of this split — leaders ≤ bytes, so
 /// `walk.total_bytes` is the slot bound the direct path commits against).
-/// `gpu` is the renderer's device when one exists — HyperLayout emits
-/// straight into its buffers; `None` is the no-GPU door
-/// (`--repo-scan-only`), where layout fills a host arena.
+/// `home` is where a field's slots will live when the load is for a scene
+/// (HyperLayout emits them straight into the field's host blocks, checked
+/// against it); `None` is the scan-only door (`--repo-scan-only`), where
+/// layout fills a host arena of neutral records.
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -466,7 +466,7 @@ pub fn load_repo_from_walk(
         prefetched,
         params,
         strategy,
-        gpu,
+        home,
         arena,
         folds,
     )
@@ -477,7 +477,7 @@ pub fn load_repo_from_prefetched(
     prefetched: PrefetchedRepo,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -485,7 +485,7 @@ pub fn load_repo_from_prefetched(
         buffer_of_view: (0..prefetched.walk.files.len() as u32).collect(),
         placement: Placement::Controller,
     };
-    load_views(root, prefetched, plan, params, strategy, gpu, arena, folds)
+    load_views(root, prefetched, plan, params, strategy, home, arena, folds)
 }
 
 /// `--render-file FILE [--copies N]` as a repo load of that one file
@@ -499,7 +499,7 @@ pub fn load_repo_from_prefetched(
 /// The bytes are refused where a walk would skip them: not UTF-8 (the
 /// decode assumes well-formed leads) or past [`MAX_FILE_BYTES`] (the
 /// per-item ordinal guard).
-pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&crate::gpu::GpuContext>) -> RepoLoad {
+pub fn load_file(path: &Path, copies: u32, params: &RepoParams, home: Option<&crate::budget::SlotHome>) -> RepoLoad {
     let started = Instant::now();
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("failed to read text file {}: {e}", path.display()));
     assert!(std::str::from_utf8(&bytes).is_ok(), "{} is not valid UTF-8; the layout decodes well-formed UTF-8 only", path.display());
@@ -524,7 +524,7 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&cra
         plan,
         params,
         Strategy::default(),
-        gpu,
+        home,
         GlyphArena::new(),
         None,
     )
@@ -556,7 +556,7 @@ fn load_views(
     plan: ViewPlan,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -583,8 +583,8 @@ fn load_views(
     let paint_mode = Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED);
 
     // Each view's group row: its own index, unless the permutation witness
-    // asks otherwise (`group_rows_of_views`). The layout writes it into the
-    // Instanced slots' group lane; the view registry carries it from here on.
+    // asks otherwise (`group_rows_of_views`). The layout writes it into each
+    // record's group lane; the view registry carries it from here on.
     // One layout item per VIEW: copies of one buffer are laid out once each
     // (every stored slot names its item, so views cannot share slots).
     let group_rows = group_rows_of_views(view_count);
@@ -602,11 +602,8 @@ fn load_views(
 
     // Every strategy runs HyperLayout; with a GPU it emits straight into
     // the field's own slot format.
-    let mut backend = match gpu {
-        Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
-            crate::gpu::SharedDevice::from_ctx(ctx),
-            params.field_mode,
-        ),
+    let mut backend = match home {
+        Some(home) => crate::layout::LayoutEngine::hyper_for_field(home.clone(), params.field_mode),
         // Without a device: host records, whatever the mode.
         None => crate::layout::LayoutEngine::hyper(),
     };
@@ -871,15 +868,6 @@ impl RepoLoad {
         // 48 B records exist there) and the arena chunks on the 48 B paths;
         // same values in the same slot order either way, so the tints are
         // bit-identical.
-        let mapped_slots = self
-            .arena
-            .emitted_slots()
-            .and_then(|d| d.mapped_slots())
-            .map(|addr| {
-                let len = self.arena.emitted_slots().expect("a mapping belongs to an emitted arena").len;
-                // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
-                unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
-            });
         let tint_stream: Option<&[u32]> = None;
         let chunks = if self.arena.emitted_slots().is_none() {
             self.arena.instance_chunks()
@@ -929,8 +917,6 @@ impl RepoLoad {
                         if let Some(pairs) = emitted_pairs {
                             debug_assert_eq!(pairs.len(), v.slot_count * 2);
                             tint.add_tint(pairs);
-                        } else if let Some(slots) = mapped_slots {
-                            tint.add_slots(&slots[want]);
                         } else if let Some(tp) = tint_stream {
                             tint.add_tint(&tp[want.start * 2..want.end * 2]);
                         } else {
@@ -967,7 +953,7 @@ impl RepoLoad {
                     })
                     .collect()
             } else {
-                build_file_blocks(v, s, mapped_slots, &chunks)
+                build_file_blocks(v, s, &chunks)
             };
             crate::glyph_scene::SegCull {
                 min: [

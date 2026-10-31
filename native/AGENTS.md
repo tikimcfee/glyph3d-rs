@@ -87,9 +87,9 @@ caller; the short version:
   `Derived` mode into HOST blocks that are the field's chunks (2026-10-26;
   `[glyph_scene] derived_block_slots`, `glyph_field::HostSlots`): the one host
   copy a makepad renderer publishes and the wgpu field uploads from, kept current
-  by every slot write. 32-byte `RenderSlot`s in `Instanced` mode go straight
-  into mapped GPU unified memory or staged windows, device-direct only because
-  Instanced is being retired.
+  by every slot write. (32-byte `RenderSlot`s for the Instanced mode went
+  straight into mapped device memory or staged windows until that mode was
+  retired, 2026-10-31.)
 - **Paint is flat at load, colour arrives as spans** (2026-10-11). Every load
   paints `Paint::Flat`; per-glyph colour comes afterwards as byte spans (the
   `--highlight` sidecar and the seam's style runs: `style_file`). `Paint::PerRecord`
@@ -108,8 +108,9 @@ caller; the short version:
   - `direct` / `batch` / `naive`: the same `HyperLayout`, without `hyper`'s
     background prefetch; the stats line prints `batch`/`naive`'s
     readback/compaction phases.
-- `--field-mode derived|instanced` selects the glyph field mode (a third,
-  `visible`, was deleted on 2026-10-26; `out/history/VISIBLE-MODE.md`):
+- `--field-mode derived` selects the glyph field mode, of which one remains
+  (`visible` was deleted on 2026-10-26, `out/history/VISIBLE-MODE.md`;
+  `instanced` on 2026-10-31, and is refused):
   - `derived` (20 B per glyph; THE DEFAULT since 2026-10-11, Instanced
     retirement step 1 — no golden pixel moved): compact word layout, x stored,
     Y/Z derived in the vertex stage from the item table. Host-staged scenes
@@ -119,19 +120,19 @@ caller; the short version:
     block (`agent_transcript::staging::block_item`) so derived y/z equal the
     absolute ones bit for bit. `nudge-glyph` y/z and `scale-glyph` have no
     lane here and reply "not representable" (x nudges apply).
-  - `instanced` (32 B per glyph): precomputed 3D coordinates. Being retired:
-    held byte-equal to every golden by the `--field-mode instanced`
-    equivalent until step 3 deletes its crate.
-  - **The Derived lanes are a load-time limit** (`layout_hyper::derived_lane_limits`,
-    2026-10-10): item count vs `ITEM_MAX`, rows per item vs `ROW_MAX`, column pages
-    vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), checked once per load before
-    any slot is emitted. A Derived load past them falls back to
-    `instanced` with ONE warning naming the item and the limit; the field the scene
-    builds follows the arena, and the panel/HUD show the mode actually built.
-    TEMPORARY (2026-10-11): with Derived the default, this fall-back is the
-    last thing Instanced does for a default load; step 3 of its retirement
-    makes it a refusal (workarounds: widen a lane, or split an oversized file
-    into several items).
+  - (`instanced`, 32 B per glyph with precomputed 3D coordinates, held
+    byte-equal to every golden by the `--field-mode instanced` equivalent
+    from 2026-10-11, was retired on 2026-10-31: step 3 deleted its crate.)
+  - **The Derived lanes are a load-time limit, per file** (`layout_hyper::derived_lane_overflow`,
+    2026-10-10; per file since 2026-10-31): rows per item vs `ROW_MAX`, column pages
+    vs `X_PAGE_MAX` (from Pass 1's `max_line_cols`), and items with a glyph past
+    `ITEM_MAX`, checked once per load before any slot is emitted. Each item past a
+    lane is laid out EMPTY with a warning naming it and its limit; every other item
+    lands exactly where it would have (`an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched`).
+    A limit costs its own file, never the load: torvalds/linux must always load
+    (Ivan, 2026-10-31). Until that day the whole load fell back to Instanced. The
+    emptied file keeps its bytes, so the pick cache refuses it (its bytes re-derive
+    slots the layout never placed) rather than map a verb onto the next file's slots.
 - **Tab stops are a recipe parameter** (`ItemParams::tab_width`, the
   type `fold::TabWidth`; 2026-10-11): a tab spans to the next multiple of N
   display cells of its logical line. A repo load takes `--tab-width`, else
@@ -202,19 +203,15 @@ display's refresh (75 on the first Linux box) and not a fact about the renderer.
 This section is the one copy of these facts (the testing skill points here;
 `research/desktop-platform-audit.md` is the 2026-10 survey behind it, and
 its staging text predates C22). Key touchpoints:
-- **Unified vs. Discrete Slot Buffers (`native/src/layout_hyper/device_alloc.rs`)**:
-  - `#[cfg(target_os = "macos")]` allocates Metal `MTLStorageModeShared` memory and maps it (`mapped_base: Some(addr)`). Pass 2 writes directly to device memory with zero copies.
-  - On non-macOS/desktop (`mapped_base: None`), the default is WINDOWED emission (C22): Pass 2 writes each 64 MiB window of the slot stream into one of two mapped staging buffers, copied to VRAM while the next fills (`GLYPH_STAGING` below names the fallbacks).
-  - ⚠️ **Dynamic Color Writes**: When `mapped_base` is `None`, `crates/glyph-field/src/storage.rs` `SlotStorage::write_colors` falls back to one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
+- **Slot emission (`native/src/layout_hyper/emit.rs`)**: Pass 2 writes the Derived slots into HOST blocks that are the field's chunks, window by window through host scratch, on every machine; the wgpu field uploads one buffer per block (`crates/glyph-field/src/storage.rs`). Until 2026-10-31 the Instanced field's slots were emitted to the device directly (Metal shared memory on macOS; on discrete GPUs C22's windowed staging, with `GLYPH_STAGING` fallbacks); that path went with the Instanced field (`device_alloc.rs`, now `emit.rs`).
+  - ⚠️ **Dynamic Color Writes**: `SlotStorage::write_colors` writes each slot's colour into its host block and, when the device holds a copy, one 4-byte `queue.write_buffer` per slot. On discrete GPUs with large repos, batch these writes to avoid driver call overhead.
 - **Cache Sizing & Chunk Threshold (`native/src/layout_hyper/chunk.rs`)**:
   - `CHUNK_THRESHOLD_BYTES = 64 * 1024` (64 KiB) is tuned for Apple Silicon M-series L1 Data Cache (128 KiB per P-core).
   - Desktop x86_64 (AMD Zen 3/4/5, Intel Raptor Lake) has **32 KiB or 48 KiB L1D** per core. A 64 KiB chunk spills to L2. On desktop, testing 32 KiB or 16 KiB thresholds can keep chunks 100% L1D-resident.
   - A line with no newline near the threshold is cut INSIDE the line, and only before an ASCII byte (C15): no cluster sequence has an ASCII member after its first (asserted at atlas load), so every chunk resolves as the whole item does. The chunk after such a cut inherits the line's column, line advance and segment advance from Pass 1's aggregation, which computes the segment advance as the fold's running f32 sum. Changing the threshold moves `native/fixtures/chunk-cut.txt`'s cuts off the sequences it plants: re-prove its mutations.
 - **Cache Lines & Burst Stores (`native/src/layout_hyper/pass2_device.rs`)**:
-  - `emit_burst8` writes 8 `DerivedSlot`s (160 B) or 4 `RenderSlot`s (128 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
-- **Copy sizes (`crates/glyph-field/src/copy.rs`, C16, measured 2026-10-09 on an RTX 5090)**:
-  - A `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed; wgpu only asks for 4. A 20 B `DerivedSlot` stream is 16-aligned only at counts ≡ 0 mod 4, so an odd count cost ~+20 ms of backend on a 94 MB tree. Discrete staging buffers are padded with `padded_staging_size` and slot copies go through `copy_split` (16-aligned body + small tail). Same bytes, same buffer sizes; the unified single-chunk path makes no copy and is untouched.
-  - An off-16 source OFFSET also costs; chunked Derived buffers start chunk k at `k x chunk_cap x 20` B (≡ 8 mod 16 at the 2 GiB binding limit; a forced two-chunk split of the 94 MB tree measured ~+1 ms at 8 mod 16, ~+5 ms at 4 mod 16). Left as is: moving it would move which slot lives in which chunk.
+  - `emit_burst8` writes 8 `DerivedSlot`s (160 B). Standard x86_64 cache line width is 64 B (Apple M2 SLC/L2 is 128 B).
+- **Copy sizes (C16, measured 2026-10-09 on an RTX 5090)**: a `copy_buffer_to_buffer` whose size is off 16 B runs whole at about half speed (wgpu only asks for 4), so the discrete staging copies were padded and split (`copy.rs`, `copy_split`). That code and its mutation went on 2026-10-31 with the host-record upload it served: the slots go up as host blocks through queued writes (`SlotStorage::from_host_slots`, then `sync` by block version), which make no buffer-to-buffer copy. The measurement stands for any copy path that returns.
 - **Golden Pixel Keys**:
   - Golden baselines are keyed per rasterizer in `out/tooling-ab/baseline/<key>/`; sets exist for `metal-apple` and `vulkan-nvidia`. Any other key (e.g. `vulkan-amd`) is red until a human adopts its set.
 - **Pure Rust Portability**:
@@ -226,21 +223,15 @@ its staging text predates C22). Key touchpoints:
   per-pass GPU timings print (windowed: 1 Hz; offscreen: once per run).
   Without it the device is created exactly as before (zero-cost Option).
 - `GLYPH_TRACE=<filter>` — the load path's span instrument: `repo.{walk,backend,verify,views,layout,staged,segments}` and
-  `hyper.{pass1,pass2,emoji_tints,pass2.windowed,staging.stream}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
+  `hyper.{pass1,pass2,emoji_tints,pass2.blocks}`, printed on span CLOSE with busy/idle times. The filter is a tracing EnvFilter string (fallback
   `RUST_LOG`; unset = off, one atomic per span). `glyph3d_native=info`
   is the useful setting — a bare `info` also admits wgpu's own
   tracing records, which is loud. The spans mirror the
   LoadStats Instant boundaries exactly so the two can be
   cross-checked; the prints stay the presentation contract.
-- `GLYPH_STAGING=host|single` — discrete GPUs only. The default is WINDOWED
-  emission (C22): Pass 2 writes each 64 MiB window of the slot stream straight
-  into one of two mapped staging buffers, uploaded while the next fills; the
-  chunks of emoji-holding items detour through host scratch for their tint
-  pairs. `host` writes host memory and streams it through one 64 MiB buffer
-  (a full extra copy); `single` is one mapped-at-creation buffer, which
-  wgpu-core zero-fills and copies. On the measured NVIDIA box (derived, 102 MB
-  tree): windowed 121 ms, host 194, single 482. The fallbacks stay for
-  hardware nobody has measured.
+- (`GLYPH_STAGING=host|single`, the discrete-GPU fallbacks of C22's windowed
+  device emission, went with that path on 2026-10-31: the slots land in host
+  blocks on every machine.)
 - `GLYPH_HYPER_ORACLE_STRICT=1` — the hyper-oracle gate's form: besides
   refusing zero records, refuse a corpus in which the reference resolved no
   sequence or no ASCII-led one.
@@ -315,10 +306,9 @@ its staging text predates C22). Key touchpoints:
   345; on fixtures/emoji-corpus-small.txt, a TEXT scene: 893 → 801).
   The button shows on repo and text scenes; demo and agent-session scenes carry
   no mode and hide it.
-- `GLYPH_FIELDMODE_SELFTEST=1` — windowed, dev-only (2026-10-10): at t≈3 s
-  cycles the field mode Instanced → Derived through the SAME
-  rebuild arm the Debug panel's selector fires, printing the F8 HUD line
-  (`FIELDMODE-SELFTEST before/after step N: …`) around each rebuild.
+- (`GLYPH_FIELDMODE_SELFTEST=1`, which cycled the field mode Instanced →
+  Derived through the Debug panel's selector, went with the Instanced field
+  and the selector on 2026-10-31.)
 - `GLYPH_GRAB_SELFTEST=file[:dx:dy]` — windowed, dev-only (C29, 2026-10-10):
   the GRAB path through the window's own entry points — `apply_pick` on
   `file` (row 0 col 0), `on_cursor` to park the cursor at the centre,

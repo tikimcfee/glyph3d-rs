@@ -11,9 +11,11 @@
 //!
 //! A write is copy-on-write per block (`Arc::make_mut`): in place while the
 //! field alone holds the block, a fresh copy of that one block while a
-//! renderer still holds the old one. A block's identity is its generation:
-//! a consumer re-reads block `k` exactly when its `Arc` is not the one it
-//! holds. Why a block and not one publication with pieces: makepad's native
+//! renderer still holds the old one. A consumer that holds the `Arc`s (the
+//! makepad host) re-reads block `k` exactly when its `Arc` is not the one
+//! it holds; one that holds none (the wgpu renderer, whose copy is on the
+//! device, 2026-10-31) re-reads it when its [`HostSlots::version`] moved,
+//! every write bumping its block's. Why a block and not one publication with pieces: makepad's native
 //! frame builder re-uploads a draw item's whole buffer whenever its
 //! publication changes, so the block is the unit of an edit's upload.
 
@@ -25,6 +27,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct HostSlots {
     blocks: Vec<Arc<[u32]>>,
+    /// Per block, bumped by every write to it.
+    versions: Vec<u64>,
     block_slots: usize,
     slot_words: usize,
     len: usize,
@@ -36,14 +40,15 @@ impl HostSlots {
     pub fn zeroed(len: usize, block_slots: usize, slot_words: usize) -> Self {
         assert!(block_slots > 0 && slot_words > 0, "a block holds at least one slot of at least one word");
         let stored = len.max(1);
-        let blocks = (0..stored.div_ceil(block_slots))
+        let blocks: Vec<Arc<[u32]>> = (0..stored.div_ceil(block_slots))
             .map(|k| {
                 let slots = (stored - k * block_slots).min(block_slots);
                 // SAFETY: zero is a valid u32, so a zeroed slice is initialised.
                 unsafe { Arc::<[u32]>::new_zeroed_slice(slots * slot_words).assume_init() }
             })
             .collect();
-        Self { blocks, block_slots, slot_words, len }
+        let versions = vec![0; blocks.len()];
+        Self { blocks, versions, block_slots, slot_words, len }
     }
 
     pub fn blocks(&self) -> &[Arc<[u32]>] {
@@ -68,6 +73,12 @@ impl HostSlots {
         self.len == 0
     }
 
+    /// Block `k`'s version: bumped by every write into it (the blocks as
+    /// first filled are version 0).
+    pub fn version(&self, k: usize) -> u64 {
+        self.versions[k]
+    }
+
     /// Slots block `k` stores.
     pub fn block_len(&self, k: usize) -> usize {
         self.blocks[k].len() / self.slot_words
@@ -90,6 +101,7 @@ impl HostSlots {
         let (k, at) = self.locate(slot);
         let block = Arc::make_mut(&mut self.blocks[k]);
         block[at + word..at + word + words.len()].copy_from_slice(words);
+        self.versions[k] += 1;
     }
 
     /// Slot `slot`'s words.
@@ -135,5 +147,7 @@ mod tests {
         slots.write(4, 0, &[1]);
         assert!(std::ptr::addr_eq(before, Arc::as_ptr(&slots.blocks()[1])), "an unshared block is written in place");
         assert_eq!(slots.slot(4), [1, 0, 0, 0, 0]);
+        // In place or copied, the written block's version moves and only its.
+        assert_eq!((slots.version(0), slots.version(1)), (0, 2), "two writes into block 1, none into block 0");
     }
 }

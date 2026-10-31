@@ -1756,17 +1756,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glyph-field-instanced"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "encase",
- "glyph-field",
- "naga",
- "wgpu",
-]
-
-[[package]]
 name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
@@ -1791,7 +1780,6 @@ dependencies = [
  "glam",
  "glyph-field",
  "glyph-field-derived",
- "glyph-field-instanced",
  "glyph-scene-graph",
  "image",
  "log",

@@ -213,7 +213,9 @@ Derived's default item table).
     saturate silently); wrap_segment and glyph_id (16 bits each) are not in
     `derived_lane_limits`; `derived_vertex_stage_agrees_with_instanced` and
     `block_cull_bounds_enclose_all_slots` use `RenderEmit` as their reference
-    and must move onto the oracle's reference instances before step 3; the
+    and must move onto the oracle's reference instances before step 3 (done
+    2026-10-31: both read `hyper_oracle::reference_item`'s instances, the first
+    renamed `derived_vertex_stage_agrees_with_the_reference`); the
     shaders' greeking gate differs (Instanced greeks a blank glyph with a
     background, Derived does not).
 
@@ -231,7 +233,12 @@ confirmed C29's and C30's fixes by eye. (`out/history/VISIBLE-MODE.md` is its lo
   every mode, and adopting the `syntax-retired/` candidates holds visible
   mode to pixels on every frame.
 - M5: visible as the default field mode.
-- Retiring the stored modes. (2026-10-11: Ivan decided to retire Instanced in
+- ~~Retiring the stored modes.~~ DONE 2026-10-31: step 3 deleted
+  `glyph-field-instanced`, layout's device-direct emission and the
+  `--field-mode instanced` equivalent; a file past a Derived lane is laid out
+  empty instead of the load falling back (branch `host-without-wgpu`). Ivan:
+  freeform positioning is to degrade gracefully to instanced cost, not keep a
+  stored mode. The record below is history. (2026-10-11: Ivan decided to retire Instanced in
   three steps; step 1 landed, above — the agent-session obstacle below is
   gone, each card block is now an item.) Dependency order found by the 2026-10-10 code
   survey: agent sessions are host-staged at absolute card positions (only

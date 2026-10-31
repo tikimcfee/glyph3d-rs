@@ -645,7 +645,6 @@ mod tests {
     /// for bit — the tree's subtree test is a prefilter, never a decision.
     #[test]
     fn the_tree_cull_draws_what_the_flat_cull_draws_over_synced_boxes() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
         let s = &crate::config::settings().library;
         let mut r = Lcg(0x7EE_C011);
         let dirs = ["", "src/", "src/core/", "src/core/deep/", "docs/", "tools/gen/", "tools/", "a/b/c/"];
@@ -706,15 +705,9 @@ mod tests {
                 seg
             })
             .collect();
-        let camera_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test camera"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         // Segment i is file i's, drawn with group row i.
         let segment_rows: Vec<Option<u32>> = (0..segments.len() as u32).map(Some).collect();
-        let mut cull = CullState::new(&ctx, crate::glyph_scene::target::POOL_FORMAT, wgpu::TextureFormat::Depth32Float, &camera_buf, &segments, &groups, &segment_rows);
+        let mut cull = CullState::new(&segments, &groups, &segment_rows);
         cull.backdrop_at_front = true;
         let rgb: Vec<[f32; 4]> = groups.iter().map(|g| g.cols[2]).collect();
         let mut tree = TreeCull::new(&mut t, lib.nodes.as_ref().unwrap().root, &file_nodes, &cull, &rgb);

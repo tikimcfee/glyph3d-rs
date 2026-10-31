@@ -27,7 +27,7 @@ pub struct ItemPrepass {
     pub has_emoji: bool,
     /// The widest line in LEADERS (its newline's column; trailers counted),
     /// over every line of the item, chunk cuts joined. Read once per load by
-    /// `derived_lane_limits`: a column-paged item's widest column page is
+    /// `derived_lane_overflow`: a column-paged item's widest column page is
     /// this over `page_cols`, and the Derived slot's row lane holds 8 bits
     /// of it.
     pub max_line_cols: u32,

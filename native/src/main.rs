@@ -7,8 +7,8 @@
 //!                    the terminal launcher (`launcher/`): pick a scene and
 //!                    its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
-//!                    `--field-mode derived|instanced`, derived the
-//!                    default since 2026-10-11).
+//!                    `--field-mode derived`, the one field mode since
+//!                    2026-10-31).
 //!   `--render-file P`  one text file; `--agent-session P` an agent transcript;
 //!                    `--demo` the quad-field stress demo.
 //!   `--screenshot PATH [--frames N]`
@@ -22,9 +22,9 @@
 //! renderer lives in the library — `src/lib.rs`.
 
 use clap::CommandFactory;
-use glyph3d_native::cli::{
-    parse_cli_from, Cli, CliCommand, FixtureTask, GpuInfoMode, RenderTarget,
-};
+use glyph3d_native::cli::{parse_cli_from, Cli, CliCommand, FixtureTask};
+#[cfg(feature = "wgpu")]
+use glyph3d_native::cli::{GpuInfoMode, RenderTarget};
 use glyph3d_native::*;
 
 /// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
@@ -85,6 +85,12 @@ fn main() {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
+        #[cfg(not(feature = "wgpu"))]
+        CliCommand::GpuInfo(_) | CliCommand::Render(_) => {
+            eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
+            std::process::exit(1);
+        }
+        #[cfg(feature = "wgpu")]
         CliCommand::GpuInfo(mode) => {
             let ctx = pollster::block_on(gpu::init(None));
             match mode {
@@ -106,6 +112,7 @@ fn main() {
             let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
         }
+        #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {
             let prefetched_walk = if let SceneChoice::Repo {
                 dir,
@@ -136,7 +143,7 @@ fn main() {
             };
 
             let ctx = pollster::block_on(gpu::init(None));
-            *ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
+            *ctx.prefetch.walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
 
             let emoji_sheet_path = match &plan.choice {
                 SceneChoice::Repo { emoji_sheet, .. } => Some(emoji_sheet.clone()),
@@ -145,15 +152,13 @@ fn main() {
                 _ => None,
             };
             if let Some(emoji_sheet) = emoji_sheet_path {
-                let dev = ctx.device.clone();
-                let q = ctx.queue.clone();
                 let atlas_handle = std::thread::spawn(move || {
                     let t = std::time::Instant::now();
-                    let a = atlas::Atlas::load_device(&dev, &q, &emoji_sheet);
+                    let a = atlas::Atlas::load(&emoji_sheet);
                     log::info!("prefetched atlas loaded in {:?}", t.elapsed());
                     a
                 });
-                *ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
+                *ctx.prefetch.atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
             }
 
             match plan.target {

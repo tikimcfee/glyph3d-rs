@@ -3,12 +3,17 @@
 //! This module is deliberately mode-agnostic — windowed and offscreen both build
 //! one `Scene` and call `render()` into whatever target view they own.
 
+#[cfg(feature = "wgpu")]
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "wgpu")]
 use glam::{Mat4, Vec3};
+#[cfg(feature = "wgpu")]
 use wgpu::util::DeviceExt;
 
+#[cfg(feature = "wgpu")]
 use crate::gpu::GpuContext;
 
+#[cfg(feature = "wgpu")]
 /// The views a frame draws into, plus their physical-pixel size.
 /// (Stage F: the cull/LOD pass needs the height to convert world units to
 /// on-screen pixels.) Bundled so `SceneLike::render` stays a 4-arg signature.
@@ -61,46 +66,44 @@ pub enum SceneKey {
     End,
 }
 
-/// Mode-agnostic scene interface: windowed and offscreen modes drive any scene
-/// (Stage A quad field, Stage C glyph field, …) through exactly this.
+/// Mode-agnostic scene interface: windowed and offscreen modes, and a host
+/// with its own window and renderer (the makepad port), drive any scene
+/// (the quad demo, the glyph field, …) through exactly this.
+///
+/// Since 2026-10-31 a scene holds no device type: its input, picks and
+/// verbs edit host state, and a frame is computed on the CPU
+/// (`prepare_frame`). What draws it is a [`SceneRenderer`], built from the
+/// scene by `make_renderer` (wgpu), or a host's own renderer reading the
+/// frames.
 pub trait SceneLike {
-    fn depth_format(&self) -> wgpu::TextureFormat;
     fn instance_count(&self) -> u32;
-    fn render(
-        &self,
-        ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &FrameTarget<'_>,
-        t: f32,
-    );
     /// The CPU half of a frame at `viewport` (physical px) and `t`, with no
-    /// wgpu type (`glyph_scene::FrameData`): what a host drawing the passes
-    /// itself consumes. None for a scene without one (the quad demo).
+    /// wgpu type (`glyph_scene::FrameData`): what every renderer draws.
+    /// None for a scene without one (the quad demo, which its own renderer
+    /// draws).
     fn prepare_frame(&self, _viewport: (u32, u32), _t: f32) -> Option<crate::glyph_scene::FrameData<'_>> {
         None
     }
 
     // ── Stage F: interactive hooks (windowed only) ─────────────────────────
-    // Default no-ops: the Stage A demo scene and all offscreen runs ignore
-    // them. `tick` integrates per-frame camera motion; the input handlers
-    // feed it. `dt` is wall-clock seconds since the previous frame.
-    // Stage G: the hooks take &GpuContext so scenes can issue partial buffer
-    // uploads from event handlers (pick flash, group drags, verb keys).
-    fn on_key(&mut self, _ctx: &GpuContext, _key: SceneKey, _pressed: bool) {}
-    fn on_mouse_look(&mut self, _ctx: &GpuContext, _dx: f32, _dy: f32) {}
-    fn on_scroll(&mut self, _ctx: &GpuContext, _lines: f32) {}
+    // Default no-ops: the demo scene and all offscreen runs ignore them.
+    // `tick` integrates per-frame camera motion; the input handlers feed
+    // it. `dt` is wall-clock seconds since the previous frame. Every edit
+    // they make lands in host state, which the next frame carries.
+    fn on_key(&mut self, _key: SceneKey, _pressed: bool) {}
+    fn on_mouse_look(&mut self, _dx: f32, _dy: f32) {}
+    fn on_scroll(&mut self, _lines: f32) {}
     /// Cursor position in physical px (tracked even without pointer grab).
-    fn on_cursor(&mut self, _ctx: &GpuContext, _x: f32, _y: f32) {}
+    fn on_cursor(&mut self, _x: f32, _y: f32) {}
     /// Left-click at a physical px position (ungrabbed pointer only).
-    fn on_click(&mut self, _ctx: &GpuContext, _x: f32, _y: f32) {}
+    fn on_click(&mut self, _x: f32, _y: f32) {}
     fn tick(&mut self, _dt: f32) {}
     /// Scene-driven animation (2026-10-10: the library's page turns and
-    /// relayouts): one step of `dt` seconds, with the context so it can
-    /// upload what moved. Both drivers call it before every frame —
-    /// windowed with wall-clock dt, offscreen with the fixed 1/60 s clock —
-    /// so an animation is scriptable and deterministic offscreen. Default:
-    /// nothing animates.
-    fn animate(&mut self, _ctx: &GpuContext, _dt: f32) {}
+    /// relayouts): one step of `dt` seconds. Both drivers call it before
+    /// every frame — windowed with wall-clock dt, offscreen with the fixed
+    /// 1/60 s clock — so an animation is scriptable and deterministic
+    /// offscreen. Default: nothing animates.
+    fn animate(&mut self, _dt: f32) {}
 
     // ── Stage G: scripted picking & manipulation (offscreen + windowed) ────
     /// Viewport in physical px for ray unprojection (offscreen sets this
@@ -120,11 +123,11 @@ pub trait SceneLike {
     /// `GLYPH_FRAME_SCRIPT` (C32, 2026-10-11). Default no-op.
     fn set_show_glyphs_px(&mut self, _px: f32) {}
     /// Resolve a pick; returns a log line (None = scene doesn't support it).
-    fn apply_pick(&mut self, _ctx: &GpuContext, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
+    fn apply_pick(&mut self, _cmd: &crate::glyph_scene::PickCommand) -> Option<String> {
         None
     }
     /// Apply a manipulation verb to the current pick; returns a log line.
-    fn apply_verb(&mut self, _ctx: &GpuContext, _verb: &crate::glyph_scene::Verb) -> Option<String> {
+    fn apply_verb(&mut self, _verb: &crate::glyph_scene::Verb) -> Option<String> {
         None
     }
     /// Returns the group ID of the currently selected file or glyph, if any selection is active.
@@ -134,32 +137,45 @@ pub trait SceneLike {
     /// S3 spike (`experiments/zedspike`): apply a Zed-pipeline highlight
     /// sidecar to per-glyph instance colors (`--highlight`, repo scenes
     /// only); returns a log line. Default: scene doesn't support it.
-    fn apply_highlight_sidecar(&self, _ctx: &GpuContext, _path: &std::path::Path) -> Option<String> {
+    fn apply_highlight_sidecar(&self, _path: &std::path::Path) -> Option<String> {
         None
     }
     /// P1c: the seam's CONTRACT consumer — apply provider envelopes, with
     /// the version law enforced against the re-derived bytes. Default:
     /// scene doesn't support it.
-    fn apply_surface_updates(
-        &self,
-        _ctx: &GpuContext,
-        _updates: &[crate::seam::SurfaceUpdate],
-    ) -> Option<String> {
+    fn apply_surface_updates(&self, _updates: &[crate::seam::SurfaceUpdate]) -> Option<String> {
         None
     }
-    /// Stage G debug: read back instance bytes at a global slot (partial-
-    /// upload verification). Default no-op.
-    fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
 
     /// Retrieve and clear any pending carrel layout options signaled by carrel navigation.
     fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
         None
     }
+
+    #[cfg(feature = "wgpu")]
+    /// The scene's draw on a wgpu device, drawing into `color_format`.
+    /// Built after the scene, and again for every scene a relayout builds.
+    fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn SceneRenderer>;
+}
+
+#[cfg(feature = "wgpu")]
+/// What draws a [`SceneLike`] on a wgpu device (2026-10-31: the GPU half
+/// the scenes held until then). The windowed and offscreen drivers hold
+/// one beside their scene.
+pub trait SceneRenderer {
+    fn depth_format(&self) -> wgpu::TextureFormat;
+    /// Upload what `scene`'s frame at `t` changed and encode it into
+    /// `encoder`, at `target`'s size.
+    fn render(&mut self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder, target: &FrameTarget<'_>, scene: &dyn SceneLike, t: f32);
+    /// Stage G debug: read back the device's slot words at a global slot
+    /// (partial-upload verification, `GLYPH_G_DUMP`). Default no-op.
+    fn debug_dump_instances(&self, _ctx: &GpuContext, _slot: u64, _out: &mut [u32]) {}
 }
 
 /// Stress-test target: 1,000,000 instances, one draw call.
 pub const INSTANCE_COUNT: u32 = 1_000_000;
 
+#[cfg(feature = "wgpu")]
 /// Per-instance GPU record. 48 bytes, mirrors `InstanceSlot` in quad_field.wgsl.
 ///
 /// FUTURE STAGES: this becomes the glyph slot record (~60 B: 8 u32
@@ -174,13 +190,15 @@ struct InstanceSlot {
     lanes: [u32; 4],
 }
 
+#[cfg(feature = "wgpu")]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [f32; 16],
 }
 
-pub struct Scene {
+#[cfg(feature = "wgpu")]
+pub struct DemoRenderer {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     camera_buf: wgpu::Buffer,
@@ -188,9 +206,11 @@ pub struct Scene {
     instance_count: u32,
 }
 
+#[cfg(feature = "wgpu")]
 /// Deterministic PRNG (xorshift64*) so both modes see the identical field
 /// and runs are reproducible for verification screenshots.
 struct Rng(u64);
+#[cfg(feature = "wgpu")]
 impl Rng {
     fn next_f32(&mut self) -> f32 {
         let mut x = self.0;
@@ -204,7 +224,8 @@ impl Rng {
     }
 }
 
-impl Scene {
+#[cfg(feature = "wgpu")]
+impl DemoRenderer {
     pub fn new(ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Self {
         let device = &ctx.device;
 
@@ -439,25 +460,33 @@ impl Scene {
     }
 }
 
-impl SceneLike for Scene {
-    fn depth_format(&self) -> wgpu::TextureFormat {
-        self.depth_format
-    }
+/// The quad stress demo (`--demo`): a million instanced quads on a
+/// slowly orbiting camera. The scene is nothing but its count; its field
+/// and camera live in its renderer, which generates them.
+pub struct DemoScene;
+
+impl SceneLike for DemoScene {
     fn instance_count(&self) -> u32 {
-        self.instance_count
+        INSTANCE_COUNT
     }
-    fn render(
-        &self,
-        ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &FrameTarget<'_>,
-        t: f32,
-    ) {
-        // Delegate to the inherent implementation.
-        Scene::render(self, ctx, encoder, target, t);
+    #[cfg(feature = "wgpu")]
+    fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn SceneRenderer> {
+        Box::new(DemoRenderer::new(ctx, color_format))
     }
 }
 
+#[cfg(feature = "wgpu")]
+impl SceneRenderer for DemoRenderer {
+    fn depth_format(&self) -> wgpu::TextureFormat {
+        self.depth_format
+    }
+    fn render(&mut self, ctx: &GpuContext, encoder: &mut wgpu::CommandEncoder, target: &FrameTarget<'_>, _scene: &dyn SceneLike, t: f32) {
+        // Delegate to the inherent implementation.
+        DemoRenderer::render(self, ctx, encoder, target, t);
+    }
+}
+
+#[cfg(feature = "wgpu")]
 /// Helper: depth texture matching a given target size. Both modes need one.
 pub fn create_depth(
     device: &wgpu::Device,

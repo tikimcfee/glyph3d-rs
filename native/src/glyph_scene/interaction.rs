@@ -1,6 +1,5 @@
 use glam::{DVec3, Vec3};
 use super::{CameraMode, GlyphScene, pick::{PickCommand, Verb}};
-use crate::gpu::GpuContext;
 
 impl GlyphScene {
     pub fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
@@ -21,15 +20,15 @@ impl GlyphScene {
     /// Windowed click: pick at the pixel and return the log line. Stage L
     /// (L4): the click-flash hack is gone — `apply_pick` now drives the
     /// selection mask instead (no instance-byte writes, nothing to restore).
-    pub fn click_pick(&mut self, ctx: &GpuContext, x: f32, y: f32) -> Option<String> {
-        self.apply_pick(ctx, &PickCommand::Pixel { x, y })
+    pub fn click_pick(&mut self, x: f32, y: f32) -> Option<String> {
+        self.apply_pick(&PickCommand::Pixel { x, y })
     }
 
     /// Windowed cursor move: while a group or carrel is grabbed (`g` or `c`),
     /// note the drag; `apply_drag` moves it once per frame (from `animate`).
     /// `GLYPH_DRAG_PER_EVENT=1` applies every move as it arrives, as before
     /// 2026-10-10 — the A/B for the drag instrument.
-    pub fn cursor_moved(&mut self, ctx: &GpuContext, x: f32, y: f32) {
+    pub fn cursor_moved(&mut self, x: f32, y: f32) {
         let prev = self.cursor;
         self.cursor = (x, y);
         if (x - prev.0).abs() + (y - prev.1).abs() < 1e-3 {
@@ -43,7 +42,7 @@ impl GlyphScene {
             None => (prev, 1),
         });
         if std::env::var_os("GLYPH_DRAG_PER_EVENT").is_some() {
-            self.apply_drag(ctx);
+            self.apply_drag();
         }
     }
 
@@ -52,13 +51,13 @@ impl GlyphScene {
     /// centre (two rays' hits on one plane: the sum of the per-event
     /// deltas, since every delta lies in that plane). `GLYPH_DRAG_TIMING=1`
     /// prints a `DRAGTIME` line per applied drag.
-    pub(super) fn apply_drag(&mut self, ctx: &GpuContext) {
+    pub(super) fn apply_drag(&mut self) {
         let Some((prev, events)) = self.drag_pending.take() else { return };
         let to = self.cursor;
         let t0 = std::time::Instant::now();
         let mut stages = DragStages::default();
         let kind = if self.grabbed_zone.is_some() { "zone" } else { "file" };
-        self.drag_from_to(ctx, prev, to, &mut stages);
+        self.drag_from_to(prev, to, &mut stages);
         if std::env::var_os("GLYPH_DRAG_TIMING").is_some() {
             println!(
                 "DRAGTIME kind={kind} events={events} groups={} move_ms={:.4} (propagate {:.4} extract {:.4}) sync_ms={:.4} upload_ms={:.4} seg_ms={:.4} total_ms={:.4}",
@@ -75,17 +74,17 @@ impl GlyphScene {
     }
 
     /// The controller's moved groups to the GPU: rows, then segments.
-    fn sync_controller_groups(&mut self, ctx: &GpuContext, stages: &mut DragStages) {
+    fn sync_controller_groups(&mut self, stages: &mut DragStages) {
         let Some(ctrl) = &mut self.controller else { return };
         let t = std::time::Instant::now();
         let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
         stages.sync_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
-        self.write_group_rows(ctx, &updated_gids);
+        self.write_group_rows(&updated_gids);
         stages.upload_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
         for &gid in &updated_gids {
-            self.sync_segment(ctx, gid);
+            self.sync_segment(gid);
         }
         stages.seg_ms = t.elapsed().as_secs_f64() * 1e3;
         stages.groups = updated_gids.len();
@@ -95,7 +94,7 @@ impl GlyphScene {
         }
     }
 
-    fn drag_from_to(&mut self, ctx: &GpuContext, prev: (f32, f32), (x, y): (f32, f32), stages: &mut DragStages) {
+    fn drag_from_to(&mut self, prev: (f32, f32), (x, y): (f32, f32), stages: &mut DragStages) {
         // Branch 1: Dragging an entire Carrel / LayoutZone (`KeyC`)
         if let Some(ref zid) = self.grabbed_zone {
             let (Some((o0, d0)), Some((o1, d1))) =
@@ -148,7 +147,7 @@ impl GlyphScene {
             let moved = self.controller.as_mut().is_some_and(|ctrl| ctrl.move_zone(&zid_str, d_vec));
             stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
             if moved {
-                self.sync_controller_groups(ctx, stages);
+                self.sync_controller_groups(stages);
             }
             return;
         }
@@ -214,7 +213,7 @@ impl GlyphScene {
                 }
                 ctrl.scene.update_transforms();
                 stages.move_ms = t.elapsed().as_secs_f64() * 1e3;
-                self.sync_controller_groups(ctx, stages);
+                self.sync_controller_groups(stages);
                 return;
             }
         }
@@ -231,13 +230,13 @@ impl GlyphScene {
             // A group outside any tree cull (every scene but a library)
             // keeps its flat cull box current here, as before.
             if self.cull.as_ref().is_none_or(|c| c.tree.is_none()) {
-                self.group_node_edited(ctx, gid);
+                self.group_node_edited(gid);
             }
         }
     }
 
     /// Windowed scroll: scales the grabbed carrel or file; otherwise camera speed.
-    pub(super) fn scroll_or_scale(&mut self, ctx: &GpuContext, lines: f32) {
+    pub(super) fn scroll_or_scale(&mut self, lines: f32) {
         if let Some(ref zid) = self.grabbed_zone {
             let f = 1.1f32.powf(lines);
             let zid_str = zid.clone();
@@ -250,9 +249,9 @@ impl GlyphScene {
             if let Some(ctrl) = &mut self.controller {
                 if ctrl.scale_zone(&zid_str, f) {
                     let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                    self.write_group_rows(ctx, &updated_gids);
+                    self.write_group_rows(&updated_gids);
                     for &gid in &updated_gids {
-                        self.sync_segment(ctx, gid);
+                        self.sync_segment(gid);
                     }
                     println!("grab carrel: zone '{zid_str}' scaled by factor {f:.3}");
                 }
@@ -267,9 +266,9 @@ impl GlyphScene {
                     }
                     ctrl.scene.update_transforms();
                     let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                    self.write_group_rows(ctx, &updated_gids);
+                    self.write_group_rows(&updated_gids);
                     for &g in &updated_gids {
-                        self.sync_segment(ctx, g);
+                        self.sync_segment(g);
                     }
                     if let Some(g) = self.nodes.row(gid) {
                         s = g.cols[3][0];
@@ -281,7 +280,7 @@ impl GlyphScene {
             // No controller entity: the wheel scales the group's node.
             if let Some(ns) = self.nodes.scale_by(gid, f) {
                 s = ns;
-                self.group_node_edited(ctx, gid);
+                self.group_node_edited(gid);
             }
             println!("grab: group {gid} scale -> {s:.3}");
         } else if matches!(self.camera_mode, CameraMode::Fly) {
@@ -295,7 +294,7 @@ impl GlyphScene {
     /// t cycle tint, x toggle hidden, b toggle the ground/sky environment; in
     /// a library load ] [ (n p . , arrows) turn pages, Home/End jump, v
     /// toggles deck/splay.
-    pub(super) fn verb_key(&mut self, ctx: &GpuContext, key: crate::scene::SceneKey) {
+    pub(super) fn verb_key(&mut self, key: crate::scene::SceneKey) {
         use crate::scene::SceneKey as K;
         // A library load takes the deck keys for its volumes (the picked
         // file's, else every volume): the same verbs `--verb` scripts.
@@ -316,15 +315,15 @@ impl GlyphScene {
         }
         match key {
             K::H => {
-                let line = self.apply_verb(ctx, &Verb::RecolorLine(None));
+                let line = self.apply_verb(&Verb::RecolorLine(None));
                 println!("{line}");
             }
             K::T => {
-                let line = self.apply_verb(ctx, &Verb::TintCycle);
+                let line = self.apply_verb(&Verb::TintCycle);
                 println!("{line}");
             }
             K::X => {
-                let line = self.apply_verb(ctx, &Verb::ToggleHidden);
+                let line = self.apply_verb(&Verb::ToggleHidden);
                 println!("{line}");
             }
             K::B => {
@@ -392,9 +391,9 @@ impl GlyphScene {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.carrel_next().or_else(|| ctrl.deck_next()) {
                         let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                        self.write_group_rows(ctx, &updated_gids);
+                        self.write_group_rows(&updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(ctx, g);
+                            self.sync_segment(g);
                         }
                         println!("{msg}");
                     } else {
@@ -406,9 +405,9 @@ impl GlyphScene {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.carrel_prev().or_else(|| ctrl.deck_prev()) {
                         let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                        self.write_group_rows(ctx, &updated_gids);
+                        self.write_group_rows(&updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(ctx, g);
+                            self.sync_segment(g);
                         }
                         println!("{msg}");
                     } else {
@@ -426,9 +425,9 @@ impl GlyphScene {
                     if total > 0 {
                         if let Some(msg) = ctrl.carrel_set_beat(total - 1) {
                             let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                            self.write_group_rows(ctx, &updated_gids);
+                            self.write_group_rows(&updated_gids);
                             for &g in &updated_gids {
-                                self.sync_segment(ctx, g);
+                                self.sync_segment(g);
                             }
                             println!("{msg}");
                         }
@@ -439,9 +438,9 @@ impl GlyphScene {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.carrel_set_beat(0) {
                         let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                        self.write_group_rows(ctx, &updated_gids);
+                        self.write_group_rows(&updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(ctx, g);
+                            self.sync_segment(g);
                         }
                         println!("{msg}");
                     }
@@ -451,9 +450,9 @@ impl GlyphScene {
                 if let Some(ctrl) = &mut self.controller {
                     if let Some(msg) = ctrl.deck_toggle_mode() {
                         let updated_gids = ctrl.sync_gpu_groups(self.nodes.external_rows());
-                        self.write_group_rows(ctx, &updated_gids);
+                        self.write_group_rows(&updated_gids);
                         for &g in &updated_gids {
-                            self.sync_segment(ctx, g);
+                            self.sync_segment(g);
                         }
                         println!("{msg}");
                     }

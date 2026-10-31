@@ -17,8 +17,8 @@ use crate::{
 
 /// A mode's contribution to the shared pipelines and bind groups.
 pub struct FieldShape<'a> {
-    /// Prefixed to every label (`""` for Instanced, `"derived "` for
-    /// Derived), so captures and validation errors name the mode.
+    /// Prefixed to every label (`"derived "` for Derived), so captures and
+    /// validation errors name the mode.
     pub label_prefix: &'static str,
     /// The WGSL module: its label and source. Entry points are `vs_main` and
     /// `fs_main`.

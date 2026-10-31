@@ -22,7 +22,6 @@
 use std::time::Instant;
 
 use super::GlyphScene;
-use crate::gpu::GpuContext;
 use crate::library::LibraryVerb;
 
 /// What noting a library move cost on the CPU, after the node writes.
@@ -120,15 +119,14 @@ impl GlyphScene {
 
     /// One animation step: nothing at all when the library is settled (or
     /// absent — every other scene returns on the first line).
-    pub(crate) fn animate_library(&mut self, ctx: &GpuContext, dt: f32) {
+    pub(crate) fn animate_library(&mut self, dt: f32) {
         let Some(ctrl) = self.controller.as_mut() else { return };
         let Some(lib) = ctrl.library.as_mut() else { return };
         let Some(tick) = lib.tick(self.nodes.tables_mut(), dt) else { return };
         let cost = self.note_tree_move(&tick.moved);
-        if ctx.profiler.is_some() {
-            crate::gpu::record_cpu_scope(ctx, "library ease (CPU)", tick.ease_ms);
-            crate::gpu::record_cpu_scope(ctx, "library move notes (CPU)", cost.note_ms);
-        }
+        // The next frame carries them (`FrameCosts::library`) for a renderer
+        // that profiles.
+        self.library_tick_ms.set((tick.ease_ms, cost.note_ms));
         if std::env::var_os("GLYPH_LIBRARY_TIMING").is_some() {
             let (rows, resolved) = self.nodes.last_flush();
             let faces = self.library_faces.as_ref().map(|f| f.last_update()).unwrap_or_default();

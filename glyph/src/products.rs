@@ -96,7 +96,7 @@ mod tests {
     fn mutated_inputs_name_the_products_they_feed() {
         let m = load().expect("build.toml loads");
         assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
-        assert_eq!(products_reading(&m, "crates/glyph-field/src/copy.rs"), ["renderer"]);
+        assert_eq!(products_reading(&m, "crates/glyph-field/src/host_slots.rs"), ["renderer"]);
         assert!(products_reading(&m, "tools/check-pick-oracle.sh").is_empty());
     }
 }

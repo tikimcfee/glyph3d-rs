@@ -13,13 +13,12 @@ path = "src/lib.rs"
 
 [dependencies]
 # Latest stable wgpu (v30.x). Let cargo resolve within the major line.
-wgpu = "30"
+wgpu = { version = "30", optional = true }
 # The glyph field, split by render mode (2026-10): the mode-neutral contract
 # (GlyphField trait, field mode, shared records) and one crate per mode, each
 # owning its slot format, upload, WGSL and pipelines.
-glyph-field = { path = "../crates/glyph-field", features = ["clap"] }
-glyph-field-instanced = { path = "../crates/glyph-field-instanced" }
-glyph-field-derived = { path = "../crates/glyph-field-derived" }
+glyph-field = { path = "../crates/glyph-field", default-features = false, features = ["clap"] }
+glyph-field-derived = { path = "../crates/glyph-field-derived", default-features = false }
 # The transform tree (2026-10-10): every group row a node, resolved on
 # the CPU into the group table, whose changed rows are uploaded
 # (glyph_scene/nodes.rs; a GPU compute pass until 2026-10-26).
@@ -27,7 +26,7 @@ glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
 # host that brings its own window links the library without it.
 winit = { version = "0.30", optional = true }
-pollster = "0.4"
+pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
 image = "0.25"
@@ -46,7 +45,7 @@ glam = { version = "0.33", features = ["debug-glam-assert"] }
 # occurrence indices — see build_ops() and the parity tests in main.rs.
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-wgpu-profiler = "0.28"
+wgpu-profiler = { version = "0.28", optional = true }
 encase = "0.12"
 rayon = "1.10"
 memchr = "2"
@@ -91,12 +90,17 @@ toml_edit = { version = "0.25", optional = true }
 [target.'cfg(not(any(target_vendor = "apple", target_family = "wasm")))'.dependencies]
 ash = "0.38"
 [features]
-default = ["windowed", "egui-ui", "launcher"]
-# The window: `windowed/` and winit (2026-10-26). Off, the library is the
-# engine alone (scenes, layout, offscreen) for a host that owns its window
-# and event loop (the makepad widget), and the binary refuses a windowed
-# run. `--no-default-features` is that build, no winit or egui in its tree.
-windowed = ["dep:winit"]
+default = ["wgpu", "windowed", "egui-ui", "launcher"]
+# The wgpu renderer (2026-10-31): the device, `GlyphRenderer`, the offscreen
+# driver and the field's draw. Off, the library is the engine's host side
+# alone (scenes, layout, picks and verbs, the frame) for a host that draws
+# the frames with its own renderer (the makepad widget); the binary then
+# refuses to render. `--no-default-features` is that build, with no wgpu,
+# winit or egui in its tree.
+wgpu = ["dep:wgpu", "dep:wgpu-profiler", "dep:pollster", "glyph-field/wgpu", "glyph-field-derived/wgpu"]
+# The window: `windowed/` and winit (2026-10-26). Off, there is no window
+# (the binary refuses a windowed run).
+windowed = ["wgpu", "dep:winit"]
 # The terminal launcher. Off, `--launcher` is refused and a bare run opens
 # the default scene, as it did before C27. It starts this binary's window
 # as a child, so it needs one.

@@ -54,7 +54,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{DQuat, DVec3};
 use glyph_scene_graph::{FramePlan, NodeHandle, NodeTables, Similarity, NONE};
 
-use super::nodes::{run_rows, upload_runs, write_runs};
+use super::nodes::{run_rows, upload_runs};
+#[cfg(feature = "wgpu")]
+use super::nodes::write_runs;
 use super::tree_cull::{is_empty, Aabb, TreeCull};
 use crate::library::plan::Plan;
 use crate::library::LibNodes;
@@ -385,39 +387,39 @@ pub struct RegionCost {
     pub ms: f64,
 }
 
-/// The regions on the GPU: the instances (host-composed, written when one
-/// changes) and the draw.
+/// The regions on the host: the table, the instances as the host composed
+/// them (written to the GPU when one changes, [`RegionsGpu`]), and the pick.
 pub(super) struct LibraryRegions {
     pub(super) table: RefCell<RegionTable>,
     count: u32,
-    /// The picked region (NONE: none), and what the uniform last carried.
+    /// The picked region (NONE: none).
     picked: Cell<u32>,
-    picked_written: Cell<u32>,
     params_cpu: RegionParamsGpu,
-    params: wgpu::Buffer,
-    /// The instances the render half draws, and what the host last wrote
-    /// to them (the buffer starts zeroed, as wgpu creates it, and so does
-    /// this).
-    pub(super) instances: wgpu::Buffer,
+    /// The instances the render half draws, as the host last composed them
+    /// (the GPU buffer starts zeroed, as wgpu creates it, and so does this).
     image: RefCell<Vec<RegionInstance>>,
-    render: wgpu::RenderPipeline,
-    render_bg: wgpu::BindGroup,
     /// Nothing composed yet (the first frame composes every region).
     pending_compose: Cell<bool>,
     dirty: RefCell<Vec<u32>>,
 }
 
+#[cfg(feature = "wgpu")]
+/// The regions on a wgpu device: the uniform, the instances and the draw.
+pub(super) struct RegionsGpu {
+    count: u32,
+    params_cpu: RegionParamsGpu,
+    params: wgpu::Buffer,
+    /// The picked index the uniform last carried.
+    picked_written: Cell<u32>,
+    pub(super) instances: wgpu::Buffer,
+    render: wgpu::RenderPipeline,
+    render_bg: wgpu::BindGroup,
+}
+
 impl LibraryRegions {
-    pub(super) fn new(device: &wgpu::Device, camera_buf: &wgpu::Buffer, color_format: wgpu::TextureFormat, table: RegionTable) -> Self {
-        use wgpu::util::DeviceExt;
+    pub(super) fn new(table: RegionTable) -> Self {
         let count = table.len() as u32;
         let spec = table.spec;
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("library region instances"),
-            size: u64::from(count.max(1)) * std::mem::size_of::<RegionInstance>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let params_cpu = RegionParamsGpu {
             edge_opacity: spec.edge_opacity,
             edge_px: spec.edge_px,
@@ -427,6 +429,30 @@ impl LibraryRegions {
             count,
             _pad: [0; 2],
         };
+        LibraryRegions {
+            table: RefCell::new(table),
+            count,
+            picked: Cell::new(NONE),
+            params_cpu,
+            image: RefCell::new(vec![RegionInstance::zeroed(); count as usize]),
+            pending_compose: Cell::new(true),
+            dirty: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl RegionsGpu {
+    pub(super) fn new(device: &wgpu::Device, camera_buf: &wgpu::Buffer, color_format: wgpu::TextureFormat, regions: &LibraryRegions) -> Self {
+        use wgpu::util::DeviceExt;
+        let count = regions.count;
+        let params_cpu = regions.params_cpu;
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("library region instances"),
+            size: u64::from(count.max(1)) * std::mem::size_of::<RegionInstance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("library region params"),
             contents: bytemuck::bytes_of(&params_cpu),
@@ -497,22 +523,35 @@ impl LibraryRegions {
             multiview_mask: None,
             cache: None,
         });
-        LibraryRegions {
-            table: RefCell::new(table),
-            count,
-            picked: Cell::new(NONE),
-            picked_written: Cell::new(NONE),
-            params_cpu,
-            params,
-            image: RefCell::new(vec![RegionInstance::zeroed(); count as usize]),
-            instances,
-            render,
-            render_bg,
-            pending_compose: Cell::new(true),
-            dirty: RefCell::new(Vec::new()),
+        RegionsGpu { count, params_cpu, params, picked_written: Cell::new(NONE), instances, render, render_bg }
+    }
+
+    /// Write `runs` (`LibraryRegions::prepare`'s) of the host `image` into
+    /// the instance buffer, and the picked region into the uniform if it
+    /// moved (a frame carries all three).
+    pub(super) fn upload(&self, queue: &wgpu::Queue, image: &[RegionInstance], picked: Option<usize>, runs: &[Range<u32>]) {
+        write_runs(queue, &self.instances, bytemuck::cast_slice(image), std::mem::size_of::<RegionInstance>(), runs);
+        let picked = picked.map_or(NONE, |r| r as u32);
+        if picked != self.picked_written.get() {
+            let p = RegionParamsGpu { picked, ..self.params_cpu };
+            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
+            self.picked_written.set(picked);
         }
     }
 
+    /// Draw every region (inside the glyph field pass, after the page faces).
+    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.count == 0 {
+            return;
+        }
+        pass.set_pipeline(&self.render);
+        pass.set_bind_group(0, &self.render_bg, &[]);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
+        pass.draw(0..36, 0..self.count);
+    }
+}
+
+impl LibraryRegions {
     /// Show region `r` as picked (None: none); the uniform follows at the
     /// next `prepare`.
     pub(super) fn set_picked(&self, r: Option<u32>) {
@@ -558,17 +597,6 @@ impl LibraryRegions {
         (cost, runs)
     }
 
-    /// The wgpu half: write `runs` (`prepare`'s) into the instance buffer,
-    /// and the picked index into the uniform if it moved.
-    pub(super) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
-        write_runs(queue, &self.instances, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<RegionInstance>(), runs);
-        if self.picked.get() != self.picked_written.get() {
-            let p = RegionParamsGpu { picked: self.picked.get(), ..self.params_cpu };
-            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
-            self.picked_written.set(self.picked.get());
-        }
-    }
-
     /// Every region instance as the host last composed it.
     pub(super) fn image(&self) -> Ref<'_, Vec<RegionInstance>> {
         self.image.borrow()
@@ -583,17 +611,6 @@ impl LibraryRegions {
     pub(super) fn params(&self) -> RegionParams {
         let p = &self.params_cpu;
         RegionParams { edge_opacity: p.edge_opacity, edge_px: p.edge_px, picked_opacity: p.picked_opacity, picked_edge_opacity: p.picked_edge_opacity }
-    }
-
-    /// Draw every region (inside the glyph field pass, after the page faces).
-    pub(super) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.count == 0 {
-            return;
-        }
-        pass.set_pipeline(&self.render);
-        pass.set_bind_group(0, &self.render_bg, &[]);
-        pass.set_vertex_buffer(0, self.instances.slice(..));
-        pass.draw(0..36, 0..self.count);
     }
 }
 

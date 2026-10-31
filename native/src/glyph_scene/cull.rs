@@ -10,8 +10,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::cell::Cell;
 
-use super::{GroupRow, SCENE_SAMPLE_COUNT};
-use crate::gpu::GpuContext;
+use super::GroupRow;
+#[cfg(feature = "wgpu")]
+use super::target::SCENE_SAMPLE_COUNT;
 
 // The LOD threshold and backdrop gain are settings: `[lod] min_px` and
 // `[lod] backdrop_gain` in config/defaults.toml, which carries their
@@ -95,6 +96,7 @@ pub struct BackdropInst {
     pub depth: [f32; 4],
 }
 
+#[cfg(feature = "wgpu")]
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
 /// partitioning draw order, per-phase work lists, no render graph).
 /// Recording iterates phases in declaration order: Backdrop first, Glyphs
@@ -453,24 +455,21 @@ pub(super) struct CullState {
     /// `tree_cull.rs`): moves cost no per-file box writes. None for every
     /// other scene, which culls flat.
     pub(super) tree: Option<std::cell::RefCell<super::tree_cull::TreeCull>>,
-    /// seg_count × 32 B staging target for the per-frame backdrop list.
-    pub(super) backdrop_insts_buf: wgpu::Buffer,
-    pub(super) backdrop_pipeline: wgpu::RenderPipeline,
-    pub(super) backdrop_bind_group: wgpu::BindGroup,
+}
+
+#[cfg(feature = "wgpu")]
+/// The far-LOD backdrop pass on a wgpu device (2026-10-31: split from
+/// [`CullState`], whose CPU cull fills `FrameData::backdrops`): the
+/// instance buffer the frame's survivors are written into, and its draw.
+pub(super) struct BackdropGpu {
+    /// seg_count × 2 (at least 64) × 48 B: the per-frame backdrop list.
+    pub(super) insts_buf: wgpu::Buffer,
+    pub(super) pipeline: wgpu::RenderPipeline,
+    pub(super) bind_group: wgpu::BindGroup,
 }
 
 impl CullState {
-    pub(super) fn new(
-        ctx: &GpuContext,
-        color_format: wgpu::TextureFormat,
-        depth_format: wgpu::TextureFormat,
-        camera_buf: &wgpu::Buffer,
-        segments: &[SegCull],
-        groups: &[GroupRow],
-        segment_group_rows: &[Option<u32>],
-    ) -> Self {
-        let device = &ctx.device;
-        let seg_count = segments.len() as u32;
+    pub(super) fn new(segments: &[SegCull], groups: &[GroupRow], segment_group_rows: &[Option<u32>]) -> Self {
 
         // Stage G: derive the local (pre-TRS) segment AABBs: local = (world −
         // group offset) / group scale. Every group but a library file's is
@@ -516,6 +515,33 @@ impl CullState {
             );
         }
 
+        Self {
+            segments: segments.to_vec(),
+            local_min,
+            local_max,
+            local_blocks,
+            em_scale,
+            base_tint,
+            orig_group_rgb,
+            hidden: vec![false; segments.len()],
+            lod_min_px: Cell::new(crate::config::settings().lod.show_glyphs_px),
+            file_backgrounds: Cell::new(false),
+            file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
+            backdrop_at_front: false,
+            tree: None,
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl BackdropGpu {
+    pub(super) fn new(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        depth_format: wgpu::TextureFormat,
+        camera_buf: &wgpu::Buffer,
+        seg_count: u32,
+    ) -> Self {
         let backdrop_stride = std::mem::size_of::<BackdropInst>() as u64;
         let max_backdrops = (seg_count * 2).max(64) as u64;
         let backdrop_insts_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -648,24 +674,7 @@ impl CullState {
             cache: None,
         });
 
-        Self {
-            segments: segments.to_vec(),
-            local_min,
-            local_max,
-            local_blocks,
-            em_scale,
-            base_tint,
-            orig_group_rgb,
-            hidden: vec![false; segments.len()],
-            lod_min_px: Cell::new(crate::config::settings().lod.show_glyphs_px),
-            file_backgrounds: Cell::new(false),
-            file_bg_color: Cell::new(crate::config::settings().glyph_scene.file_bg_color),
-            backdrop_at_front: false,
-            tree: None,
-            backdrop_insts_buf,
-            backdrop_pipeline,
-            backdrop_bind_group,
-        }
+        Self { insts_buf: backdrop_insts_buf, pipeline: backdrop_pipeline, bind_group: backdrop_bind_group }
     }
 }
 

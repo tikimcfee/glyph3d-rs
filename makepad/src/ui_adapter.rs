@@ -27,10 +27,9 @@ const PANEL_VERBS: &[&str] = &["recolor-glyph", "recolor-line", "tint-cycle", "h
 /// The layout engines the panel offers (`naive` is the CLI's alone).
 const STRATEGIES: &[(Strategy, &str)] = &[(Strategy::Hyper, "Hyper (CPU)"), (Strategy::Direct, "Direct"), (Strategy::Batched, "Batch")];
 
-const FIELD_MODES: &[(GlyphFieldMode, &str)] = &[
-    (GlyphFieldMode::Derived, "Derived (20B)"),
-    (GlyphFieldMode::Instanced, "Instanced (32B)"),
-];
+/// The glyph field modes the panel offers: one since the Instanced field's
+/// retirement (2026-10-31).
+const FIELD_MODES: &[(GlyphFieldMode, &str)] = &[(GlyphFieldMode::Derived, "Derived (20B)")];
 
 /// The camera as the `--cam-pose` argument that reproduces it (degrees).
 pub fn cam_pose_arg(eye: [f32; 3], yaw: f32, pitch: f32) -> String {
@@ -264,14 +263,14 @@ pub fn apply(host: &mut EngineHost, action: G3UiAction) {
         G3UiAction::ToggleFileGrab => host.press(SceneKey::G),
         G3UiAction::Verb(spec) => match glyph3d_native::parse_verb(&spec) {
             Ok(verb) => {
-                if let Some(line) = host.scene.apply_verb(&host.ctx, &verb) {
+                if let Some(line) = host.scene.apply_verb(&verb) {
                     println!("{line}");
                 }
             }
             Err(e) => println!("verb {spec:?}: {e}"),
         },
         G3UiAction::ClearPick => {
-            host.scene.apply_pick(&host.ctx, &PickCommand::Clear);
+            host.scene.apply_pick(&PickCommand::Clear);
         }
         G3UiAction::ToggleEnvironment => host.press(SceneKey::B),
         // The handle that moved wins and the other thresholds yield
@@ -347,10 +346,10 @@ fn pick_file(host: &mut EngineHost, row: usize) {
         return;
     };
     if host.scene.selected_group_id() == Some(group_id) {
-        host.scene.apply_pick(&host.ctx, &PickCommand::Clear);
+        host.scene.apply_pick(&PickCommand::Clear);
         return;
     }
-    host.scene.apply_pick(&host.ctx, &PickCommand::Group(group_id));
+    host.scene.apply_pick(&PickCommand::Group(group_id));
     let (w, h) = host.viewport();
     let aspect = w as f32 / h.max(1) as f32;
     let dist = fit_distance(dynst.half[1].max(dynst.half[0] / aspect));

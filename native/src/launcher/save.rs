@@ -91,6 +91,7 @@ pub fn save(path: &Path, baseline: &LaunchConfig, changed: &LaunchConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::PresentMode;
     use crate::fold::WrapMode;
     use glyph_field::GlyphFieldMode;
 
@@ -115,7 +116,7 @@ clear_color = [1.0, 0.0, 0.0, 1.0]
         let base = LaunchConfig::from_toml_str(FILE).unwrap();
         let mut changed = base.clone();
         changed.wrap_mode = Some(WrapMode::Down);
-        changed.field_mode = Some(GlyphFieldMode::Instanced);
+        changed.present_mode = Some(PresentMode::Mailbox);
         changed.show_glyphs_px = Some(2.0);
         changed.cluster_mode = Some(crate::fold::ClusterMode::Leader);
         changed.load_repo = None;
@@ -124,7 +125,7 @@ clear_color = [1.0, 0.0, 0.0, 1.0]
 
         assert!(out.contains("# My launch config\nfile_backgrounds = true\n"), "{out}");
         assert!(out.contains("# Wrap layout mode\nwrap_mode = \"down\"  # the staircase\n"), "in place, comments kept: {out}");
-        assert!(out.contains("field_mode = \"instanced\""), "{out}");
+        assert!(out.contains("present_mode = \"mailbox\""), "{out}");
         assert!(!out.contains("lod_min_px"), "the alias goes when its key is written: {out}");
         assert!(out.contains("show_glyphs_px = 2.0"), "{out}");
         assert!(!out.contains("load_repo"), "a scene key the launch dropped is removed: {out}");
@@ -139,18 +140,18 @@ clear_color = [1.0, 0.0, 0.0, 1.0]
     fn untouched_keys_keep_hand_edits() {
         let base = LaunchConfig::from_toml_str(FILE).unwrap();
         let mut changed = base.clone();
-        changed.field_mode = Some(GlyphFieldMode::Instanced);
+        changed.present_mode = Some(PresentMode::Mailbox);
         let edited = FILE.replace("wrap_mode = \"back\"", "wrap_mode = \"down\"");
         let out = apply(&edited, &base, &changed).unwrap();
         assert!(out.contains("wrap_mode = \"down\""), "{out}");
-        assert!(out.contains("field_mode = \"instanced\""), "{out}");
+        assert!(out.contains("present_mode = \"mailbox\""), "{out}");
         assert_eq!(apply(FILE, &base, &base).unwrap(), FILE, "no change, no rewrite");
     }
 
     #[test]
     fn a_new_file_starts_with_a_header_and_loads() {
         let changed = LaunchConfig {
-            field_mode: Some(GlyphFieldMode::Instanced),
+            field_mode: Some(GlyphFieldMode::Derived),
             repo_presets: Some(vec![".".into(), "~/src/linux".into()]),
             ..Default::default()
         };
