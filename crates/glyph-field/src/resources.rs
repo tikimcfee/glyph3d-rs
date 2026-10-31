@@ -78,19 +78,6 @@ pub struct SlotChunk {
 
 /// Where a field's slots come from at construction.
 pub enum SlotSource<'a> {
-    /// Already on device, in the mode's own slot format, chunked by the
-    /// producer. Bound as-is — no upload, no transcode, no copy.
-    Device {
-        /// Slots per chunk (uniform; the last chunk may hold fewer). Slot
-        /// `s` lives in chunk `s / chunk_capacity`.
-        chunk_capacity: usize,
-        chunks: &'a [SlotChunk],
-        /// Total slots (the producer's length).
-        glyph_count: usize,
-        /// When the chunks are one contiguous host-visible mapping, its base
-        /// address — lets bulk color writes skip the queue.
-        mapped_base: Option<usize>,
-    },
     /// Already on the host in the mode's own slot format, in blocks that are
     /// the field's chunks ([`crate::HostSlots`]; the Derived field's form
     /// since 2026-10-26). The storage keeps them, uploads one buffer per

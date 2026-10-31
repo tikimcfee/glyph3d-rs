@@ -33,10 +33,9 @@ unsafe impl Send for StagingRange<'_> {}
 
 /// Where a field's slots live: one buffer range per chunk.
 ///
-/// The buffers are the producer's own slot buffers on the Device path, the
-/// upload buffers otherwise. `chunks[k].offset` is slot 0's byte address in
-/// `chunks[k].buffer` (0 for staged uploads; the pool slice's start for a
-/// device source's extracted buffers).
+/// The buffers are the upload buffers, one per chunk; `chunks[k].offset` is
+/// slot 0's byte address in `chunks[k].buffer`. (A device slot source, the
+/// Instanced emitter's own buffers bound as-is, was retired 2026-10-31.)
 pub struct SlotStorage<S: SlotRecord> {
     chunks: Vec<SlotChunk>,
     /// Live slots per chunk, mirrored out of `chunks` for the trait's slice
@@ -46,9 +45,6 @@ pub struct SlotStorage<S: SlotRecord> {
     /// renderer's chunking and the producer's must agree).
     chunk_capacity: u32,
     glyph_count: u32,
-    /// When mapped in host-visible memory, base address of the contiguous
-    /// slot slice.
-    mapped_base: Option<usize>,
     /// The host blocks the buffers were uploaded from, one per chunk, kept
     /// current by every write (None unless built from them).
     host: Option<RefCell<HostSlots>>,
@@ -63,7 +59,6 @@ impl<S: SlotRecord> SlotStorage<S> {
         chunks: Vec<SlotChunk>,
         chunk_capacity: usize,
         glyph_count: usize,
-        mapped_base: Option<usize>,
     ) -> Self {
         let chunk_counts = chunks.iter().map(|c| c.slots).collect();
         Self {
@@ -71,7 +66,6 @@ impl<S: SlotRecord> SlotStorage<S> {
             chunk_counts,
             chunk_capacity: chunk_capacity as u32,
             glyph_count: glyph_count as u32,
-            mapped_base,
             host: None,
             _slot: std::marker::PhantomData,
         }
@@ -152,7 +146,7 @@ impl<S: SlotRecord> SlotStorage<S> {
                     .expect("the host-block upload's previous batch completes");
             }
         }
-        let mut storage = Self::new(chunks, slots.block_slots(), slots.len(), None);
+        let mut storage = Self::new(chunks, slots.block_slots(), slots.len());
         storage.host = Some(RefCell::new(slots));
         storage
     }
@@ -167,15 +161,14 @@ impl<S: SlotRecord> SlotStorage<S> {
             chunk_counts,
             chunk_capacity: slots.block_slots() as u32,
             glyph_count: slots.len() as u32,
-            mapped_base: None,
             host: Some(RefCell::new(slots)),
             _slot: std::marker::PhantomData,
         }
     }
 
-    /// The storage `source` describes: a Device source's buffers bound as-is
-    /// (no upload, no transcode, no copy), a Host source's records transcoded
-    /// by `transcode` and uploaded.
+    /// The storage `source` describes: host blocks uploaded one buffer per
+    /// block, or a Host source's records transcoded by `transcode` and
+    /// uploaded.
     pub fn from_source<T: Transcode<Slot = S>>(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -184,9 +177,6 @@ impl<S: SlotRecord> SlotStorage<S> {
         labels: &UploadLabels,
     ) -> Self {
         match source {
-            SlotSource::Device { chunk_capacity, chunks, mapped_base, glyph_count, .. } => {
-                Self::new(chunks.to_vec(), chunk_capacity, glyph_count, mapped_base)
-            }
             SlotSource::Blocks(slots) => Self::from_host_slots(device, queue, slots, labels),
             SlotSource::Host { slices, glyph_count, direct_host_upload } => {
                 let HostUpload { chunk_capacity, chunk_counts, buffers } =
@@ -196,7 +186,7 @@ impl<S: SlotRecord> SlotStorage<S> {
                     .zip(chunk_counts.iter())
                     .map(|(buffer, &slots)| SlotChunk { buffer, offset: 0, slots })
                     .collect();
-                Self::new(chunks, chunk_capacity, glyph_count, None)
+                Self::new(chunks, chunk_capacity, glyph_count)
             }
         }
     }
@@ -271,38 +261,15 @@ impl<S: SlotRecord> SlotStorage<S> {
         }
     }
 
-    /// Bulk color write. Mapped storage is written in place through the base
-    /// pointer; otherwise one 4 B queue write per slot.
+    /// Bulk color write: one 4 B write per slot, into the host block and,
+    /// when the device holds a copy, through the queue.
     pub fn write_colors(&self, queue: &wgpu::Queue, first_slot: u32, colors: &[u32]) {
-        if colors.is_empty() {
-            return;
-        }
-        if let Some(addr) = self.mapped_base {
-            let slots = addr as *mut u8;
-            let total = self.glyph_count as usize;
-            let base = first_slot as usize;
-            let count = colors.len().min(total.saturating_sub(base));
-            let stride = Self::SLOT_BYTES as usize;
-            // SAFETY: `mapped_base` is the host address of one contiguous mapping of
-            // all `glyph_count` slots (SlotSource::Device), kept alive by
-            // `self.chunks`; `count` clamps every write below `glyph_count`, and the
-            // colour word is aligned (below).
-            unsafe {
-                for (i, &c) in colors.iter().take(count).enumerate() {
-                    // The slot's colour word. Aligned: the mapped slice is
-                    // slot-aligned, and every mode's stride and colour offset
-                    // are multiples of 4 (each pins its layout in slot.rs).
-                    slots.add((base + i) * stride + S::COLOR_OFFSET as usize).cast::<u32>().write(c);
-                }
+        for (i, &color) in colors.iter().enumerate() {
+            let slot = first_slot + i as u32;
+            if slot >= self.glyph_count {
+                break;
             }
-        } else {
-            for (i, &color) in colors.iter().enumerate() {
-                let slot = first_slot + i as u32;
-                if slot >= self.glyph_count {
-                    break;
-                }
-                self.write_field(queue, slot, S::COLOR_OFFSET, bytemuck::bytes_of(&color));
-            }
+            self.write_field(queue, slot, S::COLOR_OFFSET, bytemuck::bytes_of(&color));
         }
     }
 }

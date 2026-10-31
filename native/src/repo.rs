@@ -871,15 +871,6 @@ impl RepoLoad {
         // 48 B records exist there) and the arena chunks on the 48 B paths;
         // same values in the same slot order either way, so the tints are
         // bit-identical.
-        let mapped_slots = self
-            .arena
-            .emitted_slots()
-            .and_then(|d| d.mapped_slots())
-            .map(|addr| {
-                let len = self.arena.emitted_slots().expect("a mapping belongs to an emitted arena").len;
-                // SAFETY: pointer was mapped by create_mapped_render_slots and outlives arena
-                unsafe { std::slice::from_raw_parts(addr as *const crate::glyph_scene::RenderSlot, len) }
-            });
         let tint_stream: Option<&[u32]> = None;
         let chunks = if self.arena.emitted_slots().is_none() {
             self.arena.instance_chunks()
@@ -929,8 +920,6 @@ impl RepoLoad {
                         if let Some(pairs) = emitted_pairs {
                             debug_assert_eq!(pairs.len(), v.slot_count * 2);
                             tint.add_tint(pairs);
-                        } else if let Some(slots) = mapped_slots {
-                            tint.add_slots(&slots[want]);
                         } else if let Some(tp) = tint_stream {
                             tint.add_tint(&tp[want.start * 2..want.end * 2]);
                         } else {
@@ -967,7 +956,7 @@ impl RepoLoad {
                     })
                     .collect()
             } else {
-                build_file_blocks(v, s, mapped_slots, &chunks)
+                build_file_blocks(v, s, &chunks)
             };
             crate::glyph_scene::SegCull {
                 min: [

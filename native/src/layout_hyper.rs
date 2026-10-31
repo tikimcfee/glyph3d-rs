@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::fold::rows_for_line;
 use crate::layout::{
-    EmittedSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, SlotResidence,
+    EmittedSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem,
 };
 use crate::text::fu_to_world;
 use glyph_field::GlyphFieldMode;
@@ -26,11 +26,11 @@ pub(crate) mod tab_stop;
 use tab_stop::TabStops;
 use char_resolve::{resolve_byte_char_cluster, ResolveCtx};
 
-mod device_alloc;
-use device_alloc::{emit_host_blocks, layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
+mod emit;
+use emit::{emit_host_blocks, EmitInputs};
 
 mod pass2_device;
-use pass2_device::{DerivedEmit, RenderEmit};
+use pass2_device::DerivedEmit;
 mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
@@ -187,33 +187,24 @@ impl HyperLayout {
             slot_bases.push(chunk_slot_bases[range.start]);
         }
 
-        let derived = field_mode == GlyphFieldMode::Derived;
-        let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
+        // With a device, Derived slots are emitted into host blocks that are
+        // the field's chunks. Instanced, being retired, lays out host
+        // instances its field uploads (2026-10-31: its slots were emitted
+        // to the device directly until then).
+        let emit_slots = allow_device && self.device.is_some() && total_survivors > 0 && field_mode == GlyphFieldMode::Derived;
 
-        if can_use_device {
+        if emit_slots {
             let dev = self.device.as_ref().unwrap();
-            let unified = dev.is_unified() && dev.host_visible_storage;
 
             // What the slots will ask of the machine, refused here if it is
             // more than it has: nothing is allocated yet.
-            let demand = if derived {
-                crate::budget::SlotDemand {
-                    slots: total_survivors as u64,
-                    slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
-                    block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
-                    host_blocks: true,
-                    device: !dev.host_draws_glyphs,
-                    staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
-                }
-            } else {
-                crate::budget::SlotDemand {
-                    slots: total_survivors as u64,
-                    slot_bytes: std::mem::size_of::<glyph_field_instanced::RenderSlot>() as u64,
-                    block_slots: 1,
-                    host_blocks: false,
-                    device: true,
-                    staging: 0,
-                }
+            let demand = crate::budget::SlotDemand {
+                slots: total_survivors as u64,
+                slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
+                block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
+                host_blocks: true,
+                device: !dev.host_draws_glyphs,
+                staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
             };
             match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter, dev.is_unified())) {
                 Ok(line) => println!("slots: {line}"),
@@ -243,27 +234,13 @@ impl HyperLayout {
 
             // Derived slots land in host blocks that are the field's chunks
             // (2026-10-26): the one copy the wgpu field uploads from and a
-            // makepad renderer publishes. Instanced slots are emitted to the
-            // device directly, and stay so only because Instanced is being
-            // retired: not a second Derived path.
-            let (residence, chunk_slots, pass2_out, emoji_tint_pairs) = if derived {
-                let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
-                let (slots, pass2, pairs) = emit_host_blocks::<DerivedEmit>(&inputs, total_survivors, block_slots);
-                (SlotResidence::Host(slots), block_slots, pass2, pairs)
-            } else {
-                let label = "glyph render slots (direct)";
-                let emission = if unified {
-                    layout_device_unified::<RenderEmit>(dev, total_survivors, &inputs, label)
-                } else {
-                    layout_device_discrete::<RenderEmit>(dev, total_survivors, &inputs, label)
-                };
-                let DeviceEmission { chunks, chunk_slots, mapped_base, pass2, emoji_tint_pairs } = emission;
-                (SlotResidence::Device { chunks, mapped_slots: mapped_base }, chunk_slots, pass2, emoji_tint_pairs)
-            };
+            // makepad renderer publishes.
+            let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
+            let (slots, pass2_out, emoji_tint_pairs) = emit_host_blocks::<DerivedEmit>(&inputs, total_survivors, block_slots);
 
             let emitted = EmittedSlots {
-                residence,
-                chunk_slots,
+                slots,
+                chunk_slots: block_slots,
                 len: total_survivors,
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
@@ -1145,14 +1122,6 @@ where
     (slots, out.placements)
 }
 
-/// [`device_pass2_on_host`] in the Instanced field's format (32 B `RenderSlot`).
-pub(crate) fn device_pass2_render_on_host(
-    items: &[LayoutItem<'_>],
-    trie: &TrieTable,
-) -> (Vec<crate::glyph_scene::RenderSlot>, Vec<ItemPlacement>) {
-    device_pass2_on_host::<RenderEmit>(items, trie)
-}
-
 /// [`device_pass2_on_host`] in the Derived field's format (20 B `DerivedSlot`).
 pub(crate) fn device_pass2_derived_on_host(
     items: &[LayoutItem<'_>],
@@ -1281,7 +1250,6 @@ mod tests {
         with_window_corpus(|items| {
             let sizes = [1, 700, usize::MAX];
             windowed_matches_unwindowed::<pass2_device::DerivedEmit>(items, &sizes);
-            windowed_matches_unwindowed::<pass2_device::RenderEmit>(items, &sizes);
         });
     }
 
@@ -1323,7 +1291,7 @@ mod tests {
             let ref_words: &[u32] = bytemuck::cast_slice(&reference[..total]);
             assert!(total > 1400, "the corpus must span many blocks of 700");
             for block_slots in [1, 7, 700, total + 3] {
-                let (slots, out, pairs) = device_alloc::emit_host_blocks::<pass2_device::DerivedEmit>(&inputs, total, block_slots);
+                let (slots, out, pairs) = emit::emit_host_blocks::<pass2_device::DerivedEmit>(&inputs, total, block_slots);
                 assert_eq!((slots.len(), slots.block_slots(), slots.slot_words()), (total, block_slots, 5));
                 assert_eq!(slots.blocks().len(), total.div_ceil(block_slots), "block_slots {block_slots}: block count");
                 let lens: Vec<usize> = (0..slots.blocks().len()).map(|k| slots.block_len(k)).collect();
@@ -1724,168 +1692,6 @@ mod tests {
         }
     }
 
-    /// The device emission (the Instanced field's, since Derived slots land
-    /// in host blocks, 2026-10-26) chunks at the binding limit and the field
-    /// binds every chunk.
-    #[test]
-    fn hyper_device_chunking_splits_and_binds_across_limits() {
-        use glyph_field::{FieldResources, FieldTargets, GlyphField, SlotSource};
-        use glyph_field_instanced::InstancedField;
-
-        let ctx = pollster::block_on(crate::gpu::init(None));
-        let dev = crate::gpu::SharedDevice::from_ctx(&ctx);
-
-        let text = b"line 1: hello world\nline 2: testing chunked emission\nline 3: across buffer boundaries\n";
-        let item = LayoutItem {
-            bytes: text,
-            params: ItemParams { line_height: 1.25, ..Default::default() },
-            group_id: 0,
-            paint: Paint::Flat(0xFFFFFFFF),
-        };
-
-        let trie = crate::default_trie();
-        let em_height_fu = trie.metrics.em_height_fu;
-        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
-        let items = [item];
-        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(&items);
-        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
-        let prepasses = agg.prepasses;
-        let slot_bases = vec![0u32];
-        let total_survivors = prepasses[0].survivor_count as usize;
-        assert!(total_survivors > 20);
-
-        let inputs = EmitInputs {
-            items: &items,
-            chunks: &chunks,
-            item_chunk_ranges: &item_chunk_ranges,
-            prepasses: &prepasses,
-            slot_bases: &slot_bases,
-            chunk_slot_bases: &agg.chunk_slot_bases,
-            chunk_base_rows: &agg.chunk_base_rows,
-            chunk_record_bases: &agg.chunk_record_bases,
-            chunk_initial_cols: &agg.chunk_initial_cols,
-            chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
-            chunk_initial_line_advs: &agg.chunk_initial_line_advs,
-            trie: &trie,
-            bitmap_adv,
-            em_height_fu,
-        };
-
-        // Force chunk_cap = 16 slots to test multi-chunk emission on real GPU buffers
-        let chunk_cap = 16;
-        let emission = device_alloc::layout_device_discrete_chunked::<pass2_device::RenderEmit>(
-            &dev,
-            total_survivors,
-            &inputs,
-            "test instanced chunked",
-            chunk_cap,
-        );
-
-        let expected_chunks = total_survivors.div_ceil(chunk_cap);
-        assert_eq!(emission.chunks.len(), expected_chunks);
-        assert_eq!(emission.chunk_slots, chunk_cap);
-
-        let total_chunk_slots: u32 = emission.chunks.iter().map(|c| c.slots).sum();
-        assert_eq!(total_chunk_slots as usize, total_survivors);
-
-        // Verify InstancedField builds bind groups for all chunks without validation error
-        let dummy_advances = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy advances"),
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let dummy_frame_uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy frame uniform"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-        let dummy_group_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy group table"),
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let dummy_glyph_map = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy glyph map"),
-            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_glyph_map_view = dummy_glyph_map.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_emoji_sheet = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy emoji sheet"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_emoji_sheet_view = dummy_emoji_sheet.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_emoji_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor::default());
-
-        let dummy_curves = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy curves"),
-            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_curves_view = dummy_curves.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_params = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy params"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-
-        let resources = FieldResources {
-            frame_uniform: &dummy_frame_uniform,
-            group_table: &dummy_group_table,
-            glyph_map: &dummy_glyph_map_view,
-            curves: &dummy_curves_view,
-            params: &dummy_params,
-            emoji_sheet: &dummy_emoji_sheet_view,
-            emoji_sampler: &dummy_emoji_sampler,
-            glyph_advances: &dummy_advances,
-            item_params: &[],
-            item_of_group: &[],
-            block_slots: chunk_cap,
-            slots_on_device: true,
-        };
-
-        let source = SlotSource::Device {
-            chunk_capacity: emission.chunk_slots,
-            chunks: &emission.chunks,
-            glyph_count: total_survivors,
-            mapped_base: emission.mapped_base,
-        };
-
-        let targets = FieldTargets {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            sample_count: 1,
-        };
-
-        let field = InstancedField::new(&ctx.device, &ctx.queue, source, &resources, targets);
-        assert_eq!(field.chunk_count(), expected_chunks as u32);
-        assert_eq!(field.chunk_capacity(), chunk_cap as u32);
-        assert_eq!(field.glyph_count(), total_survivors as u32);
-    }
-
     fn prepass_with(row_count: u32, max_line_cols: u32) -> ItemPrepass {
         ItemPrepass {
             survivor_count: 1,
@@ -1936,7 +1742,7 @@ mod tests {
     /// same placements, the same Derived slots in the host blocks.
     #[test]
     fn an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched() {
-        use crate::layout::{GlyphArena, LayoutGlyphs, LayoutItem, SlotResidence, DEFAULT_COLOR_PACKED};
+        use crate::layout::{GlyphArena, LayoutGlyphs, LayoutItem, DEFAULT_COLOR_PACKED};
         let ctx = pollster::block_on(crate::gpu::init(None));
         let plain = ItemParams { line_height: 1.25, ..ItemParams::default() };
         let paged = ItemParams { has_page: true, page_cols: 1, page_rows: 4, ..plain };
@@ -1946,9 +1752,7 @@ mod tests {
             let mut arena = GlyphArena::new();
             let mut engine = HyperLayout::with_device(crate::gpu::SharedDevice::from_ctx(&ctx), GlyphFieldMode::Derived);
             let placements = engine.layout_items(items, &mut arena).expect("layout");
-            let Some(SlotResidence::Host(slots)) = arena.take_emitted().map(|e| e.residence) else {
-                panic!("a Derived load with a device emits host blocks");
-            };
+            let slots = arena.take_emitted().expect("a Derived load with a device emits host blocks").slots;
             let words: Vec<u32> = (0..slots.len() as u32).flat_map(|k| slots.slot(k).to_vec()).collect();
             (placements, words)
         };

@@ -4,7 +4,7 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
-use crate::layout::{EmittedSlots, SlotResidence};
+use crate::layout::EmittedSlots;
 use crate::text::StagedText;
 use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldMode, SlotSource};
 use glyph_field_instanced::InstancedField;
@@ -223,18 +223,8 @@ impl GlyphScene {
         };
         // The field takes the emitted slots: host blocks move into the
         // Derived field, which keeps them.
-        let device_chunks;
         let source = match arena.take_emitted() {
-            Some(EmittedSlots { residence: SlotResidence::Host(slots), .. }) => SlotSource::Blocks(slots),
-            Some(EmittedSlots { residence: SlotResidence::Device { chunks, mapped_slots }, chunk_slots, .. }) => {
-                device_chunks = chunks;
-                SlotSource::Device {
-                    chunk_capacity: chunk_slots,
-                    chunks: &device_chunks,
-                    glyph_count: instances_len,
-                    mapped_base: mapped_slots,
-                }
-            }
+            Some(EmittedSlots { slots, .. }) => SlotSource::Blocks(slots),
             None => SlotSource::Host {
                 slices: arena.instance_chunks(),
                 glyph_count: instances_len,

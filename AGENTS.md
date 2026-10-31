@@ -103,8 +103,9 @@ cargo run -p glyph -- validate            # build.toml against its schema
 ```
 
 The layout engine is `HyperLayout` (`native/src/layout_hyper.rs`): a parallel,
-cache-blocked CPU layout written with Rayon, writing into unified-memory mapped
-buffers where the GPU allows it and staging otherwise.
+cache-blocked CPU layout written with Rayon, writing the Derived field's
+slots into host blocks that are the field's chunks (device-direct emission,
+the Instanced field's, was retired with it on 2026-10-31).
 
 **Performance characteristics:**
 - Flagship corpus: the retired JS repo, glyph3d-js (1,306 files, 97.0 MB source,
@@ -592,11 +593,11 @@ reference-port holds bit-exact to the oracle), its records compacted by
 plus a per-record tally that names the byte and both glyph ids. Four tiers:
 records (HyperLayout's recording path), host instances and placements (its
 host Pass 2, what a device-less load runs), and the DEVICE Pass 2
-(`pass2_device.rs`, what every GPU load runs) in both slot formats plus its
-placements. The device tier runs the production emitter into host memory:
-the unified, discrete and host-staging paths all hand the same
-`EmitInputs::run` a raw address of writable memory, so only where the bytes
-land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
+(`pass2_device.rs`, what every GPU load runs) in the Derived slot format
+plus its placements (in both formats until the Instanced field's RenderSlot
+went, 2026-10-31). The device tier runs the production emitter into host
+memory: every destination hands the same `EmitInputs::run` a raw address of
+writable memory, so only where the bytes land is swapped. Corpus: the 26 pipe fixtures' bytes and item params (each item
 its own buffer, as a repo file is, in its own cluster mode; `paged-rows`,
 `paged-cols` and `scroll-only` carry the `page_rows`/`page_cols`/`scroll_rows`
 classes), the IMMUTABLE
