@@ -10,7 +10,6 @@ use std::path::PathBuf;
 
 
 use super::{fov_y_deg, CameraMode, GlyphPlacement, GlyphScene, GroupRow, Selection};
-use crate::gpu::GpuContext;
 use crate::layout::{GlyphRecord, ItemParams};
 
 // ── Stage G — picking & manipulation types ─────────────────────────────────
@@ -564,7 +563,7 @@ impl GlyphScene {
     }
 
     /// Resolve a pick command, store it as the current pick, return the log line.
-    pub(super) fn apply_pick(&mut self, _ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
+    pub(super) fn apply_pick(&mut self, cmd: &PickCommand) -> Option<String> {
         // The pick reads every file's live TRS from the group table: take
         // the moves a library deferred (2026-10-10).
         self.sync_group_rows();
@@ -710,7 +709,7 @@ impl GlyphScene {
     /// themselves went up, min..max span or row by row). The adoption keeps
     /// a verb's tint and hide that the writer did not change
     /// (`GroupNodes::adopt`, the library probe's E4).
-    pub(super) fn write_group_rows(&mut self, _ctx: &GpuContext, group_rows: &[u32]) {
+    pub(super) fn write_group_rows(&mut self, group_rows: &[u32]) {
         for &group_row in group_rows {
             self.nodes.adopt(group_row);
         }
@@ -719,9 +718,9 @@ impl GlyphScene {
     /// A group verb has written group row `group_row`'s node: rebuild the
     /// row from the tables (the flush uploads it) and re-derive the cull
     /// segments that follow it.
-    pub(super) fn group_node_edited(&mut self, ctx: &GpuContext, group_row: u32) {
+    pub(super) fn group_node_edited(&mut self, group_row: u32) {
         self.nodes.rebuild_row(group_row);
-        self.sync_segment(ctx, group_row);
+        self.sync_segment(group_row);
     }
 
     /// Re-derive the cull segments that follow group row `group_row` (each
@@ -732,7 +731,7 @@ impl GlyphScene {
     /// the view registry (2026-10-11) this re-derived the segment whose index
     /// was the group row's — right only while every file's segment and group
     /// row were its index. `_ctx` stays for the callers' sake.
-    pub(super) fn sync_segment(&mut self, _ctx: &GpuContext, group_row: u32) {
+    pub(super) fn sync_segment(&mut self, group_row: u32) {
         let Some(g) = self.nodes.row(group_row) else {
             return;
         };
@@ -788,7 +787,7 @@ impl GlyphScene {
 
     /// Apply a manipulation verb to the current pick. All GPU writes are
     /// partial uploads; the return string is the audit log line.
-    pub(super) fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> String {
+    pub(super) fn apply_verb(&mut self, verb: &Verb) -> String {
         if let Verb::Library(v) = verb {
             return self.apply_library_verb(v);
         }
@@ -968,7 +967,7 @@ impl GlyphScene {
                 if !self.nodes.translate(group_row, *d) {
                     return format!("verb move-group: group {group_row} out of range");
                 }
-                self.group_node_edited(ctx, group_row);
+                self.group_node_edited(group_row);
                 let off = self.nodes.row(group_row).expect("a moved group has a row").cols[0];
                 format!(
                     "verb move-group: {rel} group {group_row} offset -> ({:.1},{:.1},{:.1}) (32 B local row)",
@@ -979,14 +978,14 @@ impl GlyphScene {
                 let Some(s) = self.nodes.scale_by(group_row, *f) else {
                     return format!("verb scale-group: group {group_row} out of range");
                 };
-                self.group_node_edited(ctx, group_row);
+                self.group_node_edited(group_row);
                 format!("verb scale-group: {rel} group {group_row} scale -> {s:.3} (32 B local row)")
             }
             Verb::TintGroup(rgb) => {
                 if !self.nodes.set_tint(group_row, *rgb) {
                     return format!("verb tint-group: group {group_row} out of range");
                 }
-                self.group_node_edited(ctx, group_row);
+                self.group_node_edited(group_row);
                 format!(
                     "verb tint-group: {rel} group {group_row} tint -> ({:.2},{:.2},{:.2}) (32 B appearance row)",
                     rgb[0], rgb[1], rgb[2]
@@ -1000,7 +999,7 @@ impl GlyphScene {
                 }
                 let tints = crate::repo::dir_tints();
                 let rgb = tints[(step as usize) % tints.len()];
-                let line = self.apply_verb(ctx, &Verb::TintGroup(rgb));
+                let line = self.apply_verb(&Verb::TintGroup(rgb));
                 format!("{line} [palette step {step}]")
             }
             Verb::SetGlyphBackground(bg_rgba) => {
@@ -1073,7 +1072,7 @@ impl GlyphScene {
             }
             Verb::ToggleHidden => {
                 let hidden = self.group_hidden(group_row);
-                self.apply_verb(ctx, &Verb::SetHidden(!hidden))
+                self.apply_verb(&Verb::SetHidden(!hidden))
             }
         }
     }

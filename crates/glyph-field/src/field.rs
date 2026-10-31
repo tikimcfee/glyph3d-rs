@@ -90,10 +90,11 @@ pub trait GlyphField {
 /// tables, the pipelines that read them, and the draw recording. Built from
 /// the field it draws by the mode's crate.
 pub trait GlyphFieldGpu {
-    /// Bring the device copy up to `field`'s host state: every block, and
-    /// the overrides, whose version moved since the last sync. Call before
-    /// recording any draw of the frame.
-    fn sync(&self, queue: &wgpu::Queue, field: &dyn GlyphField);
+    /// Bring the device copy up to a field's host state — its blocks, and
+    /// its overrides table at `overrides_version` — re-uploading every block
+    /// and the table whose version moved since the last sync. Call before
+    /// recording any draw of the frame (a frame carries all three).
+    fn sync(&self, queue: &wgpu::Queue, slots: &HostSlots, overrides: &[u32], overrides_version: u64);
 
     /// The main glyph pipeline (the pooled color target, depth-tested and
     /// depth-writing).

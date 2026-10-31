@@ -522,11 +522,12 @@ impl RegionsGpu {
         RegionsGpu { count, params_cpu, params, picked_written: Cell::new(NONE), instances, render, render_bg }
     }
 
-    /// Write `runs` (`LibraryRegions::prepare`'s) into the instance buffer,
-    /// and the picked index into the uniform if it moved.
-    pub(super) fn upload(&self, queue: &wgpu::Queue, regions: &LibraryRegions, runs: &[Range<u32>]) {
-        write_runs(queue, &self.instances, bytemuck::cast_slice(&regions.image.borrow()), std::mem::size_of::<RegionInstance>(), runs);
-        let picked = regions.picked.get();
+    /// Write `runs` (`LibraryRegions::prepare`'s) of the host `image` into
+    /// the instance buffer, and the picked region into the uniform if it
+    /// moved (a frame carries all three).
+    pub(super) fn upload(&self, queue: &wgpu::Queue, image: &[RegionInstance], picked: Option<usize>, runs: &[Range<u32>]) {
+        write_runs(queue, &self.instances, bytemuck::cast_slice(image), std::mem::size_of::<RegionInstance>(), runs);
+        let picked = picked.map_or(NONE, |r| r as u32);
         if picked != self.picked_written.get() {
             let p = RegionParamsGpu { picked, ..self.params_cpu };
             queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));

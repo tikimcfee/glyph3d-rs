@@ -136,7 +136,7 @@ fn main() {
             };
 
             let ctx = pollster::block_on(gpu::init(None));
-            *ctx.prefetched_walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
+            *ctx.prefetch.walk.lock().unwrap_or_else(|e| e.into_inner()) = prefetched_walk;
 
             let emoji_sheet_path = match &plan.choice {
                 SceneChoice::Repo { emoji_sheet, .. } => Some(emoji_sheet.clone()),
@@ -151,7 +151,7 @@ fn main() {
                     log::info!("prefetched atlas loaded in {:?}", t.elapsed());
                     a
                 });
-                *ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
+                *ctx.prefetch.atlas.lock().unwrap_or_else(|e| e.into_inner()) = Some(atlas_handle);
             }
 
             match plan.target {

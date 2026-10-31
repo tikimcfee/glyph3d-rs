@@ -1,39 +1,32 @@
 use std::cell::Cell;
+use std::sync::Arc;
+
 use glam::Vec3;
-use wgpu::util::DeviceExt;
 
 use crate::atlas::Atlas;
-use crate::gpu::GpuContext;
 use crate::layout::EmittedSlots;
 use crate::text::StagedText;
-use glyph_field::{FieldResources, FieldTargets, GlyphField, GlyphFieldGpu, GlyphFieldMode, SlotSource};
-use glyph_field_derived::{DerivedField, DerivedFieldGpu};
+use glyph_field::{GlyphField, GlyphFieldMode, SlotSource};
+use glyph_field_derived::DerivedField;
 use super::{
     CameraMode, CullState, FlyCamera, GlyphScene,
     cull::SegCull,
-    instance::{FrameUniform, Params, GlyphInstance, GroupRow},
-    target::{MASK_FORMAT, POOL_FORMAT, SCENE_SAMPLE_COUNT},
+    instance::{Params, GlyphInstance, GroupRow},
     camera::fit_distance,
     tint::seg_tint,
-    pipelines, mesh
 };
 
 impl GlyphScene {
+    /// The scene over `staged`, with no device type (2026-10-31): a
+    /// renderer is built from it afterwards (`GlyphRenderer::new` for wgpu;
+    /// the makepad host draws its frames itself). It keeps `atlas` for that.
     pub fn new(
-        ctx: &GpuContext,
-        color_format: wgpu::TextureFormat,
-        atlas: &Atlas,
+        atlas: Arc<Atlas>,
         mut staged: StagedText,
         camera_mode: CameraMode,
         cull_enabled: bool,
         field_mode: GlyphFieldMode,
     ) -> Self {
-        let device = &ctx.device;
-
-        // Stage L (L3): the glyph/backdrop pipelines render into the POOL
-        // format (Rgba8UnormSrgb); the composite step maps the pool into the
-        // driver's view. (The --no-composite direct path proved the pool
-        // draw byte-neutral and was removed at stage end.)
 
         // --- instance + group buffers --------------------------------------
         let mut arena = staged.instances;
@@ -57,20 +50,12 @@ impl GlyphScene {
         }
 
         let t_scene_start = std::time::Instant::now();
-        let binding_limit = ctx.device.limits().max_storage_buffer_binding_size as usize;
         let instances_len = arena.len();
-        
+
         let max_groups = groups.len().max(65536);
-        let group_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("group table"),
-            size: (max_groups * std::mem::size_of::<GroupRow>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        ctx.queue.write_buffer(&group_buf, 0, bytemuck::cast_slice(&groups));
         // The rows as nodes under an identity root: the first frame's resolve
-        // rebuilds columns 0-3 of every row with the bits uploaded here, so
-        // only a row a library load moved goes up again.
+        // rebuilds columns 0-3 of every row with the bits a renderer uploads
+        // when it is built, so only a row a library load moved goes up again.
         let mut nodes = super::nodes::GroupNodes::new(&groups);
         // Each view's node is its group row's (`crate::views`).
         let mut views = staged.views;
@@ -88,26 +73,8 @@ impl GlyphScene {
             let slots: Vec<u32> = lib.nodes.as_ref().expect("just attached").sheet.iter().map(|h| h.index()).collect();
             Some(super::faces::LibraryFaces::new(&spec, &slots))
         });
-        let atlas_gpu = crate::atlas::AtlasGpu::upload(device, &ctx.queue, atlas);
-        log::info!(
-            "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
-            atlas.emoji.sheet.cells.len(),
-            atlas.emoji.mip_levels,
-            atlas_gpu.emoji.texture_bytes as f64 / (1 << 20) as f64,
-        );
-        let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            // Stage L (L1): the widened FrameUniform buffer (104 B) — binds to
-            // the unchanged 64 B WGSL block via the minimum-binding-size rule.
-            label: Some("frame uniform"),
-            size: std::mem::size_of::<FrameUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let emoji_view = atlas_gpu.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("emoji sheet view"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+
+
         let sheet = &atlas.emoji.sheet;
         let params = Params {
             max_groups: max_groups as u32,
@@ -126,74 +93,11 @@ impl GlyphScene {
             greek_onset_px: crate::config::settings().lod.text_detail_px,
             _pad3: 0,
         };
-        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let mesh_frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mesh frame bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let mesh_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mesh frame bg"),
-            layout: &mesh_frame_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buf.as_entire_binding(),
-                },
-            ],
-        });
-        let mesh_pipeline = std::cell::RefCell::new(mesh::MeshPipeline::new(device, POOL_FORMAT, &mesh_frame_bgl));
-
-        // Trilinear, clamped: the UV rect is inset half a texel so clamping
-        // never engages inside a cell; it only guards the sheet's padding.
-        let emoji_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("emoji sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        let glyph_map_view = atlas_gpu.glyphmap.create_view(&Default::default());
-        let curves_view = atlas_gpu.curves.create_view(&Default::default());
         // The item table is the registry's (one row per view, its group lane
         // the view's group row), and so is the map a host record's group
         // row is read through to find its item.
         let item_table = views.item_table();
         let item_of_group = views.item_of_group_rows(groups.len());
-        let resources = FieldResources {
-            frame_uniform: &camera_buf,
-            group_table: &group_buf,
-            glyph_map: &glyph_map_view,
-            curves: &curves_view,
-            params: &params_buf,
-            emoji_sheet: &emoji_view,
-            emoji_sampler: &emoji_sampler,
-            glyph_advances: &atlas_gpu.glyph_advances,
-        };
-        let depth_format = wgpu::TextureFormat::Depth32Float;
-        let targets = FieldTargets {
-            // Stage L (L3): the glyph pipeline renders into the POOL format.
-            color_format: POOL_FORMAT,
-            depth_format,
-            sample_count: SCENE_SAMPLE_COUNT,
-        };
         // The arena's forms map onto the field's sources. An EMITTED arena is
         // already the field's own slots: 20 B DerivedSlots in host blocks the
         // Derived field keeps. A HOST arena is the engine's neutral records,
@@ -210,25 +114,17 @@ impl GlyphScene {
         let field: Box<dyn GlyphField> = match field_mode {
             GlyphFieldMode::Derived => Box::new(DerivedField::new(source, &item_table, &item_of_group, block_slots)),
         };
-        let field_gpu: Box<dyn GlyphFieldGpu> = match field_mode {
-            GlyphFieldMode::Derived => Box::new(DerivedFieldGpu::new(device, &ctx.queue, &*field, &resources, targets)),
-        };
         let field_dur = t_scene_start.elapsed();
         let t_pipe_start = std::time::Instant::now();
         log::info!(
-            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{} ({} MiB binding limit), {} groups",
+            "glyph field ({}): {} instances ({} MiB) in {} chunk(s) of ≤{}, {} groups",
             field.mode(),
             instances_len,
             (instances_len * field.slot_bytes() as usize) >> 20,
             field.chunk_count(),
             field.chunk_capacity(),
-            binding_limit >> 20,
             groups.len(),
         );
-        // Stage L (L4): create selection mask pipeline unconditionally so both
-        // windowed platforms (Metal Bgra8UnormSrgb and Linux/Vulkan Rgba8UnormSrgb)
-        // render selection visuals.
-        let mask_pipeline = Some(field_gpu.create_mask_pipeline(device, MASK_FORMAT, SCENE_SAMPLE_COUNT));
 
         // Camera fit from staged bounds (or the Stage E2 focus-file override).
         let (center, half_w, half_h) = match staged.focus_bounds {
@@ -319,17 +215,6 @@ impl GlyphScene {
             None
         };
 
-        let face_instances = library_faces.as_ref().map(|f| f.buffer(device));
-        let regions_gpu = library_regions.as_ref().map(|r| super::regions::RegionsGpu::new(device, &camera_buf, POOL_FORMAT, r));
-        // The backdrop pass draws the CPU cull's survivors; no cull, no pass.
-        // Stage L (L3): the backdrop pipeline renders into the pool.
-        let backdrops = cull
-            .as_ref()
-            .map(|c| super::cull::BackdropGpu::new(device, POOL_FORMAT, depth_format, &camera_buf, c.segments.len() as u32));
-        // Stage L (L3): the composite machinery (persistent half). The
-        // pooled target itself is sized by set_viewport — GlyphScene::new
-        // doesn't know the viewport (the drivers decide it later).
-        let composite = pipelines::build_composite_state(device, color_format, mask_pipeline);
 
         let pick = staged.pick;
         if let Some(pctx) = &pick {
@@ -339,15 +224,15 @@ impl GlyphScene {
         let tint_step = vec![0u32; groups.len()];
         let pipe_dur = t_pipe_start.elapsed();
         log::info!(
-            "scene timings: field build (upload + glyph pipeline) {:.3}s | cull/composite init {:.3}s | total scene {:.3}s",
+            "scene timings: field build {:.3}s | cull init {:.3}s | total scene {:.3}s",
             field_dur.as_secs_f64(),
             pipe_dur.as_secs_f64(),
             (field_dur + pipe_dur).as_secs_f64(),
         );
 
         Self {
+            atlas,
             field,
-            depth_format,
             center,
             half_w,
             half_h,
@@ -380,23 +265,8 @@ impl GlyphScene {
             picked_region: None,
             scene_min_y: staged.bounds_min[1],
             environment: super::environment::Environment::new(),
-            gpu: super::renderer::SceneGpu {
-                device: device.clone(),
-                environment: super::environment::EnvironmentGpu::new(device, depth_format),
-                backdrops,
-                face_instances,
-                regions: regions_gpu,
-                field: field_gpu,
-                camera_buf,
-                params_buf,
-                params_uploaded: Cell::new(0),
-                group_buf,
-                mesh_pipeline,
-                mesh_frame_bg,
-                _emoji_view: emoji_view,
-                composite,
-            },
             item_table,
+            library_tick_ms: Cell::new((0.0, 0.0)),
         }
     }
 
@@ -470,37 +340,40 @@ impl GlyphScene {
 mod tests {
     use std::sync::Arc;
 
-    use crate::glyph_scene::{CameraMode, GlyphScene, PickCommand};
+    use crate::glyph_scene::{CameraMode, GlyphRenderer, GlyphScene, PickCommand};
     use crate::repo::{self, RepoParams, Strategy};
     use crate::scene::SceneLike;
     use glyph_field::GlyphFieldMode;
 
-    /// g-pick-repo loaded as a Derived scene on `ctx`, edited by the verbs
-    /// that write slots (a glyph's colour, x and group, a line, a whole file
-    /// through the highlight sidecar), with the host blocks as they were
-    /// before the edits.
-    fn edited_derived_scene(ctx: &crate::gpu::GpuContext) -> (GlyphScene, Vec<Arc<[u32]>>) {
+    /// g-pick-repo loaded as a Derived scene with its wgpu renderer on
+    /// `ctx` (built before the edits, so the device holds the load), then
+    /// edited by the verbs that write slots (a glyph's colour, x and group,
+    /// a line, a whole file through the highlight sidecar), with the host
+    /// blocks as they were before the edits.
+    fn edited_derived_scene(ctx: &crate::gpu::GpuContext) -> (GlyphScene, GlyphRenderer, Vec<Arc<[u32]>>) {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/g-pick-repo");
         let params = RepoParams { field_mode: GlyphFieldMode::Derived, ..Default::default() };
         let prefetched = repo::prefetch_repo(&dir, params, Strategy::Hyper);
-        let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, Some(ctx), crate::layout::GlyphArena::new(), None);
+        let home = crate::budget::SlotHome::of(ctx);
+        let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, Some(&home), crate::layout::GlyphArena::new(), None);
         let atlas = crate::atlas::Atlas::load(&crate::default_emoji_sheet());
         let staged = load.into_staged(None, &atlas.slot_ink);
-        let mut scene = GlyphScene::new(ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
+        let mut scene = GlyphScene::new(Arc::new(atlas), staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
         scene.set_viewport(crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
+        let renderer = GlyphRenderer::new(ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &scene);
 
         let held: Vec<Arc<[u32]>> = scene.field.host_slots().blocks().to_vec();
         assert!(held.len() >= 2, "g-pick-repo spans more than one block");
 
-        let pick = SceneLike::apply_pick(&mut scene, ctx, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
+        let pick = SceneLike::apply_pick(&mut scene, &PickCommand::RowCol { file: "alpha.rs".into(), row: 1, col: 4 });
         assert!(pick.is_some_and(|l| l.contains("alpha.rs")), "the pick resolves in alpha.rs");
         for verb in ["recolor-glyph ff0000", "nudge-glyph 0.5 0", "set-glyph-transform 1 2 0", "recolor-line 00ff00", "reset-glyph-group"] {
             let verb = crate::parse_verb(verb).expect("a verb literal parses");
-            SceneLike::apply_verb(&mut scene, ctx, &verb).expect("the scene applies the verb");
+            SceneLike::apply_verb(&mut scene, &verb).expect("the scene applies the verb");
         }
         let sidecar = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/highlight-alpha.tsv");
-        SceneLike::apply_highlight_sidecar(&scene, ctx, &sidecar).expect("the sidecar applies");
-        (scene, held)
+        SceneLike::apply_highlight_sidecar(&scene, &sidecar).expect("the sidecar applies");
+        (scene, renderer, held)
     }
 
     /// The Derived field keeps its slots in host blocks (2026-10-26), and
@@ -513,17 +386,18 @@ mod tests {
     #[test]
     fn derived_host_blocks_follow_every_slot_write() {
         let ctx = pollster::block_on(crate::gpu::init(None));
-        let (scene, _held) = edited_derived_scene(&ctx);
+        let (scene, renderer, _held) = edited_derived_scene(&ctx);
         let device_copy = |k: usize| {
             let host = scene.field.host_slots();
             let mut gpu = vec![0u32; host.blocks()[k].len()];
-            scene.gpu.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
+            renderer.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
             gpu
         };
         let blocks = scene.field.host_slots().blocks().len();
         let stale: Vec<usize> = (0..blocks).filter(|&k| device_copy(k)[..] != scene.field.host_slots().blocks()[k][..]).collect();
         assert_eq!(stale, [0], "before the sync only the edited block (alpha.rs's, block 0) differs on the device");
-        scene.gpu.field.sync(&ctx.queue, &*scene.field);
+        let field = &scene.field;
+        renderer.field.sync(&ctx.queue, &field.host_slots(), &field.group_overrides(), field.group_overrides_version());
         for k in 0..blocks {
             assert!(device_copy(k)[..] == scene.field.host_slots().blocks()[k][..], "block {k}: the host block and its buffer differ after the sync");
         }
@@ -536,7 +410,7 @@ mod tests {
     #[test]
     fn edits_move_only_the_block_they_touch() {
         let ctx = pollster::block_on(crate::gpu::init(None));
-        let (scene, held) = edited_derived_scene(&ctx);
+        let (scene, _renderer, held) = edited_derived_scene(&ctx);
         let host = scene.field.host_slots();
         let moved: Vec<usize> = (0..host.blocks().len()).filter(|&k| host.version(k) != 0).collect();
         assert_eq!(moved, [0], "only alpha.rs's block has a new version");

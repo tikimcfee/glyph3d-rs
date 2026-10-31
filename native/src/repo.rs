@@ -436,15 +436,16 @@ pub fn prefetch_repo(
 /// first so it can size the arena to the byte count (the render path's
 /// device-mapped arena exists because of this split — leaders ≤ bytes, so
 /// `walk.total_bytes` is the slot bound the direct path commits against).
-/// `gpu` is the renderer's device when one exists — HyperLayout emits
-/// straight into its buffers; `None` is the no-GPU door
-/// (`--repo-scan-only`), where layout fills a host arena.
+/// `home` is where a field's slots will live when the load is for a scene
+/// (HyperLayout emits them straight into the field's host blocks, checked
+/// against it); `None` is the scan-only door (`--repo-scan-only`), where
+/// layout fills a host arena of neutral records.
 pub fn load_repo_from_walk(
     root: &Path,
     walk: WalkResult,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -465,7 +466,7 @@ pub fn load_repo_from_walk(
         prefetched,
         params,
         strategy,
-        gpu,
+        home,
         arena,
         folds,
     )
@@ -476,7 +477,7 @@ pub fn load_repo_from_prefetched(
     prefetched: PrefetchedRepo,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -484,7 +485,7 @@ pub fn load_repo_from_prefetched(
         buffer_of_view: (0..prefetched.walk.files.len() as u32).collect(),
         placement: Placement::Controller,
     };
-    load_views(root, prefetched, plan, params, strategy, gpu, arena, folds)
+    load_views(root, prefetched, plan, params, strategy, home, arena, folds)
 }
 
 /// `--render-file FILE [--copies N]` as a repo load of that one file
@@ -498,7 +499,7 @@ pub fn load_repo_from_prefetched(
 /// The bytes are refused where a walk would skip them: not UTF-8 (the
 /// decode assumes well-formed leads) or past [`MAX_FILE_BYTES`] (the
 /// per-item ordinal guard).
-pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&crate::gpu::GpuContext>) -> RepoLoad {
+pub fn load_file(path: &Path, copies: u32, params: &RepoParams, home: Option<&crate::budget::SlotHome>) -> RepoLoad {
     let started = Instant::now();
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("failed to read text file {}: {e}", path.display()));
     assert!(std::str::from_utf8(&bytes).is_ok(), "{} is not valid UTF-8; the layout decodes well-formed UTF-8 only", path.display());
@@ -523,7 +524,7 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, gpu: Option<&cra
         plan,
         params,
         Strategy::default(),
-        gpu,
+        home,
         GlyphArena::new(),
         None,
     )
@@ -555,7 +556,7 @@ fn load_views(
     plan: ViewPlan,
     params: &RepoParams,
     strategy: Strategy,
-    gpu: Option<&crate::gpu::GpuContext>,
+    home: Option<&crate::budget::SlotHome>,
     mut arena: GlyphArena,
     folds: Option<&std::collections::HashMap<String, Vec<std::ops::Range<u32>>>>,
 ) -> RepoLoad {
@@ -601,11 +602,8 @@ fn load_views(
 
     // Every strategy runs HyperLayout; with a GPU it emits straight into
     // the field's own slot format.
-    let mut backend = match gpu {
-        Some(ctx) => crate::layout::LayoutEngine::hyper_with_device(
-            crate::gpu::SharedDevice::from_ctx(ctx),
-            params.field_mode,
-        ),
+    let mut backend = match home {
+        Some(home) => crate::layout::LayoutEngine::hyper_for_field(home.clone(), params.field_mode),
         // Without a device: host records, whatever the mode.
         None => crate::layout::LayoutEngine::hyper(),
     };
