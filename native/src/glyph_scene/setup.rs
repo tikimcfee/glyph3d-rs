@@ -88,11 +88,12 @@ impl GlyphScene {
             let slots: Vec<u32> = lib.nodes.as_ref().expect("just attached").sheet.iter().map(|h| h.index()).collect();
             Some(super::faces::LibraryFaces::new(device, &spec, &slots))
         });
+        let atlas_gpu = crate::atlas::AtlasGpu::upload(device, &ctx.queue, atlas);
         log::info!(
             "emoji sheet bound: {} cells, {} mip levels, {:.1} MiB",
             atlas.emoji.sheet.cells.len(),
             atlas.emoji.mip_levels,
-            atlas.emoji.texture_bytes as f64 / (1 << 20) as f64,
+            atlas_gpu.emoji.texture_bytes as f64 / (1 << 20) as f64,
         );
         let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
             // Stage L (L1): the widened FrameUniform buffer (104 B) — binds to
@@ -102,7 +103,7 @@ impl GlyphScene {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let emoji_view = atlas.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
+        let emoji_view = atlas_gpu.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("emoji sheet view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -169,8 +170,8 @@ impl GlyphScene {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let glyph_map_view = atlas.glyphmap.create_view(&Default::default());
-        let curves_view = atlas.curves.create_view(&Default::default());
+        let glyph_map_view = atlas_gpu.glyphmap.create_view(&Default::default());
+        let curves_view = atlas_gpu.curves.create_view(&Default::default());
         // The item table is the registry's (one row per view, its group lane
         // the view's group row), and so is the map a host record's group
         // row is read through to find its item.
@@ -184,7 +185,7 @@ impl GlyphScene {
             params: &params_buf,
             emoji_sheet: &emoji_view,
             emoji_sampler: &emoji_sampler,
-            glyph_advances: &atlas.glyph_advances,
+            glyph_advances: &atlas_gpu.glyph_advances,
             item_params: &item_table,
             item_of_group: &item_of_group,
             block_slots: crate::config::settings().glyph_scene.derived_block_slots as usize,
@@ -484,7 +485,7 @@ mod tests {
         let params = RepoParams { field_mode: GlyphFieldMode::Derived, ..Default::default() };
         let prefetched = repo::prefetch_repo(&dir, params, Strategy::Hyper);
         let load = repo::load_repo_from_prefetched(&dir, prefetched, &params, Strategy::Hyper, Some(ctx), crate::layout::GlyphArena::new(), None);
-        let atlas = crate::atlas::Atlas::load_device(&ctx.device, &ctx.queue, &crate::default_emoji_sheet());
+        let atlas = crate::atlas::Atlas::load(&crate::default_emoji_sheet());
         let staged = load.into_staged(None, &atlas.slot_ink);
         let mut scene = GlyphScene::new(ctx, wgpu::TextureFormat::Rgba8UnormSrgb, &atlas, staged, CameraMode::Front { zoom: 1.0 }, true, GlyphFieldMode::Derived);
         scene.set_viewport(crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);

@@ -268,7 +268,7 @@ fn build_scene_impl(
             let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
             let atlas = match prefetched_atlas_handle {
                 Some(handle) => handle.join().expect("prefetched atlas thread panicked"),
-                None => atlas::Atlas::load_device(&ctx.device, &ctx.queue, emoji_sheet),
+                None => atlas::Atlas::load(emoji_sheet),
             };
             let load = repo::load_file(file, *copies, &params, Some(ctx));
             log::info!(
@@ -302,7 +302,7 @@ fn build_scene_impl(
             };
             let (session, rev_engine) = (*loaded).clone();
 
-            let atlas = atlas::Atlas::load(ctx, emoji_sheet);
+            let atlas = atlas::Atlas::load(emoji_sheet);
             let staged = agent_transcript::stage_agent_session_with_options(
                 Some(&atlas.trie),
                 &atlas.slot_ink,
@@ -334,8 +334,6 @@ fn build_scene_impl(
                 ..Default::default()
             };
             let t_visual_start = std::time::Instant::now();
-            let device = &ctx.device;
-            let queue = &ctx.queue;
             let prefetched_atlas_handle = ctx.prefetched_atlas.lock().unwrap_or_else(|e| e.into_inner()).take();
             let (load, atlas, atlas_wall) = std::thread::scope(|s| {
                 let atlas_handle = s.spawn(move || {
@@ -345,7 +343,7 @@ fn build_scene_impl(
                         log::info!("joined prefetched atlas in {:?}", t.elapsed());
                         res
                     } else {
-                        atlas::Atlas::load_device(device, queue, emoji_sheet)
+                        atlas::Atlas::load(emoji_sheet)
                     };
                     (a, t.elapsed())
                 });
