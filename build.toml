@@ -50,7 +50,9 @@
 # RenderSlot layout pins, one naga validation of its shader) went with it.
 # 345 -> 343 (2026-10-31): copy.rs's two copy_split tests, deleted with the
 # host-record upload path it served.
-test_floor = 343
+# 343 -> 345 (2026-10-31): prove_relax's two (the suite route runs the
+# workspace's members alone; a mutant is overlaid for the members reading it).
+test_floor = 345
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
