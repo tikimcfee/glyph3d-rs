@@ -54,7 +54,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{DQuat, DVec3};
 use glyph_scene_graph::{FramePlan, NodeHandle, NodeTables, Similarity, NONE};
 
-use super::nodes::{run_rows, upload_runs, write_runs};
+use super::nodes::{run_rows, upload_runs};
+#[cfg(feature = "wgpu")]
+use super::nodes::write_runs;
 use super::tree_cull::{is_empty, Aabb, TreeCull};
 use crate::library::plan::Plan;
 use crate::library::LibNodes;
@@ -401,6 +403,7 @@ pub(super) struct LibraryRegions {
     dirty: RefCell<Vec<u32>>,
 }
 
+#[cfg(feature = "wgpu")]
 /// The regions on a wgpu device: the uniform, the instances and the draw.
 pub(super) struct RegionsGpu {
     count: u32,
@@ -438,6 +441,7 @@ impl LibraryRegions {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl RegionsGpu {
     pub(super) fn new(device: &wgpu::Device, camera_buf: &wgpu::Buffer, color_format: wgpu::TextureFormat, regions: &LibraryRegions) -> Self {
         use wgpu::util::DeviceExt;

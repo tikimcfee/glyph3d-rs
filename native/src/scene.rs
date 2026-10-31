@@ -3,12 +3,17 @@
 //! This module is deliberately mode-agnostic — windowed and offscreen both build
 //! one `Scene` and call `render()` into whatever target view they own.
 
+#[cfg(feature = "wgpu")]
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "wgpu")]
 use glam::{Mat4, Vec3};
+#[cfg(feature = "wgpu")]
 use wgpu::util::DeviceExt;
 
+#[cfg(feature = "wgpu")]
 use crate::gpu::GpuContext;
 
+#[cfg(feature = "wgpu")]
 /// The views a frame draws into, plus their physical-pixel size.
 /// (Stage F: the cull/LOD pass needs the height to convert world units to
 /// on-screen pixels.) Bundled so `SceneLike::render` stays a 4-arg signature.
@@ -147,11 +152,13 @@ pub trait SceneLike {
         None
     }
 
+    #[cfg(feature = "wgpu")]
     /// The scene's draw on a wgpu device, drawing into `color_format`.
     /// Built after the scene, and again for every scene a relayout builds.
     fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn SceneRenderer>;
 }
 
+#[cfg(feature = "wgpu")]
 /// What draws a [`SceneLike`] on a wgpu device (2026-10-31: the GPU half
 /// the scenes held until then). The windowed and offscreen drivers hold
 /// one beside their scene.
@@ -168,6 +175,7 @@ pub trait SceneRenderer {
 /// Stress-test target: 1,000,000 instances, one draw call.
 pub const INSTANCE_COUNT: u32 = 1_000_000;
 
+#[cfg(feature = "wgpu")]
 /// Per-instance GPU record. 48 bytes, mirrors `InstanceSlot` in quad_field.wgsl.
 ///
 /// FUTURE STAGES: this becomes the glyph slot record (~60 B: 8 u32
@@ -182,12 +190,14 @@ struct InstanceSlot {
     lanes: [u32; 4],
 }
 
+#[cfg(feature = "wgpu")]
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [f32; 16],
 }
 
+#[cfg(feature = "wgpu")]
 pub struct DemoRenderer {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
@@ -196,9 +206,11 @@ pub struct DemoRenderer {
     instance_count: u32,
 }
 
+#[cfg(feature = "wgpu")]
 /// Deterministic PRNG (xorshift64*) so both modes see the identical field
 /// and runs are reproducible for verification screenshots.
 struct Rng(u64);
+#[cfg(feature = "wgpu")]
 impl Rng {
     fn next_f32(&mut self) -> f32 {
         let mut x = self.0;
@@ -212,6 +224,7 @@ impl Rng {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl DemoRenderer {
     pub fn new(ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Self {
         let device = &ctx.device;
@@ -456,11 +469,13 @@ impl SceneLike for DemoScene {
     fn instance_count(&self) -> u32 {
         INSTANCE_COUNT
     }
+    #[cfg(feature = "wgpu")]
     fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn SceneRenderer> {
         Box::new(DemoRenderer::new(ctx, color_format))
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl SceneRenderer for DemoRenderer {
     fn depth_format(&self) -> wgpu::TextureFormat {
         self.depth_format
@@ -471,6 +486,7 @@ impl SceneRenderer for DemoRenderer {
     }
 }
 
+#[cfg(feature = "wgpu")]
 /// Helper: depth texture matching a given target size. Both modes need one.
 pub fn create_depth(
     device: &wgpu::Device,

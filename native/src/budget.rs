@@ -33,6 +33,7 @@ impl DeviceMemory {
     }
 }
 
+#[cfg(feature = "wgpu")]
 /// `adapter`'s device-local memory, where the driver reports a budget.
 #[cfg(not(any(target_vendor = "apple", target_family = "wasm")))]
 pub fn device_memory(adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
@@ -64,6 +65,7 @@ pub fn device_memory(adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
     (memory.heap_bytes > 0).then_some(memory)
 }
 
+#[cfg(feature = "wgpu")]
 /// No backend but Vulkan reports a budget through wgpu.
 #[cfg(any(target_vendor = "apple", target_family = "wasm"))]
 pub fn device_memory(_adapter: &wgpu::Adapter) -> Option<DeviceMemory> {
@@ -127,6 +129,7 @@ impl SlotHome {
         }
     }
 
+    #[cfg(feature = "wgpu")]
     /// A wgpu renderer's: the context's adapter, and the device copy its
     /// field draw uploads.
     pub fn of(ctx: &crate::gpu::GpuContext) -> Self {
@@ -136,6 +139,7 @@ impl SlotHome {
 }
 
 impl Machine {
+    #[cfg(feature = "wgpu")]
     pub fn of(adapter: &wgpu::Adapter, unified: bool) -> Self {
         Self {
             host_available: host_available_bytes(),

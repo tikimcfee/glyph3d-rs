@@ -13,6 +13,7 @@ pub mod fold;
 pub mod glyph_scene;
 pub mod glyph_trie;
 pub mod hyper_oracle;
+#[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod launch_config;
 #[cfg(feature = "launcher")]
@@ -21,6 +22,7 @@ pub mod layout;
 pub mod layout_hyper;
 pub mod layout_stack;
 pub mod library;
+#[cfg(feature = "wgpu")]
 pub mod offscreen;
 pub mod relayout;
 pub mod repo;
@@ -36,9 +38,12 @@ pub mod windowed;
 pub use atlas::default_trie;
 pub use cli::{Op, parse_verb};
 pub use glyph_scene::{CameraMode, GlyphScene};
+#[cfg(feature = "wgpu")]
 pub use gpu::GpuContext;
 pub use layout::{LayoutEngine, LayoutGlyphs, VerifyLayout};
-pub use scene::{DemoScene, SceneLike, SceneRenderer};
+pub use scene::{DemoScene, SceneLike};
+#[cfg(feature = "wgpu")]
+pub use scene::SceneRenderer;
 
 pub const OFFSCREEN_WIDTH: u32 = 1600;
 pub const OFFSCREEN_HEIGHT: u32 = 1000;
@@ -151,6 +156,7 @@ pub struct SceneLoad {
 }
 
 impl SceneLoad {
+    #[cfg(feature = "wgpu")]
     /// A wgpu driver's: its adapter's memory, a device copy of the slots,
     /// and whatever it prefetched.
     pub fn of(ctx: &GpuContext) -> Self {

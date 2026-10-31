@@ -336,7 +336,7 @@ impl GlyphScene {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wgpu"))]
 mod tests {
     use std::sync::Arc;
 

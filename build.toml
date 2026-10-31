@@ -396,8 +396,8 @@ tier = "merge"
 kind = "cargo"
 cmd = "check-no-ui"
 needs = []
-compare = "rustc warning count vs zero, renderer checked with --no-default-features twice, all targets: with --features windowed (the window, no egui overlay) and bare (no window: the library a host that owns its window links, 2026-10-26); and the bare build's dependency tree holds the renderer and no winit or egui crate"
-blind_to = "whether either build RUNS correctly — they are checked, not executed; every other feature combination; and a windowing crate in the bare tree under a name not starting winit or egui"
+compare = "rustc warning count vs zero, renderer checked with --no-default-features twice, all targets: with --features windowed (the window, no egui overlay) and bare (no window: the library a host that owns its window links, 2026-10-26); and the bare build's dependency tree holds the renderer and no winit, egui or wgpu crate (wgpu since 2026-10-31: the bare library is the engine's host side, drawn by a host's own renderer)"
+blind_to = "whether either build RUNS correctly — they are checked, not executed; every other feature combination; and a windowing or GPU crate in the bare tree under a name not starting winit, egui or wgpu"
 
 [[gate]]
 name = "cargo-clippy"
@@ -1022,6 +1022,25 @@ file = "native/Cargo.toml"
 op = "append"
 arg = "\n[target.'cfg(all())'.dependencies]\nwinit = \"0.30\"\n"
 expect = "winit v0.30"
+
+[[mutation]]
+name = "wgpu-unconditional"
+gate = "cargo-check-no-ui"
+why = "wgpu back as a dependency every build takes (2026-10-31), declared again in a target table every target matches, so the manifest still resolves: every check compiles, wgpu unused by the bare library, and that library drags the GPU stack (a device a makepad host never makes, and its driver) into a host that draws the frames itself. CONSUMED BY: the bare tree's grep for wgpu"
+file = "native/Cargo.toml"
+op = "append"
+arg = "\n[target.'cfg(all())'.dependencies]\nwgpu = \"30\"\n"
+expect = "wgpu v30"
+
+[[mutation]]
+name = "renderer-module-ungated"
+gate = "cargo-check-no-ui"
+why = "the wgpu renderer compiled without its feature (2026-10-31): the default build is unchanged, and the bare library, the build a host with its own renderer links, no longer compiles, since wgpu is absent from it. CONSUMED BY: the bare --no-default-features check"
+file = "native/src/glyph_scene.rs"
+op = "replace"
+find = "#[cfg(feature = \"wgpu\")]\nmod renderer;"
+with = "mod renderer;"
+expect = "cargo-check-no-ui errored"
 
 [[mutation]]
 name = "derived-curve-cap-128"

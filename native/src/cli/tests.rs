@@ -73,6 +73,7 @@ fn defaults_match_old_parser() {
     // 2026-09-07 was measured under; changing it would make old numbers
     // incomparable without saying so.
     assert_eq!(cli.present_mode, PresentMode::Fifo);
+    #[cfg(feature = "wgpu")]
     assert_eq!(parse_present_mode("fifo"), wgpu::PresentMode::Fifo);
 }
 
@@ -95,6 +96,7 @@ fn scalar_flags_parse() {
     ]);
     assert_eq!(cli.emoji_sheet, Some(PathBuf::from("sheets/other.bin")));
     assert_eq!(cli.present_mode, PresentMode::Mailbox);
+    #[cfg(feature = "wgpu")]
     assert_eq!(parse_present_mode("mailbox"), wgpu::PresentMode::Mailbox);
     assert!(cli.gpu_key);
     assert!(cli.gpu_profile);

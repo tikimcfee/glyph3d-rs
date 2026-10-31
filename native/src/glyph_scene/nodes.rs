@@ -93,6 +93,7 @@ pub(crate) fn run_rows(runs: &[Range<u32>]) -> usize {
     runs.iter().map(|r| r.len()).sum()
 }
 
+#[cfg(feature = "wgpu")]
 /// Write `runs` of a host table `data` (`row_bytes` a row) into `buffer`.
 pub(super) fn write_runs(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8], row_bytes: usize, runs: &[Range<u32>]) {
     for r in runs {
@@ -460,6 +461,7 @@ fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Ap
     bytemuck::bytes_of(row) != bytemuck::bytes_of(&old)
 }
 
+#[cfg(feature = "wgpu")]
 /// Block on a readback of `bytes` of `src` (tests only, never the frame
 /// path).
 #[cfg(test)]
@@ -534,6 +536,7 @@ mod tests {
         assert!(!n.translate(9, [1.0; 3]), "an unknown group is refused");
     }
 
+    #[cfg(feature = "wgpu")]
     /// What reaches the GPU's group table (2026-10-26, the CPU resolve as
     /// the path): a load's rows resolve to their own bits and upload
     /// nothing; a verb uploads exactly the rows it changed (as one run when

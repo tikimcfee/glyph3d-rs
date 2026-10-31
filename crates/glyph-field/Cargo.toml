@@ -12,8 +12,15 @@ description = "The glyph field's mode-neutral contract: the GlyphField trait eve
 # rayon is the upload's parallel transcode; its Metal direct-upload path
 # reaches `wgpu::hal` (wgpu's default features carry the Metal backend on
 # macOS, exactly as native relies on).
+[features]
+default = ["wgpu"]
+# The field's draw on a wgpu device (`GlyphFieldGpu`, the slot storage, the
+# shared pipelines and bindings). Off, the crate is the field's host side
+# alone, for a host with its own renderer (2026-10-31).
+wgpu = ["dep:wgpu"]
+
 [dependencies]
-wgpu = "30"
+wgpu = { version = "30", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 encase = "0.12"
 rayon = "1.10"

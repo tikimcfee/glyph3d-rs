@@ -5,8 +5,11 @@
 use glam::DVec3;
 use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
-use super::{ray_to_local, region_box, region_instance, LibraryRegions, RegionInstance, RegionsGpu, RegionSpec, RegionTable};
+use super::{ray_to_local, region_box, RegionSpec, RegionTable};
+#[cfg(feature = "wgpu")]
+use super::{region_instance, LibraryRegions, RegionInstance, RegionsGpu};
 use crate::glyph_scene::cull::{CullState, SegCull};
+#[cfg(feature = "wgpu")]
 use crate::glyph_scene::nodes::read_buffer;
 use crate::glyph_scene::tree_cull::{Aabb, TreeCull};
 use crate::library::plan::LibFile;
@@ -250,6 +253,7 @@ fn the_region_pick_is_the_innermost_region_the_ray_enters() {
     sweep(&t, &table, "after a drag");
 }
 
+#[cfg(feature = "wgpu")]
 /// What reaches the GPU (2026-10-26, the host composes the regions): after
 /// each frame's resolve and `prepare`, the instance buffer read back is
 /// `region_instance` of every region's box under its directory's

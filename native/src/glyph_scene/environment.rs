@@ -17,8 +17,10 @@ use std::cell::Cell;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, Mat4};
+#[cfg(feature = "wgpu")]
 use wgpu::util::DeviceExt;
 
+#[cfg(feature = "wgpu")]
 use super::target::{POOL_FORMAT, SCENE_SAMPLE_COUNT};
 use crate::config::EnvironmentMode;
 
@@ -64,6 +66,7 @@ pub(super) struct Environment {
     pub(super) ground_y_override: Cell<Option<f32>>,
 }
 
+#[cfg(feature = "wgpu")]
 /// The environment pass on a wgpu device: its pipeline and uniform.
 pub(super) struct EnvironmentGpu {
     pipeline: wgpu::RenderPipeline,
@@ -71,6 +74,7 @@ pub(super) struct EnvironmentGpu {
     bind_group: wgpu::BindGroup,
 }
 
+#[cfg(feature = "wgpu")]
 impl EnvironmentGpu {
     pub(super) fn new(device: &wgpu::Device, depth_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

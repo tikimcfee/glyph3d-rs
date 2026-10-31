@@ -31,15 +31,16 @@ fn cargo_cmd(name: Option<&str>) -> Option<&'static str> {
         // compiled until 2026-10-09, when it was found broken (C24); and
         // since 2026-10-26 the bare library, no window at all, the build a
         // host that owns its window links. The bare build's tree must hold
-        // no winit or egui (and must hold the renderer: an empty tree
-        // proves nothing). Its own target dir, so the changed feature sets
-        // never invalidate the main build.
+        // no winit or egui, and since 2026-10-31 no wgpu (that host draws
+        // the frames with its own renderer); and it must hold the renderer
+        // crate: an empty tree proves nothing. Its own target dir, so the
+        // changed feature sets never invalidate the main build.
         Some("check-no-ui") => concat!(
             "cargo check -p glyph3d-native --no-default-features --features windowed --all-targets --target-dir target/no-ui",
             " && cargo check -p glyph3d-native --no-default-features --all-targets --target-dir target/no-ui",
             " && cargo tree -p glyph3d-native --no-default-features -e no-dev --prefix none > target/no-ui/tree.txt",
             " && grep -q '^glyph3d-native ' target/no-ui/tree.txt",
-            " && ! grep -E '^(winit|egui)' target/no-ui/tree.txt",
+            " && ! grep -E '^(winit|egui|wgpu)' target/no-ui/tree.txt",
         ),
         _ => return None,
     })
