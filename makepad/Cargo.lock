@@ -1064,6 +1064,7 @@ dependencies = [
  "clap",
  "glyph-field",
  "glyph3d-native",
+ "makepad-texcomp",
  "makepad-widgets",
 ]
 
@@ -1763,6 +1764,10 @@ dependencies = [
  "makepad-html",
  "makepad-live-id",
 ]
+
+[[package]]
+name = "makepad-texcomp"
+version = "0.1.0"
 
 [[package]]
 name = "makepad-toml-parser"

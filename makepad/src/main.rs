@@ -39,6 +39,7 @@ script_mod! {
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
+                depth_buffer: false
                 window.inner_size: vec2(1600, 1000)
                 window.title: "glyph3d"
                 body +: {

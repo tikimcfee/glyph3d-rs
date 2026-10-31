@@ -21,32 +21,57 @@ use glyph3d_native::atlas::Atlas;
 use glyph3d_native::float_tables::{self, FloatTexture, TexelRect};
 use glyph3d_native::glyph_scene::{FrameData, RegionParams};
 
-use crate::g3_passes::{G3AtlasTables, G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
+use crate::g3_passes::{G3AtlasTables, G3EmojiPayload, G3EmojiSheet, G3FrameInputs, G3GroupTable, G3Renderer, G3Selection, G3StaticTables};
 
 /// Every scene a process builds stages against the same immutable atlas
 /// (`assets/atlas/` + the `--emoji-sheet` path), so `G3AtlasTables` is built
 /// and handed to `G3Renderer` once (`ATLAS_GENERATION = 1`), keeping neither
-/// `FloatTexture` copies nor the `361.79 MiB` emoji buffer in `FrameFeed`.
+/// `FloatTexture` copies nor the emoji payload buffer in `FrameFeed`.
 const ATLAS_GENERATION: u64 = 1;
 
-fn emoji_sheet_of(atlas: &Atlas) -> G3EmojiSheet {
-    let byte_len = atlas.emoji.byte_len();
-    assert_eq!(byte_len % 4, 0, "emoji sheet byte_len is 4-byte RGBA8 texels");
-    let mut bgra = vec![0u32; byte_len / 4];
-    // SAFETY: `u32` has alignment 4 >= `u8` alignment 1 and size 4, and `bgra`
-    // holds `byte_len / 4` initialized elements (`byte_len` bytes).
-    let dst_bytes = unsafe { std::slice::from_raw_parts_mut(bgra.as_mut_ptr() as *mut u8, byte_len) };
-    atlas.emoji.copy_into(dst_bytes);
-    for px in &mut bgra {
-        let [r, g, b, a] = px.to_ne_bytes();
-        *px = (b as u32) | ((g as u32) << 8) | ((r as u32) << 16) | ((a as u32) << 24);
-    }
+fn emoji_sheet_of(atlas: &Atlas, use_bc7: bool) -> G3EmojiSheet {
+    let payload = if use_bc7 {
+        let mut bc7_len = 0usize;
+        atlas.emoji.for_each_level(|_, _, w, h, _| {
+            bc7_len += makepad_texcomp::bc7::encoded_len(w, h);
+        });
+        let mut bc7 = Vec::with_capacity(bc7_len);
+        let t0 = std::time::Instant::now();
+        atlas.emoji.for_each_level(|_, _, w, h, rgba| {
+            makepad_texcomp::bc7::encode_image_into(rgba, w, h, 0, &mut bc7)
+                .expect("emoji sheet level dimensions match RGBA8 slice");
+        });
+        makepad_widgets::log!(
+            "g3: encoded emoji sheet to BC7 ({} layers, {}x{}, {} mips): {:.2} MiB -> {:.2} MiB in {:.1} ms",
+            atlas.emoji.sheet.layers,
+            atlas.emoji.sheet.layer_w,
+            atlas.emoji.sheet.layer_h,
+            atlas.emoji.mip_levels,
+            atlas.emoji.byte_len() as f64 / (1024.0 * 1024.0),
+            bc7.len() as f64 / (1024.0 * 1024.0),
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        G3EmojiPayload::Bc7(bc7)
+    } else {
+        let byte_len = atlas.emoji.byte_len();
+        assert_eq!(byte_len % 4, 0, "emoji sheet byte_len is 4-byte RGBA8 texels");
+        let mut bgra = Vec::with_capacity(byte_len / 4);
+        atlas.emoji.for_each_level(|_, _, _, _, rgba| {
+            bgra.extend(
+                rgba.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&[r, g, b, a]| (b as u32) | ((g as u32) << 8) | ((r as u32) << 16) | ((a as u32) << 24)),
+            );
+        });
+        G3EmojiPayload::Bgra(bgra)
+    };
     G3EmojiSheet {
         width: atlas.emoji.sheet.layer_w as usize,
         height: atlas.emoji.sheet.layer_h as usize,
         layers: atlas.emoji.sheet.layers as usize,
         max_level: atlas.emoji.mip_levels as usize - 1,
-        bgra,
+        payload,
     }
 }
 
@@ -117,13 +142,14 @@ impl FrameFeed {
         frame: &FrameData<'_>,
     ) {
         let atlas_generation = ATLAS_GENERATION;
+        let use_bc7 = cx.gpu_info().texture_bc7;
         let atlas = (renderer.seen().atlas != Some(atlas_generation)).then(|| {
             let tables = float_tables::atlas_tables_of(frame.atlas);
             G3AtlasTables {
                 glyphmap: tables.glyphmap,
                 curves: tables.curves,
                 advances: tables.glyph_advances,
-                emoji: emoji_sheet_of(frame.atlas),
+                emoji: emoji_sheet_of(frame.atlas, use_bc7),
             }
         });
 

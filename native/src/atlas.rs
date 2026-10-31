@@ -1100,6 +1100,40 @@ impl EmojiLevels {
         total
     }
 
+    /// Visit every layer's mip chain in upload order (`layer` `0..sheet.layers`,
+    /// `level` `0..mip_levels`), borrowing the sRGB-encoded RGBA8 straight-alpha
+    /// bytes directly from the mmap or owned buffers without copying.
+    pub fn for_each_level(&self, mut f: impl FnMut(u32, u32, u32, u32, &[u8])) {
+        match &self.levels {
+            CachedLevels::Mmap { mmap, data_offset, total_bytes } => {
+                let src = &mmap[*data_offset..*data_offset + *total_bytes];
+                let mut cursor = 0usize;
+                for layer in 0..self.sheet.layers {
+                    let (mut w, mut h) = (self.sheet.layer_w, self.sheet.layer_h);
+                    for level in 0..self.mip_levels {
+                        let len = (w * h * 4) as usize;
+                        f(layer, level, w, h, &src[cursor..cursor + len]);
+                        cursor += len;
+                        w /= 2;
+                        h /= 2;
+                    }
+                }
+                debug_assert_eq!(cursor, *total_bytes);
+            }
+            CachedLevels::Owned(layers) => {
+                for (layer, chain) in layers.iter().enumerate() {
+                    let (mut w, mut h) = (self.sheet.layer_w, self.sheet.layer_h);
+                    for (level, data) in chain.iter().enumerate() {
+                        debug_assert_eq!(data.len(), (w * h * 4) as usize);
+                        f(layer as u32, level as u32, w, h, data);
+                        w /= 2;
+                        h /= 2;
+                    }
+                }
+            }
+        }
+    }
+
     /// The texels into `dst` (exactly [`Self::byte_len`] bytes): layer-major,
     /// each layer's levels from 0 down, rows tight, sRGB-encoded RGBA8 with
     /// straight alpha — what the device upload stages.
