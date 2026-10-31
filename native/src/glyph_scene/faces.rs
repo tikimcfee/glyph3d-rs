@@ -69,9 +69,9 @@ pub(crate) struct LibraryFaces {
     /// Face → its sheet's pool slot (draw order), and slot → face.
     sheets: Vec<u32>,
     face_of_slot: Vec<u32>,
-    /// The instances mesh.wgsl draws, and what the host last wrote to them
-    /// (the buffer starts zeroed, as wgpu creates it, and so does this).
-    pub(crate) instances: wgpu::Buffer,
+    /// The instances mesh.wgsl draws, as the host last built them (the GPU
+    /// buffer, [`LibraryFaces::buffer`], starts zeroed as wgpu creates it,
+    /// and so does this).
     image: RefCell<Vec<MeshInstance>>,
     last: Cell<UploadCost>,
     /// Bumped by every `prepare` that changed a face (`FrameData::faces_generation`).
@@ -82,14 +82,8 @@ impl LibraryFaces {
     /// One face per entry of `sheet_slots` (each a sheet node's pool slot),
     /// in draw order. The first frame's resolve reaches every sheet, so it
     /// writes every face.
-    pub(crate) fn new(device: &wgpu::Device, spec: &FaceSpec, sheet_slots: &[u32]) -> Self {
+    pub(crate) fn new(spec: &FaceSpec, sheet_slots: &[u32]) -> Self {
         let count = sheet_slots.len();
-        let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("library face instances"),
-            size: (count.max(1) * std::mem::size_of::<MeshInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let slots = sheet_slots.iter().map(|&s| s as usize + 1).max().unwrap_or(0);
         let mut face_of_slot = vec![NONE; slots];
         for (k, &s) in sheet_slots.iter().enumerate() {
@@ -99,7 +93,6 @@ impl LibraryFaces {
             spec: *spec,
             sheets: sheet_slots.to_vec(),
             face_of_slot,
-            instances,
             image: RefCell::new(vec![MeshInstance::zeroed(); count]),
             last: Cell::new(UploadCost::default()),
             generation: Cell::new(0),
@@ -108,6 +101,17 @@ impl LibraryFaces {
 
     pub(crate) fn count(&self) -> u32 {
         self.sheets.len() as u32
+    }
+
+    /// The GPU instance buffer the faces are drawn from, zeroed, sized for
+    /// every face (the renderer's; `upload` writes it).
+    pub(crate) fn buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("library face instances"),
+            size: (self.sheets.len().max(1) * std::mem::size_of::<MeshInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
     }
 
     /// The CPU half, after the frame's resolve: rebuild the face of every
@@ -143,12 +147,12 @@ impl LibraryFaces {
     }
 
     /// The wgpu half: write `runs` (`prepare`'s) into the instance buffer.
-    pub(crate) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
+    pub(crate) fn upload(&self, queue: &wgpu::Queue, buffer: &wgpu::Buffer, runs: &[Range<u32>]) {
         if runs.is_empty() {
             return;
         }
         let t0 = std::time::Instant::now();
-        write_runs(queue, &self.instances, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<MeshInstance>(), runs);
+        write_runs(queue, buffer, bytemuck::cast_slice(&self.image.borrow()), std::mem::size_of::<MeshInstance>(), runs);
         let mut cost = self.last.get();
         cost.ms += t0.elapsed().as_secs_f64() * 1e3;
         self.last.set(cost);
@@ -221,13 +225,14 @@ mod tests {
         let spec = lib.face.expect("the default settings draw faces");
         let nodes = lib.nodes.clone().unwrap();
         let slots: Vec<u32> = nodes.sheet.iter().map(|h| h.index()).collect();
-        let faces = LibraryFaces::new(&ctx.device, &spec, &slots);
+        let faces = LibraryFaces::new(&spec, &slots);
+        let face_buf = faces.buffer(&ctx.device);
 
         let frame = |g: &GroupNodes| {
             let (plan, rows) = g.prepare();
             g.upload(&ctx.queue, &table, &rows);
             let runs = faces.prepare(&g.tables(), &plan);
-            faces.upload(&ctx.queue, &runs);
+            faces.upload(&ctx.queue, &face_buf, &runs);
             (g.last_flush().0.bytes, faces.last_update().bytes * usize::from(!runs.is_empty()))
         };
         let check = |g: &GroupNodes, what: &str| {
@@ -239,7 +244,7 @@ mod tests {
                 let (a, b): (&[u32; 24], &[u32; 24]) = (bytemuck::cast_ref(&a.cols), bytemuck::cast_ref(&b.cols));
                 assert_eq!(a[..16], b[..16], "{what}: file {i}'s group row on the GPU");
             }
-            let got: Vec<MeshInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &faces.instances, (n * 80) as u64)).to_vec();
+            let got: Vec<MeshInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &face_buf, (n * 80) as u64)).to_vec();
             for (i, (a, &sheet)) in got.iter().zip(&nodes.sheet).enumerate() {
                 let b = face_instance(&g.tables().world(sheet).unwrap().0, &spec);
                 assert_eq!(bytemuck::bytes_of(a), bytemuck::bytes_of(&b), "{what}: face {i} on the GPU {a:?}, composed {b:?}");

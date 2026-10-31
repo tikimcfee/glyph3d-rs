@@ -44,11 +44,11 @@ pub(super) fn encode_frame(
     // pass reads a row (the glyph pass);
     // the page faces and regions with them. Nothing moved, nothing written.
     scene.nodes.upload(&ctx.queue, &scene.gpu.group_buf, &frame.group_runs);
-    if let Some(faces) = &scene.library_faces {
-        faces.upload(&ctx.queue, &frame.face_runs);
+    if let (Some(faces), Some(buf)) = (&scene.library_faces, &scene.gpu.face_instances) {
+        faces.upload(&ctx.queue, buf, &frame.face_runs);
     }
-    if let Some(regions) = &scene.library_regions {
-        regions.upload(&ctx.queue, &frame.region_runs);
+    if let (Some(regions), Some(gpu)) = (&scene.library_regions, &scene.gpu.regions) {
+        gpu.upload(&ctx.queue, regions, &frame.region_runs);
     }
     if ctx.profiler.is_some() {
         let c = &frame.costs;
@@ -190,12 +190,12 @@ pub(super) fn encode_frame(
                 // The library's faces take the scene meshes' place (a
                 // library load has no other scene mesh): same pipeline,
                 // same position in the phase.
-                if let Some(faces) = &scene.library_faces {
-                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.gpu.mesh_frame_bg, &faces.instances);
+                if let (Some(faces), Some(buf)) = (&scene.library_faces, &scene.gpu.face_instances) {
+                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.gpu.mesh_frame_bg, buf);
                 }
                 // The regions after the faces (a page hides the walls
                 // behind it), before the glyphs (which read over them).
-                if let Some(regions) = &scene.library_regions {
+                if let Some(regions) = &scene.gpu.regions {
                     regions.draw(&mut pass);
                 }
                 if let Some(meshes) = &scene_meshes {

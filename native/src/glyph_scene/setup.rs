@@ -86,7 +86,7 @@ impl GlyphScene {
             lib.attach(nodes.tables_mut(), Some(root), &files);
             let spec = lib.face?;
             let slots: Vec<u32> = lib.nodes.as_ref().expect("just attached").sheet.iter().map(|h| h.index()).collect();
-            Some(super::faces::LibraryFaces::new(device, &spec, &slots))
+            Some(super::faces::LibraryFaces::new(&spec, &slots))
         });
         let atlas_gpu = crate::atlas::AtlasGpu::upload(device, &ctx.queue, atlas);
         log::info!(
@@ -316,7 +316,7 @@ impl GlyphScene {
                     }
                     tree.log_refits();
                     let table = super::regions::RegionTable::new(&lib.plan, lnodes, &tree, spec);
-                    library_regions = Some(super::regions::LibraryRegions::new(device, &camera_buf, POOL_FORMAT, table));
+                    library_regions = Some(super::regions::LibraryRegions::new(table));
                 }
                 cull.tree = Some(std::cell::RefCell::new(tree));
             }
@@ -326,6 +326,8 @@ impl GlyphScene {
             None
         };
 
+        let face_instances = library_faces.as_ref().map(|f| f.buffer(device));
+        let regions_gpu = library_regions.as_ref().map(|r| super::regions::RegionsGpu::new(device, &camera_buf, POOL_FORMAT, r));
         // The backdrop pass draws the CPU cull's survivors; no cull, no pass.
         // Stage L (L3): the backdrop pipeline renders into the pool.
         let backdrops = cull
@@ -389,6 +391,8 @@ impl GlyphScene {
                 device: device.clone(),
                 environment: super::environment::EnvironmentGpu::new(device, depth_format),
                 backdrops,
+                face_instances,
+                regions: regions_gpu,
                 camera_buf,
                 params_buf,
                 params_uploaded: Cell::new(0),

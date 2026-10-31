@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 
 use super::cull::BackdropGpu;
 use super::environment::EnvironmentGpu;
+use super::regions::RegionsGpu;
 use super::mesh::MeshPipeline;
 use super::target::CompositeState;
 
@@ -20,6 +21,10 @@ pub(crate) struct SceneGpu {
     pub(super) environment: EnvironmentGpu,
     /// The far-LOD backdrop pass (None without the cull, `--no-cull`).
     pub(super) backdrops: Option<BackdropGpu>,
+    /// The library's page-face instances (None without page faces).
+    pub(super) face_instances: Option<wgpu::Buffer>,
+    /// The library's bounding regions (None without them).
+    pub(super) regions: Option<RegionsGpu>,
     /// The frame uniform (`FrameData::uniform`), written every frame.
     pub(super) camera_buf: wgpu::Buffer,
     /// The glyph params (`FrameData::params`) and the generation it holds.

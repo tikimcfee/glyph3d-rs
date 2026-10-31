@@ -5,7 +5,7 @@
 use glam::DVec3;
 use glyph_scene_graph::{Appearance, NodeHandle, NodeTables, Similarity};
 
-use super::{ray_to_local, region_box, region_instance, LibraryRegions, RegionInstance, RegionSpec, RegionTable};
+use super::{ray_to_local, region_box, region_instance, LibraryRegions, RegionInstance, RegionsGpu, RegionSpec, RegionTable};
 use crate::glyph_scene::cull::{CullState, SegCull};
 use crate::glyph_scene::nodes::read_buffer;
 use crate::glyph_scene::tree_cull::{Aabb, TreeCull};
@@ -272,20 +272,21 @@ fn the_gpu_draws_the_regions_the_tree_composes() {
         mapped_at_creation: false,
     });
     let table = RegionTable::new(&fx.lib.plan, fx.lib.nodes.as_ref().unwrap(), &fx.tree, spec);
-    let regions = LibraryRegions::new(&ctx.device, &camera_buf, crate::glyph_scene::target::POOL_FORMAT, table);
+    let regions = LibraryRegions::new(table);
+    let gpu = RegionsGpu::new(&ctx.device, &camera_buf, crate::glyph_scene::target::POOL_FORMAT, &regions);
     let nodes = fx.lib.nodes.clone().unwrap();
     let frame = |t: &mut NodeTables, fx: &mut Fixture| {
         let plan = t.resolve_frame();
         fx.tree.refit(t, &fx.cull);
         let (cost, runs) = regions.prepare(&mut fx.tree, t, Some(&plan));
-        regions.upload(&ctx.queue, &runs);
+        gpu.upload(&ctx.queue, &regions, &runs);
         cost
     };
     let check = |t: &mut NodeTables, fx: &mut Fixture, what: &str| {
         let cost = frame(t, fx);
         assert!(cost.uploaded > 0, "{what}: something moved ({cost:?})");
         let count = regions.table.borrow().len();
-        let got: Vec<RegionInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &regions.instances, (count * 64) as u64)).to_vec();
+        let got: Vec<RegionInstance> = bytemuck::cast_slice(&read_buffer(&ctx, &gpu.instances, (count * 64) as u64)).to_vec();
         let table = regions.table.borrow();
         for (r, a) in got.iter().enumerate() {
             let (d, _) = table.dir_of(r as u32);
