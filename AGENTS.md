@@ -288,7 +288,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   the diff (it once caught a gate whose PASS line was a log line). What the
   route proves is the mutation's claim: the test its `expect` names (the
   whole suite under relax, judged by the floor, when it names none), the
-  golden view it names. A renderer gate's mutation of a file the renderer
+  golden view it names. The suite is the root manifest's `[workspace].members`
+  (not every `Cargo.toml`: the excluded makepad host made it red on every
+  tree until 2026-10-31), and each member's run is overlaid with only the
+  files it reads, since relax refuses a run whose overlaid file was never
+  read. A renderer gate's mutation of a file the renderer
   reads at run time (a fixture) is applied on disk, last and one at a
   time. Gates with no declaration (the compiler's
   diagnostics, the corpus gates) are proven on cargo: their Rust mutations

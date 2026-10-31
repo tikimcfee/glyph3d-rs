@@ -133,18 +133,104 @@ enum Apply {
     Disk,
 }
 
-/// The workspace's packages, by name and directory (the root's members:
-/// `native/`, `glyph/` and `crates/*`).
+/// The workspace's packages, by name and directory: the root manifest's
+/// `[workspace].members`, each expanded as cargo expands it. (Until
+/// 2026-10-31 this globbed every `*/Cargo.toml`, which took the makepad
+/// host, a crate the root `exclude`s, so the whole-suite route ran `relax
+/// test glyph3d-makepad`, red as "not a member", on every tree.)
 fn workspace_packages() -> Vec<(String, PathBuf)> {
-    ["*/Cargo.toml", "crates/*/Cargo.toml"]
+    let root_manifest = std::fs::read_to_string(root().join("Cargo.toml")).expect("the root Cargo.toml reads");
+    let members: Vec<String> = root_manifest
+        .parse::<toml::Table>()
+        .expect("the root Cargo.toml parses")
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .expect("the root Cargo.toml declares [workspace].members")
         .iter()
-        .flat_map(|p| glob::glob(&root().join(p).to_string_lossy()).into_iter().flatten().flatten())
+        .filter_map(|m| m.as_str().map(str::to_string))
+        .collect();
+    members
+        .iter()
+        .flat_map(|m| glob::glob(&root().join(m).join("Cargo.toml").to_string_lossy()).into_iter().flatten().flatten())
         .filter_map(|manifest| {
             let text = std::fs::read_to_string(&manifest).ok()?;
             let name = text.parse::<toml::Table>().ok()?.get("package")?.get("name")?.as_str()?.to_string();
             Some((name, manifest.parent()?.to_path_buf()))
         })
         .collect()
+}
+
+/// The members whose build reads `file`: the member it lies in and every
+/// member depending on that one by path, directly or through another
+/// (2026-10-31): the members a suite run overlays the file for
+/// (`member_overlays`).
+fn packages_reading(file: &Path) -> std::collections::BTreeSet<String> {
+    let packages = workspace_packages();
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let file = canon(file);
+    let owner = packages.iter().filter(|(_, dir)| file.starts_with(canon(dir))).max_by_key(|(_, dir)| dir.components().count());
+    let mut reading: std::collections::BTreeSet<String> = owner.map(|(n, _)| n.clone()).into_iter().collect();
+    // Each member's path dependencies, by member name.
+    let deps: Vec<(String, Vec<String>)> = packages
+        .iter()
+        .map(|(name, dir)| {
+            let table = std::fs::read_to_string(dir.join("Cargo.toml")).ok().and_then(|t| t.parse::<toml::Table>().ok()).unwrap_or_default();
+            let paths: Vec<String> = ["dependencies", "dev-dependencies", "build-dependencies"]
+                .iter()
+                .filter_map(|k| table.get(*k).and_then(|d| d.as_table()))
+                .flat_map(|d| d.values())
+                .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(|p| canon(&dir.join(p))))
+                .filter_map(|dep_dir| packages.iter().find(|(_, d)| canon(d) == dep_dir).map(|(n, _)| n.clone()))
+                .collect();
+            (name.clone(), paths)
+        })
+        .collect();
+    loop {
+        let before = reading.len();
+        for (name, on) in &deps {
+            if on.iter().any(|d| reading.contains(d)) {
+                reading.insert(name.clone());
+            }
+        }
+        if reading.len() == before {
+            return reading;
+        }
+    }
+}
+
+/// Per member of the suite's `targets`, its env with `MAKEPAD_RUN_OVERLAY`
+/// narrowed to the overlay list's files that member reads
+/// (`packages_reading`), or dropped when it reads none of them; a member
+/// whose env would not change is absent (2026-10-31). relax refuses a run
+/// whose first overlaid file was never read, so a list naming a renderer
+/// file (a mutant, or a cargo mutation's shield) failed every crate the
+/// renderer is built on.
+fn member_overlays<'e>(targets: &[(String, Vec<String>)], env: &[(&'e str, OsString)]) -> BTreeMap<String, Vec<(&'e str, OsString)>> {
+    let mut out = BTreeMap::new();
+    let Some(list) = env.iter().find(|(k, _)| *k == "MAKEPAD_RUN_OVERLAY").map(|(_, v)| PathBuf::from(v)) else { return out };
+    let Ok(text) = std::fs::read_to_string(&list) else { return out };
+    let entries: Vec<(&str, std::collections::BTreeSet<String>)> = text
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(file, _)| (file, packages_reading(Path::new(file))))
+        .collect();
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains('\t')).collect();
+    for package in targets.iter().map(|(p, _)| p).collect::<std::collections::BTreeSet<_>>() {
+        let kept: Vec<&str> = lines.iter().zip(&entries).filter(|(_, (_, readers))| readers.contains(package)).map(|(l, _)| *l).collect();
+        if kept.len() == lines.len() {
+            continue;
+        }
+        let mut narrowed: Vec<(&'e str, OsString)> = env.iter().filter(|(k, _)| *k != "MAKEPAD_RUN_OVERLAY").cloned().collect();
+        if !kept.is_empty() {
+            let path = list.with_file_name(format!("overlay.{package}.tsv"));
+            if std::fs::write(&path, kept.iter().map(|l| format!("{l}\n")).collect::<String>()).is_ok() {
+                narrowed.push(("MAKEPAD_RUN_OVERLAY", path.into()));
+            }
+        }
+        out.insert(package.clone(), narrowed);
+    }
+    out
 }
 
 /// Every test target of the workspace, as `relax test` selects it: a lib,
@@ -321,11 +407,14 @@ fn relax_test(package: &str, target: &[String], filters: &[&str], env: &[(&str, 
 
 /// Runs a route under relax with `env` added. The suite's verdict is the
 /// cargo-test gate's rule over every target's output, its report appended.
+/// Each suite target gets the overlay list narrowed to the files its member
+/// reads (`member_overlays`).
 fn run(m: &Manifest, r: &Route, renderer: &Path, env: &[(&str, OsString)], jobs: usize) -> (bool, String) {
     match r {
         Route::Test(t) => relax_test(&t.package, &t.target, &[&t.name], env),
         Route::Suite => {
             let targets = workspace_test_targets();
+            let per_member = member_overlays(&targets, env);
             let outs: Mutex<Vec<(bool, String)>> = Mutex::new(Vec::new());
             let mut tasks: Vec<&(String, Vec<String>)> = targets.iter().collect();
             tasks.reverse();
@@ -334,8 +423,19 @@ fn run(m: &Manifest, r: &Route, renderer: &Path, env: &[(&str, OsString)], jobs:
                 for _ in 0..jobs.clamp(1, targets.len().max(1)) {
                     s.spawn(|| loop {
                         let Some((package, target)) = tasks.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
-                        let run = relax_test(package, target, &[], env);
-                        outs.lock().unwrap_or_else(|e| e.into_inner()).push(run);
+                        let env = per_member.get(package).map_or(env, Vec::as_slice);
+                        let (ok, out) = relax_test(package, target, &[], env);
+                        // A target that fails without a libtest FAILED line
+                        // (relax refused it, or it died before reporting)
+                        // would leave the judge's bare `FAIL  cargo test`
+                        // unexplained: name it, with its last line.
+                        let out = if ok || out.contains("FAILED") {
+                            out
+                        } else {
+                            let last = out.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("(no output)").trim();
+                            format!("{out}\n      FAILED  relax test {package} {}: {last}", target.join(" "))
+                        };
+                        outs.lock().unwrap_or_else(|e| e.into_inner()).push((ok, out));
                     });
                 }
             });
@@ -556,10 +656,16 @@ fn verdict(mu: &Mutation, r: &Route, ok: bool, out: &str) -> (bool, String) {
             .rfind(|l| l.starts_with("test result") || l.starts_with("FAIL"))
             .unwrap_or("(no output)");
         (false, format!(
-            "FAIL  {} — went red, but for an unstated reason.\n      expected text containing: {:?}\n      got: {}\n",
+            "FAIL  {} — went red, but for an unstated reason.\n      expected text containing: {:?}\n      got: {}\n{}",
             mu.name,
             mu.expect,
-            got.trim()
+            got.trim(),
+            // What failed, so a wrong reason can be read without a rerun.
+            out.lines()
+                .filter(|l| l.contains("FAILED") || l.trim_start().starts_with("panicked"))
+                .take(6)
+                .map(|l| format!("      {}\n", l.trim()))
+                .collect::<String>()
         ))
     } else {
         (true, format!("PASS  {r} reddens under relax on {} — {:?}\n", mu.name, mu.expect))
@@ -979,6 +1085,27 @@ mod tests {
     use crate::load;
 
     /// The route follows the gate's declaration and the test `expect` names.
+    /// A mutant's file is overlaid for the members that read it alone: a
+    /// renderer file for the renderer, a contract-crate file for it and
+    /// every member built on it.
+    #[test]
+    fn a_file_is_read_by_its_member_and_the_members_built_on_it() {
+        let names = |f: &str| packages_reading(&root().join(f)).into_iter().collect::<Vec<_>>();
+        assert_eq!(names("native/src/glyph_trie.rs"), ["glyph3d-native"]);
+        assert_eq!(names("crates/glyph-field/src/host_slots.rs"), ["glyph-field", "glyph-field-derived", "glyph3d-native"]);
+        assert_eq!(names("glyph/src/gates.rs"), ["glyph"]);
+    }
+
+    /// The suite route runs the workspace's members and nothing else: the
+    /// makepad host beside them is `exclude`d, and running it under relax
+    /// failed the clean tree every time (2026-10-31).
+    #[test]
+    fn workspace_packages_are_the_members_alone() {
+        let mut names: Vec<String> = workspace_packages().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(names, ["glyph", "glyph-field", "glyph-field-derived", "glyph-scene-graph", "glyph3d-native"]);
+    }
+
     #[test]
     fn routes_follow_the_declaration_and_the_test_expect_names() {
         let m = load().expect("build.toml loads");
