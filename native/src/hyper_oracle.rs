@@ -916,20 +916,22 @@ mod tests {
     }
 
     /// The Derived field's vertex stage, the one lane the oracle cannot see
-    /// (a `DerivedSlot` carries no Y or Z), held to the Instanced emitter:
-    /// `glyph_field_derived::derive_yz` — the shader's `derive_yz`
-    /// transcribed — over every device-emitted Derived slot of the
-    /// pagination grid must land on the `RenderSlot`'s own y and z, within
-    /// the ulps the shader's f32 fma chain is allowed against the emitter's
-    /// f64 arithmetic. Before 2026-10-10 every column-paged shape failed
+    /// (a `DerivedSlot` carries no Y or Z), held to the oracle-backed
+    /// reference's instances: `glyph_field_derived::derive_yz` — the
+    /// shader's `derive_yz` transcribed — over every device-emitted Derived
+    /// slot of the pagination grid must land on the reference instance's
+    /// own y and z, within the ulps the shader's f32 fma chain is allowed
+    /// against the fold's f64 arithmetic. (Held to the Instanced emitter's
+    /// RenderSlots until 2026-10-31, which the device tier holds bit-exact
+    /// to these instances.) Before 2026-10-10 every column-paged shape failed
     /// here: the slot had no column page and z dropped
     /// `x_page × depth_per_col` (0.75 per page in this grid, thousands of
     /// ulps). The shader and its transcription are kept in step by hand;
     /// `derive::tests::wgsl_derive_yz_carries_the_column_page_term` pins
     /// the term in the shader's text.
     #[test]
-    fn derived_vertex_stage_agrees_with_instanced() {
-        use crate::layout_hyper::{device_pass2_derived_on_host, device_pass2_render_on_host};
+    fn derived_vertex_stage_agrees_with_the_reference() {
+        use crate::layout_hyper::device_pass2_derived_on_host;
         let trie = crate::default_trie();
         let texts: [&str; 3] = [
             "abcdefgh\n\nabcdefghijklmnop\nxy\n\u{E9}t\u{E9} caf\u{E9} \u{4E16}\u{754C}\nabcdefghijkl\n\n12345678901234567890123",
@@ -983,12 +985,17 @@ mod tests {
                         paint: Paint::Flat(DEFAULT_COLOR_PACKED),
                     })
                     .collect();
-                let (render, _) = device_pass2_render_on_host(&items, &trie);
+                let mut arena = GlyphArena::new();
+                for (i, it) in items.iter().enumerate() {
+                    let r = reference_item(it.bytes, &it.params, &trie);
+                    compact_records_into(&r.records, Paint::Flat(DEFAULT_COLOR_PACKED), i as u32, &mut arena);
+                }
+                let reference = arena.instances();
                 let (derived, _) = device_pass2_derived_on_host(&items, &trie);
-                assert_eq!(render.len(), derived.len());
+                assert_eq!(reference.len(), derived.len());
                 let gpu = glyph_field::ItemParamsGpu::from(&params);
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
-                for (k, (r, d)) in render.iter().zip(derived.iter()).enumerate() {
+                for (k, (r, d)) in reference.iter().zip(derived.iter()).enumerate() {
                     let [y, z] = glyph_field_derived::derive_yz(d.row, d.wrap_segment() as u32, &gpu);
                     for (name, got, want) in [("y", y, r.pos[1]), ("z", z, r.pos[2])] {
                         // The shader's f32 fma chain against the emitter's f64:
@@ -997,7 +1004,7 @@ mod tests {
                         let err = (got - want).abs();
                         assert!(
                             got.is_finite() && err <= 1e-4,
-                            "{at}: slot {k} {name}: shader {got} vs emitter {want} (err {err}; row lane {:#x})",
+                            "{at}: slot {k} {name}: shader {got} vs reference {want} (err {err}; row lane {:#x})",
                             d.row
                         );
                         max_err = max_err.max(err);
