@@ -38,11 +38,11 @@ tool; re-baselining is a human act (root `AGENTS.md` § pixel-ab).
   independent Python fold oracle (`alpha.rs`, `wide.txt`, `sub/deep.py`,
   `long.md`, `text.rs`, `emoji-view.txt`).
 - `hyper-oracle`: HyperLayout, the production engine, held to the
-  oracle-backed fold bit-for-bit (records, host and device Pass 2 in both
-  slot formats) over the
+  oracle-backed fold bit-for-bit (records, host and device Pass 2) over the
   fixture corpus, `g-pick-repo`, `g-cluster-repo` and the chunk-cut fixtures.
 - `pixel-ab`: the golden views byte-compared per rasterizer key, plain and
-  under each `golden_equivalents` entry (`--field-mode instanced`).
+  under each `golden_equivalents` entry (none since the Instanced field's
+  retirement, 2026-10-31).
 
 ## 3. Performance
 

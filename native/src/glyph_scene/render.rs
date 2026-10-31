@@ -1,35 +1,68 @@
-//! The wgpu half of a frame (2026-10-26): `render_scene` prepares the
-//! frame on the CPU (`frame.rs`, `GlyphScene::prepare_frame`) and
-//! `encode_frame` uploads and draws it — the group rows, faces and regions
-//! it changed, the uniforms, the backdrops, the self-culling field's
-//! compute, then the passes: environment, backdrops, faces and regions,
-//! scene meshes, glyphs; the selection mask and tint; the composite.
+//! The wgpu half of a frame (2026-10-26; a renderer of its own since
+//! 2026-10-31): `GlyphRenderer::render` asks the scene for the frame on the
+//! CPU (`SceneLike::prepare_frame`, `frame.rs`) and `encode_frame` uploads
+//! and draws it — the group rows, faces and regions it changed, the
+//! field's blocks, the uniforms, the backdrops, then the passes:
+//! environment, backdrops, faces and regions, scene meshes, glyphs; the
+//! selection mask and tint; the composite. It reads nothing of the scene
+//! but the frame, as a host renderer (the makepad port) reads nothing else.
 
 use crate::gpu::GpuContext;
 use crate::glyph_scene::cull::Phase;
 use crate::glyph_scene::frame::FrameData;
-use crate::glyph_scene::target::POOL_FORMAT;
-use crate::glyph_scene::GlyphScene;
+use crate::glyph_scene::target::{ViewTarget, POOL_FORMAT};
+use crate::glyph_scene::mesh::MeshInstance;
+use crate::glyph_scene::{GlyphRenderer, GroupRow};
+use crate::scene::{SceneLike, SceneRenderer};
 
-pub(super) fn render_scene(
-    scene: &GlyphScene,
-    ctx: &GpuContext,
-    encoder: &mut wgpu::CommandEncoder,
-    target: &crate::scene::FrameTarget<'_>,
-    t: f32,
-) {
-    let frame = scene.prepare_frame((target.width, target.height), t);
-    encode_frame(scene, ctx, encoder, target, &frame);
+impl SceneRenderer for GlyphRenderer {
+    fn depth_format(&self) -> wgpu::TextureFormat {
+        super::renderer::DEPTH_FORMAT
+    }
+
+    fn render(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &crate::scene::FrameTarget<'_>,
+        scene: &dyn SceneLike,
+        t: f32,
+    ) {
+        let frame = scene.prepare_frame((target.width, target.height), t).expect("a glyph scene prepares every frame");
+        self.encode_frame(ctx, encoder, target, &frame);
+    }
+
+    fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
+        self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
+    }
 }
 
-/// Upload and draw a prepared frame into `target`.
-pub(super) fn encode_frame(
-    scene: &GlyphScene,
-    ctx: &GpuContext,
-    encoder: &mut wgpu::CommandEncoder,
-    target: &crate::scene::FrameTarget<'_>,
-    frame: &FrameData<'_>,
-) {
+impl GlyphRenderer {
+    /// Stage L (L3): (re)size the pooled view target to the frame's size
+    /// (the first frame, and every resize).
+    fn fit_target(&mut self, w: u32, h: u32) {
+        let comp = &mut self.composite;
+        let stale = comp.target.as_ref().is_none_or(|t| t.width != w || t.height != h);
+        if stale && w > 0 && h > 0 {
+            comp.target = Some(ViewTarget::new(
+                &self.device,
+                w,
+                h,
+                &comp.bind_group_layout,
+                &comp.sampler,
+                comp.selection_fx.as_ref(), // Stage L (L4): mask + tint bind groups
+            ));
+        }
+    }
+
+    /// Upload and draw a prepared frame into `target`.
+    pub(super) fn encode_frame(
+        &mut self,
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &crate::scene::FrameTarget<'_>,
+        frame: &FrameData<'_>,
+    ) {
     let crate::scene::FrameTarget {
         color_view,
         color_texture,
@@ -40,20 +73,25 @@ pub(super) fn encode_frame(
         width,
         height,
     } = *target;
+    self.fit_target(width, height);
+    let scene = &*self;
     // The tables first: the group rows the resolve changed go up before any
     // pass reads a row (the glyph pass);
     // the page faces and regions with them. Nothing moved, nothing written.
-    scene.nodes.upload(&ctx.queue, &frame.group_runs);
-    if let Some(faces) = &scene.library_faces {
-        faces.upload(&ctx.queue, &frame.face_runs);
+    super::nodes::write_runs(&ctx.queue, &scene.group_buf, bytemuck::cast_slice(&frame.group_rows), std::mem::size_of::<GroupRow>(), &frame.group_runs);
+    if let (Some(faces), Some(buf)) = (&frame.faces, &scene.face_instances) {
+        super::nodes::write_runs(&ctx.queue, buf, bytemuck::cast_slice(faces), std::mem::size_of::<MeshInstance>(), &frame.face_runs);
     }
-    if let Some(regions) = &scene.library_regions {
-        regions.upload(&ctx.queue, &frame.region_runs);
+    if let (Some(regions), Some(gpu)) = (&frame.regions, &scene.regions) {
+        gpu.upload(&ctx.queue, regions, frame.picked_region, &frame.region_runs);
     }
+    // The field's device copy up to its host blocks and overrides (the
+    // blocks an edit touched since the last frame; nothing when none).
+    scene.field.sync(&ctx.queue, &frame.slots, &frame.group_overrides, frame.group_overrides_version);
     if ctx.profiler.is_some() {
         let c = &frame.costs;
         if !frame.group_runs.is_empty() {
-            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", scene.nodes.last_flush().0.ms);
+            crate::gpu::record_cpu_scope(ctx, "group nodes flush (CPU)", c.rows.ms);
         }
         if c.faces.rows > 0 {
             crate::gpu::record_cpu_scope(ctx, "library faces (CPU)", c.faces.ms);
@@ -61,8 +99,12 @@ pub(super) fn encode_frame(
         if c.regions.composed > 0 {
             crate::gpu::record_cpu_scope(ctx, "library regions (CPU)", c.regions.ms);
         }
-        if scene.cull.is_some() {
+        if scene.backdrops.is_some() {
             crate::gpu::record_cpu_scope(ctx, "cull (CPU)", f64::from(c.cull_ms));
+        }
+        if c.library != (0.0, 0.0) {
+            crate::gpu::record_cpu_scope(ctx, "library ease (CPU)", c.library.0);
+            crate::gpu::record_cpu_scope(ctx, "library move notes (CPU)", c.library.1);
         }
     }
     // GLYPH_LIBRARY_TIMING: one line per frame the regions did anything (a
@@ -98,17 +140,17 @@ pub(super) fn encode_frame(
         scene.environment.write(&ctx.queue, env);
     }
     // The CPU cull's backdrop survivors, up to the buffer's capacity.
-    if let Some(cull) = &scene.cull {
+    if let Some(bd) = &scene.backdrops {
         if !frame.backdrops.is_empty() {
-            let max_cap = (cull.backdrop_insts_buf.size() / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64) as usize;
+            let max_cap = (bd.insts_buf.size() / std::mem::size_of::<crate::glyph_scene::cull::BackdropInst>() as u64) as usize;
             let n = frame.backdrops.len().min(max_cap);
-            ctx.queue.write_buffer(&cull.backdrop_insts_buf, 0, bytemuck::cast_slice(&frame.backdrops[..n]));
+            ctx.queue.write_buffer(&bd.insts_buf, 0, bytemuck::cast_slice(&frame.backdrops[..n]));
         }
     }
 
-    let scene_meshes = scene.controller.as_ref().map(|ctrl| ctrl.scene.mesh_draws());
-    if let Some(meshes) = scene_meshes {
-        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, meshes);
+    let has_meshes = !frame.quads.is_empty() || !frame.cubes.is_empty();
+    if has_meshes {
+        scene.mesh_pipeline.borrow_mut().prepare(&ctx.device, &ctx.queue, frame.meshes_generation, frame.quads, frame.cubes);
     }
     let glyph_ranges = frame.glyph_ranges.pairs();
 
@@ -172,14 +214,14 @@ pub(super) fn encode_frame(
                 // machinery, see the module header). The pipeline lives
                 // in CullState; the legacy branch never reaches in here
                 // (its backdrops list is empty).
-                if let Some(cull) = &scene.cull {
+                if let Some(bd) = &scene.backdrops {
                     if !frame.backdrops.is_empty() {
                         let q = ctx
                             .profiler
                             .as_ref()
                             .map(|p| p.borrow().begin_query("backdrop stream", &mut pass));
-                        pass.set_pipeline(&cull.backdrop_pipeline);
-                        pass.set_bind_group(0, &cull.backdrop_bind_group, &[]);
+                        pass.set_pipeline(&bd.pipeline);
+                        pass.set_bind_group(0, &bd.bind_group, &[]);
                         pass.draw(0..6, 0..frame.backdrops.len() as u32);
                         if let (Some(p), Some(q)) = (&ctx.profiler, q) {
                             p.borrow().end_query(&mut pass, q);
@@ -190,17 +232,17 @@ pub(super) fn encode_frame(
                 // The library's faces take the scene meshes' place (a
                 // library load has no other scene mesh): same pipeline,
                 // same position in the phase.
-                if let Some(faces) = &scene.library_faces {
-                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.count(), &scene.mesh_frame_bg, &faces.instances);
+                if let (Some(faces), Some(buf)) = (&frame.faces, &scene.face_instances) {
+                    mp_ref.render_from(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..faces.len() as u32, &scene.mesh_frame_bg, buf);
                 }
                 // The regions after the faces (a page hides the walls
                 // behind it), before the glyphs (which read over them).
-                if let Some(regions) = &scene.library_regions {
+                if let Some(regions) = &scene.regions {
                     regions.draw(&mut pass);
                 }
-                if let Some(meshes) = &scene_meshes {
-                    let q_len = meshes.quads.len() as u32;
-                    let c_len = meshes.cubes.len() as u32;
+                if has_meshes {
+                    let q_len = frame.quads.len() as u32;
+                    let c_len = frame.cubes.len() as u32;
                     if q_len > 0 {
                         mp_ref.render(&mut pass, crate::glyph_scene::mesh::UnitMesh::Quad, 0..q_len, &scene.mesh_frame_bg);
                     }
@@ -375,4 +417,5 @@ pub(super) fn encode_frame(
             p.borrow().end_query(encoder, q);
         }
     }
+}
 }

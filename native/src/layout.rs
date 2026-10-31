@@ -355,6 +355,7 @@ pub enum Paint<'a> {
 
 /// One item to lay out: the bytes, how to lay them out, how to paint them, and
 /// which group row the resulting instances answer to.
+#[derive(Clone, Copy)]
 pub struct LayoutItem<'a> {
     pub bytes: &'a [u8],
     pub params: ItemParams,
@@ -450,8 +451,7 @@ impl ItemPlacement {
 ///
 /// Two forms: a host `Vec<GlyphInstance>` (the engine's neutral 48 B
 /// records), and the EMITTED form, slots already in the field's own format
-/// ([`EmittedSlots`]: Derived blocks on the host, Instanced slots on the
-/// device).
+/// ([`EmittedSlots`]: Derived blocks on the host).
 #[derive(Default)]
 pub struct GlyphArena {
     instances: Vec<GlyphInstance>,
@@ -474,8 +474,11 @@ pub struct FileTintAccum {
 /// by `chunk_slots`, and computed each item's tint inputs and sub-file
 /// blocks on the way (so nothing reads the slots back for them).
 pub struct EmittedSlots {
-    /// Where the slots are.
-    pub residence: SlotResidence,
+    /// The slots, on the host in blocks that are the chunks: the Derived
+    /// field's form since 2026-10-26, the one host copy a makepad renderer
+    /// publishes and the wgpu field uploads from. (Instanced slots were
+    /// emitted to the device directly until 2026-10-31.)
+    pub slots: glyph_field::HostSlots,
     /// Slots per chunk (uniform; the last chunk may hold fewer).
     pub chunk_slots: usize,
     pub len: usize,
@@ -483,49 +486,11 @@ pub struct EmittedSlots {
     pub file_tints: Vec<FileTintAccum>,
     /// Precomputed in-flight local block bounds per item, avoiding 3 GB mapped memory readback in build_file_blocks.
     pub file_blocks: Vec<Vec<crate::glyph_scene::BlockCull>>,
-    /// Which field's slot format the chunks hold. A field binds only its own
-    /// format; setup refuses a mismatch rather than drawing garbage.
-    pub format: glyph_field::GlyphFieldMode,
     /// Per item: `(glyph_id, color)` pairs captured at emission for items
     /// whose fast tint is not final (`has_emoji`), empty otherwise — so the
-    /// tint fold never reads device slots back. Empty when not produced.
+    /// tint fold never reads the slots back. Empty when not produced.
     pub emoji_tint_pairs: Vec<Vec<u32>>,
 }
-
-/// Where emitted slots live.
-pub enum SlotResidence {
-    /// On the host, in blocks that are the chunks: the Derived field's form
-    /// since 2026-10-26, the one host copy a makepad renderer publishes and
-    /// the wgpu field uploads from.
-    Host(glyph_field::HostSlots),
-    /// On the device, written there directly (mapped unified memory, or
-    /// staged windows): the Instanced field's form. It stays device-direct
-    /// only because Instanced is being retired (step 3 deletes it); it is
-    /// not a second Derived path (2026-10-26).
-    Device {
-        /// One entry per chunk buffer. `offset` is slot 0's byte address in
-        /// the buffer.
-        chunks: Vec<DeviceSlotChunk>,
-        /// When the chunks are one host-visible mapping (unified memory),
-        /// the base address of its `RenderSlot` slice.
-        mapped_slots: Option<usize>,
-    },
-}
-
-impl EmittedSlots {
-    /// The `RenderSlot` mapping, when the slots are one (Instanced on
-    /// unified memory).
-    pub fn mapped_slots(&self) -> Option<usize> {
-        match &self.residence {
-            SlotResidence::Device { mapped_slots, .. } => *mapped_slots,
-            SlotResidence::Host(_) => None,
-        }
-    }
-}
-
-/// One chunk of device slots — the field contract's [`glyph_field::SlotChunk`]
-/// (buffer, slot-0 byte offset, live slots), named for its producer role here.
-pub use glyph_field::SlotChunk as DeviceSlotChunk;
 
 impl GlyphArena {
     pub fn new() -> Self {
@@ -548,8 +513,8 @@ impl GlyphArena {
         self.emitted.is_some()
     }
 
-    /// The emitted slots, for the field to bind (Instanced) or keep and
-    /// upload (Derived). None on the host form.
+    /// The emitted slots, for the field to keep and upload. None on the
+    /// host form.
     pub fn emitted_slots(&self) -> Option<&EmittedSlots> {
         self.emitted.as_ref()
     }
@@ -604,36 +569,18 @@ impl GlyphArena {
         self.instances
     }
 
-    /// Update slot colors in-place for host or direct-mapped device slots.
-    /// Returns the number of slots updated.
+    /// Update the host form's slot colors in place; an emitted arena's
+    /// slots are the field's to write (none updated here). Returns the
+    /// number of slots updated.
     pub fn update_slot_colors(&mut self, slot_base: usize, colors: &[u32]) -> usize {
-        if colors.is_empty() {
+        if colors.is_empty() || self.emitted.is_some() {
             return 0;
         }
-        if let Some(d) = &self.emitted {
-            if let Some(addr) = d.mapped_slots() {
-                let count = colors.len().min(d.len.saturating_sub(slot_base));
-                let ptr = addr as *mut crate::glyph_scene::RenderSlot;
-                // SAFETY: `mapped_slots` is set only for RenderSlot arenas, never
-                // Derived (its doc; layout_hyper builds it so), and maps `d.len` slots
-                // the arena's buffers keep alive; `count` clamps every write below
-                // `d.len`.
-                unsafe {
-                    for (i, &c) in colors.iter().take(count).enumerate() {
-                        (*ptr.add(slot_base + i)).color = c;
-                    }
-                }
-                count
-            } else {
-                0
-            }
-        } else {
-            let count = colors.len().min(self.instances.len().saturating_sub(slot_base));
-            for (i, &c) in colors.iter().take(count).enumerate() {
-                self.instances[slot_base + i].color = c;
-            }
-            count
+        let count = colors.len().min(self.instances.len().saturating_sub(slot_base));
+        for (i, &c) in colors.iter().take(count).enumerate() {
+            self.instances[slot_base + i].color = c;
         }
+        count
     }
 
     /// Hint the upper bound on slots still to come (records, before blanks are
@@ -777,15 +724,11 @@ impl LayoutEngine {
         Self::Hyper(crate::layout_hyper::HyperLayout::new())
     }
 
-    /// Constructs a HyperLayout engine sharing a GPU context device. The
-    /// device path emits `field_mode`'s own slot format directly (32 B
-    /// `RenderSlot` for Instanced, 20 B `DerivedSlot` + line table for
-    /// Derived) — the renderer then binds it with no transcode.
-    pub fn hyper_with_device(
-        device: crate::gpu::SharedDevice,
-        field_mode: glyph_field::GlyphFieldMode,
-    ) -> Self {
-        Self::Hyper(crate::layout_hyper::HyperLayout::with_device(device, field_mode))
+    /// A HyperLayout engine laying out for a field: it emits `field_mode`'s
+    /// own slot format directly (20 B `DerivedSlot`s in host blocks), which
+    /// the field then keeps with no transcode, checked against `home`.
+    pub fn hyper_for_field(home: crate::budget::SlotHome, field_mode: glyph_field::GlyphFieldMode) -> Self {
+        Self::Hyper(crate::layout_hyper::HyperLayout::for_field(home, field_mode))
     }
 
     /// Sets prefetched inputs from the background prefetch thread for HyperLayout.

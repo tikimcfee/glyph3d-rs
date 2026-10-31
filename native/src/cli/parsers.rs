@@ -62,6 +62,7 @@ pub fn parse_rgba(s: &str) -> Result<[f32; 4], String> {
     Ok(out)
 }
 
+#[cfg(feature = "wgpu")]
 /// Parse windowed present mode string.
 pub fn parse_present_mode(s: &str) -> wgpu::PresentMode {
     let mode: super::args::PresentMode = s

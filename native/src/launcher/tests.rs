@@ -85,13 +85,18 @@ fn focus_skips_controls_the_target_does_not_use() {
 #[test]
 fn choices_cycle_both_ways_and_dials_clamp() {
     let mut l = Launcher::defaults();
+    // Field mode has one choice since the Instanced field's retirement
+    // (2026-10-31): a step stays on it. Present mode cycles three.
     l.focus = Control::FieldMode;
     l.step(1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "from the default, derived, it wraps");
+    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Derived), "one choice: a step stays on it");
+    l.focus = Control::PresentMode;
     l.step(-1);
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Derived));
+    assert_eq!(l.cfg.present_mode, Some(PresentMode::Immediate), "from the default, fifo, it wraps back");
+    l.step(1);
+    assert_eq!(l.cfg.present_mode, Some(PresentMode::Fifo));
     l.toggle();
-    assert_eq!(l.cfg.field_mode, Some(GlyphFieldMode::Instanced), "space steps a choice forward");
+    assert_eq!(l.cfg.present_mode, Some(PresentMode::Mailbox), "space steps a choice forward");
 
     l.focus = Control::ZWrapSpacing;
     l.step(1);
@@ -204,13 +209,13 @@ fn a_launch_saves_changes_and_remembers_the_repo() {
 
     l.target = Target::Repo;
     l.repo_path = "~/src/linux".into();
-    l.cfg.field_mode = Some(GlyphFieldMode::Instanced);
+    l.cfg.present_mode = Some(PresentMode::Mailbox);
     l.remember_repo();
     assert!(l.save().unwrap());
     let text = std::fs::read_to_string(&path).unwrap();
     let back = LaunchConfig::from_toml_str(&text).unwrap();
     assert!(text.starts_with("# mine\nwrap_mode = \"back\"\n"), "{text}");
-    assert_eq!(back.field_mode, Some(GlyphFieldMode::Instanced));
+    assert_eq!(back.present_mode, Some(PresentMode::Mailbox));
     assert_eq!(back.load_repo, Some(PathBuf::from("~/src/linux")), "saved as typed, not absolute");
     assert_eq!(back.agent_session, None, "the scene is the one launched");
     assert_eq!(
@@ -264,7 +269,7 @@ fn the_written_file_builds_the_plan_the_flags_build() {
     l.target = Target::Repo;
     l.repo_path = "/repo".into();
     l.cfg.focus_file = Some("alpha".into());
-    l.cfg.field_mode = Some(GlyphFieldMode::Instanced);
+    l.cfg.field_mode = Some(GlyphFieldMode::Derived);
     l.cfg.wrap_mode = Some(WrapMode::Down);
     l.cfg.layout_mode = Some(RepoLayoutMode::Carrel);
     l.cfg.repo_engine = Some(Strategy::Direct);
@@ -285,7 +290,7 @@ fn the_written_file_builds_the_plan_the_flags_build() {
         "glyph3d-native",
         "--load-repo", "/repo",
         "--focus-file", "alpha",
-        "--field-mode", "instanced",
+        "--field-mode", "derived",
         "--wrap-mode", "down",
         "--layout-mode", "carrel",
         "--repo-engine", "direct",

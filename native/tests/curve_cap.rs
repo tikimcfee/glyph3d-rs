@@ -10,7 +10,8 @@
 //!
 //! It reads the shaders as the renderer embeds them (each field crate's
 //! `include_str!` constant), so what it checks is what ships; and it reads
-//! the atlas; it modifies neither.
+//! the atlas; it modifies neither. (One field crate remains since the
+//! Instanced field's retirement, 2026-10-31.)
 
 use std::path::{Path, PathBuf};
 
@@ -19,9 +20,8 @@ fn repo() -> PathBuf {
 }
 
 /// The glyph field shaders that run the curve loop, by the file each embeds.
-const SHADERS: [(&str, &str); 2] = [
+const SHADERS: [(&str, &str); 1] = [
     ("crates/glyph-field-derived/shaders/glyph_field_derived.wgsl", glyph_field_derived::GLYPH_FIELD_DERIVED_WGSL),
-    ("crates/glyph-field-instanced/shaders/glyph_field.wgsl", glyph_field_instanced::GLYPH_FIELD_WGSL),
 ];
 
 fn max_curves(path: &str, src: &str) -> u32 {

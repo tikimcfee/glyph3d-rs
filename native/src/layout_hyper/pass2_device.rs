@@ -1,18 +1,19 @@
-//! Pass 2 parallel layout worker for device-mapped / VRAM slot buffers.
+//! Pass 2 parallel layout worker: emits the field's slots straight into
+//! writable memory (the host blocks, `emit::emit_host_blocks`).
 //!
-//! One walk, two slot formats. The per-glyph math (fold, wrap, pagination,
-//! extents, tint, cull blocks) is written once; what a survivor becomes in
-//! memory is the [`SlotEmit`] parameter, monomorphized per format so neither
-//! format pays a branch for the other:
+//! The per-glyph math (fold, wrap, pagination, extents, tint, cull blocks)
+//! is written once; what a survivor becomes in memory is the [`SlotEmit`]
+//! parameter, monomorphized per format. One format remains since the
+//! Instanced field's 32 B `RenderSlot` (`RenderEmit`) was retired on
+//! 2026-10-31:
 //!
-//! - [`RenderEmit`] — the Instanced field's 32 B `RenderSlot`.
 //! - [`DerivedEmit`] — the Derived field's 20 B `DerivedSlot`, whose Y/Z the
 //!   vertex stage re-derives from the slot's row, its item's `ItemParamsGpu`
 //!   and its wrap segment.
 
 use rayon::prelude::*;
 use crate::fold::{rows_for_line, wrap_row_of, wrap_segment_of};
-use crate::glyph_scene::{BlockCull, RenderSlot, SUBSEG_BLOCK_SIZE};
+use crate::glyph_scene::{BlockCull, SUBSEG_BLOCK_SIZE};
 use crate::layout::{FileTintAccum, InkExtent, ItemPlacement, PageExtent, Paint};
 use glyph_field_derived::DerivedSlot;
 use super::char_resolve::{resolve_byte_char, ResolveCtx};
@@ -21,21 +22,17 @@ use super::tab_stop::TabStops;
 use super::types::Pass2DeviceOutput;
 
 /// What every glyph of one row run shares, computed once per run and handed
-/// to the run emitters (`emit_fast`, `emit_burst8/4`) by value: `Copy`, seven
-/// scalars, which the inlined emitters break back into registers. Each slot
-/// format reads its own subset (Instanced the world Y/Z, Derived the row and
-/// wrap word). Named in C3 (2026-10-09), where the seven travelled as loose
-/// arguments to every emitter.
+/// to the run emitters (`emit_fast`, `emit_burst8/4`) by value: `Copy`,
+/// three words, which the inlined emitters break back into registers. Named
+/// in C3 (2026-10-09), where its fields travelled as loose arguments to
+/// every emitter; the world Y/Z, group and ASCII advance only the Instanced
+/// emitter read left with it (2026-10-31).
 #[derive(Clone, Copy)]
 pub(crate) struct RowFrame {
-    pub py: f32,
-    pub pz: f32,
     pub row: u32,
     /// The wrap segment, pre-shifted into the high half of Derived's glyph word.
     pub wrap_high: u32,
     pub item_and_group: u32,
-    pub group_id: u32,
-    pub ascii_adv: f32,
 }
 
 /// A device slot format Pass 2 can emit directly.
@@ -90,92 +87,6 @@ pub(crate) trait SlotEmit: Sync {
     fn tint_pair(s: &Self::Slot) -> [u32; 2];
 }
 
-pub(crate) struct RenderEmit;
-
-impl SlotEmit for RenderEmit {
-    type Slot = RenderSlot;
-    const USES_LINES: bool = false;
-    #[inline(always)]
-    fn emit(
-        pos_x: f32,
-        pos_y: f32,
-        pos_z: f32,
-        glyph_id: u32,
-        color: u32,
-        group_id: u32,
-        _item_idx: u32,
-        advance: f32,
-        height: f32,
-        _row: i64,
-        _wrap_segment: i64,
-        _x_page: i64,
-    ) -> RenderSlot {
-        RenderSlot {
-            pos: [pos_x, pos_y, pos_z],
-            glyph_id,
-            color,
-            group_id,
-            advance,
-            height,
-        }
-    }
-    #[inline(always)]
-    fn emit_fast(
-        pos_x: f32,
-        glyph_id: u32,
-        color: u32,
-        frame: RowFrame,
-    ) -> RenderSlot {
-        let RowFrame { py: row_py, pz: row_pz, group_id, ascii_adv, .. } = frame;
-        RenderSlot {
-            pos: [pos_x, row_py, row_pz],
-            glyph_id,
-            color,
-            group_id,
-            advance: ascii_adv,
-            height: crate::text::CELL_HEIGHT_WORLD,
-        }
-    }
-    #[inline(always)]
-    unsafe fn emit_burst8(
-        dest: *mut RenderSlot,
-        pos_xs: [f32; 8],
-        glyph_ids: [u32; 8],
-        colors: [u32; 8],
-        frame: RowFrame,
-    ) {
-        let RowFrame { py: row_py, pz: row_pz, group_id, ascii_adv, .. } = frame;
-        let cell_h = crate::text::CELL_HEIGHT_WORLD;
-        dest.write(RenderSlot { pos: [pos_xs[0], row_py, row_pz], glyph_id: glyph_ids[0], color: colors[0], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(1).write(RenderSlot { pos: [pos_xs[1], row_py, row_pz], glyph_id: glyph_ids[1], color: colors[1], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(2).write(RenderSlot { pos: [pos_xs[2], row_py, row_pz], glyph_id: glyph_ids[2], color: colors[2], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(3).write(RenderSlot { pos: [pos_xs[3], row_py, row_pz], glyph_id: glyph_ids[3], color: colors[3], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(4).write(RenderSlot { pos: [pos_xs[4], row_py, row_pz], glyph_id: glyph_ids[4], color: colors[4], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(5).write(RenderSlot { pos: [pos_xs[5], row_py, row_pz], glyph_id: glyph_ids[5], color: colors[5], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(6).write(RenderSlot { pos: [pos_xs[6], row_py, row_pz], glyph_id: glyph_ids[6], color: colors[6], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(7).write(RenderSlot { pos: [pos_xs[7], row_py, row_pz], glyph_id: glyph_ids[7], color: colors[7], group_id, advance: ascii_adv, height: cell_h });
-    }
-    #[inline(always)]
-    unsafe fn emit_burst4(
-        dest: *mut RenderSlot,
-        pos_xs: [f32; 4],
-        glyph_ids: [u32; 4],
-        colors: [u32; 4],
-        frame: RowFrame,
-    ) {
-        let RowFrame { py: row_py, pz: row_pz, group_id, ascii_adv, .. } = frame;
-        let cell_h = crate::text::CELL_HEIGHT_WORLD;
-        dest.write(RenderSlot { pos: [pos_xs[0], row_py, row_pz], glyph_id: glyph_ids[0], color: colors[0], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(1).write(RenderSlot { pos: [pos_xs[1], row_py, row_pz], glyph_id: glyph_ids[1], color: colors[1], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(2).write(RenderSlot { pos: [pos_xs[2], row_py, row_pz], glyph_id: glyph_ids[2], color: colors[2], group_id, advance: ascii_adv, height: cell_h });
-        dest.add(3).write(RenderSlot { pos: [pos_xs[3], row_py, row_pz], glyph_id: glyph_ids[3], color: colors[3], group_id, advance: ascii_adv, height: cell_h });
-    }
-    #[inline(always)]
-    fn tint_pair(s: &RenderSlot) -> [u32; 2] {
-        [s.glyph_id, s.color]
-    }
-}
-
 pub(crate) struct DerivedEmit;
 
 impl SlotEmit for DerivedEmit {
@@ -213,7 +124,7 @@ impl SlotEmit for DerivedEmit {
         color: u32,
         frame: RowFrame,
     ) -> DerivedSlot {
-        let RowFrame { row: row_u32, wrap_high, item_and_group, .. } = frame;
+        let RowFrame { row: row_u32, wrap_high, item_and_group } = frame;
         DerivedSlot {
             x: pos_x,
             row: row_u32,
@@ -230,7 +141,7 @@ impl SlotEmit for DerivedEmit {
         colors: [u32; 8],
         frame: RowFrame,
     ) {
-        let RowFrame { row: row_u32, wrap_high, item_and_group, .. } = frame;
+        let RowFrame { row: row_u32, wrap_high, item_and_group } = frame;
         dest.write(DerivedSlot { x: pos_xs[0], row: row_u32, glyph_and_wrap: (glyph_ids[0] & 0xFFFF) | wrap_high, color: colors[0], item_and_group });
         dest.add(1).write(DerivedSlot { x: pos_xs[1], row: row_u32, glyph_and_wrap: (glyph_ids[1] & 0xFFFF) | wrap_high, color: colors[1], item_and_group });
         dest.add(2).write(DerivedSlot { x: pos_xs[2], row: row_u32, glyph_and_wrap: (glyph_ids[2] & 0xFFFF) | wrap_high, color: colors[2], item_and_group });
@@ -248,7 +159,7 @@ impl SlotEmit for DerivedEmit {
         colors: [u32; 4],
         frame: RowFrame,
     ) {
-        let RowFrame { row: row_u32, wrap_high, item_and_group, .. } = frame;
+        let RowFrame { row: row_u32, wrap_high, item_and_group } = frame;
         dest.write(DerivedSlot { x: pos_xs[0], row: row_u32, glyph_and_wrap: (glyph_ids[0] & 0xFFFF) | wrap_high, color: colors[0], item_and_group });
         dest.add(1).write(DerivedSlot { x: pos_xs[1], row: row_u32, glyph_and_wrap: (glyph_ids[1] & 0xFFFF) | wrap_high, color: colors[1], item_and_group });
         dest.add(2).write(DerivedSlot { x: pos_xs[2], row: row_u32, glyph_and_wrap: (glyph_ids[2] & 0xFFFF) | wrap_high, color: colors[2], item_and_group });
@@ -284,7 +195,7 @@ pub(crate) struct ChunkPass2Output {
 /// item, prepass, slot bases and the seed a mid-line chunk inherits (C15)
 /// are read from `inputs` here rather than passed one by one (C3).
 fn layout_pass2_chunk<E: SlotEmit>(
-    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    inputs: &super::emit::EmitInputs<'_, '_>,
     chunk_idx: usize,
     dest_addr: usize,
     lut: &[f64; 256],
@@ -516,7 +427,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
                     // The Derived lane is the ITEM (its group comes from the item
                     // table; an override rides the high 12 bits, derive.rs).
                     let item_and_group = glyph_field_derived::item_lane(item_idx);
-                    let frame = RowFrame { py: row_py, pz: row_pz, row: row_u32, wrap_high, item_and_group, group_id, ascii_adv };
+                    let frame = RowFrame { row: row_u32, wrap_high, item_and_group };
                     let start_survivors = survivor_out;
 
                     let qw = ascii_adv.max(crate::text::CELL_HEIGHT_WORLD);
@@ -1363,7 +1274,7 @@ fn layout_pass2_chunk<E: SlotEmit>(
 }
 
 pub(crate) fn layout_pass2_device<E: SlotEmit>(
-    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    inputs: &super::emit::EmitInputs<'_, '_>,
     dest_addr: usize,
 ) -> Pass2DeviceOutput {
     let chunk_results = pass2_chunk_range::<E>(inputs, 0..inputs.chunks.len(), dest_addr);
@@ -1375,7 +1286,7 @@ pub(crate) fn layout_pass2_device<E: SlotEmit>(
 /// WINDOW of the slot stream passes the window's address minus its first
 /// slot's byte offset (C22). Results come back in chunk order.
 pub(crate) fn pass2_chunk_range<E: SlotEmit>(
-    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    inputs: &super::emit::EmitInputs<'_, '_>,
     range: std::ops::Range<usize>,
     dest_addr: usize,
 ) -> Vec<ChunkPass2Output> {
@@ -1388,7 +1299,7 @@ pub(crate) fn pass2_chunk_range<E: SlotEmit>(
 
 /// Fold the per-chunk results into per-item placements, tints and blocks.
 pub(crate) fn pass2_merge<E: SlotEmit>(
-    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    inputs: &super::emit::EmitInputs<'_, '_>,
     chunk_results: &[ChunkPass2Output],
 ) -> Pass2DeviceOutput {
     let lut = crate::glyph_scene::srgb_to_linear_table();
@@ -1549,7 +1460,7 @@ pub(crate) trait WindowSink {
 /// first, their pairs taken from cached memory, then copied into the window.
 /// Emoji items are rare; every other chunk writes once, in place.
 pub(crate) fn emit_windows<E: SlotEmit>(
-    inputs: &super::device_alloc::EmitInputs<'_, '_>,
+    inputs: &super::emit::EmitInputs<'_, '_>,
     windows: &[SlotWindow],
     total_slots: usize,
     sink: &mut impl WindowSink,

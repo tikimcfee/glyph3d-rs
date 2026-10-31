@@ -25,7 +25,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use crate::gpu::GpuContext;
 
 static DEFAULT_TRIE: OnceLock<Arc<TrieTable>> = OnceLock::new();
 
@@ -513,24 +512,55 @@ impl TrieTable {
     }
 }
 
+/// The atlas on the host (2026-10-31: no device type in it — the scene and
+/// layout read it, and a renderer uploads it: [`AtlasGpu`] for wgpu, the
+/// float tables for makepad).
 pub struct Atlas {
-    pub curves: wgpu::Texture,
-    pub glyphmap: wgpu::Texture,
+    /// The Slug curve and glyph-map texel payloads, as read.
+    pub curves: SlugTexels,
+    pub glyphmap: SlugTexels,
     pub metrics: PrimaryMetrics,
     /// The CPU-side codepoint→slot trie (Stage E1: shared with the engine
     /// cross-check via [`TrieTable`]).
     pub trie: TrieTable,
-    /// The colour-emoji sheet, decoded and resident; the shader's mode-1
-    /// branch samples it.
-    pub emoji: EmojiTexture,
+    /// The colour-emoji sheet, decoded with its mip chain; the shader's
+    /// mode-1 branch samples it once a renderer uploads it.
+    pub emoji: EmojiLevels,
     /// Per SLOT, what a bitmap glyph's pixels average to — linear rgb,
     /// alpha-weighted, plus its mean alpha — for the far-LOD backdrop tint
     /// (`glyph_scene::seg_tint`), which otherwise only knows the instance's
     /// text colour, a colour an emoji does not display. `None` for every
     /// slot that is not a bitmap with a cell.
     pub slot_ink: Vec<Option<[f32; 4]>>,
-    /// Per-slot advance in world units, uploaded as a resident storage buffer.
+    /// Per-slot advance in world units ([`slot_advances`]), which a renderer
+    /// uploads as a resident storage buffer.
+    pub glyph_advances: Vec<f32>,
+}
+
+#[cfg(feature = "wgpu")]
+/// The atlas on a wgpu device: what [`Atlas`] uploads to.
+pub struct AtlasGpu {
+    pub curves: wgpu::Texture,
+    pub glyphmap: wgpu::Texture,
+    pub emoji: EmojiTexture,
     pub glyph_advances: wgpu::Buffer,
+}
+
+#[cfg(feature = "wgpu")]
+impl AtlasGpu {
+    pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) -> Self {
+        let curves = upload_uint_texture(device, queue, "slug curves", atlas.curves.width(), atlas.curves.height(), atlas.curves.payload());
+        let glyphmap =
+            upload_uint_texture(device, queue, "slug glyphmap", atlas.glyphmap.width(), atlas.glyphmap.height(), atlas.glyphmap.payload());
+        let emoji = EmojiTexture::upload(device, queue, &atlas.emoji);
+        use wgpu::util::DeviceExt;
+        let glyph_advances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("glyph advances"),
+            contents: bytemuck::cast_slice(&atlas.glyph_advances),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        Self { curves, glyphmap, emoji, glyph_advances }
+    }
 }
 
 // ── the colour-emoji sheet (G3ES) ─────────────────────────────────────────
@@ -815,19 +845,15 @@ pub fn box_down_straight(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "wgpu")]
 /// The sheet on the device: an `Rgba8UnormSrgb` 2D-array texture, one layer
 /// per sheet layer, `mip_levels` levels, straight alpha. The shader (step 5)
 /// samples with filtering and premultiplies after the sample. Views are the
 /// scene's to make (a D2Array view per bind group, as for the Slug textures).
 pub struct EmojiTexture {
     pub texture: wgpu::Texture,
-    pub sheet: EmojiSheet,
-    pub mip_levels: u32,
     /// Bytes uploaded across all layers and levels.
     pub texture_bytes: u64,
-    /// Per cell: alpha-weighted mean linear rgb + mean alpha (see
-    /// `EmojiSheet::decode_layers`).
-    pub cell_ink: Vec<[f32; 4]>,
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"G3MC"; // Glyph3D Mip Cache
@@ -994,10 +1020,6 @@ pub struct EmojiLevels {
     /// `EmojiSheet::decode_layers`).
     pub cell_ink: Vec<[f32; 4]>,
     levels: CachedLevels,
-    from_cache: bool,
-    t_parse: std::time::Duration,
-    t_decode: std::time::Duration,
-    t_mips: std::time::Duration,
 }
 
 impl EmojiLevels {
@@ -1035,7 +1057,33 @@ impl EmojiLevels {
                 (CachedLevels::Owned(levels), cell_ink, false, t_decode, t_mips)
             }
         };
-        Self { sheet, mip_levels, cell_ink, levels, from_cache, t_parse, t_decode, t_mips }
+        let levels = Self { sheet, mip_levels, cell_ink, levels };
+        let sheet = &levels.sheet;
+        log::info!(
+            "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \
+             {} mip levels, {:.1} MiB of texels; {} codepoints, {} sequences carried; font sha256 {:08x}…; \
+             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms{}",
+            sheet.cells.len(),
+            sheet.cell_w,
+            sheet.cell_h,
+            sheet.ppem,
+            sheet.bearing_y,
+            sheet.advance_px,
+            sheet.layers,
+            sheet.layer_w,
+            sheet.layer_h,
+            mip_levels,
+            levels.byte_len() as f64 / (1 << 20) as f64,
+            sheet.codepoints.len(),
+            sheet.sequence_count,
+            sheet.font_sha256[0].swap_bytes(),
+            t_parse.as_secs_f64() * 1e3,
+            t_decode.as_secs_f64() * 1e3,
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            t_mips.as_secs_f64() * 1e3,
+            if from_cache { " (cached)" } else { "" },
+        );
+        levels
     }
 
     /// Every layer's chain in bytes: layers × levels of `w × h × 4`.
@@ -1080,10 +1128,11 @@ impl EmojiLevels {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl EmojiTexture {
-    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) -> Self {
+    /// The decoded levels onto the device, one layer per sheet layer.
+    pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, host: &EmojiLevels) -> Self {
         let t0 = std::time::Instant::now();
-        let host = EmojiLevels::load(path);
         let total_texture_bytes = host.byte_len() as u64;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("emoji sheet"),
@@ -1112,7 +1161,7 @@ impl EmojiTexture {
             let dst = unsafe { std::slice::from_raw_parts_mut(dest_ptr, total_texture_bytes as usize) };
             host.copy_into(dst);
         }
-        let EmojiLevels { sheet, mip_levels, cell_ink, from_cache, t_parse, t_decode, t_mips, .. } = host;
+        let (sheet, mip_levels) = (&host.sheet, host.mip_levels);
         staging.unmap();
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1148,33 +1197,14 @@ impl EmojiTexture {
         }
         queue.submit([encoder.finish()]);
         let texture_bytes = total_texture_bytes;
-        let t_upload = t0.elapsed() - t_parse - t_decode - t_mips;
         log::info!(
-            "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \
-             {} mip levels, {:.1} MiB of texture; {} codepoints, {} sequences carried; font sha256 {:08x}…; \
-             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms{}, upload enqueue {:.1} ms",
-            sheet.cells.len(),
-            sheet.cell_w,
-            sheet.cell_h,
-            sheet.ppem,
-            sheet.bearing_y,
-            sheet.advance_px,
-            sheet.layers,
-            sheet.layer_w,
-            sheet.layer_h,
-            mip_levels,
+            "emoji sheet uploaded: {:.1} MiB in {} layer(s) of {} mip levels, enqueue {:.1} ms",
             texture_bytes as f64 / (1 << 20) as f64,
-            sheet.codepoints.len(),
-            sheet.sequence_count,
-            sheet.font_sha256[0].swap_bytes(),
-            t_parse.as_secs_f64() * 1e3,
-            t_decode.as_secs_f64() * 1e3,
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-            t_mips.as_secs_f64() * 1e3,
-            if from_cache { " (cached)" } else { "" },
-            t_upload.as_secs_f64() * 1e3,
+            sheet.layers,
+            mip_levels,
+            t0.elapsed().as_secs_f64() * 1e3,
         );
-        Self { texture, sheet, mip_levels, texture_bytes, cell_ink }
+        Self { texture, texture_bytes }
     }
 }
 
@@ -1278,6 +1308,7 @@ fn check_magic(words: &[u32], expected: &str, path: &Path) {
     );
 }
 
+#[cfg(feature = "wgpu")]
 /// Upload a raw u32 texel payload as a 1024-wide Rgba32Uint texture.
 fn upload_uint_texture(
     device: &wgpu::Device,
@@ -1332,21 +1363,12 @@ impl Atlas {
     /// Load from the workspace atlas directory (`<crate>/../assets/atlas`),
     /// with the emoji sheet at `emoji_sheet` (the `--emoji-sheet` flag; the
     /// default is the committed one beside the other bins).
-    pub fn load(ctx: &GpuContext, emoji_sheet: &Path) -> Self {
-        Self::load_device(&ctx.device, &ctx.queue, emoji_sheet)
+    pub fn load(emoji_sheet: &Path) -> Self {
+        Self::load_from(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas"), emoji_sheet)
     }
 
-    pub fn load_device(device: &wgpu::Device, queue: &wgpu::Queue, emoji_sheet: &Path) -> Self {
-        Self::load_from_device(
-            device,
-            queue,
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas"),
-            emoji_sheet,
-        )
-    }
-
-    pub fn load_from_device(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path, emoji_sheet: &Path) -> Self {
-        let ((cv, gm), trie) = std::thread::scope(|s| {
+    pub fn load_from(dir: &Path, emoji_sheet: &Path) -> Self {
+        let ((curves, glyphmap), trie, emoji) = std::thread::scope(|s| {
             let h_bins = s.spawn(|| {
                 std::thread::scope(|s2| {
                     let h_cv = s2.spawn(|| SlugTexels::read(&dir.join("curves.bin"), "G3CV"));
@@ -1354,35 +1376,29 @@ impl Atlas {
                     (h_cv.join().expect("curves read"), gm)
                 })
             });
+            let h_emoji = s.spawn(|| EmojiLevels::load(emoji_sheet));
             let trie = TrieTable::load(dir);
-            (h_bins.join().expect("bins read"), trie)
+            (h_bins.join().expect("bins read"), trie, h_emoji.join().expect("emoji sheet load"))
         });
-
-        let (cv_w, cv_h, curve_count) = (cv.width(), cv.height(), cv.count());
-        let curves = upload_uint_texture(device, queue, "slug curves", cv_w, cv_h, cv.payload());
-
-        let (gm_w, gm_h, entry_count) = (gm.width(), gm.height(), gm.count());
-        let glyphmap = upload_uint_texture(device, queue, "slug glyphmap", gm_w, gm_h, gm.payload());
 
         let metrics = trie.metrics;
 
         // --- glyphmap/glyphs slot-count agreement --------------------------
         let slot_count = trie.slot_count;
-        assert_eq!(slot_count, entry_count, "glyphmap/glyphs slot count mismatch");
+        assert_eq!(slot_count, glyphmap.count(), "glyphmap/glyphs slot count mismatch");
 
         log::info!(
             "atlas: {} slots, {} curves ({}x{}), {} mapped codepoints, fonts upem={} cell={}fu em={}fu",
             slot_count,
-            curve_count,
-            cv_w,
-            cv_h,
+            curves.count(),
+            curves.width(),
+            curves.height(),
             trie.mapped_count,
             metrics.upem,
             metrics.advance_fu,
             metrics.em_height_fu,
         );
 
-        let emoji = EmojiTexture::load_device(device, queue, emoji_sheet);
         let slot_ink: Vec<Option<[f32; 4]>> = trie
             .emoji_cell
             .iter()
@@ -1393,23 +1409,9 @@ impl Atlas {
             slot_ink.iter().filter(|s| s.is_some()).count(),
             slot_ink.len()
         );
+        let glyph_advances = slot_advances(&trie);
 
-        use wgpu::util::DeviceExt;
-        let glyph_advances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glyph advances"),
-            contents: bytemuck::cast_slice(&slot_advances(&trie)),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        Self {
-            curves,
-            glyphmap,
-            metrics,
-            trie,
-            emoji,
-            slot_ink,
-            glyph_advances,
-        }
+        Self { curves, glyphmap, metrics, trie, emoji, slot_ink, glyph_advances }
     }
 
     /// Codepoint → trie entry (the two dependent loads of FORMAT.md).

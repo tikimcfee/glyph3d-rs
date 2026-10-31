@@ -9,7 +9,6 @@
 use std::time::Instant;
 
 use crate::glyph_scene::{CameraMode, UiProbe};
-use crate::gpu::GpuContext;
 use crate::scene::SceneLike;
 use crate::{SceneChoice, SceneCullOptions};
 
@@ -42,10 +41,8 @@ pub struct RelayoutRequest {
 /// probe (the host shows a panel). Returns the new scene, sized to `width` x
 /// `height`, and its probe for the host to swap in; None when nothing moved
 /// and nothing was rebuilt.
-#[expect(clippy::too_many_arguments, reason = "the host's side of a rebuild: its context and surface, the choice and options it owns, and the old scene's probe, passed apart")]
 pub fn rebuild_for_relayout(
-    ctx: &GpuContext,
-    color_format: wgpu::TextureFormat,
+    load: &crate::SceneLoad,
     (width, height): (u32, u32),
     choice: &mut SceneChoice,
     cull_opts: &mut SceneCullOptions,
@@ -170,13 +167,14 @@ pub fn rebuild_for_relayout(
     };
     let t = Instant::now();
     let (mut scene, probe) = if probed {
-        crate::build_scene_probed(ctx, color_format, choice, CameraMode::Fly, live_cull_opts)
+        crate::build_scene_probed(load, choice, CameraMode::Fly, live_cull_opts)
     } else {
-        (crate::build_scene_with_options(ctx, color_format, choice, CameraMode::Fly, live_cull_opts), None)
+        (crate::build_scene_with_options(load, choice, CameraMode::Fly, live_cull_opts), None)
     };
-    // The mode the scene BUILT may not be the one asked for (a load past the
-    // Derived lanes falls back to Instanced, loudly — `layout_hyper::
-    // derived_lane_limits`); the options follow the build, so the panel's
+    // The mode the scene BUILT is the one asked for since 2026-10-31 (a file
+    // past the Derived lanes is laid out empty, `layout_hyper::
+    // derived_lane_overflow`, where the whole load once fell back to
+    // Instanced); the options follow the build all the same, so the panel's
     // selector and the next request start from what is actually drawn.
     if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
         if built != cull_opts.field_mode {

@@ -1,120 +1,75 @@
-//! [`DerivedField`]: the `GlyphField` implementation over `DerivedSlot`s (20 B).
+//! [`DerivedField`]: the `GlyphField` implementation over `DerivedSlot`s
+//! (20 B), on the host; [`crate::field_gpu::DerivedFieldGpu`] draws it.
 
-use std::ops::Range;
+use std::cell::{Cell, Ref, RefCell};
 
-use glyph_field::{
-    FieldCore, FieldResources, FieldShape, FieldTargets, GlyphField, GlyphFieldMode, GlyphPlacement,
-    ItemParamsGpu, SlotSource, SlotStorage,
-};
-use wgpu::util::DeviceExt;
+use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement, HostSlots, ItemParamsGpu, SlotSource};
 
-use crate::pipeline::{BINDING_GLYPH_ADVANCES, BINDING_GROUP_OVERRIDES, BINDING_ITEM_TABLE, EXTRA_LAYOUT};
-use crate::slot::{DerivedSlot, COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
-use crate::upload::{DerivedTranscode, LABELS};
+use crate::slot::{COLOR_OFFSET, ITEM_AND_GROUP_OFFSET, SLOT_BYTES, X_OFFSET};
+use crate::upload::DerivedTranscode;
 
 const _: () = assert!(ITEM_AND_GROUP_OFFSET == COLOR_OFFSET + 4, "write_placements writes colour and group as one 8 B run");
 
 /// The Derived glyph field: compact 20 B slots per glyph, Y/Z derived in the
-/// vertex stage from each slot's row and its item's `ItemParamsGpu`. The
-/// pipelines, chunk bind groups and storage are the shared [`FieldCore`].
+/// vertex stage from each slot's row and its item's `ItemParamsGpu`.
+///
+/// The slots live on the host, in blocks that are the field's chunks
+/// (2026-10-26), and every edit lands there (2026-10-31: until then the
+/// field held its device copy too and wrote both). A renderer draws from
+/// them: the wgpu one through a `DerivedFieldGpu`, which uploads the blocks
+/// whose version moved; the makepad host by publishing the blocks.
 pub struct DerivedField {
-    core: FieldCore<DerivedSlot>,
-    /// Bound in every chunk's group (binding 8); held so it outlives them.
-    _item_table_buffer: wgpu::Buffer,
+    slots: RefCell<HostSlots>,
+    /// Live slots per chunk (the blocks' counts; fixed for the field's life).
+    chunk_counts: Vec<u32>,
+    /// The item table, one row per item (an empty scene's one default row).
+    item_table: Vec<ItemParamsGpu>,
     /// Each item's group row, as the item table carries it: a verb that
     /// sets a glyph back to it clears the glyph's override.
     item_groups: Vec<u32>,
-    /// The group overrides (binding 10, `derive.rs`): `OVERRIDE_MAX + 1`
-    /// words, index 0 unused. Filled as group verbs allocate rows.
-    group_overrides: wgpu::Buffer,
-    /// The same table on the host, written with the buffer, for a renderer
-    /// that draws from the host copy (`GlyphField::group_overrides`).
-    group_overrides_host: std::cell::RefCell<Vec<u32>>,
+    /// The group overrides (the shader's binding 10, `derive.rs`):
+    /// `OVERRIDE_MAX + 1` words, index 0 unused. Filled as group verbs
+    /// allocate rows; its version bumps with every write.
+    group_overrides: RefCell<Vec<u32>>,
+    overrides_version: Cell<u64>,
     /// The next free override index; never reused (a verb's group row is
     /// never freed either).
-    next_override: std::cell::Cell<u32>,
+    next_override: Cell<u32>,
 }
 
 impl DerivedField {
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        source: SlotSource<'_>,
-        resources: &FieldResources<'_>,
-        targets: FieldTargets,
-    ) -> Self {
+    /// The field over `source`: host blocks as HyperLayout's Pass 2 emitted
+    /// them, kept; or host records, transcoded into blocks of `block_slots`
+    /// slots (`[glyph_scene] derived_block_slots`) against `item_params`,
+    /// `item_of_group` naming each group row's item (`glyph_field::NO_ITEM`
+    /// for a row no single item draws with).
+    pub fn new(source: SlotSource<'_>, item_params: &[ItemParamsGpu], item_of_group: &[u32], block_slots: usize) -> Self {
         let default_items = [ItemParamsGpu::default()];
-        let item_params = if resources.item_params.is_empty() {
-            &default_items[..]
-        } else {
-            resources.item_params
-        };
-
-        // The field keeps its slots on the host, in blocks that are its
-        // chunks (2026-10-26): the producer's Derived emission arrives as
-        // those blocks (HyperLayout's Pass 2 writes them), host records are
-        // transcoded into them against the same item table, and the storage
-        // uploads one buffer per block from them. Instanced is the field
-        // whose slots are emitted straight to the device.
-        let transcode = DerivedTranscode { item_params, item_of_group: resources.item_of_group, no_items: resources.item_params.is_empty() };
+        let item_table = if item_params.is_empty() { &default_items[..] } else { item_params };
+        let transcode = DerivedTranscode { item_params: item_table, item_of_group, no_items: item_params.is_empty() };
         let slots = match source {
             SlotSource::Blocks(slots) => slots,
-            SlotSource::Host { slices, glyph_count, .. } => {
-                glyph_field::transcode_host_slots(&slices, glyph_count, resources.block_slots, &transcode)
+            SlotSource::Host { slices, glyph_count } => {
+                glyph_field::transcode_host_slots(&slices, glyph_count, block_slots, &transcode)
             }
-            SlotSource::Device { .. } => panic!(
-                "the Derived field keeps its slots on the host (2026-10-26): a device slot source is the Instanced field's"
-            ),
         };
-        let storage = if resources.slots_on_device {
-            SlotStorage::from_source(device, queue, SlotSource::Blocks(slots), &transcode, &LABELS)
-        } else {
-            SlotStorage::host_only(slots)
-        };
-
-        let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("derived item table"),
-            contents: bytemuck::cast_slice(item_params),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-        let item_groups: Vec<u32> = item_params.iter().map(|p| p.group).collect();
-        let group_overrides = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("derived group overrides"),
-            size: (crate::derive::OVERRIDE_MAX as u64 + 1) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let extra_entries = [
-            wgpu::BindGroupEntry {
-                binding: BINDING_ITEM_TABLE,
-                resource: item_table_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: BINDING_GLYPH_ADVANCES,
-                resource: resources.glyph_advances.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: BINDING_GROUP_OVERRIDES,
-                resource: group_overrides.as_entire_binding(),
-            },
-        ];
-        let shape = FieldShape {
-            label_prefix: "derived ",
-            shader_label: "glyph_field_derived.wgsl",
-            shader_source: crate::GLYPH_FIELD_DERIVED_WGSL,
-            extra_layout: &EXTRA_LAYOUT,
-            extra_entries: &extra_entries,
-        };
-        let core = FieldCore::new(device, storage, resources, targets, &shape);
-
+        let chunk_counts = (0..slots.blocks().len()).map(|k| slots.block_len(k) as u32).collect();
         Self {
-            core,
-            _item_table_buffer: item_table_buffer,
-            item_groups,
-            group_overrides,
-            group_overrides_host: std::cell::RefCell::new(vec![0; crate::derive::OVERRIDE_MAX as usize + 1]),
-            next_override: std::cell::Cell::new(1),
+            slots: RefCell::new(slots),
+            chunk_counts,
+            item_groups: item_table.iter().map(|p| p.group).collect(),
+            item_table: item_table.to_vec(),
+            group_overrides: RefCell::new(vec![0; crate::derive::OVERRIDE_MAX as usize + 1]),
+            overrides_version: Cell::new(0),
+            next_override: Cell::new(1),
         }
+    }
+
+    /// `data` at byte `field_offset` of `slot`, whole words, into its block.
+    fn write_field(&self, slot: u32, field_offset: u64, data: &[u8]) {
+        let (whole, _) = data.as_chunks::<4>();
+        let words: Vec<u32> = whole.iter().map(|w| u32::from_le_bytes(*w)).collect();
+        self.slots.borrow_mut().write(slot, (field_offset / 4) as usize, &words);
     }
 }
 
@@ -124,11 +79,11 @@ impl GlyphField for DerivedField {
     }
 
     fn glyph_count(&self) -> u32 {
-        self.core.storage().glyph_count()
+        self.slots.borrow().len() as u32
     }
 
     fn chunk_capacity(&self) -> u32 {
-        self.core.storage().chunk_capacity()
+        self.slots.borrow().block_slots() as u32
     }
 
     fn slot_bytes(&self) -> u32 {
@@ -136,42 +91,25 @@ impl GlyphField for DerivedField {
     }
 
     fn chunk_glyph_counts(&self) -> &[u32] {
-        self.core.storage().chunk_counts()
+        &self.chunk_counts
     }
 
-    fn glyph_pipeline(&self) -> &wgpu::RenderPipeline {
-        self.core.glyph_pipeline()
+    fn write_color(&self, slot: u32, rgba: u32) {
+        self.write_field(slot, COLOR_OFFSET, &rgba.to_le_bytes());
     }
 
-    fn create_mask_pipeline(
-        &self,
-        device: &wgpu::Device,
-        mask_format: wgpu::TextureFormat,
-        sample_count: u32,
-    ) -> wgpu::RenderPipeline {
-        self.core.create_mask_pipeline(device, mask_format, sample_count)
+    fn write_position(&self, slot: u32, position: [f32; 3]) {
+        self.write_field(slot, X_OFFSET, bytemuck::bytes_of(&position[0]));
     }
 
-    fn record_draws(&self, pass: &mut wgpu::RenderPass<'_>, draws: &[(u32, Range<u32>)]) {
-        self.core.record_draws(pass, draws);
-    }
-
-    fn write_color(&self, queue: &wgpu::Queue, slot: u32, rgba: u32) {
-        self.core.storage().write_field(queue, slot, COLOR_OFFSET, &rgba.to_le_bytes());
-    }
-
-    fn write_position(&self, queue: &wgpu::Queue, slot: u32, position: [f32; 3]) {
-        self.core.storage().write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&position[0]));
-    }
-
-    fn write_extent(&self, _queue: &wgpu::Queue, _slot: u32, _advance: f32, _height: f32) {
+    fn write_extent(&self, _slot: u32, _advance: f32, _height: f32) {
         // In Derived mode, glyph advance and height are looked up from the atlas table in GPU memory.
     }
 
     /// The lane stays the glyph's ITEM (Y/Z derive from it); the group
     /// rides as an override index into the resident table, or none when the
     /// group is the item's own again (`derive.rs`).
-    fn write_group_id(&self, queue: &wgpu::Queue, slot: u32, item: u32, group_id: u32) {
+    fn write_group_id(&self, slot: u32, item: u32, group_id: u32) {
         let own = self.item_groups.get(item as usize).copied().unwrap_or(item);
         let lane = if group_id == own {
             crate::derive::item_lane(item)
@@ -182,11 +120,11 @@ impl GlyphField for DerivedField {
                 return;
             }
             self.next_override.set(idx + 1);
-            queue.write_buffer(&self.group_overrides, idx as u64 * 4, bytemuck::bytes_of(&group_id));
-            self.group_overrides_host.borrow_mut()[idx as usize] = group_id;
+            self.group_overrides.borrow_mut()[idx as usize] = group_id;
+            self.overrides_version.set(self.overrides_version.get() + 1);
             crate::derive::override_lane(item, idx)
         };
-        self.core.storage().write_field(queue, slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&lane));
+        self.write_field(slot, ITEM_AND_GROUP_OFFSET, bytemuck::bytes_of(&lane));
     }
 
     /// What a Derived slot can take from a placement: X, colour and the
@@ -198,33 +136,39 @@ impl GlyphField for DerivedField {
     /// those stay as loaded. Until 2026-10-09 this wrote whole slots with
     /// row and wrap zeroed, moving every edited glyph to its item's first
     /// row (C19: the highlight sidecar emptied the frame).
-    fn write_placements(&self, queue: &wgpu::Queue, first_slot: u32, placements: &[GlyphPlacement]) {
-        let storage = self.core.storage();
+    fn write_placements(&self, first_slot: u32, placements: &[GlyphPlacement]) {
         for (i, p) in placements.iter().enumerate() {
             let slot = first_slot + i as u32;
-            storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));
-            // w3 colour and w4 group are adjacent (pinned below): one write.
-            storage.write_field(queue, slot, COLOR_OFFSET, bytemuck::cast_slice(&[p.color, crate::derive::item_lane(p.item)]));
+            self.write_field(slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));
+            // w3 colour and w4 group are adjacent (pinned above): one write.
+            self.write_field(slot, COLOR_OFFSET, bytemuck::cast_slice(&[p.color, crate::derive::item_lane(p.item)]));
         }
     }
 
-    fn write_colors(&self, queue: &wgpu::Queue, first_slot: u32, colors: &[u32]) {
-        self.core.storage().write_colors(queue, first_slot, colors);
+    fn write_colors(&self, first_slot: u32, colors: &[u32]) {
+        let count = self.glyph_count();
+        for (i, &color) in colors.iter().enumerate() {
+            let slot = first_slot + i as u32;
+            if slot >= count {
+                break;
+            }
+            self.write_field(slot, COLOR_OFFSET, &color.to_le_bytes());
+        }
     }
 
-    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
-        self.core.read_slot_words(device, queue, slot, out);
+    fn host_slots(&self) -> Ref<'_, HostSlots> {
+        self.slots.borrow()
     }
 
-    fn host_slots(&self) -> Option<std::cell::Ref<'_, glyph_field::HostSlots>> {
-        self.core.storage().host_slots()
+    fn item_table(&self) -> &[ItemParamsGpu] {
+        &self.item_table
     }
 
-    fn slots_on_device(&self) -> bool {
-        self.core.storage().on_device()
+    fn group_overrides(&self) -> Ref<'_, [u32]> {
+        Ref::map(self.group_overrides.borrow(), Vec::as_slice)
     }
 
-    fn group_overrides(&self) -> Option<std::cell::Ref<'_, [u32]>> {
-        Some(std::cell::Ref::map(self.group_overrides_host.borrow(), Vec::as_slice))
+    fn group_overrides_version(&self) -> u64 {
+        self.overrides_version.get()
     }
 }

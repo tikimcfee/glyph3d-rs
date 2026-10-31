@@ -7,26 +7,22 @@
 //! and swaps in what comes back. The panels and the viewport reach it
 //! through `Scope` data (`ui_adapter`, `viewport`).
 //!
-//! The engine still builds its scene against a wgpu device (its own field
-//! buffers and pipelines, unused here: the makepad passes draw from the
-//! frame's data and the field's host blocks), so the host holds a
-//! `GpuContext` of its own, with no surface, until the scene builds
-//! without one.
+//! The scene holds no device type (2026-10-31): the makepad passes draw
+//! from its frames (`FrameData`: the field's host blocks, the tables, the
+//! atlas), so the host builds it with `SceneLoad::host()` and never makes
+//! a wgpu device. (Until that day it made one, with no surface, only so
+//! the scene could build: 1.3 GB of that device's VRAM on g-pick-repo.)
 
 use std::time::Instant;
 
 use glyph3d_native::cli::{parse_cli_from, Cli, CliCommand, Op};
 use glyph3d_native::glyph_scene::{CameraMode, UiProbe};
-use glyph3d_native::gpu::{self, GpuContext};
 use glyph3d_native::relayout::{rebuild_for_relayout, RelayoutRequest};
 use glyph3d_native::scene::{SceneKey, SceneLike};
 use glyph3d_native::{SceneChoice, SceneCullOptions};
 
 use crate::sessions::SessionBrowser;
 
-/// The format the engine's wgpu pipelines are built for (the scene builds
-/// them, the host never draws through them): the windowed driver's.
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 /// The flags makepad's platform reads from the command line itself
 /// (`--remote`, the virtual clock, `--window WxH@s` ...): dropped before the
@@ -105,7 +101,8 @@ pub fn take_plan() -> Plan {
 
 /// The engine as the host holds it.
 pub struct EngineHost {
-    pub ctx: GpuContext,
+    /// What a (re)build takes: the host's memory, no device copy.
+    load: glyph3d_native::SceneLoad,
     /// Owned: a relayout mutates the choice's params in place before it
     /// rebuilds.
     choice: SceneChoice,
@@ -143,14 +140,10 @@ impl EngineHost {
     /// its startup ops (`--pick`, `--verb`, `--cam-pose`, `--highlight`)
     /// through the same entry points the panels use.
     pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op], glyph_envelope: usize) -> Self {
-        let mut ctx = pollster::block_on(gpu::init(None));
-        // The makepad passes draw the glyphs from the field's host blocks:
-        // the engine's device gets no copy of them.
-        ctx.host_draws_glyphs = true;
-        let (mut scene, probe) =
-            glyph3d_native::build_scene_probed(&ctx, COLOR_FORMAT, &choice, CameraMode::Fly, cull_opts);
-        // The options follow the mode the scene BUILT (a load past the
-        // Derived lanes falls back to Instanced, loudly).
+        let load = glyph3d_native::SceneLoad::host();
+        let (mut scene, probe) = glyph3d_native::build_scene_probed(&load, &choice, CameraMode::Fly, cull_opts);
+        // The options follow the mode the scene BUILT (until 2026-10-31 a
+        // load past the Derived lanes fell back to Instanced).
         if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
             cull_opts.field_mode = built;
         }
@@ -158,20 +151,20 @@ impl EngineHost {
         scene.set_viewport(viewport.0, viewport.1);
         for op in ops {
             let line = match op {
-                Op::Pick(p) => scene.apply_pick(&ctx, p),
-                Op::Verb(v) => scene.apply_verb(&ctx, v),
+                Op::Pick(p) => scene.apply_pick(p),
+                Op::Verb(v) => scene.apply_verb(v),
                 Op::CamPose(eye, yaw, pitch) => {
                     scene.set_cam_pose(*eye, *yaw, *pitch);
                     None
                 }
-                Op::Highlight(p) => scene.apply_highlight_sidecar(&ctx, p),
+                Op::Highlight(p) => scene.apply_highlight_sidecar(p),
             };
             if let Some(line) = line {
                 println!("{line}");
             }
         }
         Self {
-            ctx,
+            load,
             choice,
             cull_opts,
             scene,
@@ -222,7 +215,7 @@ impl EngineHost {
         let dt = self.last_tick.elapsed().as_secs_f32().min(0.1);
         self.last_tick = Instant::now();
         self.scene.tick(dt);
-        self.scene.animate(&self.ctx, dt);
+        self.scene.animate(dt);
         self.apply_pending_relayout();
     }
 
@@ -245,8 +238,7 @@ impl EngineHost {
         }
         let Some(req) = self.pending_relayout.take() else { return };
         let rebuilt = rebuild_for_relayout(
-            &self.ctx,
-            COLOR_FORMAT,
+            &self.load,
             self.viewport,
             &mut self.choice,
             &mut self.cull_opts,
@@ -263,7 +255,7 @@ impl EngineHost {
 
     /// A key the scene acts on, pressed or released.
     pub fn key(&mut self, key: SceneKey, pressed: bool) {
-        self.scene.on_key(&self.ctx, key, pressed);
+        self.scene.on_key(key, pressed);
     }
 
     /// A press of one of the scene's keys, as a panel button makes one.

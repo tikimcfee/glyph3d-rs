@@ -5,6 +5,9 @@
 
 pub mod derive;
 pub mod field;
+#[cfg(feature = "wgpu")]
+pub mod field_gpu;
+#[cfg(feature = "wgpu")]
 pub mod pipeline;
 pub mod slot;
 pub mod upload;
@@ -14,6 +17,8 @@ pub use derive::{
     OVERRIDE_MAX, ROW_MAX, X_PAGE_MAX,
 };
 pub use field::DerivedField;
+#[cfg(feature = "wgpu")]
+pub use field_gpu::DerivedFieldGpu;
 pub use slot::DerivedSlot;
 
 pub const GLYPH_FIELD_DERIVED_WGSL: &str = include_str!("../shaders/glyph_field_derived.wgsl");

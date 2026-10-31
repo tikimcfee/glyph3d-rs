@@ -31,6 +31,8 @@ pub(super) struct WindowState {
     pub(super) config: wgpu::SurfaceConfiguration,
     pub(super) depth: wgpu::TextureView,
     pub(super) scene: Box<dyn SceneLike>,
+    /// The scene's draw: built with each scene (`SceneLike::make_renderer`).
+    pub(super) renderer: Box<dyn crate::scene::SceneRenderer>,
     pub(super) start: Instant,
     /// Stage F/G: mouse-look is active only while the pointer is grabbed
     /// (right button held, or backquote toggle).
@@ -101,13 +103,6 @@ pub(super) struct WindowState {
     /// the same pending_relayout arm the panel's button uses.
     #[cfg(feature = "egui-ui")]
     pub(super) cluster_selftest: u8,
-    /// Dev-only verification hook state (GLYPH_FIELDMODE_SELFTEST=1): at
-    /// t≈3 s cycles the field mode Instanced → Derived through the
-    /// same pending_relayout arm the panel's selector fires, printing the
-    /// HUD line after each rebuild. 0 = off/done; odd states fire, even
-    /// states are the quiet frame after a rebuild (see `render`).
-    #[cfg(feature = "egui-ui")]
-    pub(super) fieldmode_selftest: u8,
     /// Dev-only verification hook state (GLYPH_GRAB_SELFTEST=file[:dx:dy],
     /// C29): the windowed GRAB path — `g` on a picked file, cursor drags
     /// through `SceneLike::on_cursor`, `g` again — printing the HUD line
@@ -175,7 +170,7 @@ impl WindowState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&ctx.device, &self.config);
-        self.depth = scene::create_depth(&ctx.device, self.scene.depth_format(), width, height);
+        self.depth = scene::create_depth(&ctx.device, self.renderer.depth_format(), width, height);
     }
 
     /// Stage F: grab the pointer for mouse-look (confined to the window —
@@ -437,48 +432,6 @@ impl WindowState {
             }
             _ => {}
         }
-        // Dev-only verification hook (GLYPH_FIELDMODE_SELFTEST=1): cycle the
-        // field mode Instanced → Derived through the SAME pending_relayout
-        // arm the panel's selector fires, printing the HUD line after each
-        // rebuild. Odd states fire a request (consumed after this render),
-        // even states are the quiet frame whose render fills the new probe;
-        // the print reads that.
-        #[cfg(feature = "egui-ui")]
-        {
-            let step_mode = |s: u8| match s {
-                1 => Some(glyph_field::GlyphFieldMode::Instanced),
-                3 => Some(glyph_field::GlyphFieldMode::Derived),
-                _ => None,
-            };
-            match self.fieldmode_selftest {
-                s @ (1 | 3) if s > 1 || self.time() > 3.0 => {
-                    let has_mode = self.ui_probe.as_ref().and_then(|p| p.borrow().field_mode);
-                    match (has_mode, step_mode(s)) {
-                        (Some(_), Some(mode)) => {
-                            if let Some(probe) = &self.ui_probe {
-                                println!("FIELDMODE-SELFTEST before step {}: {}", s.div_ceil(2), hud_line(&probe.borrow(), self.ui_fps));
-                            }
-                            self.pending_relayout = Some(RelayoutRequest {
-                                set_field_mode: Some(mode),
-                                ..Default::default()
-                            });
-                            self.fieldmode_selftest = s + 1;
-                        }
-                        _ => {
-                            println!("FIELDMODE-SELFTEST: scene carries no field mode (no probe) — skipping");
-                            self.fieldmode_selftest = 0;
-                        }
-                    }
-                }
-                s @ (2 | 4) => {
-                    if let Some(probe) = &self.ui_probe {
-                        println!("FIELDMODE-SELFTEST after step {}:  {}", s / 2, hud_line(&probe.borrow(), self.ui_fps));
-                    }
-                    self.fieldmode_selftest = if s == 4 { 0 } else { s + 1 };
-                }
-                _ => {}
-            }
-        }
         // Dev-only verification hook (GLYPH_GRAB_SELFTEST=file[:dx:dy], C29,
         // 2026-10-10): the windowed GRAB path, through the SAME entry points
         // the window uses — `apply_pick` on `file`, `on_cursor` to park the
@@ -502,25 +455,25 @@ impl WindowState {
             match step {
                 1 => {
                     let cmd = crate::glyph_scene::PickCommand::RowCol { file, row: 0, col: 0 };
-                    let line = self.scene.apply_pick(ctx, &cmd).unwrap_or_else(|| "scene does not support picks".to_string());
+                    let line = self.scene.apply_pick(&cmd).unwrap_or_else(|| "scene does not support picks".to_string());
                     println!("GRAB-SELFTEST step 1 (pick {cmd:?}): {line}");
                     // Park the cursor before grabbing: a drag's delta is
                     // measured from wherever the cursor last was.
-                    self.scene.on_cursor(ctx, cx, cy);
+                    self.scene.on_cursor(cx, cy);
                 }
                 2 => {
-                    self.scene.on_key(ctx, SceneKey::G, true);
+                    self.scene.on_key(SceneKey::G, true);
                     println!("GRAB-SELFTEST step 2 (g, grabbed): hud {}", hud(self));
                 }
                 s if s < 3 + DRAG_STEPS => {
                     let k = f32::from(s - 2) / f32::from(DRAG_STEPS);
-                    self.scene.on_cursor(ctx, cx + dx * k, cy + dy * k);
+                    self.scene.on_cursor(cx + dx * k, cy + dy * k);
                     println!("GRAB-SELFTEST step {s} (drag to {:+.0},{:+.0} px): hud {}", dx * k, dy * k, hud(self));
                 }
                 s if s == 3 + DRAG_STEPS => {
-                    self.scene.on_key(ctx, SceneKey::G, true);
+                    self.scene.on_key(SceneKey::G, true);
                     let verb = crate::parse_verb("move-group 0 0 0").expect("selftest verb literal must parse like the CLI");
-                    let line = self.scene.apply_verb(ctx, &verb).unwrap_or_default();
+                    let line = self.scene.apply_verb(&verb).unwrap_or_default();
                     println!("GRAB-SELFTEST step {s} (g, released): {line}");
                 }
                 _ => {
@@ -560,7 +513,7 @@ impl WindowState {
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("windowed frame"), // Stage L (O2)
         });
-        self.scene.render(
+        self.renderer.render(
             ctx,
             &mut encoder,
             &crate::scene::FrameTarget {
@@ -573,6 +526,7 @@ impl WindowState {
                 width: self.config.width,
                 height: self.config.height,
             },
+            &*self.scene,
             self.time(),
         );
 
@@ -745,22 +699,22 @@ impl WindowState {
                                 ui.horizontal(|ui| {
                                     if let Some(z) = &snap.grabbed_zone {
                                         if ui.button(format!("Release Carrel '{z}' (C)")).clicked() {
-                                            self.scene.on_key(ctx, SceneKey::C, true);
+                                            self.scene.on_key(SceneKey::C, true);
                                         }
                                     } else if snap.active_zone.is_some()
                                         && ui.button("Grab Entire Carrel (C)").clicked()
                                     {
-                                        self.scene.on_key(ctx, SceneKey::C, true);
+                                        self.scene.on_key(SceneKey::C, true);
                                     }
 
                                     if let Some(g) = snap.grabbed_group {
                                         if ui.button(format!("Release File #{g} (G)")).clicked() {
-                                            self.scene.on_key(ctx, SceneKey::G, true);
+                                            self.scene.on_key(SceneKey::G, true);
                                         }
                                     } else if snap.last_pick.is_some()
                                         && ui.button("Grab File (G)").clicked()
                                     {
-                                        self.scene.on_key(ctx, SceneKey::G, true);
+                                        self.scene.on_key(SceneKey::G, true);
                                     }
                                 });
                             }
@@ -775,7 +729,7 @@ impl WindowState {
                                 if ui.button(*spec).clicked() {
                                     let verb = crate::parse_verb(spec)
                                         .expect("panel verb literal must parse like the CLI");
-                                    if let Some(line) = self.scene.apply_verb(ctx, &verb) {
+                                    if let Some(line) = self.scene.apply_verb(&verb) {
                                         println!("{line}");
                                     }
                                 }
@@ -918,34 +872,6 @@ impl WindowState {
                             }
                         }
 
-                        // Glyph field mode selection: the two stored formats.
-                        // The highlighted label is the mode actually BUILT
-                        // (the probe reads `field.mode()`), so a lane-limit
-                        // fallback shows as Instanced here.
-                        if let Some(snap) = &probe_snap {
-                            if let Some(current_mode) = snap.field_mode {
-                                ui.separator();
-                                ui.label(
-                                    "glyph field mode — click switches the field & rebuilds:",
-                                );
-                                ui.horizontal(|ui| {
-                                    for (mode, label) in [
-                                        (glyph_field::GlyphFieldMode::Derived, "Derived (20B)"),
-                                        (glyph_field::GlyphFieldMode::Instanced, "Instanced (32B)"),
-                                    ] {
-                                        if ui.selectable_label(current_mode == mode, label).clicked()
-                                            && current_mode != mode
-                                        {
-                                            *pending_relayout = Some(RelayoutRequest {
-                                                set_field_mode: Some(mode),
-                                                ..Default::default()
-                                            });
-                                        }
-                                    }
-                                });
-                            }
-                        }
-
                         // The sequence pass toggle — repo AND text scenes
                         // (text scenes seed the probe from the staging
                         // choice, no pick context needed). The same rebuild
@@ -1073,15 +999,11 @@ impl WindowState {
                                                 if resp.clicked() {
                                                     if *selected_group == Some(row.group_id) {
                                                         *selected_group = None;
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Clear,
+                                                        self.scene.apply_pick(&crate::glyph_scene::PickCommand::Clear,
                                                         );
                                                     } else {
                                                         *selected_group = Some(row.group_id);
-                                                        self.scene.apply_pick(
-                                                            ctx,
-                                                            &crate::glyph_scene::PickCommand::Group(
+                                                        self.scene.apply_pick(&crate::glyph_scene::PickCommand::Group(
                                                                 row.group_id,
                                                             ),
                                                         );
@@ -1125,13 +1047,13 @@ impl WindowState {
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.horizontal(|ui| {
                                 if ui.button("⏮ Oldest (End)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::End, true);
+                                    self.scene.on_key(SceneKey::End, true);
                                 }
 
                                 let total_beats = carrel.beat_count.max(carrel.turn_count);
 
                                 if ui.button("◀ Prev (P/←/〔)").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, SceneKey::BracketLeft, true);
+                                    self.scene.on_key(SceneKey::BracketLeft, true);
                                 }
 
                                 if carrel.beat_count > 0 {
@@ -1146,16 +1068,16 @@ impl WindowState {
                                 }
 
                                 if ui.button("Next (N/→/〕) ▶").clicked() && total_beats > 0 {
-                                    self.scene.on_key(ctx, SceneKey::BracketRight, true);
+                                    self.scene.on_key(SceneKey::BracketRight, true);
                                 }
 
                                 if ui.button("Latest ⏭ (Home)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::Home, true);
+                                    self.scene.on_key(SceneKey::Home, true);
                                 }
 
                                 ui.separator();
                                 if ui.button("Mode (V)").clicked() {
-                                    self.scene.on_key(ctx, SceneKey::V, true);
+                                    self.scene.on_key(SceneKey::V, true);
                                 }
                                 ui.separator();
                                 if ui.button("Sessions (F7) 📂").clicked() {

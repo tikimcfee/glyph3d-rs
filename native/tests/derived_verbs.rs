@@ -5,8 +5,8 @@
 //! from the atlas table. So `nudge-glyph`'s y/z and `scale-glyph` have no
 //! lane to land in. Until 2026-10-11 the field dropped them silently while
 //! the reply claimed them applied; now the reply says "not representable",
-//! and nothing is applied for those components.
-//! Instanced (still a mode until its retirement) applies all of them.
+//! and nothing is applied for those components. (The Instanced field, which
+//! applied all of them, was retired on 2026-10-31.)
 //!
 //! Witnessed through the release binary, offscreen, at `repo-zoom`'s camera
 //! (alpha.rs at zoom 3, where one glyph is a few hundred pixels): each verb's
@@ -57,7 +57,6 @@ fn render(mode: &str, verb: Option<&str>, out: &Path) -> (Vec<u8>, String) {
 fn derived_glyph_verbs_reply_not_representable_and_apply_nothing_they_cannot() {
     let dir = scratch();
     let (plain_derived, _) = render("derived", None, &dir.join("derived-plain.png"));
-    let (plain_instanced, _) = render("instanced", None, &dir.join("instanced-plain.png"));
 
     // Derived: a y-only nudge and a scale are refused in the reply and move
     // no pixel; the x component of a nudge still applies.
@@ -75,14 +74,4 @@ fn derived_glyph_verbs_reply_not_representable_and_apply_nothing_they_cannot() {
     println!("derived nudge xy: {reply}");
     assert!(reply.contains("not representable") && reply.contains("x -> "), "x applies, y is refused: {reply:?}");
     assert!(x_nudge != plain_derived, "the x component of a nudge still moves the glyph in Derived");
-
-    // Instanced keeps its behaviour: every component applies, no refusal.
-    let (y_nudge, reply) = render("instanced", Some("nudge-glyph 0 0.5 0"), &dir.join("instanced-nudge-y.png"));
-    println!("instanced nudge y: {reply}");
-    assert!(!reply.contains("not representable") && reply.contains("pos -> "), "{reply:?}");
-    assert!(y_nudge != plain_instanced, "a y nudge moves the glyph in Instanced");
-    let (scaled, reply) = render("instanced", Some("scale-glyph 2"), &dir.join("instanced-scale.png"));
-    println!("instanced scale: {reply}");
-    assert!(!reply.contains("not representable") && reply.contains("advance/height"), "{reply:?}");
-    assert!(scaled != plain_instanced, "scale-glyph grows the glyph in Instanced");
 }

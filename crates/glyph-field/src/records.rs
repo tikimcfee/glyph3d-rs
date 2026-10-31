@@ -11,8 +11,8 @@ use bytemuck::{Pod, Zeroable};
 /// The engine's glyph record — 48 B, the neutral form every CPU producer
 /// (HyperLayout's host path, the agent-session staging)
 /// emits. No mode binds it directly: each mode converts it into its own slot
-/// format at upload (Instanced: field-wise into the 32 B `RenderSlot`, so the
-/// vertex math reads the same values).
+/// format at upload (Derived: into the 20 B `DerivedSlot` against its item
+/// table, so the vertex stage derives the same positions).
 ///
 /// Stage H: encase ShaderType derive — generated WGSL-layout size/offsets,
 /// asserted against the bytemuck wire format in `layout_tests` below (the
@@ -79,7 +79,7 @@ pub struct GlyphPlacement {
     pub glyph_id: u32,
     /// Packed RGBA8 (sRGB display values).
     pub color: u32,
-    /// The group row the glyph draws with (Instanced's group lane).
+    /// The group row the glyph draws with.
     pub group_id: u32,
     /// The item-table row the glyph belongs to — its view (Derived's item
     /// lane, which y and z derive from). Not the group: since the view

@@ -67,6 +67,7 @@ use std::cell::Cell;
 
 
 
+#[cfg(feature = "wgpu")]
 use crate::gpu::GpuContext;
 use crate::scene::SceneLike;
 
@@ -91,18 +92,24 @@ mod tint;
 pub use tint::{SegTintAccum, seg_tint, srgb_to_linear_table};
 
 mod instance;
-pub use instance::{GlyphInstance, GroupRow, RenderSlot};
+pub use instance::{GlyphInstance, GroupRow};
 pub use instance::Params;
 
 pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};
 
+#[cfg(feature = "wgpu")]
 mod target;
-use target::{CompositeState, Selection, ViewTarget, SCENE_SAMPLE_COUNT};
+mod selection;
+use selection::Selection;
 
 mod ui_probe;
 pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
+#[cfg(feature = "wgpu")]
+mod renderer;
+#[cfg(feature = "wgpu")]
+pub use renderer::GlyphRenderer;
 mod interaction;
 mod nodes;
 mod tree_cull;
@@ -111,7 +118,9 @@ mod regions;
 mod library;
 mod style;
 mod setup;
+#[cfg(feature = "wgpu")]
 mod pipelines;
+#[cfg(feature = "wgpu")]
 mod render;
 mod frame;
 pub use frame::{ChunkRanges, FrameCosts, FrameData, FrameSelection};
@@ -128,11 +137,10 @@ pub struct GlyphScene {
     /// chunked (a repo-scale field exceeds one storage binding); the cull and
     /// pick slot math key on `field.chunk_capacity()`.
     pub(crate) field: Box<dyn GlyphField>,
-    /// The colour-emoji sheet's view, held so the texture outlives the bind
-    /// groups that sample it (binding 6 of every chunk's bind group).
-    pub(crate) _emoji_view: wgpu::TextureView,
-    pub(crate) camera_buf: wgpu::Buffer,
-    pub(crate) depth_format: wgpu::TextureFormat,
+    /// The atlas the scene was staged against, on the host: what a renderer
+    /// uploads when it is built (`GlyphRenderer::new`; the makepad host's
+    /// static tables).
+    pub(crate) atlas: std::sync::Arc<crate::atlas::Atlas>,
     pub(crate) center: Vec3,
     pub(crate) half_w: f32,
     pub(crate) half_h: f32,
@@ -145,10 +153,6 @@ pub struct GlyphScene {
     /// the legacy per-chunk draws.
     pub(in crate::glyph_scene) cull: Option<CullState>,
     // ── Stage G: picking & live manipulation ────────────────────────────
-    /// Group table buffer (96 B rows): written by the load, then by the
-    /// group nodes' flush (each row whose bytes changed, a verb's new row
-    /// whole).
-    pub(crate) group_buf: wgpu::Buffer,
     /// Every group row as a node of the transform tree (2026-10-10,
     /// `nodes.rs`), and the group table itself (`GroupNodes::rows`, the one
     /// host copy: pick, cull and the HUD read the live TRS there): the group
@@ -205,21 +209,9 @@ pub struct GlyphScene {
     pub(crate) tint_step: Vec<u32>,
     /// Stage K: windowed debug-UI probe (None offscreen / under --no-ui).
     pub(crate) ui_probe: Option<UiProbe>,
-    /// Stage L (L3): device handle for pool (re)creation in set_viewport
-    /// (which has no ctx param — the trait shape is fenced).
-    pub(crate) device: wgpu::Device,
-    /// Stage L (L3): composite machinery — the ONLY release path (the
-    /// --no-composite A/B escape hatch proved neutrality and was removed at
-    /// stage end; see out/history/STAGE_L_REPORT.md).
-    pub(in crate::glyph_scene) composite: CompositeState,
-    pub(in crate::glyph_scene) params_buf: wgpu::Buffer,
     pub(in crate::glyph_scene) params: Cell<Params>,
-    /// Bumped by every Params setter (`FrameData::params_generation`), and
-    /// the generation `params_buf` holds.
+    /// Bumped by every Params setter (`FrameData::params_generation`).
     pub(in crate::glyph_scene) params_generation: Cell<u64>,
-    pub(in crate::glyph_scene) params_uploaded: Cell<u64>,
-    pub(crate) mesh_pipeline: std::cell::RefCell<mesh::MeshPipeline>,
-    pub(crate) mesh_frame_bg: wgpu::BindGroup,
     /// A library load's page faces, built on the host from the sheets'
     /// resolved worlds and uploaded where they changed (`faces.rs`); None
     /// in every other scene.
@@ -241,6 +233,9 @@ pub struct GlyphScene {
     /// uploads it itself (`FrameData::item_table`). Fixed for the scene's
     /// life; a relayout builds a new scene.
     pub(in crate::glyph_scene) item_table: Vec<glyph_field::ItemParamsGpu>,
+    /// The library animation's last step (ease ms, move-note ms), handed to
+    /// the next frame's costs (`FrameCosts::library`) and cleared there.
+    pub(in crate::glyph_scene) library_tick_ms: Cell<(f64, f64)>,
 }
 
 // ── Stage K (K4): what the live controls change, and what stays const ────
@@ -382,65 +377,42 @@ impl GlyphScene {
 }
 
 impl SceneLike for GlyphScene {
-    fn depth_format(&self) -> wgpu::TextureFormat {
-        self.depth_format
-    }
-
     fn instance_count(&self) -> u32 {
         self.field.glyph_count()
     }
 
-    fn on_key(&mut self, ctx: &GpuContext, key: crate::scene::SceneKey, pressed: bool) {
+    fn on_key(&mut self, key: crate::scene::SceneKey, pressed: bool) {
         if matches!(self.camera_mode, CameraMode::Fly) && self.fly.on_key(key, pressed) {
             return;
         }
         if pressed {
-            self.verb_key(ctx, key);
+            self.verb_key(key);
         }
     }
 
-    fn on_mouse_look(&mut self, _ctx: &GpuContext, dx: f32, dy: f32) {
+    fn on_mouse_look(&mut self, dx: f32, dy: f32) {
         if matches!(self.camera_mode, CameraMode::Fly) {
             self.fly.on_look(dx, dy);
         }
     }
 
-    fn on_scroll(&mut self, ctx: &GpuContext, lines: f32) {
+    fn on_scroll(&mut self, lines: f32) {
         // Stage G: scroll scales a grabbed group; otherwise camera speed.
-        self.scroll_or_scale(ctx, lines);
+        self.scroll_or_scale(lines);
     }
 
-    fn on_cursor(&mut self, ctx: &GpuContext, x: f32, y: f32) {
-        self.cursor_moved(ctx, x, y);
+    fn on_cursor(&mut self, x: f32, y: f32) {
+        self.cursor_moved(x, y);
     }
 
-    fn on_click(&mut self, ctx: &GpuContext, x: f32, y: f32) {
-        if let Some(line) = self.click_pick(ctx, x, y) {
+    fn on_click(&mut self, x: f32, y: f32) {
+        if let Some(line) = self.click_pick(x, y) {
             println!("{line}");
         }
     }
 
     fn set_viewport(&mut self, w: u32, h: u32) {
         self.viewport.set((w, h));
-        // Stage L (L3): (re)size the pooled view target to the viewport.
-        // Both drivers call set_viewport before the first render (windowed:
-        // on window creation and every resize; offscreen: once at startup).
-        let comp = &mut self.composite;
-        let stale = comp
-            .target
-            .as_ref()
-            .is_none_or(|t| t.width != w || t.height != h);
-        if stale && w > 0 && h > 0 {
-            let target = ViewTarget::new(
-                &self.device,
-                w,
-                h,
-                &comp.bind_group_layout,
-                &comp.sampler,
-                comp.selection_fx.as_ref(), // Stage L (L4): mask + tint bind groups
-            );
-            comp.target = Some(target);
-        }
     }
 
     fn set_cam_pose(&mut self, eye: [f32; 3], yaw: f32, pitch: f32) {
@@ -455,32 +427,24 @@ impl SceneLike for GlyphScene {
         self.set_lod_min_px(px);
     }
 
-    fn apply_pick(&mut self, ctx: &GpuContext, cmd: &PickCommand) -> Option<String> {
-        GlyphScene::apply_pick(self, ctx, cmd)
+    fn apply_pick(&mut self, cmd: &PickCommand) -> Option<String> {
+        GlyphScene::apply_pick(self, cmd)
     }
 
-    fn apply_verb(&mut self, ctx: &GpuContext, verb: &Verb) -> Option<String> {
-        Some(GlyphScene::apply_verb(self, ctx, verb))
+    fn apply_verb(&mut self, verb: &Verb) -> Option<String> {
+        Some(GlyphScene::apply_verb(self, verb))
     }
 
     fn selected_group_id(&self) -> Option<u32> {
         GlyphScene::selected_group_id(self)
     }
 
-    fn apply_highlight_sidecar(&self, ctx: &GpuContext, path: &std::path::Path) -> Option<String> {
-        Some(GlyphScene::apply_highlight_sidecar(self, ctx, path))
+    fn apply_highlight_sidecar(&self, path: &std::path::Path) -> Option<String> {
+        Some(GlyphScene::apply_highlight_sidecar(self, path))
     }
 
-    fn apply_surface_updates(
-        &self,
-        ctx: &GpuContext,
-        updates: &[crate::seam::SurfaceUpdate],
-    ) -> Option<String> {
-        Some(GlyphScene::apply_surface_updates(self, ctx, updates))
-    }
-
-    fn debug_dump_instances(&self, ctx: &GpuContext, slot: u64, out: &mut [u32]) {
-        self.field.read_slot_words(&ctx.device, &ctx.queue, slot as u32, out);
+    fn apply_surface_updates(&self, updates: &[crate::seam::SurfaceUpdate]) -> Option<String> {
+        Some(GlyphScene::apply_surface_updates(self, updates))
     }
 
     fn tick(&mut self, dt: f32) {
@@ -489,19 +453,9 @@ impl SceneLike for GlyphScene {
         }
     }
 
-    fn animate(&mut self, ctx: &GpuContext, dt: f32) {
-        self.apply_drag(ctx);
-        self.animate_library(ctx, dt);
-    }
-
-    fn render(
-        &self,
-        ctx: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &crate::scene::FrameTarget<'_>,
-        t: f32,
-    ) {
-        render::render_scene(self, ctx, encoder, target, t);
+    fn animate(&mut self, dt: f32) {
+        self.apply_drag();
+        self.animate_library(dt);
     }
 
     fn prepare_frame(&self, viewport: (u32, u32), t: f32) -> Option<FrameData<'_>> {
@@ -510,6 +464,11 @@ impl SceneLike for GlyphScene {
 
     fn take_pending_carrel_options(&mut self) -> Option<crate::spatial_scene::CarrelLayoutOptions> {
         self.controller.as_mut().and_then(|c| c.pending_carrel_options.take())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn crate::scene::SceneRenderer> {
+        Box::new(GlyphRenderer::new(ctx, color_format, self))
     }
 }
 

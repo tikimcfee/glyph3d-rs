@@ -1,8 +1,10 @@
-//! Host records → device slots: the Derived transcode, 48 B `GlyphInstance`
-//! → 20 B `DerivedSlot`. The chunking, staging and upload paths are
-//! `glyph_field::upload_host_slots`, shared with the Instanced mode (C1).
+//! Host records → slots: the Derived transcode, 48 B `GlyphInstance` → 20 B
+//! `DerivedSlot` (`glyph_field::transcode_host_slots` runs it into host
+//! blocks), and the labels the device copy's buffers carry.
 
-use glyph_field::{GlyphInstance, ItemParamsGpu, SlotRecord, Transcode, UploadLabels};
+use glyph_field::{GlyphInstance, ItemParamsGpu, SlotRecord, Transcode};
+#[cfg(feature = "wgpu")]
+use glyph_field::UploadLabels;
 
 use crate::slot::{DerivedSlot, COLOR_OFFSET};
 
@@ -33,11 +35,8 @@ impl Transcode for DerivedTranscode<'_> {
     }
 }
 
-pub const LABELS: UploadLabels = UploadLabels {
-    buffers: "derived glyph instances",
-    staging: "derived glyph instance staging",
-    staging_copy: "derived_instance_staging_copy",
-};
+#[cfg(feature = "wgpu")]
+pub const LABELS: UploadLabels = UploadLabels { buffers: "derived glyph instances" };
 
 #[inline(always)]
 fn transcode_one(inst: &GlyphInstance, item_params: &[ItemParamsGpu], item_of_group: &[u32], no_items: bool) -> DerivedSlot {

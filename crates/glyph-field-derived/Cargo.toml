@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "The Derived glyph field: compact 20 B DerivedSlot per glyph, positions derived in vertex stage from line tables."
 
+[features]
+default = ["wgpu"]
+# `DerivedFieldGpu` and its pipeline bindings (2026-10-31). Off, the Derived
+# field's host side alone.
+wgpu = ["dep:wgpu", "glyph-field/wgpu"]
+
 [dependencies]
-glyph-field = { path = "../glyph-field" }
-wgpu = "30"
+glyph-field = { path = "../glyph-field", default-features = false }
+wgpu = { version = "30", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 encase = "0.12"
 log = "0.4"

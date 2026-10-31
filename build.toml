@@ -44,25 +44,34 @@
 # two (a load past the device or the host refused with its numbers).
 # 348 -> 349: a host-drawn field keeps its blocks alone and edits them alike.
 # 349 -> 350: on unified memory the host blocks and device copy are one demand.
-test_floor = 350
+# 350 -> 349 (2026-10-31): hyper_device_chunking_splits_and_binds_across_limits
+# deleted with the device slot emission it tested (Instanced retirement).
+# 349 -> 345 (2026-10-31): the glyph-field-instanced crate's four tests (three
+# RenderSlot layout pins, one naga validation of its shader) went with it.
+# 345 -> 343 (2026-10-31): copy.rs's two copy_split tests, deleted with the
+# host-record upload path it served.
+# 343 -> 345 (2026-10-31): prove_relax's two (the suite route runs the
+# workspace's members alone; a mutant is overlaid for the members reading it).
+test_floor = 345
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
 # until then they rendered Instanced and the Derived field was held here as
 # `--field-mode derived` — the two render every golden frame identically
 # (measured on vulkan-nvidia and metal-apple), which is why the default could
-# move with no pixel moving. `--field-mode instanced` (2026-10-11) holds the
-# Instanced field byte-equal to the same frames until step 3 deletes it.
-# `--field-mode visible` was the second entry from 2026-10-10 until the
-# Visible field was deleted (2026-10-26). A view can be exempted from an
-# equivalent (`[[golden_view.exempt]]`, rendered and reported, never judged)
-# for a variant that legitimately differs; none is today.
-golden_equivalents = ["--field-mode instanced"]
+# move with no pixel moving. `--field-mode instanced` held the Instanced field
+# byte-equal to the same frames from 2026-10-11 until its retirement
+# (2026-10-31). `--field-mode visible` was an entry from 2026-10-10 until the
+# Visible field was deleted (2026-10-26). None is declared today; a variant
+# that must render the same frames lands here, and a view can be exempted
+# from one (`[[golden_view.exempt]]`, rendered and reported, never judged)
+# where it legitimately differs.
+golden_equivalents = []
 # The golden equivalents that run in the merge tier only (2026-10-26, test
-# diet step 6): a field the makepad port does not have, held byte-equal
-# before every landing, not after every change. Each names a declared
-# equivalent exactly; `glyph test --inner` prints each one it skips.
-golden_equivalents_merge = ["--field-mode instanced"]
+# diet step 6): held byte-equal before every landing, not after every change.
+# Each names a declared equivalent exactly; `glyph test --inner` prints each
+# one it skips.
+golden_equivalents_merge = []
 
 
 # ── Products ─────────────────────────────────────────────────────────────
@@ -389,8 +398,8 @@ tier = "merge"
 kind = "cargo"
 cmd = "check-no-ui"
 needs = []
-compare = "rustc warning count vs zero, renderer checked with --no-default-features twice, all targets: with --features windowed (the window, no egui overlay) and bare (no window: the library a host that owns its window links, 2026-10-26); and the bare build's dependency tree holds the renderer and no winit or egui crate"
-blind_to = "whether either build RUNS correctly — they are checked, not executed; every other feature combination; and a windowing crate in the bare tree under a name not starting winit or egui"
+compare = "rustc warning count vs zero, renderer checked with --no-default-features twice, all targets: with --features windowed (the window, no egui overlay) and bare (no window: the library a host that owns its window links, 2026-10-26); and the bare build's dependency tree holds the renderer and no winit, egui or wgpu crate (wgpu since 2026-10-31: the bare library is the engine's host side, drawn by a host's own renderer)"
+blind_to = "whether either build RUNS correctly — they are checked, not executed; every other feature combination; and a windowing or GPU crate in the bare tree under a name not starting winit, egui or wgpu"
 
 [[gate]]
 name = "cargo-clippy"
@@ -500,7 +509,7 @@ relax = "renderer"
 cmd = "GLYPH_TRACE=warn $GLYPH_RENDERER --hyper-oracle-check native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt --cluster-mode leader && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 $GLYPH_RENDERER --hyper-oracle-check engine/fixtures/*.pipe.bin native/fixtures/cubecl-fork native/fixtures/g-cluster-repo native/fixtures/overflow-leads.txt native/fixtures/g-pick-repo native/fixtures/chunk-cut.txt native/fixtures/chunk-cut-paint.txt && GLYPH_TRACE=warn GLYPH_HYPER_ORACLE_STRICT=1 $GLYPH_RENDERER --hyper-oracle-check native/fixtures/tab-stops native/fixtures/g-cluster-repo native/fixtures/g-pick-repo --tab-width 4 && GLYPH_TRACE=warn $GLYPH_RENDERER --hyper-oracle-check native/fixtures/tab-stops --tab-width 8 --cluster-mode leader"
 pass_line = "hyper-oracle PASS"
 needs = ["renderer", "fixtures"]
-compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory in both slot formats — RenderSlot byte-for-byte, DerivedSlot on every lane it carries — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) and the IMMUTABLE chunk-cut-paint.txt (a `return` across every intra-line cut, one pure-ASCII cut line; built for the paint tier retired 2026-10-11, kept as a cut input) in cluster mode, then those six again in leader mode. 2026-10-09 (with chunk-cut-paint.txt): 1,504,558 records / 1,497,095 instances / 1,497,095 device slots x2 / 47 placements in the strict cluster run (389 sequence heads, 36 ASCII-led); 1,349,336 records / 1,344,746 instances and device slots x2 / 14 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots. (A PAINT tier, C17, held the device Pass 2's syntax colouring to the whole-item colouriser from 2026-10-09 until the syntax heuristic was retired on 2026-10-11.) (A VISIBLE tier, M2/M3, held the Visible field's GPU layout kernel, and under byte spans its colouring, to the device Pass 2 from 2026-10-10 until the field was deleted on 2026-10-26; with it went the gate's only GPU use, so every tier now runs on the CPU.) TAB STOPS (2026-10-11): two more runs, every tier, at --tab-width 4 (strict, cluster: tab-stops, g-cluster-repo, g-pick-repo — 413,131 records / 411,950 instances and device slots x2, 658 tabs wider than a cell) and --tab-width 8 (leader: tab-stops — 5,311 records / 4,478 instances, 695 tabs wider than a cell); each refuses a corpus in which no tab spanned more than one cell"
+compare = "HyperLayout vs fold.rs's records compacted by layout::compact_records_into, bit-exact, through layout::diff_backends plus a per-record tally naming the byte, on FOUR tiers: records (its recording path, rederive.rs), host instances and placements (pass2_host.rs, a device-less load), and the DEVICE Pass 2 (pass2_device.rs, what every GPU load runs) run into host memory — the DerivedSlot on every lane it carries (the Instanced RenderSlot byte-for-byte too until that field's retirement, 2026-10-31) — plus its placements. Corpora: the 26 pipe fixtures (each item its own buffer, its own cluster mode; paged-rows, paged-cols and scroll-only carry the page_rows / page_cols / scroll_rows classes), the IMMUTABLE cubecl-fork corpus, g-cluster-repo, overflow-leads.txt, g-pick-repo and the IMMUTABLE chunk-cut.txt (lines cut inside into chunks: a sequence across each 64 KiB target, non-ASCII advances before each cut, a continuation wider than any ASCII segment past the first page) and the IMMUTABLE chunk-cut-paint.txt (a `return` across every intra-line cut, one pure-ASCII cut line; built for the paint tier retired 2026-10-11, kept as a cut input) in cluster mode, then those six again in leader mode. 2026-10-09 (with chunk-cut-paint.txt): 1,504,558 records / 1,497,095 instances / 1,497,095 device slots x2 / 47 placements in the strict cluster run (389 sequence heads, 36 ASCII-led); 1,349,336 records / 1,344,746 instances and device slots x2 / 14 placements in the leader run. STRICT (first run) refuses zero records, zero sequence heads, or zero ASCII-led heads; both runs refuse zero device slots. (A PAINT tier, C17, held the device Pass 2's syntax colouring to the whole-item colouriser from 2026-10-09 until the syntax heuristic was retired on 2026-10-11.) (A VISIBLE tier, M2/M3, held the Visible field's GPU layout kernel, and under byte spans its colouring, to the device Pass 2 from 2026-10-10 until the field was deleted on 2026-10-26; with it went the gate's only GPU use, so every tier now runs on the CPU.) TAB STOPS (2026-10-11): two more runs, every tier, at --tab-width 4 (strict, cluster: tab-stops, g-cluster-repo, g-pick-repo — 413,131 records / 411,950 instances and device slots x2, 658 tabs wider than a cell) and --tab-width 8 (leader: tab-stops — 5,311 records / 4,478 instances, 695 tabs wider than a cell); each refuses a corpus in which no tab spanned more than one cell"
 blind_to = "Shared with the reference and so invisible here: the atlas trie (TrieTable::lookup, fu_to_world — the fixtures' own tries are world-unit and HyperLayout resolves font units) and fold::{rows_for_line, wrap_segment_of, wrap_row_of}, which HyperLayout borrows (reference-port fences those; phantom-row is the measured example). The device path past the emitter (the staging copy into VRAM, buffer chunking), the Derived field's vertex-stage Y/Z (the slot carries none), and the background Pass 1 prefetch (it runs the same Pass 1 driver as the inline Pass 1 used here). Paint: every tier runs flat paint, and the oracle has none; per-glyph colour through Pass 2 is cargo-test's (Paint::ByteSpans: hyper_byte_spans_painting, resolve_spans_and_inplace_update_slot_colors; Paint::PerRecord: windowed_emission_matches_unwindowed, hyper_and_batched_agree_on_samples), not here. Tab stops past one cell: NO oracle — the JS oracle and the fixtures know one-cell tabs only, so the reference there is fold.rs's own stop rule (fold::tests holds it to text::reference_layout, the independent lineage, and to the oracle-backed one-cell fold over the spaces a tab stands for); `fold::TabWidth::tab_cells` is shared by every engine and both witnesses but reference_layout, which computes the stop itself. A tabbed line long enough to be cut into chunks reaches this gate nowhere (cargo-test's grid has it)"
 
 [[gate]]
@@ -511,7 +520,7 @@ apart_from = ["cargo-test"]
 kind = "golden-verify"
 relax = "renderer"
 needs = ["renderer", "pixel-baselines"]
-compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (--field-mode instanced) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
+compare = "every declared golden_view re-rendered vs out/tooling-ab/baseline/<this host's --gpu-key>, byte-equal — and again under each settings.golden_equivalents (none since the Instanced field's retirement, 2026-10-31) against the same baseline (the plain frames render the Derived field, the default since 2026-10-11); a view exempt from an equivalent (golden_view.exempt, with its why) is rendered under it all the same and its distance printed as a NOTE with the pixel count, never judged, and an exempt frame that turns out byte-equal is flagged as a possibly stale exemption"
 blind_to = "everything outside the declared frames; regression vs intentional change (re-baselining is a human act); any rasterizer other than this host's — a set proves nothing about another vendor; an equivalent that legitimately stops matching (it cannot be given its own baseline here); the exempt (view, equivalent) pairs `glyph gates` lists — none today"
 
 # ── Declared mutations ───────────────────────────────────────────────────
@@ -670,7 +679,7 @@ expect = "native/src/agent_transcript/tests.rs"
 [[mutation]]
 name = "coverage-scale"
 gate = "pixel-ab"
-why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other. Targets the Derived field's shader since 2026-10-11, when Derived became the default and so the plain frames' field; the Instanced shader is held by the --field-mode instanced equivalent alone until step 3 deletes it"
+why = "the golden views are the ONLY pixel check; a shader constant that changes glyph antialiasing must move them. Chosen because it is purely visual — it does not touch the fold, the corpus or CPU-side picking, so a red here is attributable to this gate and no other. Targets the Derived field's shader since 2026-10-11, when Derived became the default and so the plain frames' field; the Instanced shader it once shared the constant with went with that field, 2026-10-31"
 file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
@@ -692,11 +701,11 @@ expect = "repo-back-oblique.png diverges from baseline"
 [[mutation]]
 name = "derived-placement-row-zeroed"
 gate = "pixel-ab"
-why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load, and the --field-mode instanced equivalent runs the other field"
+why = "C19 put back: a Derived placement edit that zeroes the slot's row (here the X write widened by one word over w1), so every edited glyph moves to its item's first row — the defect that emptied the highlight frame in Derived mode until 2026-10-09. CONSUMED BY: repo-highlight's plain frame (Derived since 2026-10-11; before, the --field-mode derived equivalent), and nothing else: no other view edits placements after load"
 file = "crates/glyph-field-derived/src/field.rs"
 op = "replace"
-find = "storage.write_field(queue, slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
-with = "storage.write_field(queue, slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
+find = "self.write_field(slot, X_OFFSET, bytemuck::bytes_of(&p.position[0]));"
+with = "self.write_field(slot, X_OFFSET, bytemuck::cast_slice(&[p.position[0], 0.0]));"
 expect = "repo-highlight.png diverges from baseline — the renderer changed"
 
 [[mutation]]
@@ -712,7 +721,7 @@ expect = "repo-highlight.png diverges from baseline — the renderer changed"
 [[mutation]]
 name = "emoji-uv-flip"
 gate = "pixel-ab"
-why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet. Targets the Derived field's shader since 2026-10-11 (the default, so the plain frame's field); the Instanced copy is held by the --field-mode instanced equivalent until step 3"
+why = "the sheet sampled upside down — the class of defect the emoji frame exists for (a cell placement, inset or flip error), which no numeric gate can see because the layout is untouched. CONSUMED BY: emoji.png and nothing else; every text frame stays byte-equal under it, which is also the proof that no text frame samples the sheet. Targets the Derived field's shader since 2026-10-11 (the default, so the plain frame's field); the Instanced copy went with that field, 2026-10-31"
 file = "crates/glyph-field-derived/shaders/glyph_field_derived.wgsl"
 op = "replace"
 find = "        let t = vec2<f32>(c.x, 1.0 - c.y);"
@@ -869,14 +878,24 @@ with = "    item_lane(item) | override_idx.min(OVERRIDE_MAX)"
 expect = "group_lane_resolves_to_the_item_or_its_override"
 
 [[mutation]]
+name = "lane-overflow-item-kept"
+gate = "cargo-test"
+why = "a file past a Derived lane laid out as if it fit (2026-10-31): its slots pack a wrong lane and misplace its glyphs, where it must be laid out empty and named while the rest of the load is untouched (the torvalds/linux rule: a limit costs its file, never the load). CONSUMED BY: HyperLayout::layout_items_internal's per-item drop; reddens layout_hyper::tests::an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched (the item past X_PAGE_MAX keeps its slots). Blind to which items are named (derived_lane_overflow_names_every_item_past_a_lane holds that)"
+file = "native/src/layout_hyper.rs"
+op = "replace"
+find = "            if !over.is_empty() {"
+with = "            if !over.is_empty() && false {"
+expect = "an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched"
+
+[[mutation]]
 name = "derived-column-page-term-dropped"
 gate = "cargo-test"
-why = "the Derived vertex stage before 2026-10-10: z without fold::paginate's x_page * depth_per_col term. Every column-paged item's z was wrong in Derived mode and nothing saw it — no golden view is column-paged (the repo never sets page_cols) and hyper-oracle compares slots, not the vertex stage. The row lane now carries the column page (row:24 | x_page:8) and glyph_field_derived::derive_yz is the shader's transcription; dropping the term there reddens the witness. CONSUMED BY: derive_yz's paged branch; reddens hyper_oracle::tests::derived_vertex_stage_agrees_with_instanced on every column-paged shape of the grid (thousands of ulps). Blind to the shader's own text drifting from the transcription — derive::tests::wgsl_derive_yz_carries_the_column_page_term pins the term's text, nothing executes the WGSL"
+why = "the Derived vertex stage before 2026-10-10: z without fold::paginate's x_page * depth_per_col term. Every column-paged item's z was wrong in Derived mode and nothing saw it — no golden view is column-paged (the repo never sets page_cols) and hyper-oracle compares slots, not the vertex stage. The row lane now carries the column page (row:24 | x_page:8) and glyph_field_derived::derive_yz is the shader's transcription; dropping the term there reddens the witness. CONSUMED BY: derive_yz's paged branch; reddens hyper_oracle::tests::derived_vertex_stage_agrees_with_the_reference (held to the oracle-backed reference since 2026-10-31) on every column-paged shape of the grid (thousands of ulps). Blind to the shader's own text drifting from the transcription — derive::tests::wgsl_derive_yz_carries_the_column_page_term pins the term's text, nothing executes the WGSL"
 file = "crates/glyph-field-derived/src/derive.rs"
 op = "replace"
 find = "        let z = (x_page as f32).mul_add(item.depth_per_col, z_banded);"
 with = "        let z = (0.0 * x_page as f32).mul_add(item.depth_per_col, z_banded);"
-expect = "derived_vertex_stage_agrees_with_instanced"
+expect = "derived_vertex_stage_agrees_with_the_reference"
 
 [[mutation]]
 name = "session-block-origin-z-dropped"
@@ -958,12 +977,12 @@ with = "        for (out, pairs) in done.into_iter().rev() {"
 expect = "windowed_emission_matches_unwindowed"
 
 [[mutation]]
-name = "host-block-write-dropped"
+name = "host-block-version-unbumped"
 gate = "cargo-test"
-why = "2026-10-26: the Derived field keeps its slots in host blocks a makepad renderer draws from, so a slot write that reaches the buffer and not the block leaves that renderer drawing the glyph as loaded. CONSUMED BY: SlotStorage::write_field, which every Derived verb goes through, via derived_host_blocks_follow_every_slot_write (verbs and a sidecar on g-pick-repo, blocks compared with their buffers)"
-file = "crates/glyph-field/src/storage.rs"
+why = "2026-10-31: the Derived field's edits land in its host blocks alone, and the wgpu draw uploads a block when its version moved (SlotStorage::sync), so a write that does not bump its block's version leaves the device drawing the glyph as loaded. (It replaces host-block-write-dropped, 2026-10-26: a write reaching the buffer and not the block, which cannot happen since nothing writes the buffer but the sync.) CONSUMED BY: HostSlots::write, which every Derived verb goes through, via derived_host_blocks_follow_every_slot_write (verbs and a sidecar on g-pick-repo; after the sync every block is compared with its buffer). Blind to a consumer that reads Arc identity instead (the makepad host): edits_move_only_the_block_they_touch holds that"
+file = "crates/glyph-field/src/host_slots.rs"
 op = "replace"
-find = "        self.patch_host(slot, field_offset, data);\n"
+find = "        self.versions[k] += 1;\n"
 with = ""
 expect = "derived_host_blocks_follow_every_slot_write"
 
@@ -971,7 +990,7 @@ expect = "derived_host_blocks_follow_every_slot_write"
 name = "host-block-scatter-shifted"
 gate = "cargo-test"
 why = "2026-10-26: Pass 2 writes the Derived slots window by window into scratch, then each window into the host blocks it covers; a block-relative offset one slot off moves every glyph past a block edge by a slot (and loses the block's last). CONSUMED BY: BlockSink::end, via host_blocks_match_the_contiguous_emission (block sizes 1, 7, 700 and past the stream, edges inside windows, layout chunks and emoji items)"
-file = "native/src/layout_hyper/device_alloc.rs"
+file = "native/src/layout_hyper/emit.rs"
 op = "replace"
 find = "            let to = (lo - block_start) * slot_words..(hi - block_start) * slot_words;"
 with = "            let to = (lo - block_start + 1).min(block_slots - (hi - lo)) * slot_words..((lo - block_start + 1).min(block_slots - (hi - lo)) + hi - lo) * slot_words;"
@@ -1007,14 +1026,23 @@ arg = "\n[target.'cfg(all())'.dependencies]\nwinit = \"0.30\"\n"
 expect = "winit v0.30"
 
 [[mutation]]
-name = "copy-split-body-unaligned"
-gate = "cargo-test"
-why = "C16 (2026-10-09): a slot-buffer copy whose size is off 16 B runs whole at about half speed on the discrete path (RTX 5090/Vulkan measured; wgpu only asks for 4), so an odd Derived survivor count cost ~+20 ms of backend on the 94 MB tree across its two staging copies. Copying the whole size as the 'body' restores exactly that shape. Invisible to every byte and pixel gate BY DESIGN — the bytes that land are the same, only the speed moves — so the reddening witness is the helper's own unit test. CONSUMED BY: glyph_field::copy_split, called by the discrete staging copies in layout_hyper/device_alloc.rs and glyph_field::upload_host_slots (both modes' host upload since C1)"
-file = "crates/glyph-field/src/copy.rs"
+name = "wgpu-unconditional"
+gate = "cargo-check-no-ui"
+why = "wgpu back as a dependency every build takes (2026-10-31), declared again in a target table every target matches, so the manifest still resolves: every check compiles, wgpu unused by the bare library, and that library drags the GPU stack (a device a makepad host never makes, and its driver) into a host that draws the frames itself. CONSUMED BY: the bare tree's grep for wgpu"
+file = "native/Cargo.toml"
+op = "append"
+arg = "\n[target.'cfg(all())'.dependencies]\nwgpu = \"30\"\n"
+expect = "wgpu v30"
+
+[[mutation]]
+name = "renderer-module-ungated"
+gate = "cargo-check-no-ui"
+why = "the wgpu renderer compiled without its feature (2026-10-31): the default build is unchanged, and the bare library, the build a host with its own renderer links, no longer compiles, since wgpu is absent from it. CONSUMED BY: the bare --no-default-features check"
+file = "native/src/glyph_scene.rs"
 op = "replace"
-find = "    let body = size - size % FAST_COPY_ALIGN;"
-with = "    let body = size;"
-expect = "split_body_is_fast_aligned_and_covers_the_size"
+find = "#[cfg(feature = \"wgpu\")]\nmod renderer;"
+with = "mod renderer;"
+expect = "cargo-check-no-ui errored"
 
 [[mutation]]
 name = "derived-curve-cap-128"
@@ -1045,16 +1073,6 @@ op = "replace"
 find = "+ if newline_ended { line_height } else { 0.0 });"
 with = "+ if newline_ended { 0.0 } else { 0.0 });"
 expect = "tile_views_frame_copies_as_the_text_stager_did"
-
-[[mutation]]
-name = "instanced-coverage-scale"
-gate = "pixel-ab"
-why = "proves the `--field-mode instanced` golden equivalent renders Instanced: since Derived became the default (2026-10-11) every other pixel mutation targets Derived or shared code, so an equivalent whose argument stopped reaching the field would compare Derived with Derived and stay green. CONSUMED BY: every golden view under the instanced equivalent; the plain frames stay byte-equal"
-file = "crates/glyph-field-instanced/shaders/glyph_field.wgsl"
-op = "replace"
-find = "cov = clamp(coverage * 0.5, 0.0, 1.0);"
-with = "cov = clamp(coverage * 0.62, 0.0, 1.0);"
-expect = "text.png diverges from baseline under --field-mode instanced"
 
 [[mutation]]
 name = "prove-ambiguous-find-accepted"

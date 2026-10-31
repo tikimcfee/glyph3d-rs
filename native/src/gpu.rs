@@ -376,59 +376,8 @@ pub struct GpuContext {
     /// Stage H: CPU-side scope times (e.g. the cull pass), merged into the
     /// profile summary. Written by scenes only when `profiler` is `Some`.
     pub cpu_scopes: RefCell<std::collections::BTreeMap<String, (f64, u64)>>,
-    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
-    pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
-    /// A host renderer draws the glyphs from the field's host blocks (the
-    /// makepad port), so the Derived field gives this device no copy of its
-    /// slots (2026-10-26). False for this crate's own renderer, which
-    /// draws them from the device; set by the host before it builds.
-    pub host_draws_glyphs: bool,
-}
-
-/// The renderer's device context handles passed across layout stages.
-/// The wgpu handles clone as cheap Arcs.
-#[derive(Clone)]
-pub struct SharedDevice {
-    pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub max_buffer_size: u64,
-    pub host_visible_storage: bool,
-    pub memory_arch: MemoryArchitecture,
-    pub prefetched_walk: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::repo::PrefetchedRepo>>>>,
-    pub prefetched_atlas: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<crate::atlas::Atlas>>>>,
-    /// `GpuContext::host_draws_glyphs`.
-    pub host_draws_glyphs: bool,
-}
-
-impl SharedDevice {
-    pub fn from_ctx(ctx: &GpuContext) -> Self {
-        let memory_arch = ctx.profile.memory_architecture();
-        Self {
-            instance: ctx.instance.clone(),
-            adapter: ctx.adapter.clone(),
-            device: ctx.device.clone(),
-            queue: ctx.queue.clone(),
-            max_buffer_size: ctx.profile.max_buffer_size,
-            host_visible_storage: memory_arch == MemoryArchitecture::Unified
-                && ctx.profile.mappable_primary_buffers,
-            memory_arch,
-            prefetched_walk: ctx.prefetched_walk.clone(),
-            prefetched_atlas: ctx.prefetched_atlas.clone(),
-            host_draws_glyphs: ctx.host_draws_glyphs,
-        }
-    }
-
-    #[inline(always)]
-    pub fn is_unified(&self) -> bool {
-        self.memory_arch == MemoryArchitecture::Unified
-    }
-
-    #[inline(always)]
-    pub fn is_discrete(&self) -> bool {
-        self.memory_arch == MemoryArchitecture::Discrete
-    }
+    /// Loads started before the scene is built (`crate::Prefetch`).
+    pub prefetch: crate::Prefetch,
 }
 
 /// Record one CPU scope sample (ms) — no-op semantics live at the call site
@@ -651,9 +600,7 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         profile,
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
-        prefetched_walk: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        prefetched_atlas: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        host_draws_glyphs: false,
+        prefetch: crate::Prefetch::default(),
     }
 }
 

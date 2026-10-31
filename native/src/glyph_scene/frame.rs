@@ -32,7 +32,7 @@ use super::mesh::MeshInstance;
 use super::nodes::UploadCost;
 use super::pick::format_pick;
 use super::regions::{RegionCost, RegionInstance, RegionParams};
-use super::target::Selection;
+use super::selection::Selection;
 use super::ui_probe::UiFileDyn;
 use super::{GlyphScene, GroupRow};
 
@@ -114,6 +114,9 @@ pub struct FrameCosts {
     pub regions: RegionCost,
     /// The CPU cull, when the scene culls (0 under --no-cull).
     pub cull_ms: f32,
+    /// The library animation's last step before this frame: its ease and
+    /// its move notes, ms (0, 0 when nothing animated).
+    pub library: (f64, f64),
 }
 
 /// One frame, prepared: see the module header.
@@ -160,18 +163,25 @@ pub struct FrameData<'a> {
     pub meshes_generation: u64,
     pub quads: &'a [MeshInstance],
     pub cubes: &'a [MeshInstance],
-    // ── what a host renderer draws the glyphs from (2026-10-26; the wgpu
-    // half binds the field's own buffers) ──
-    /// The field's slots on the host, in blocks that are its chunks
-    /// (Derived; None for a field without them). A block's `Arc` identity
-    /// is its generation: a write gives the block it touched a new one.
-    pub slots: Option<Ref<'a, glyph_field::HostSlots>>,
-    /// The Derived field's group overrides table (index 0 unused).
-    pub group_overrides: Option<Ref<'a, [u32]>>,
+    // ── what a renderer draws the glyphs from (2026-10-26; the wgpu half
+    // syncs its device copy from the field itself, 2026-10-31) ──
+    /// The field's slots on the host, in blocks that are its chunks. A
+    /// consumer holding the blocks' `Arc`s sees a written block as a new
+    /// one; one holding none reads `HostSlots::version`.
+    pub slots: Ref<'a, glyph_field::HostSlots>,
+    /// The Derived field's group overrides table (index 0 unused), and its
+    /// version, bumped by every write to it.
+    pub group_overrides: Ref<'a, [u32]>,
+    pub group_overrides_version: u64,
     /// The item table the Derived shader reads, fixed for the scene's life.
     pub item_table: &'a [glyph_field::ItemParamsGpu],
+    /// The atlas the scene was staged against (glyph map, curves, advances,
+    /// the emoji sheet's levels), fixed for the scene's life: a host
+    /// renderer's static tables, held by the `Arc` as long as it needs them.
+    pub atlas: &'a std::sync::Arc<crate::atlas::Atlas>,
     // ── for the wgpu half only ──
     pub costs: FrameCosts,
+    #[cfg(feature = "wgpu")]
     /// The frame uniform the stored fields' shaders read.
     pub(super) uniform: FrameUniform,
 }
@@ -312,6 +322,7 @@ impl GlyphScene {
             faces: if face_runs.is_empty() { UploadCost::default() } else { self.library_faces.as_ref().map(|f| f.last_update()).unwrap_or_default() },
             regions: region_cost,
             cull_ms,
+            library: self.library_tick_ms.replace((0.0, 0.0)),
         };
         FrameData {
             viewport: [width, height],
@@ -341,8 +352,11 @@ impl GlyphScene {
             cubes: meshes.map_or(&[], |m| &m.cubes),
             slots: self.field.host_slots(),
             group_overrides: self.field.group_overrides(),
+            group_overrides_version: self.field.group_overrides_version(),
             item_table: &self.item_table,
+            atlas: &self.atlas,
             costs,
+            #[cfg(feature = "wgpu")]
             uniform,
         }
     }

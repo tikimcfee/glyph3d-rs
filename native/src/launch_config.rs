@@ -321,7 +321,11 @@ mod tests {
     fn unknown_mode_value_is_an_error_naming_it() {
         let err = LaunchConfig::from_toml_str("field_mode = \"visable\"\n").unwrap_err();
         assert!(err.contains("visable"), "error should name the value: {err}");
-        assert!(err.contains("instanced | derived"), "error should list the modes: {err}");
+        assert!(err.contains("expected derived"), "error should list the modes: {err}");
+        // The Instanced field, retired 2026-10-31, is refused like any
+        // unknown mode.
+        let err = LaunchConfig::from_toml_str("field_mode = \"instanced\"\n").unwrap_err();
+        assert!(err.contains("instanced") && err.contains("expected derived"), "{err}");
         // Case is forgiven, as the launcher always forgave it.
         let cfg = LaunchConfig::from_toml_str("repo_engine = \"Hyper\"\n").expect("case-insensitive");
         assert_eq!(cfg.repo_engine, Some(Strategy::Hyper));
@@ -345,7 +349,7 @@ mod tests {
             focus_file = "alpha"
             layout_mode = "carrel"
             repo_engine = "direct"
-            field_mode = "instanced"
+            field_mode = "derived"
             present_mode = "mailbox"
             kimi_sessions_dir = ""
             repo_presets = ["."]
@@ -356,7 +360,7 @@ mod tests {
         )
         .expect("parse failed");
         let text = cfg.to_toml_string();
-        assert!(text.contains("field_mode = \"instanced\""), "modes are written by CLI name: {text}");
+        assert!(text.contains("field_mode = \"derived\"") && text.contains("present_mode = \"mailbox\""), "modes are written by CLI name: {text}");
         assert_eq!(LaunchConfig::from_toml_str(&text).expect("re-parse failed"), cfg);
         let other = LaunchConfig { demo: Some(true), render_file: Some("/f.rs".into()), ..Default::default() };
         assert_eq!(LaunchConfig::from_toml_str(&other.to_toml_string()).expect("re-parse failed"), other);

@@ -93,6 +93,7 @@ pub(crate) fn run_rows(runs: &[Range<u32>]) -> usize {
     runs.iter().map(|r| r.len()).sum()
 }
 
+#[cfg(feature = "wgpu")]
 /// Write `runs` of a host table `data` (`row_bytes` a row) into `buffer`.
 pub(super) fn write_runs(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u8], row_bytes: usize, runs: &[Range<u32>]) {
     for r in runs {
@@ -125,8 +126,6 @@ fn ext_appearance(row: &GroupRow) -> [u32; 5] {
 pub(crate) struct GroupNodes {
     /// Interior mutability for the flush, which runs from `render(&self)`.
     tables: RefCell<NodeTables>,
-    /// The GPU group table; None only in the device-less unit tests.
-    buffer: Option<wgpu::Buffer>,
     /// The group table, row per group id (`0..len()`).
     rows: RefCell<Vec<GroupRow>>,
     /// Rows written since the last upload: the GPU's differ from `rows`
@@ -150,11 +149,12 @@ pub(crate) struct GroupNodes {
 }
 
 impl GroupNodes {
-    /// One node per row of `groups`, under an identity root, each writing
-    /// its row of `group_buf`, which already holds `groups` (rows of 96 B;
-    /// the caller sizes it for every row a verb may allocate).
-    pub(crate) fn new(group_buf: &wgpu::Buffer, groups: &[GroupRow]) -> Self {
-        let this = Self { buffer: Some(group_buf.clone()), ..Self::cpu_only(groups) };
+    /// One node per row of `groups`, under an identity root. The rows
+    /// start SENT: whoever holds the GPU group table writes `groups` whole
+    /// when it builds it (rows of 96 B, sized for every row a verb may
+    /// allocate), and then each frame's runs (`upload`).
+    pub(crate) fn new(groups: &[GroupRow]) -> Self {
+        let this = Self::cpu_only(groups);
         this.unsent.borrow_mut().clear();
         this
     }
@@ -164,7 +164,6 @@ impl GroupNodes {
         let root = tables.insert(None, Similarity::IDENTITY, Appearance::IDENTITY).expect("a fresh pool accepts a root");
         let mut this = Self {
             tables: RefCell::new(tables),
-            buffer: None,
             rows: RefCell::new(Vec::with_capacity(groups.len())),
             unsent: RefCell::new(Vec::new()),
             root,
@@ -350,18 +349,6 @@ impl GroupNodes {
         (plan, runs)
     }
 
-    /// The wgpu half of the flush: write `runs` (`prepare`'s) into the GPU
-    /// group table, before any pass reads a row (the writes land at the
-    /// frame's submit, ahead of its passes). Its time joins the flush's.
-    pub(crate) fn upload(&self, queue: &wgpu::Queue, runs: &[Range<u32>]) {
-        let Some(buffer) = &self.buffer else { return };
-        let t0 = Instant::now();
-        write_runs(queue, buffer, bytemuck::cast_slice(&self.rows.borrow()), std::mem::size_of::<GroupRow>(), runs);
-        let (mut cost, resolved) = self.last_flush.get();
-        cost.ms += t0.elapsed().as_secs_f64() * 1e3;
-        self.last_flush.set((cost, resolved));
-    }
-
     /// The flush generation: bumped whenever a flush planned any run.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.get()
@@ -474,6 +461,7 @@ fn write_row(row: &mut GroupRow, w: &Similarity, alpha: f32, p: [f32; 3], a: &Ap
     bytemuck::bytes_of(row) != bytemuck::bytes_of(&old)
 }
 
+#[cfg(feature = "wgpu")]
 /// Block on a readback of `bytes` of `src` (tests only, never the frame
 /// path).
 #[cfg(test)]
@@ -548,6 +536,7 @@ mod tests {
         assert!(!n.translate(9, [1.0; 3]), "an unknown group is refused");
     }
 
+    #[cfg(feature = "wgpu")]
     /// What reaches the GPU's group table (2026-10-26, the CPU resolve as
     /// the path): a load's rows resolve to their own bits and upload
     /// nothing; a verb uploads exactly the rows it changed (as one run when
@@ -571,10 +560,10 @@ mod tests {
             mapped_at_creation: false,
         });
         ctx.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&rows));
-        let mut n = GroupNodes::new(&buf, &rows);
+        let mut n = GroupNodes::new(&rows);
         let flush = |n: &GroupNodes| {
             let (plan, runs) = n.prepare();
-            n.upload(&ctx.queue, &runs);
+            write_runs(&ctx.queue, &buf, bytemuck::cast_slice(&n.rows()), std::mem::size_of::<GroupRow>(), &runs);
             (plan.resolved, n.last_flush().0)
         };
         let (resolved, up) = flush(&n);

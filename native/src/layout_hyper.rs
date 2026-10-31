@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::atlas::TrieTable;
 use crate::fold::rows_for_line;
 use crate::layout::{
-    EmittedSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem, SlotResidence,
+    EmittedSlots, GlyphArena, ItemPlacement, LayoutError, LayoutGlyphs, LayoutItem,
 };
 use crate::text::fu_to_world;
 use glyph_field::GlyphFieldMode;
@@ -26,20 +26,23 @@ pub(crate) mod tab_stop;
 use tab_stop::TabStops;
 use char_resolve::{resolve_byte_char_cluster, ResolveCtx};
 
-mod device_alloc;
-use device_alloc::{emit_host_blocks, layout_device_discrete, layout_device_unified, DeviceEmission, EmitInputs};
+mod emit;
+use emit::{emit_host_blocks, EmitInputs};
 
 mod pass2_device;
-use pass2_device::{DerivedEmit, RenderEmit};
+use pass2_device::DerivedEmit;
 mod page;
 mod pass2_host;
 pub use pass2_host::{compute_single_item_placement, layout_pass2_host, scan_item_max_row_extent};
 
 pub struct HyperLayout {
     trie: Option<Arc<TrieTable>>,
-    device: Option<crate::gpu::SharedDevice>,
-    /// Whose slot format the device path emits. Host (no-device) runs
-    /// always produce the neutral 48 B records regardless.
+    /// Where the emitted slots will live: a load for a field (Some) emits
+    /// the field's slots into host blocks and checks them against the
+    /// machine; one without (the oracle's and the tests' host runs)
+    /// produces the neutral 48 B records.
+    home: Option<crate::budget::SlotHome>,
+    /// Whose slot format a field load emits.
     field_mode: GlyphFieldMode,
     pub(crate) prefetched_data: Option<PrefetchedHyperData>,
 }
@@ -54,16 +57,16 @@ impl HyperLayout {
     pub fn new() -> Self {
         Self {
             trie: None,
-            device: None,
+            home: None,
             field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
     }
 
-    pub(crate) fn with_device(device: crate::gpu::SharedDevice, field_mode: GlyphFieldMode) -> Self {
+    pub(crate) fn for_field(home: crate::budget::SlotHome, field_mode: GlyphFieldMode) -> Self {
         Self {
             trie: None,
-            device: Some(device),
+            home: Some(home),
             field_mode,
             prefetched_data: None,
         }
@@ -72,7 +75,7 @@ impl HyperLayout {
     pub fn with_trie(trie: Arc<TrieTable>) -> Self {
         Self {
             trie: Some(trie),
-            device: None,
+            home: None,
             field_mode: GlyphFieldMode::default(),
             prefetched_data: None,
         }
@@ -147,19 +150,31 @@ impl HyperLayout {
             drop(sp_pass1);
             (chunks, item_chunk_ranges, agg)
         };
-        // The Derived lanes are release-time
-        // limits: past them a slot would pack a wrong lane and misplace
-        // glyphs, so the load falls back to Instanced, once, loudly.
-        let field_mode = if allow_device {
+        // The Derived lanes are release-time limits: past them a slot would
+        // pack a wrong lane and misplace glyphs. An item past one is laid
+        // out EMPTY, loudly, and every other item as it would have been: a
+        // limit costs its own file, never the load (2026-10-31; until then
+        // the whole load fell back to the Instanced field). Only where
+        // Derived slots are packed: the host instances a device-less load
+        // emits carry absolute positions and no lane (hyper-oracle's host
+        // tier lays out items past every lane on purpose).
+        if allow_device && self.home.is_some() && self.field_mode == GlyphFieldMode::Derived {
             let params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
-            let (mode, note) = effective_field_mode(self.field_mode, &derived_lane_limits(&agg.prepasses, &params));
-            if let Some(note) = note {
-                log::warn!("{note}");
+            let over = derived_lane_overflow(&agg.prepasses, &params);
+            if !over.is_empty() {
+                for (item, why) in &over {
+                    log::warn!("item {item}: {why}; laid out empty, the rest of the load is unaffected");
+                }
+                let mut kept: Vec<LayoutItem<'_>> = items.to_vec();
+                for (item, _) in &over {
+                    kept[*item].bytes = &[];
+                }
+                // An emptied item has no survivors, so the second Pass 1
+                // finds nothing past a lane and this runs once.
+                return self.layout_items_internal(&kept, arena, allow_device);
             }
-            mode
-        } else {
-            self.field_mode
-        };
+        }
+        let field_mode = self.field_mode;
 
         let prepasses = agg.prepasses;
         let chunk_slot_bases = agg.chunk_slot_bases;
@@ -175,35 +190,24 @@ impl HyperLayout {
             slot_bases.push(chunk_slot_bases[range.start]);
         }
 
-        let derived = field_mode == GlyphFieldMode::Derived;
-        let can_use_device = allow_device && self.device.is_some() && total_survivors > 0;
+        // A load for a field emits its Derived slots into host blocks that
+        // are the field's chunks (with or without a device: 2026-10-31).
+        let emit_slots = allow_device && self.home.is_some() && total_survivors > 0 && field_mode == GlyphFieldMode::Derived;
 
-        if can_use_device {
-            let dev = self.device.as_ref().unwrap();
-            let unified = dev.is_unified() && dev.host_visible_storage;
+        if emit_slots {
+            let home = self.home.as_ref().unwrap();
 
             // What the slots will ask of the machine, refused here if it is
             // more than it has: nothing is allocated yet.
-            let demand = if derived {
-                crate::budget::SlotDemand {
-                    slots: total_survivors as u64,
-                    slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
-                    block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
-                    host_blocks: true,
-                    device: !dev.host_draws_glyphs,
-                    staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
-                }
-            } else {
-                crate::budget::SlotDemand {
-                    slots: total_survivors as u64,
-                    slot_bytes: std::mem::size_of::<glyph_field_instanced::RenderSlot>() as u64,
-                    block_slots: 1,
-                    host_blocks: false,
-                    device: true,
-                    staging: 0,
-                }
+            let demand = crate::budget::SlotDemand {
+                slots: total_survivors as u64,
+                slot_bytes: std::mem::size_of::<glyph_field_derived::DerivedSlot>() as u64,
+                block_slots: u64::from(crate::config::settings().glyph_scene.derived_block_slots),
+                host_blocks: true,
+                device: home.device_copy,
+                staging: 2 * glyph_field::UPLOAD_BATCH_BYTES as u64,
             };
-            match crate::budget::check(&demand, &crate::budget::Machine::of(&dev.adapter, dev.is_unified())) {
+            match crate::budget::check(&demand, &home.machine) {
                 Ok(line) => println!("slots: {line}"),
                 Err(why) => {
                     return Err(LayoutError { backend: "hyper", status: crate::layout::LAYOUT_PAST_BUDGET, what: why });
@@ -231,31 +235,16 @@ impl HyperLayout {
 
             // Derived slots land in host blocks that are the field's chunks
             // (2026-10-26): the one copy the wgpu field uploads from and a
-            // makepad renderer publishes. Instanced slots are emitted to the
-            // device directly, and stay so only because Instanced is being
-            // retired: not a second Derived path.
-            let (residence, chunk_slots, pass2_out, emoji_tint_pairs) = if derived {
-                let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
-                let (slots, pass2, pairs) = emit_host_blocks::<DerivedEmit>(&inputs, total_survivors, block_slots);
-                (SlotResidence::Host(slots), block_slots, pass2, pairs)
-            } else {
-                let label = "glyph render slots (direct)";
-                let emission = if unified {
-                    layout_device_unified::<RenderEmit>(dev, total_survivors, &inputs, label)
-                } else {
-                    layout_device_discrete::<RenderEmit>(dev, total_survivors, &inputs, label)
-                };
-                let DeviceEmission { chunks, chunk_slots, mapped_base, pass2, emoji_tint_pairs } = emission;
-                (SlotResidence::Device { chunks, mapped_slots: mapped_base }, chunk_slots, pass2, emoji_tint_pairs)
-            };
+            // makepad renderer publishes.
+            let block_slots = crate::config::settings().glyph_scene.derived_block_slots as usize;
+            let (slots, pass2_out, emoji_tint_pairs) = emit_host_blocks::<DerivedEmit>(&inputs, total_survivors, block_slots);
 
             let emitted = EmittedSlots {
-                residence,
-                chunk_slots,
+                slots,
+                chunk_slots: block_slots,
                 len: total_survivors,
                 file_tints: pass2_out.file_tints,
                 file_blocks: pass2_out.file_blocks,
-                format: field_mode,
                 emoji_tint_pairs,
             };
             *arena = GlyphArena::from_emitted(emitted);
@@ -286,53 +275,44 @@ impl HyperLayout {
 
 /// The Derived slot's lanes have fixed widths (`glyph_field_derived::derive`:
 /// `item:20`, `row:24 | x_page:8`), asserted only in debug builds where they
-/// are packed. This is the release-time decision, made ONCE per load from
-/// Pass 1's aggregate, before any slot is emitted or any field built: the
-/// item count against `ITEM_MAX`, each item's `row_count` against `ROW_MAX`,
-/// and each column-paged item's widest column page (`max_line_cols /
-/// page_cols`) against `X_PAGE_MAX`. `Err` names the first item and limit.
-pub fn derived_lane_limits(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Result<(), String> {
+/// are packed. This is the release-time decision, made once per load from
+/// Pass 1's aggregate, before any slot is emitted or any field built: every
+/// item whose slots could not be packed, each with the limit it passes —
+/// its `row_count` against `ROW_MAX`, a column-paged item's widest column
+/// page (`max_line_cols / page_cols`) against `X_PAGE_MAX`, and an item past
+/// `ITEM_MAX` that has a glyph to place (one with none packs no lane).
+pub fn derived_lane_overflow(prepasses: &[ItemPrepass], params: &[crate::layout::ItemParams]) -> Vec<(usize, String)> {
     use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
-    if prepasses.len() as u64 > u64::from(ITEM_MAX) + 1 {
-        return Err(format!(
-            "{} items, but the Derived item lane holds at most {} (ITEM_MAX {ITEM_MAX})",
-            prepasses.len(),
-            u64::from(ITEM_MAX) + 1
-        ));
-    }
+    let mut over = Vec::new();
     for (i, (pre, p)) in prepasses.iter().zip(params).enumerate() {
+        if i as u64 > u64::from(ITEM_MAX) {
+            if pre.survivor_count > 0 {
+                over.push((i, format!("past the Derived item lane, which holds {} items (ITEM_MAX {ITEM_MAX})", u64::from(ITEM_MAX) + 1)));
+            }
+            continue;
+        }
         // Rows are 0..row_count.
         if pre.row_count > 0 && pre.row_count - 1 > ROW_MAX {
-            return Err(format!(
-                "item {i}: {} rows, but the Derived row lane holds at most {} (ROW_MAX {ROW_MAX})",
-                pre.row_count,
-                u64::from(ROW_MAX) + 1
+            over.push((
+                i,
+                format!("{} rows, but the Derived row lane holds at most {} (ROW_MAX {ROW_MAX})", pre.row_count, u64::from(ROW_MAX) + 1),
             ));
+            continue;
         }
         if p.has_page && p.page_cols > 0 {
             let pages = pre.max_line_cols / p.page_cols as u32;
             if pages > X_PAGE_MAX {
-                return Err(format!(
-                    "item {i}: a line of {} leaders reaches column page {pages} at page_cols {}, but the Derived lane holds at most {X_PAGE_MAX} (X_PAGE_MAX)",
-                    pre.max_line_cols, p.page_cols
+                over.push((
+                    i,
+                    format!(
+                        "a line of {} leaders reaches column page {pages} at page_cols {}, but the Derived lane holds at most {X_PAGE_MAX} (X_PAGE_MAX)",
+                        pre.max_line_cols, p.page_cols
+                    ),
                 ));
             }
         }
     }
-    Ok(())
-}
-
-/// The field mode a load builds, given the one asked for and the lane
-/// check: a Derived request past the lanes becomes Instanced,
-/// with the warning to print. Instanced has no lanes to exceed.
-pub fn effective_field_mode(requested: GlyphFieldMode, limits: &Result<(), String>) -> (GlyphFieldMode, Option<String>) {
-    match (requested, limits) {
-        (GlyphFieldMode::Instanced, _) | (_, Ok(())) => (requested, None),
-        (mode, Err(why)) => (
-            GlyphFieldMode::Instanced,
-            Some(format!("field mode {mode} refused for this load — {why}; falling back to instanced")),
-        ),
-    }
+    over
 }
 
 /// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
@@ -1142,14 +1122,6 @@ where
     (slots, out.placements)
 }
 
-/// [`device_pass2_on_host`] in the Instanced field's format (32 B `RenderSlot`).
-pub(crate) fn device_pass2_render_on_host(
-    items: &[LayoutItem<'_>],
-    trie: &TrieTable,
-) -> (Vec<crate::glyph_scene::RenderSlot>, Vec<ItemPlacement>) {
-    device_pass2_on_host::<RenderEmit>(items, trie)
-}
-
 /// [`device_pass2_on_host`] in the Derived field's format (20 B `DerivedSlot`).
 pub(crate) fn device_pass2_derived_on_host(
     items: &[LayoutItem<'_>],
@@ -1187,7 +1159,6 @@ pub use rederive::{rederive_item_records, resolve_spans_to_slot_colors};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glyph_scene::RenderSlot;
     use crate::layout::{ItemParams, Paint};
     use glyph_field_derived::DerivedSlot;
 
@@ -1279,7 +1250,6 @@ mod tests {
         with_window_corpus(|items| {
             let sizes = [1, 700, usize::MAX];
             windowed_matches_unwindowed::<pass2_device::DerivedEmit>(items, &sizes);
-            windowed_matches_unwindowed::<pass2_device::RenderEmit>(items, &sizes);
         });
     }
 
@@ -1321,7 +1291,7 @@ mod tests {
             let ref_words: &[u32] = bytemuck::cast_slice(&reference[..total]);
             assert!(total > 1400, "the corpus must span many blocks of 700");
             for block_slots in [1, 7, 700, total + 3] {
-                let (slots, out, pairs) = device_alloc::emit_host_blocks::<pass2_device::DerivedEmit>(&inputs, total, block_slots);
+                let (slots, out, pairs) = emit::emit_host_blocks::<pass2_device::DerivedEmit>(&inputs, total, block_slots);
                 assert_eq!((slots.len(), slots.block_slots(), slots.slot_words()), (total, block_slots, 5));
                 assert_eq!(slots.blocks().len(), total.div_ceil(block_slots), "block_slots {block_slots}: block count");
                 let lens: Vec<usize> = (0..slots.blocks().len()).map(|k| slots.block_len(k)).collect();
@@ -1637,7 +1607,18 @@ mod tests {
             slot_bases.push(slots_acc);
             slots_acc += p.survivor_count;
         }
-        let mut direct: Vec<RenderSlot> = vec![bytemuck::Zeroable::zeroed(); slots_acc as usize];
+        // The blocks come from the production emitter; the positions they
+        // must enclose from the oracle-backed reference, which every slot
+        // the emitter writes is held to (hyper-oracle). Until 2026-10-31
+        // the positions were the Instanced emitter's own RenderSlots.
+        let mut direct: Vec<glyph_field_derived::DerivedSlot> = vec![bytemuck::Zeroable::zeroed(); slots_acc as usize];
+        let reference = {
+            let r = crate::hyper_oracle::reference_item(bytes, &items[0].params, &trie);
+            let mut arena = crate::layout::GlyphArena::new();
+            crate::layout::compact_records_into(&r.records, Paint::Flat(crate::layout::DEFAULT_COLOR_PACKED), 0, &mut arena);
+            arena.instances().to_vec()
+        };
+        assert_eq!(reference.len(), slots_acc as usize, "the reference places every survivor");
         let inputs = EmitInputs {
             items: &items,
             chunks: &chunks,
@@ -1654,7 +1635,7 @@ mod tests {
             bitmap_adv,
             em_height_fu,
         };
-        let (out, _pairs) = inputs.run::<RenderEmit>(direct.as_mut_ptr() as usize);
+        let (out, _pairs) = inputs.run::<DerivedEmit>(direct.as_mut_ptr() as usize);
         assert!(!out.file_blocks.is_empty());
         let blocks = &out.file_blocks[0];
         assert!(blocks.len() >= 2, "must have multiple blocks for > 512 survivors, got {}", blocks.len());
@@ -1681,7 +1662,7 @@ mod tests {
 
             let start = block.slot_base as usize;
             let end = (block.slot_base + block.slot_count) as usize;
-            for (slot_idx, slot) in direct[start..end].iter().enumerate() {
+            for (slot_idx, slot) in reference[start..end].iter().enumerate() {
                 assert!(
                     slot.pos[0] >= block.min[0] - 1e-4,
                     "block {block_index}, slot {slot_idx}: x {} < min_x {}",
@@ -1711,168 +1692,6 @@ mod tests {
         }
     }
 
-    /// The device emission (the Instanced field's, since Derived slots land
-    /// in host blocks, 2026-10-26) chunks at the binding limit and the field
-    /// binds every chunk.
-    #[test]
-    fn hyper_device_chunking_splits_and_binds_across_limits() {
-        use glyph_field::{FieldResources, FieldTargets, GlyphField, SlotSource};
-        use glyph_field_instanced::InstancedField;
-
-        let ctx = pollster::block_on(crate::gpu::init(None));
-        let dev = crate::gpu::SharedDevice::from_ctx(&ctx);
-
-        let text = b"line 1: hello world\nline 2: testing chunked emission\nline 3: across buffer boundaries\n";
-        let item = LayoutItem {
-            bytes: text,
-            params: ItemParams { line_height: 1.25, ..Default::default() },
-            group_id: 0,
-            paint: Paint::Flat(0xFFFFFFFF),
-        };
-
-        let trie = crate::default_trie();
-        let em_height_fu = trie.metrics.em_height_fu;
-        let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
-        let items = [item];
-        let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(&items);
-        let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, &items, &trie, bitmap_adv, em_height_fu);
-        let prepasses = agg.prepasses;
-        let slot_bases = vec![0u32];
-        let total_survivors = prepasses[0].survivor_count as usize;
-        assert!(total_survivors > 20);
-
-        let inputs = EmitInputs {
-            items: &items,
-            chunks: &chunks,
-            item_chunk_ranges: &item_chunk_ranges,
-            prepasses: &prepasses,
-            slot_bases: &slot_bases,
-            chunk_slot_bases: &agg.chunk_slot_bases,
-            chunk_base_rows: &agg.chunk_base_rows,
-            chunk_record_bases: &agg.chunk_record_bases,
-            chunk_initial_cols: &agg.chunk_initial_cols,
-            chunk_initial_seg_advs: &agg.chunk_initial_seg_advs,
-            chunk_initial_line_advs: &agg.chunk_initial_line_advs,
-            trie: &trie,
-            bitmap_adv,
-            em_height_fu,
-        };
-
-        // Force chunk_cap = 16 slots to test multi-chunk emission on real GPU buffers
-        let chunk_cap = 16;
-        let emission = device_alloc::layout_device_discrete_chunked::<pass2_device::RenderEmit>(
-            &dev,
-            total_survivors,
-            &inputs,
-            "test instanced chunked",
-            chunk_cap,
-        );
-
-        let expected_chunks = total_survivors.div_ceil(chunk_cap);
-        assert_eq!(emission.chunks.len(), expected_chunks);
-        assert_eq!(emission.chunk_slots, chunk_cap);
-
-        let total_chunk_slots: u32 = emission.chunks.iter().map(|c| c.slots).sum();
-        assert_eq!(total_chunk_slots as usize, total_survivors);
-
-        // Verify InstancedField builds bind groups for all chunks without validation error
-        let dummy_advances = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy advances"),
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let dummy_frame_uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy frame uniform"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-        let dummy_group_table = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy group table"),
-            size: 256,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let dummy_glyph_map = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy glyph map"),
-            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_glyph_map_view = dummy_glyph_map.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_emoji_sheet = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy emoji sheet"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_emoji_sheet_view = dummy_emoji_sheet.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_emoji_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor::default());
-
-        let dummy_curves = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dummy curves"),
-            size: wgpu::Extent3d { width: 1024, height: 161, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let dummy_curves_view = dummy_curves.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let dummy_params = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dummy params"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM,
-            mapped_at_creation: false,
-        });
-
-        let resources = FieldResources {
-            frame_uniform: &dummy_frame_uniform,
-            group_table: &dummy_group_table,
-            glyph_map: &dummy_glyph_map_view,
-            curves: &dummy_curves_view,
-            params: &dummy_params,
-            emoji_sheet: &dummy_emoji_sheet_view,
-            emoji_sampler: &dummy_emoji_sampler,
-            glyph_advances: &dummy_advances,
-            item_params: &[],
-            item_of_group: &[],
-            block_slots: chunk_cap,
-            slots_on_device: true,
-        };
-
-        let source = SlotSource::Device {
-            chunk_capacity: emission.chunk_slots,
-            chunks: &emission.chunks,
-            glyph_count: total_survivors,
-            mapped_base: emission.mapped_base,
-        };
-
-        let targets = FieldTargets {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth32Float,
-            sample_count: 1,
-        };
-
-        let field = InstancedField::new(&ctx.device, &ctx.queue, source, &resources, targets);
-        assert_eq!(field.chunk_count(), expected_chunks as u32);
-        assert_eq!(field.chunk_capacity(), chunk_cap as u32);
-        assert_eq!(field.glyph_count(), total_survivors as u32);
-    }
-
     fn prepass_with(row_count: u32, max_line_cols: u32) -> ItemPrepass {
         ItemPrepass {
             survivor_count: 1,
@@ -1885,53 +1704,64 @@ mod tests {
         }
     }
 
-    /// THE LANE LIMITS ARE A LOAD-TIME DECISION. A synthetic prepass past
-    /// each Derived lane is refused with the item and the limit named; one
-    /// within every lane passes, including the exact boundaries.
+    /// THE LANE LIMITS ARE A LOAD-TIME DECISION, PER ITEM. Every item past a
+    /// Derived lane is named with its limit; one within every lane passes,
+    /// including the exact boundaries, and an item past the item lane with
+    /// nothing to place packs no lane and is not named.
     #[test]
-    fn derived_lane_limits_refuse_past_each_lane_and_name_the_item() {
+    fn derived_lane_overflow_names_every_item_past_a_lane() {
         use glyph_field_derived::{ITEM_MAX, ROW_MAX, X_PAGE_MAX};
         let plain = ItemParams::default();
         let paged = ItemParams { has_page: true, page_cols: 10, ..ItemParams::default() };
 
         // Within: the boundary rows and the boundary column page pass.
         let ok = [prepass_with(ROW_MAX + 1, 5), prepass_with(1, (X_PAGE_MAX + 1) * 10 - 1), prepass_with(0, 0)];
-        assert_eq!(derived_lane_limits(&ok, &[plain, paged, paged]), Ok(()));
+        assert!(derived_lane_overflow(&ok, &[plain, paged, paged]).is_empty());
 
-        // Rows: item 1 has one row too many.
-        let rows = [prepass_with(3, 1), prepass_with(ROW_MAX + 2, 1)];
-        let why = derived_lane_limits(&rows, &[plain, plain]).unwrap_err();
-        assert!(why.contains("item 1") && why.contains("ROW_MAX"), "{why}");
+        // Rows and column pages, each named; a plain item has no column
+        // page to exceed, whatever its widest line.
+        let mixed = [prepass_with(3, 1), prepass_with(ROW_MAX + 2, 1), prepass_with(1, (X_PAGE_MAX + 1) * 10), prepass_with(1, (X_PAGE_MAX + 1) * 10)];
+        let over = derived_lane_overflow(&mixed, &[plain, plain, paged, plain]);
+        assert_eq!(over.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 2], "{over:?}");
+        assert!(over[0].1.contains("ROW_MAX") && over[1].1.contains("X_PAGE_MAX"), "{over:?}");
 
-        // Column pages: item 0's widest line reaches page X_PAGE_MAX + 1 —
-        // only because it IS column-paged; the same line under a plain item
-        // has no column page to exceed.
-        let wide = [prepass_with(1, (X_PAGE_MAX + 1) * 10)];
-        let why = derived_lane_limits(&wide, &[paged]).unwrap_err();
-        assert!(why.contains("item 0") && why.contains("X_PAGE_MAX"), "{why}");
-        assert_eq!(derived_lane_limits(&wide, &[plain]), Ok(()));
-
-        // Items: one past the item lane.
-        let many = vec![prepass_with(1, 1); ITEM_MAX as usize + 2];
+        // Items: the two past the item lane are named, an empty one is not.
+        let mut many = vec![prepass_with(1, 1); ITEM_MAX as usize + 4];
+        many[ITEM_MAX as usize + 2].survivor_count = 0;
         let params = vec![plain; many.len()];
-        let why = derived_lane_limits(&many, &params).unwrap_err();
-        assert!(why.contains("ITEM_MAX"), "{why}");
-        assert_eq!(derived_lane_limits(&many[..ITEM_MAX as usize + 1], &params[..ITEM_MAX as usize + 1]), Ok(()));
+        let over = derived_lane_overflow(&many, &params);
+        let first_past = ITEM_MAX as usize + 1;
+        assert_eq!(over.iter().map(|o| o.0).collect::<Vec<_>>(), [first_past, first_past + 2], "{over:?}");
+        assert!(over[0].1.contains("ITEM_MAX"), "{over:?}");
     }
 
-    /// The fallback decision: Derived past the lanes becomes Instanced with
-    /// a warning that names the reason; within them, or for Instanced
-    /// itself, the request stands and nothing is said.
+    /// An item past a lane costs that item alone (2026-10-31: the torvalds/linux
+    /// rule — a limit drops its component, never the load). Item 1's line
+    /// reaches a column page past `X_PAGE_MAX`; it is laid out empty, and
+    /// items 0 and 2 land exactly where a load without it puts them: the
+    /// same placements, the same Derived slots in the host blocks. No
+    /// device: a field load emits its host blocks without one (2026-10-31).
     #[test]
-    fn effective_field_mode_falls_back_to_instanced_past_the_lanes() {
-        let refused: Result<(), String> = Err("item 7: too many rows".into());
-        let mode = GlyphFieldMode::Derived;
-        let (got, note) = effective_field_mode(mode, &refused);
-        assert_eq!(got, GlyphFieldMode::Instanced);
-        let note = note.expect("a fallback is announced");
-        assert!(note.contains(mode.as_str()) && note.contains("item 7") && note.contains("instanced"), "{note}");
-        assert_eq!(effective_field_mode(mode, &Ok(())), (mode, None));
-        assert_eq!(effective_field_mode(GlyphFieldMode::Instanced, &refused), (GlyphFieldMode::Instanced, None));
+    fn an_item_past_a_lane_is_laid_out_empty_and_the_rest_is_untouched() {
+        use crate::layout::{GlyphArena, LayoutGlyphs, LayoutItem, DEFAULT_COLOR_PACKED};
+        let plain = ItemParams { line_height: 1.25, ..ItemParams::default() };
+        let paged = ItemParams { has_page: true, page_cols: 1, page_rows: 4, ..plain };
+        let wide = "x".repeat(glyph_field_derived::X_PAGE_MAX as usize + 2);
+        let item = |bytes, params, group_id| LayoutItem { bytes, params, group_id, paint: Paint::Flat(DEFAULT_COLOR_PACKED) };
+        let run = |items: &[LayoutItem<'_>]| {
+            let mut arena = GlyphArena::new();
+            let mut engine = HyperLayout::for_field(crate::budget::SlotHome::host(), GlyphFieldMode::Derived);
+            let placements = engine.layout_items(items, &mut arena).expect("layout");
+            let slots = arena.take_emitted().expect("a Derived load with a device emits host blocks").slots;
+            let words: Vec<u32> = (0..slots.len() as u32).flat_map(|k| slots.slot(k).to_vec()).collect();
+            (placements, words)
+        };
+        let (with, with_words) = run(&[item(b"fn a() {}\n", plain, 0), item(wide.as_bytes(), paged, 1), item(b"let b = 2;\n", plain, 2)]);
+        let (without, without_words) = run(&[item(b"fn a() {}\n", plain, 0), item(b"", paged, 1), item(b"let b = 2;\n", plain, 2)]);
+        assert_eq!((with[1].slot_count, with[1].record_count), (0, 0), "the item past the lane is empty");
+        assert!(with.iter().zip(&without).all(|(a, b)| a.bit_eq(b)), "placements differ from a load without the item");
+        assert_eq!(with_words, without_words, "the other items' slots differ");
+        assert!(with[0].slot_count > 0 && with[2].slot_count > 0, "the other items placed nothing");
     }
 
     /// `max_line_cols` is the widest line in leaders over the whole item,

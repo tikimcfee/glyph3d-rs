@@ -28,8 +28,7 @@ pub fn run(
     } else {
         wgpu::TextureFormat::Rgba8UnormSrgb
     };
-    let scene =
-        build_scene_with_options(ctx, format, choice, CameraMode::Front { zoom }, cull_opts);
+    let scene = build_scene_with_options(&crate::SceneLoad::of(ctx), choice, CameraMode::Front { zoom }, cull_opts);
     run_scene(ctx, scene, format, path, frames, ops);
 }
 
@@ -93,14 +92,14 @@ pub fn run_scene(
     scene.set_viewport(size.width, size.height);
     for op in ops {
         let line = match op {
-            Op::Pick(p) => scene.apply_pick(ctx, p),
-            Op::Verb(v) => scene.apply_verb(ctx, v),
+            Op::Pick(p) => scene.apply_pick(p),
+            Op::Verb(v) => scene.apply_verb(v),
             Op::CamPose(eye, yaw, pitch) => {
                 scene.set_cam_pose(*eye, *yaw, *pitch);
                 None
             }
             // S3 spike: Zed-sidecar highlight — one op, applied like a verb.
-            Op::Highlight(p) => scene.apply_highlight_sidecar(ctx, p),
+            Op::Highlight(p) => scene.apply_highlight_sidecar(p),
         };
         match line {
             Some(line) => println!("{line}"),
@@ -118,8 +117,8 @@ pub fn run_scene(
     // drag prints a DRAGTIME line.
     let drag = std::env::var("GLYPH_DRAG_SCRIPT").ok().map(|spec| parse_drag_script(&spec));
     if let Some((key, ..)) = drag {
-        scene.on_cursor(ctx, size.width as f32 * 0.5, size.height as f32 * 0.5);
-        scene.on_key(ctx, key, true);
+        scene.on_cursor(size.width as f32 * 0.5, size.height as f32 * 0.5);
+        scene.on_key(key, true);
     }
     let mut drag_cursor = (size.width as f32 * 0.5, size.height as f32 * 0.5);
 
@@ -159,6 +158,9 @@ pub fn run_scene(
     // 3) from silently dropping newer frames; the post-loop drain below
     // collects whatever is still in flight.
     let mut profile_acc = crate::gpu::ProfileAccumulator::default();
+    // The scene's draw, built from it as it stands after the ops (what they
+    // changed it uploads now; what the frames change, frame by frame).
+    let mut renderer = scene.make_renderer(ctx, format);
     let t0 = std::time::Instant::now();
     for frame in 0..frames {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -171,7 +173,7 @@ pub fn run_scene(
         if let Some((_, dx, dy, events, _)) = drag.filter(|d| frame < d.4) {
             for _ in 0..events {
                 drag_cursor = (drag_cursor.0 + dx / events as f32, drag_cursor.1 + dy / events as f32);
-                scene.on_cursor(ctx, drag_cursor.0, drag_cursor.1);
+                scene.on_cursor(drag_cursor.0, drag_cursor.1);
             }
         }
         for (_, step) in frame_script.iter().filter(|(at, _)| *at == frame) {
@@ -180,8 +182,8 @@ pub fn run_scene(
                 FrameStep::ShowGlyphsPx(px) => scene.set_show_glyphs_px(px),
             }
         }
-        scene.animate(ctx, 1.0 / 60.0);
-        scene.render(
+        scene.animate(1.0 / 60.0);
+        renderer.render(
             ctx,
             &mut encoder,
             &crate::scene::FrameTarget {
@@ -194,6 +196,7 @@ pub fn run_scene(
                 width: size.width,
                 height: size.height,
             },
+            &*scene,
             frame as f32 / 60.0,
         );
         // Stage H: resolve profiler queries into their readback buffers before
@@ -280,7 +283,7 @@ pub fn run_scene(
         match parse_dump_spec(&spec.to_string_lossy()) {
             Ok(DumpSpec { slot, len }) => {
                 let mut buf = vec![0u32; (len / 4).max(12)];
-                scene.debug_dump_instances(ctx, slot, &mut buf);
+                renderer.debug_dump_instances(ctx, slot, &mut buf);
                 println!("GLYPH_G_DUMP slot {slot}: {buf:08x?}");
             }
             Err(e) => panic!("GLYPH_G_DUMP: {e}"),

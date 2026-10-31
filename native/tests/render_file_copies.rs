@@ -10,13 +10,12 @@
 //!
 //! Witnessed through the release binary, offscreen, at a camera parked on
 //! the gap between the 2x2 grid's copies, so the frame's quadrants are the
-//! copies: in Derived and Instanced alike, the four-copy frame's
-//! top-left quadrant is the one-copy frame's byte for byte (copy 0 is where
-//! a lone file is) and each other quadrant carries ink the one-copy frame
-//! does not (the copies did not stack on copy 0). And the Derived frame of
-//! four copies at the fitted camera is Instanced's, byte for byte. Before
-//! 2026-10-11 this test was only that last comparison, against the text
-//! stager's copies. Needs a GPU, like every render test in this crate.
+//! copies: the four-copy frame's top-left quadrant is the one-copy frame's
+//! byte for byte (copy 0 is where a lone file is) and each other quadrant
+//! carries ink the one-copy frame does not (the copies did not stack on
+//! copy 0). Until 2026-10-31 this ran in the Instanced field too, and held
+//! the Derived four-copy frame to Instanced's byte for byte. Needs a GPU,
+//! like every render test in this crate.
 //!
 //! And `--render-file`'s tab stops (2026-10-11): its one-item recipe has a
 //! default of its own, `[layout] render_file_tab_width_cells` (4, the stops
@@ -72,7 +71,7 @@ fn quadrant_diff(a: &image::RgbaImage, b: &image::RgbaImage, right: bool, bottom
 fn copies_tile_in_every_field() {
     let dir = std::env::temp_dir().join(format!("glyph-render-file-copies-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    for field in ["derived", "instanced"] {
+    for field in glyph_field::GlyphFieldMode::ALL.map(|m| m.as_str()) {
         let mode = ["--field-mode", field];
         let one = render(&[&mode[..], &POSE_ON_THE_GAP[..]].concat(), &dir.join(format!("one-{field}.png")));
         let four =
@@ -85,9 +84,6 @@ fn copies_tile_in_every_field() {
             );
         }
     }
-    let four = render(&["--copies", "4"], &dir.join("four.png"));
-    let four_instanced = render(&["--copies", "4", "--field-mode", "instanced"], &dir.join("four-instanced.png"));
-    assert!(four == four_instanced, "--copies 4: the default field's frame differs from Instanced's");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
