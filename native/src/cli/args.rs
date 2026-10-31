@@ -14,6 +14,7 @@ pub enum PresentMode {
     Immediate,
 }
 
+#[cfg(feature = "wgpu")]
 impl From<PresentMode> for wgpu::PresentMode {
     fn from(m: PresentMode) -> Self {
         match m {

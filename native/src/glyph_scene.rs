@@ -67,6 +67,7 @@ use std::cell::Cell;
 
 
 
+#[cfg(feature = "wgpu")]
 use crate::gpu::GpuContext;
 use crate::scene::SceneLike;
 
@@ -96,14 +97,18 @@ pub use instance::Params;
 
 pub use glyph_field::{GlyphField, GlyphFieldMode, GlyphPlacement};
 
+#[cfg(feature = "wgpu")]
 mod target;
-use target::Selection;
+mod selection;
+use selection::Selection;
 
 mod ui_probe;
 pub use ui_probe::{LodHandle, UiCarrelState, UiProbe, UiProbeState};
 
 mod environment;
+#[cfg(feature = "wgpu")]
 mod renderer;
+#[cfg(feature = "wgpu")]
 pub use renderer::GlyphRenderer;
 mod interaction;
 mod nodes;
@@ -113,7 +118,9 @@ mod regions;
 mod library;
 mod style;
 mod setup;
+#[cfg(feature = "wgpu")]
 mod pipelines;
+#[cfg(feature = "wgpu")]
 mod render;
 mod frame;
 pub use frame::{ChunkRanges, FrameCosts, FrameData, FrameSelection};
@@ -459,6 +466,7 @@ impl SceneLike for GlyphScene {
         self.controller.as_mut().and_then(|c| c.pending_carrel_options.take())
     }
 
+    #[cfg(feature = "wgpu")]
     fn make_renderer(&self, ctx: &GpuContext, color_format: wgpu::TextureFormat) -> Box<dyn crate::scene::SceneRenderer> {
         Box::new(GlyphRenderer::new(ctx, color_format, self))
     }

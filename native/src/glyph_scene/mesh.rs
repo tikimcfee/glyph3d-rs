@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+#[cfg(feature = "wgpu")]
 use wgpu::util::DeviceExt;
 
 /// A single vertex of a generic 3D mesh.
@@ -58,14 +59,17 @@ pub enum UnitMesh {
     Cube,
 }
 
+#[cfg(feature = "wgpu")]
 const QUAD_VERTS: &[MeshVertex] = &[
     MeshVertex { position: [-0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
     MeshVertex { position: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
     MeshVertex { position: [ 0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
     MeshVertex { position: [ 0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], uv: [1.0, 0.0] },
 ];
+#[cfg(feature = "wgpu")]
 const QUAD_IDXS: &[u32] = &[0, 1, 2, 0, 2, 3];
 
+#[cfg(feature = "wgpu")]
 const CUBE_VERTS: &[MeshVertex] = &[
     // +Z Front
     MeshVertex { position: [-0.5,  0.5,  0.5], normal: [0.0, 0.0, 1.0], uv: [0.0, 0.0] },
@@ -98,6 +102,7 @@ const CUBE_VERTS: &[MeshVertex] = &[
     MeshVertex { position: [ 0.5, -0.5, -0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 1.0] },
     MeshVertex { position: [ 0.5, -0.5,  0.5], normal: [0.0, -1.0, 0.0], uv: [1.0, 0.0] },
 ];
+#[cfg(feature = "wgpu")]
 const CUBE_IDXS: &[u32] = &[
     0, 1, 2, 0, 2, 3,       // Front
     4, 5, 6, 4, 6, 7,       // Back
@@ -107,6 +112,7 @@ const CUBE_IDXS: &[u32] = &[
     20, 21, 22, 20, 22, 23, // Bottom
 ];
 
+#[cfg(feature = "wgpu")]
 pub struct MeshPipeline {
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
@@ -118,6 +124,7 @@ pub struct MeshPipeline {
     last_revision: u64,
 }
 
+#[cfg(feature = "wgpu")]
 impl MeshPipeline {
     pub fn new(
         device: &wgpu::Device,

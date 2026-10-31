@@ -18,12 +18,17 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
 
 - `native/` — the pure-Rust renderer and layout engine binary (`glyph3d-native`).
   Features sub-200ms repo loading (`HyperLayout`) and modularized Slug WGSL rendering.
-  The window (`native/src/windowed/`, winit) is the `windowed` cargo feature
-  (2026-10-26), which `egui-ui` and `launcher` imply; all three are default.
-  `--no-default-features` is the engine alone, no winit or egui in its tree,
-  for a host that brings its own window (the makepad port): it drives a
-  scene through `SceneLike` with `scene::SceneKey` for keys, and rebuilds
-  one for a layout change with `relayout::rebuild_for_relayout`.
+  The wgpu renderer is the `wgpu` cargo feature (2026-10-31) and the window
+  (`native/src/windowed/`, winit) the `windowed` one (2026-10-26), which
+  implies it, as `egui-ui` and `launcher` imply `windowed`; all four are
+  default. `--no-default-features` is the engine's host side alone, no
+  wgpu, winit or egui in its tree, for a host that brings its own window
+  and renderer (the makepad port): it builds a scene with
+  `SceneLoad::host()`, drives it through `SceneLike` with `scene::SceneKey`
+  for keys, draws its `FrameData` (the field's host blocks, the tables, the
+  atlas), and rebuilds one for a layout change with
+  `relayout::rebuild_for_relayout`. A scene holds no device type; the wgpu
+  drivers build its `SceneRenderer` from it (`SceneLike::make_renderer`).
 - `glyph/` — the build/verify tool: gate runner, mutation prover. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
@@ -464,14 +469,17 @@ being met is itself a warning, so a silence cannot outlive its cause).
 `target/no-ui` so the changed feature sets never invalidate the main build:
 with `--features windowed` (the window without the egui overlay) and bare
 (since 2026-10-26: the engine with no window, what a host that owns its
-window and event loop links). The bare build's `cargo tree` must hold the
-renderer and no `winit` or `egui` crate. It exists because these builds are
-supported and nothing compiled the first: an `egui` use outside the `egui-ui`
-gate broke it unnoticed (C24, found by the GPU research agent).
-`egui-use-ungated` proves the windowed half, `windowed-module-ungated` the bare
-compile and `winit-unconditional` the tree. Blind to whether either build
-RUNS correctly — they are checked, not executed — and to a windowing crate in
-the bare tree whose name starts with neither.
+window and event loop links; since 2026-10-31 with no wgpu either, the
+`wgpu` feature off: the scene, layout, picks, verbs and frames, drawn by
+the host's own renderer). The bare build's `cargo tree` must hold the
+renderer and no `winit`, `egui` or `wgpu` crate. It exists because these
+builds are supported and nothing compiled the first: an `egui` use outside
+the `egui-ui` gate broke it unnoticed (C24, found by the GPU research agent).
+`egui-use-ungated` proves the windowed half, `windowed-module-ungated` and
+`renderer-module-ungated` the bare compile, `winit-unconditional` and
+`wgpu-unconditional` the tree. Blind to whether either build RUNS correctly
+— they are checked, not executed — and to a windowing or GPU crate in the
+bare tree whose name starts with none of the three.
 
 **cargo-clippy.** `cargo clippy --release`, zero warnings. Same, for lints.
 It runs with `--all-targets` (since 2026-10-09), so test code is linted too:

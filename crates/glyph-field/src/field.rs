@@ -89,6 +89,7 @@ pub trait GlyphField {
 /// A field's draw on a wgpu device: the device copy of its slots and
 /// tables, the pipelines that read them, and the draw recording. Built from
 /// the field it draws by the mode's crate.
+#[cfg(feature = "wgpu")]
 pub trait GlyphFieldGpu {
     /// Bring the device copy up to a field's host state — its blocks, and
     /// its overrides table at `overrides_version` — re-uploading every block

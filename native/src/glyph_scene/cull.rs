@@ -10,7 +10,9 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::cell::Cell;
 
-use super::{target::SCENE_SAMPLE_COUNT, GroupRow};
+use super::GroupRow;
+#[cfg(feature = "wgpu")]
+use super::target::SCENE_SAMPLE_COUNT;
 
 // The LOD threshold and backdrop gain are settings: `[lod] min_px` and
 // `[lod] backdrop_gain` in config/defaults.toml, which carries their
@@ -94,6 +96,7 @@ pub struct BackdropInst {
     pub depth: [f32; 4],
 }
 
+#[cfg(feature = "wgpu")]
 /// Stage L (L2): draw phases — re_renderer's DrawPhase borrow (a flat enum
 /// partitioning draw order, per-phase work lists, no render graph).
 /// Recording iterates phases in declaration order: Backdrop first, Glyphs
@@ -454,6 +457,7 @@ pub(super) struct CullState {
     pub(super) tree: Option<std::cell::RefCell<super::tree_cull::TreeCull>>,
 }
 
+#[cfg(feature = "wgpu")]
 /// The far-LOD backdrop pass on a wgpu device (2026-10-31: split from
 /// [`CullState`], whose CPU cull fills `FrameData::backdrops`): the
 /// instance buffer the frame's survivors are written into, and its draw.
@@ -529,6 +533,7 @@ impl CullState {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl BackdropGpu {
     pub(super) fn new(
         device: &wgpu::Device,

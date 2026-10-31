@@ -32,7 +32,7 @@ use super::mesh::MeshInstance;
 use super::nodes::UploadCost;
 use super::pick::format_pick;
 use super::regions::{RegionCost, RegionInstance, RegionParams};
-use super::target::Selection;
+use super::selection::Selection;
 use super::ui_probe::UiFileDyn;
 use super::{GlyphScene, GroupRow};
 
@@ -181,6 +181,7 @@ pub struct FrameData<'a> {
     pub atlas: &'a std::sync::Arc<crate::atlas::Atlas>,
     // ── for the wgpu half only ──
     pub costs: FrameCosts,
+    #[cfg(feature = "wgpu")]
     /// The frame uniform the stored fields' shaders read.
     pub(super) uniform: FrameUniform,
 }
@@ -355,6 +356,7 @@ impl GlyphScene {
             item_table: &self.item_table,
             atlas: &self.atlas,
             costs,
+            #[cfg(feature = "wgpu")]
             uniform,
         }
     }

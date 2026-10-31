@@ -41,24 +41,37 @@
 //! touching any other glyph. Both modes address it by slot.
 
 mod field;
+#[cfg(feature = "wgpu")]
 mod field_core;
 mod host_slots;
 mod mode;
 mod records;
+#[cfg(feature = "wgpu")]
 mod resources;
+#[cfg(feature = "wgpu")]
 mod storage;
 mod transcode;
 
-pub use field::{split_at_chunks, GlyphField, GlyphFieldGpu};
+pub use field::{split_at_chunks, GlyphField};
+#[cfg(feature = "wgpu")]
+pub use field::GlyphFieldGpu;
+#[cfg(feature = "wgpu")]
 pub use field_core::{FieldCore, FieldShape};
 pub use host_slots::HostSlots;
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
+#[cfg(feature = "wgpu")]
 pub use resources::{
     shared_bind_group_entries, shared_layout_entries, FieldResources, FieldTargets, SlotChunk,
     BINDING_FRAME_UNIFORM, BINDING_SLOTS,
 };
-pub use storage::{SlotStorage, UploadLabels, UPLOAD_BATCH_BYTES};
+#[cfg(feature = "wgpu")]
+pub use storage::{SlotStorage, UploadLabels};
 pub use transcode::{transcode_host_slots, SlotRecord, SlotSource, Transcode};
+
+/// The host-block upload's batch: the staging wgpu holds for an upload in
+/// flight is at most two of these (`SlotStorage::from_host_slots`). Here,
+/// not in the wgpu storage, because the load's memory budget counts it.
+pub const UPLOAD_BATCH_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 pub use upload::create_mapped_slot_buffer;

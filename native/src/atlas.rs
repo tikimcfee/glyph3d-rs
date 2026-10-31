@@ -537,6 +537,7 @@ pub struct Atlas {
     pub glyph_advances: Vec<f32>,
 }
 
+#[cfg(feature = "wgpu")]
 /// The atlas on a wgpu device: what [`Atlas`] uploads to.
 pub struct AtlasGpu {
     pub curves: wgpu::Texture,
@@ -545,6 +546,7 @@ pub struct AtlasGpu {
     pub glyph_advances: wgpu::Buffer,
 }
 
+#[cfg(feature = "wgpu")]
 impl AtlasGpu {
     pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, atlas: &Atlas) -> Self {
         let curves = upload_uint_texture(device, queue, "slug curves", atlas.curves.width(), atlas.curves.height(), atlas.curves.payload());
@@ -843,6 +845,7 @@ pub fn box_down_straight(src: &[u8], w: u32, h: u32) -> Vec<u8> {
     out
 }
 
+#[cfg(feature = "wgpu")]
 /// The sheet on the device: an `Rgba8UnormSrgb` 2D-array texture, one layer
 /// per sheet layer, `mip_levels` levels, straight alpha. The shader (step 5)
 /// samples with filtering and premultiplies after the sample. Views are the
@@ -1017,10 +1020,6 @@ pub struct EmojiLevels {
     /// `EmojiSheet::decode_layers`).
     pub cell_ink: Vec<[f32; 4]>,
     levels: CachedLevels,
-    from_cache: bool,
-    t_parse: std::time::Duration,
-    t_decode: std::time::Duration,
-    t_mips: std::time::Duration,
 }
 
 impl EmojiLevels {
@@ -1058,7 +1057,33 @@ impl EmojiLevels {
                 (CachedLevels::Owned(levels), cell_ink, false, t_decode, t_mips)
             }
         };
-        Self { sheet, mip_levels, cell_ink, levels, from_cache, t_parse, t_decode, t_mips }
+        let levels = Self { sheet, mip_levels, cell_ink, levels };
+        let sheet = &levels.sheet;
+        log::info!(
+            "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \
+             {} mip levels, {:.1} MiB of texels; {} codepoints, {} sequences carried; font sha256 {:08x}…; \
+             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms{}",
+            sheet.cells.len(),
+            sheet.cell_w,
+            sheet.cell_h,
+            sheet.ppem,
+            sheet.bearing_y,
+            sheet.advance_px,
+            sheet.layers,
+            sheet.layer_w,
+            sheet.layer_h,
+            mip_levels,
+            levels.byte_len() as f64 / (1 << 20) as f64,
+            sheet.codepoints.len(),
+            sheet.sequence_count,
+            sheet.font_sha256[0].swap_bytes(),
+            t_parse.as_secs_f64() * 1e3,
+            t_decode.as_secs_f64() * 1e3,
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            t_mips.as_secs_f64() * 1e3,
+            if from_cache { " (cached)" } else { "" },
+        );
+        levels
     }
 
     /// Every layer's chain in bytes: layers × levels of `w × h × 4`.
@@ -1103,6 +1128,7 @@ impl EmojiLevels {
     }
 }
 
+#[cfg(feature = "wgpu")]
 impl EmojiTexture {
     /// The decoded levels onto the device, one layer per sheet layer.
     pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, host: &EmojiLevels) -> Self {
@@ -1135,8 +1161,7 @@ impl EmojiTexture {
             let dst = unsafe { std::slice::from_raw_parts_mut(dest_ptr, total_texture_bytes as usize) };
             host.copy_into(dst);
         }
-        let EmojiLevels { sheet, mip_levels, from_cache, t_parse, t_decode, t_mips, .. } = host;
-        let (mip_levels, from_cache, t_parse, t_decode, t_mips) = (*mip_levels, *from_cache, *t_parse, *t_decode, *t_mips);
+        let (sheet, mip_levels) = (&host.sheet, host.mip_levels);
         staging.unmap();
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1172,31 +1197,12 @@ impl EmojiTexture {
         }
         queue.submit([encoder.finish()]);
         let texture_bytes = total_texture_bytes;
-        let t_upload = t0.elapsed();
         log::info!(
-            "emoji sheet: {} cells ({}x{}, {} ppem, bearing y {}, advance {} px) in {} layer(s) of {}x{}, \
-             {} mip levels, {:.1} MiB of texture; {} codepoints, {} sequences carried; font sha256 {:08x}…; \
-             parse {:.1} ms, decode {:.1} ms on {} threads, mips {:.1} ms{}, upload enqueue {:.1} ms",
-            sheet.cells.len(),
-            sheet.cell_w,
-            sheet.cell_h,
-            sheet.ppem,
-            sheet.bearing_y,
-            sheet.advance_px,
-            sheet.layers,
-            sheet.layer_w,
-            sheet.layer_h,
-            mip_levels,
+            "emoji sheet uploaded: {:.1} MiB in {} layer(s) of {} mip levels, enqueue {:.1} ms",
             texture_bytes as f64 / (1 << 20) as f64,
-            sheet.codepoints.len(),
-            sheet.sequence_count,
-            sheet.font_sha256[0].swap_bytes(),
-            t_parse.as_secs_f64() * 1e3,
-            t_decode.as_secs_f64() * 1e3,
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-            t_mips.as_secs_f64() * 1e3,
-            if from_cache { " (cached)" } else { "" },
-            t_upload.as_secs_f64() * 1e3,
+            sheet.layers,
+            mip_levels,
+            t0.elapsed().as_secs_f64() * 1e3,
         );
         Self { texture, texture_bytes }
     }
@@ -1302,6 +1308,7 @@ fn check_magic(words: &[u32], expected: &str, path: &Path) {
     );
 }
 
+#[cfg(feature = "wgpu")]
 /// Upload a raw u32 texel payload as a 1024-wide Rgba32Uint texture.
 fn upload_uint_texture(
     device: &wgpu::Device,

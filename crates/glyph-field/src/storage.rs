@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 
-use crate::{HostSlots, SlotChunk, SlotRecord};
+use crate::{HostSlots, SlotChunk, SlotRecord, UPLOAD_BATCH_BYTES};
 
 /// A mode's buffer labels, so captures and validation errors name the mode.
 pub struct UploadLabels {
@@ -24,9 +24,6 @@ pub(crate) const SLOT_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_DST)
     .union(wgpu::BufferUsages::COPY_SRC);
 
-/// The host-block upload's batch: the staging wgpu holds for an upload
-/// in flight is at most two of these (`SlotStorage::from_host_slots`).
-pub const UPLOAD_BATCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// A queued write's staging range, handed to the rayon worker that fills
 /// it. wgpu-types 30 makes `WriteOnly<T>` `Send` for a sized `T` only, so a

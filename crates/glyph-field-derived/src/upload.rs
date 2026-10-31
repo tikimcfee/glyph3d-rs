@@ -2,7 +2,9 @@
 //! `DerivedSlot` (`glyph_field::transcode_host_slots` runs it into host
 //! blocks), and the labels the device copy's buffers carry.
 
-use glyph_field::{GlyphInstance, ItemParamsGpu, SlotRecord, Transcode, UploadLabels};
+use glyph_field::{GlyphInstance, ItemParamsGpu, SlotRecord, Transcode};
+#[cfg(feature = "wgpu")]
+use glyph_field::UploadLabels;
 
 use crate::slot::{DerivedSlot, COLOR_OFFSET};
 
@@ -33,6 +35,7 @@ impl Transcode for DerivedTranscode<'_> {
     }
 }
 
+#[cfg(feature = "wgpu")]
 pub const LABELS: UploadLabels = UploadLabels { buffers: "derived glyph instances" };
 
 #[inline(always)]

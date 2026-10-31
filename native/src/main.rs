@@ -22,9 +22,9 @@
 //! renderer lives in the library — `src/lib.rs`.
 
 use clap::CommandFactory;
-use glyph3d_native::cli::{
-    parse_cli_from, Cli, CliCommand, FixtureTask, GpuInfoMode, RenderTarget,
-};
+use glyph3d_native::cli::{parse_cli_from, Cli, CliCommand, FixtureTask};
+#[cfg(feature = "wgpu")]
+use glyph3d_native::cli::{GpuInfoMode, RenderTarget};
 use glyph3d_native::*;
 
 /// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
@@ -85,6 +85,12 @@ fn main() {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
+        #[cfg(not(feature = "wgpu"))]
+        CliCommand::GpuInfo(_) | CliCommand::Render(_) => {
+            eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
+            std::process::exit(1);
+        }
+        #[cfg(feature = "wgpu")]
         CliCommand::GpuInfo(mode) => {
             let ctx = pollster::block_on(gpu::init(None));
             match mode {
@@ -106,6 +112,7 @@ fn main() {
             let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
         }
+        #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {
             let prefetched_walk = if let SceneChoice::Repo {
                 dir,

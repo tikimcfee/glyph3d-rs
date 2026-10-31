@@ -99,6 +99,7 @@ impl LibraryFaces {
         }
     }
 
+    #[cfg(feature = "wgpu")]
     /// The GPU instance buffer the faces are drawn from, zeroed, sized for
     /// every face (the renderer's; `upload` writes it).
     pub(crate) fn buffer(&self, device: &wgpu::Device) -> wgpu::Buffer {
@@ -159,7 +160,7 @@ impl LibraryFaces {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wgpu"))]
 mod tests {
     use glyph_scene_graph::{NodeHandle, Similarity};
 

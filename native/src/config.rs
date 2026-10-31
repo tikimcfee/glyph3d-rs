@@ -494,6 +494,7 @@ fn merge(base: &mut toml::Table, over: toml::Table) {
     }
 }
 
+#[cfg(feature = "wgpu")]
 /// An `[r, g, b, a]` setting as a `wgpu::Color`.
 pub fn wgpu_color([r, g, b, a]: [f64; 4]) -> wgpu::Color {
     wgpu::Color { r, g, b, a }
