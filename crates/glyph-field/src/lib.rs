@@ -44,6 +44,7 @@ mod field;
 #[cfg(feature = "wgpu")]
 mod field_core;
 mod host_slots;
+mod footprint;
 mod mode;
 mod records;
 #[cfg(feature = "wgpu")]
@@ -58,6 +59,7 @@ pub use field::GlyphFieldGpu;
 #[cfg(feature = "wgpu")]
 pub use field_core::{FieldCore, FieldShape};
 pub use host_slots::HostSlots;
+pub use footprint::{analytic_source, Footprint};
 pub use mode::{GlyphFieldMode, ParseGlyphFieldModeError};
 pub use records::{GlyphInstance, GlyphPlacement, GroupRow, ItemParamsGpu, LineRecord, NO_ITEM};
 #[cfg(feature = "wgpu")]

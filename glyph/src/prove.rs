@@ -224,6 +224,25 @@ fn declarations_changed(base: Option<&str>, current: &str) -> (BTreeSet<String>,
     (changed("mutation"), changed("gate"))
 }
 
+/// Whether a mutation can be proven on this host (C35). `Some(why)` when it
+/// cannot: it is scoped to another rasterizer's golden key, or the host's key
+/// is unknown (the renderer did not answer `--gpu-key`).
+fn not_applicable(mu: &Mutation, host: Option<&str>) -> Option<String> {
+    let want = mu.gpu.as_deref()?;
+    match host {
+        Some(h) if h == want => None,
+        Some(h) => Some(format!("scoped to gpu {want}; this host is {h}")),
+        None => Some(format!("scoped to gpu {want}; this host's key is unknown (no --gpu-key answer)")),
+    }
+}
+
+/// A selection whose every mutation is not applicable here proved nothing,
+/// and a check that compared nothing must not pass (C35: a scoped prove of a
+/// Metal-only mutation on the 5090 exited 0 before this).
+fn proved_nothing(applicable: usize, not_applicable: usize) -> bool {
+    applicable == 0 && not_applicable > 0
+}
+
 /// Whether a change set touches a mutation: its target file changed, the
 /// script its gate runs did, or its own declaration or its gate's did. The
 /// script clause is what makes a gate's own edit re-prove the gate: a change
@@ -303,10 +322,45 @@ pub(crate) fn cmd_prove(
     }
     if list {
         for mu in &selected {
-            println!("  {:<44} {:<20} {}", mu.name, mu.gate, mu.file);
+            let scope = mu.gpu.as_deref().map(|k| format!("  [gpu {k}]")).unwrap_or_default();
+            println!("  {:<44} {:<20} {}{scope}", mu.name, mu.gate, mu.file);
         }
         println!("LIST      {} of {} mutations selected; nothing was built or mutated", selected.len(), m.mutation.len());
         return true;
+    }
+    // Host-scoped mutations (C35): one that cannot be observed on this
+    // host's rasterizer is set aside before either route mutates anything,
+    // and reported as such. Here, ahead of BOTH routes: under the cargo
+    // route alone (where the merge of 2026-10-31 first put it), a relax
+    // gate's scoped mutation would be proven on every host. `--gpu-key`
+    // needs a renderer to exist, any build of it.
+    if selected.iter().any(|mu| mu.gpu.is_some()) && !crate::paths::renderer().exists() && !ensure_products(m, false) {
+        println!("FATAL the products do not build; this host's gpu key cannot be read.");
+        return false;
+    }
+    let host = if selected.iter().any(|mu| mu.gpu.is_some()) { crate::paths::gpu_key() } else { None };
+    let mut not_here: Vec<(&str, String)> = Vec::new();
+    let selected: Vec<&Mutation> = selected
+        .into_iter()
+        .filter(|mu| match not_applicable(mu, host) {
+            Some(why) => {
+                not_here.push((mu.name.as_str(), why));
+                false
+            }
+            None => true,
+        })
+        .collect();
+    for (name, why) in &not_here {
+        println!("N/A   {name} — {why}: NOT APPLICABLE here, so neither proven nor failed");
+    }
+    if proved_nothing(selected.len(), not_here.len()) {
+        println!();
+        println!(
+            "PROVE: NOTHING PROVEN — all {} selected mutation{} scoped to another rasterizer; run it on that host",
+            not_here.len(),
+            if not_here.len() == 1 { " is" } else { "s are" },
+        );
+        return false;
     }
     // Each mutation as its gate declares (prove_relax.rs): under relax, in
     // parallel and never writing the tree; the rest here, on cargo, beside
@@ -326,6 +380,16 @@ pub(crate) fn cmd_prove(
         println!("          uncovered: {}", uncovered.join(", "));
         println!("          an uncovered gate is an unproven claim, not a passing one.");
     }
+    if !not_here.is_empty() {
+        let names: Vec<&str> = not_here.iter().map(|(n, _)| *n).collect();
+        println!(
+            "N/A       {} mutation{} scoped to another rasterizer, unproven on this host: {}",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            names.join(", ")
+        );
+    }
+    let na_note = if not_here.is_empty() { String::new() } else { format!(" ({} not applicable on this host)", not_here.len()) };
     println!();
     println!(
         "{}",
@@ -333,12 +397,12 @@ pub(crate) fn cmd_prove(
             "PROVE: FAILURES — see above".to_string()
         } else if scoped {
             format!(
-                "PROVE: {} selected mutation{} reddened — a scoped run proves its scope, not the manifest",
+                "PROVE: {} selected mutation{} reddened{na_note} — a scoped run proves its scope, not the manifest",
                 total,
                 if total == 1 { "" } else { "s" },
             )
         } else {
-            "PROVE: every declared mutation reddened its gate".to_string()
+            format!("PROVE: every declared mutation reddened its gate{na_note}")
         }
     );
     !fail
@@ -578,6 +642,7 @@ mod tests {
             find: None,
             with_: None,
             rebuild: None,
+            gpu: None,
         };
         let set = |files: &[&str], mutations: &[&str], gates: &[&str]| ChangeSet {
             files: files.iter().map(|s| s.to_string()).collect(),
@@ -636,6 +701,41 @@ mod tests {
             // absent"), and is also what this test sees for a mutation that is
             // APPLIED while cargo-test runs under prove.
             assert!(n <= 1, "mutation {} matches {n} times in {}", mu.name, mu.file);
+        }
+    }
+
+    /// C35: a host-scoped mutation is proven only on its rasterizer; anywhere
+    /// else, or where the key is unknown, it is set aside, never "survived".
+    #[test]
+    fn a_gpu_scoped_mutation_applies_only_on_its_host() {
+        let mu = |gpu: Option<&str>| Mutation {
+            name: "m".into(),
+            gate: "g".into(),
+            why: None,
+            file: "f".into(),
+            op: "replace".into(),
+            expect: "x".into(),
+            arg: None,
+            find: None,
+            with_: None,
+            rebuild: None,
+            gpu: gpu.map(Into::into),
+        };
+        assert_eq!(not_applicable(&mu(None), Some("vulkan-nvidia")), None, "unscoped runs everywhere");
+        assert_eq!(not_applicable(&mu(None), None), None, "unscoped needs no key");
+        assert_eq!(not_applicable(&mu(Some("metal-apple")), Some("metal-apple")), None, "its own host");
+        assert!(not_applicable(&mu(Some("metal-apple")), Some("vulkan-nvidia")).is_some_and(|w| w.contains("vulkan-nvidia")));
+        assert!(not_applicable(&mu(Some("metal-apple")), None).is_some_and(|w| w.contains("unknown")));
+        // A selection that is all not-applicable proved nothing and fails;
+        // any applicable mutation, or an empty selection, is judged as before.
+        assert!(proved_nothing(0, 1));
+        assert!(!proved_nothing(1, 1));
+        assert!(!proved_nothing(0, 0));
+        // Every declared scope names a golden set (validate refuses otherwise).
+        let m = load().expect("build.toml loads");
+        for mu in m.mutation.iter().filter(|mu| mu.gpu.is_some()) {
+            let key = mu.gpu.as_deref().unwrap();
+            assert!(root().join("out/tooling-ab/baseline").join(key).is_dir(), "mutation {} names gpu {key}", mu.name);
         }
     }
 }

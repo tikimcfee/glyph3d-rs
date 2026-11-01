@@ -48,6 +48,7 @@ impl DerivedFieldGpu {
             label_prefix: "derived ",
             shader_label: "glyph_field_derived.wgsl",
             shader_source: crate::GLYPH_FIELD_DERIVED_WGSL,
+            quad_height: crate::QUAD_HEIGHT,
             extra_layout: &EXTRA_LAYOUT,
             extra_entries: &extra_entries,
         };
