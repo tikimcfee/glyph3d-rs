@@ -132,6 +132,16 @@ impl Store {
         bytes
     }
 
+    /// The run file's modification time and length: what a host watching
+    /// one run compares to know it changed (a save renames a new file over
+    /// it, so both move).
+    pub fn stamp(&self, id: &str) -> Result<(std::time::SystemTime, u64), String> {
+        let path = self.path(id);
+        let metadata = fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        let modified = metadata.modified().map_err(|e| format!("{}: no modification time: {e}", path.display()))?;
+        Ok((modified, metadata.len()))
+    }
+
     /// Every run id in the store, sorted.
     pub fn ids(&self) -> Result<Vec<String>, String> {
         let runs = self.root.join("runs");

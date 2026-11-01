@@ -120,8 +120,10 @@ The schema, exactly (all four keys optional, at least one entry overall):
   waiting. For a run made with `--file`, the file's path
   is in the run's `source`.
 - **Translations:** check `$DEFN_LANGUAGES` once when you start
-  (comma-separated tags, `es,ja,pt-BR`); when it is unset, Spanish and
-  Japanese. Each translation is plain text in the language's own script,
+  (comma-separated tags, `es,fr,pt-BR`); when it is unset, Spanish and
+  French. The renderer's glyph atlas has no CJK glyphs today, so a
+  Japanese or Chinese translation draws blank in the 3D view (the CLI shows
+  it). Give one only when `$DEFN_LANGUAGES` asks for it. Each translation is plain text in the language's own script,
   with no gloss or parenthetical, because a reader can take a translation
   into the text, and selecting the translated word gets its own expansion.
   Skip identifiers and proper nouns that do not translate.
