@@ -87,9 +87,14 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   as JSON files in a store directory (`$DEFN_STORE`), the one state its
   `defn` CLI, an agent and a renderer share: no socket, no provider protocol.
   It also files a tree by layer (code, binary, directory, extension-named; a
-  path sits in each it belongs to). Nothing in the renderer reads it yet.
-  An agent answers through `defn pending --wait` (blocks until a reader
-  asks), per the `definition-engine` skill.
+  path sits in each it belongs to). An agent answers through `defn pending
+  --wait` (blocks until a reader asks), per the `definition-engine` skill.
+  Its `view` module lays a run out as panels (passage, options, the card
+  stack) and says what a tap on each does; the makepad host draws them
+  (`--definition-run`, `makepad/src/definition.rs`) through the engine's
+  `build_text_scene` (in-memory texts at given offsets, `repo::load_texts`)
+  and `SceneLike::picked_glyph` (a pick's view and byte). No golden view
+  renders it.
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.

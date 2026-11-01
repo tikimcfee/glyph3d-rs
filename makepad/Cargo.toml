@@ -32,5 +32,13 @@ makepad-widgets = { path = "../../makepad/widgets", default-features = false }
 # engine resolves, so the graph unifies. (wgpu and pollster were here while
 # the engine's scene built against a wgpu device, until 2026-10-31.)
 clap = "4"
+# The definition engine's view (2026-10-31): its runs, store and the panel
+# layout a tap is applied through (src/definition.rs).
+definition-engine = { path = "../crates/definition-engine" }
+# The host's own log lines, and the subscriber that prints them and the
+# engine's (filtered as the engine's binary filters: GLYPH_TRACE, RUST_LOG).
+# Both already in the graph through the engine.
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace]

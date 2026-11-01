@@ -21,6 +21,7 @@ use glyph3d_native::relayout::{rebuild_for_relayout, RelayoutRequest};
 use glyph3d_native::scene::{SceneKey, SceneLike};
 use glyph3d_native::{SceneChoice, SceneCullOptions};
 
+use crate::definition::DefinitionView;
 use crate::sessions::SessionBrowser;
 
 
@@ -65,6 +66,17 @@ pub type Plan = (SceneChoice, SceneCullOptions, Vec<Op>);
 thread_local! {
     /// The plan, parsed at startup and taken once by the app.
     static PLAN: std::cell::RefCell<Option<Plan>> = const { std::cell::RefCell::new(None) };
+    /// The definition run the command line named, opened at startup.
+    static DEFINITION: std::cell::RefCell<Option<DefinitionView>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Print the host's log lines and the engine's to stderr, filtered by
+/// `GLYPH_TRACE`, else `RUST_LOG`, else the host's own info lines.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("GLYPH_TRACE")
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("glyph3d_makepad=info,warn"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
 /// Parse the command line at startup (`app_main!`'s `configure:`, which
@@ -76,11 +88,17 @@ thread_local! {
 /// for a run that will not draw (2026-10-26: `--help` used to open one).
 pub fn parse_plan_or_exit() {
     use clap::CommandFactory;
-    let matches = Cli::command().try_get_matches_from(engine_args(std::env::args())).unwrap_or_else(|e| e.exit());
+    init_logging();
     let refuse = |why: String| -> ! {
         eprintln!("error: {why}");
         std::process::exit(1);
     };
+    let mut args = engine_args(std::env::args());
+    if let Some((run, store)) = crate::definition::take_args(&mut args).unwrap_or_else(|e| refuse(e)) {
+        let view = DefinitionView::open(&run, store).unwrap_or_else(|e| refuse(e));
+        DEFINITION.with(|d| *d.borrow_mut() = Some(view));
+    }
+    let matches = Cli::command().try_get_matches_from(args).unwrap_or_else(|e| e.exit());
     let cli = parse_cli_from(matches).unwrap_or_else(|e| refuse(e));
     let plan = match cli.action() {
         CliCommand::Render(plan) => match plan.target {
@@ -92,6 +110,12 @@ pub fn parse_plan_or_exit() {
         _ => refuse("this run mode has no window: run glyph3d-native for it".to_string()),
     };
     PLAN.with(|p| *p.borrow_mut() = Some(plan));
+}
+
+/// The definition view [`parse_plan_or_exit`] opened, if the command line
+/// named a run; once.
+pub fn take_definition() -> Option<DefinitionView> {
+    DEFINITION.with(|d| d.borrow_mut().take())
 }
 
 /// The plan [`parse_plan_or_exit`] stored, once.
@@ -133,15 +157,28 @@ pub struct EngineHost {
     /// publication envelope, read once at startup, never 0): the glyph
     /// blocks are resident within it.
     pub glyph_envelope: usize,
+    /// The definition run this window shows, when the command line named
+    /// one (`--definition-run`): its panels are the scene, rebuilt when the
+    /// run changes, and a click is a tap on them.
+    definition: Option<DefinitionView>,
 }
 
 impl EngineHost {
     /// Build the scene the command line asked for, with its probe, and run
     /// its startup ops (`--pick`, `--verb`, `--cam-pose`, `--highlight`)
     /// through the same entry points the panels use.
-    pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op], glyph_envelope: usize) -> Self {
+    pub fn new(choice: SceneChoice, mut cull_opts: SceneCullOptions, ops: &[Op], glyph_envelope: usize, definition: Option<DefinitionView>) -> Self {
         let load = glyph3d_native::SceneLoad::host();
-        let (mut scene, probe) = glyph3d_native::build_scene_probed(&load, &choice, CameraMode::Fly, cull_opts);
+        // A definition window shows its run, not the command line's scene:
+        // the demo stands in until the run's panels are built below.
+        let (mut scene, mut probe) = match definition {
+            Some(_) => (Box::new(glyph3d_native::DemoScene) as Box<dyn SceneLike>, None),
+            None => glyph3d_native::build_scene_probed(&load, &choice, CameraMode::Fly, cull_opts),
+        };
+        let mut definition = definition;
+        if let Some(view) = &mut definition {
+            (scene, probe) = view.build(&load, cull_opts);
+        }
         // The options follow the mode the scene BUILT (until 2026-10-31 a
         // load past the Derived lanes fell back to Instanced).
         if let Some(built) = probe.as_ref().and_then(|p| p.borrow().field_mode) {
@@ -173,7 +210,9 @@ impl EngineHost {
             pending_relayout: None,
             looking: false,
             hud_open: false,
-            debug_open: true,
+            // Closed over a definition run (F1 opens it): it would cover the
+            // card stack, which sits left of the passage.
+            debug_open: definition.is_none(),
             sessions_open: false,
             sessions: SessionBrowser::default(),
             scene_generation: 1,
@@ -182,6 +221,31 @@ impl EngineHost {
             fps_window: (Instant::now(), 0),
             fps: 0.0,
             glyph_envelope,
+            definition,
+        }
+    }
+
+    /// Lay the definition run out again and swap its scene in, the camera
+    /// kept where it was.
+    fn rebuild_definition(&mut self) {
+        let Some(definition) = &mut self.definition else { return };
+        let pose = self.scene.cam_pose();
+        let (mut scene, probe) = definition.build(&self.load, self.cull_opts);
+        scene.set_viewport(self.viewport.0, self.viewport.1);
+        if let Some((eye, yaw, pitch)) = pose {
+            scene.set_cam_pose(eye, yaw, pitch);
+        }
+        self.scene = scene;
+        self.probe = probe;
+        self.scene_generation += 1;
+    }
+
+    /// After a click's pick: a tap on the definition run's panels, if this
+    /// window shows one.
+    pub fn definition_tap(&mut self) {
+        let picked = self.scene.picked_glyph();
+        if self.definition.as_mut().is_some_and(|d| d.tap(picked)) {
+            self.rebuild_definition();
         }
     }
 
@@ -216,6 +280,9 @@ impl EngineHost {
         self.last_tick = Instant::now();
         self.scene.tick(dt);
         self.scene.animate(dt);
+        if self.definition.as_mut().is_some_and(|d| d.poll()) {
+            self.rebuild_definition();
+        }
         self.apply_pending_relayout();
     }
 
@@ -237,6 +304,12 @@ impl EngineHost {
             self.pending_relayout = Some(RelayoutRequest { carrel_options: Some(opts), ..Default::default() });
         }
         let Some(req) = self.pending_relayout.take() else { return };
+        if self.definition.is_some() {
+            // A relayout rebuilds the command line's choice, which is not
+            // what this window shows: the definition view lays itself out.
+            log::info!("definition view: a relayout was asked for and dropped");
+            return;
+        }
         let rebuilt = rebuild_for_relayout(
             &self.load,
             self.viewport,

@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use makepad_widgets::*;
 
+mod definition;
 mod frame_feed;
 mod g3_passes;
 mod g3_ui;
@@ -137,7 +138,8 @@ impl AppMain for App {
             // on it rather than run on, its HAL containing the panic, with
             // no scene.
             let (choice, cull_opts, ops) = host::take_plan();
-            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| EngineHost::new(choice, cull_opts, &ops, envelope)));
+            let definition = host::take_definition();
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| EngineHost::new(choice, cull_opts, &ops, envelope, definition)));
             self.host = Some(built.unwrap_or_else(|_| std::process::exit(1)));
         }
         self.match_event(cx, event);

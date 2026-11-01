@@ -145,6 +145,7 @@ impl Widget for Glyph3dViewport {
                     Some(b) if b.is_primary() && !host.looking => {
                         let (x, y) = self.physical(cx, fe.abs);
                         host.scene.on_click(x, y);
+                        host.definition_tap();
                     }
                     _ => {}
                 }
