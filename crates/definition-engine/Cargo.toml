@@ -1,0 +1,23 @@
+[package]
+name = "definition-engine"
+version = "0.1.0"
+edition = "2021"
+description = "The definition engine's core: definition-runs (a passage, words selected in it, their expansions, and the stack of substitution diffs), their file store, and the layer categorization of a tree. UI-free; the defn CLI and the renderers read the same store."
+
+# Slice 1 (2026-10-31) of the note `definition-engine-root`. The store
+# directory IS the server: one JSON file per run, written atomically, read by
+# the `defn` CLI (the agent's door), and later by the renderer and the
+# makepad host. No socket and no provider protocol yet, on purpose: an
+# expansion is a request an agent answers with `defn answer`, not a call
+# this crate makes.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "defn"
+path = "src/bin/defn.rs"
+
+[lints]
+workspace = true
