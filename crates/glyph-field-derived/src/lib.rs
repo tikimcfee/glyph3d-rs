@@ -22,3 +22,7 @@ pub use field_gpu::DerivedFieldGpu;
 pub use slot::DerivedSlot;
 
 pub const GLYPH_FIELD_DERIVED_WGSL: &str = include_str!("../shaders/glyph_field_derived.wgsl");
+
+/// The quad's local height in `vs_main`: a Derived cell is one world unit tall
+/// (`(c.y - 0.5) * 1.0`). Read by the analytic footprint ([`glyph_field::analytic_source`]).
+pub const QUAD_HEIGHT: &str = "1.0";

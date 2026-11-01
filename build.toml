@@ -52,7 +52,12 @@
 # host-record upload path it served.
 # 343 -> 345 (2026-10-31): prove_relax's two (the suite route runs the
 # workspace's members alone; a mutant is overlaid for the members reading it).
-test_floor = 345
+# 345 -> 353 (2026-10-31): the C35/C36 work merged from the unpushed
+# viz-native clone (2026-10-24): the analytic footprint's derivation and its
+# Derived wgsl validation, the profile's footprint choice, the host-scoped
+# mutation rule, the oblique repeat witness and the profiled offscreen run
+# (there 386 -> 395, counted with the Instanced and Visible crates' share).
+test_floor = 353
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1153,6 +1158,49 @@ op = "replace"
 find = "            3 if v == NO_CELL => NO_CELL_TEXEL,"
 with = "            3 if v == NO_CELL => f32::from_bits(v),"
 expect = "the_shipped_atlas_round_trips_exactly"
+
+[[mutation]]
+name = "footprint-selection-dropped"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C35 (2026-10-24): on Apple TBDR the glyph shaders take their AA footprint from the quad's projective map, because there `fwidth` over a 2x2 quad depends on whether a quad-mate lane hidden behind a nearer glyph was depth-rejected before or after shading — GPU timing — and a still frame flickered at delta 1 (63-81 px in one process at the oblique pose, frame 0 a further ~880 px off: the state the golden captured). Building the field on the hardware footprint puts the M2 back on it. CONSUMED BY: FieldTargets.footprint, set from GpuProfile::glyph_footprint in setup.rs and read at glyph-pipeline creation (field_core.rs), judged by native/tests/oblique_repeat.rs (every frame of one process equal to frame 0, three field modes). Scoped to metal-apple: every other rasterizer builds the hardware footprint anyway, so there the mutation changes nothing and cannot redden"
+file = "native/src/glyph_scene/renderer.rs"
+op = "replace"
+find = "            footprint: ctx.profile.glyph_footprint(),"
+with = "            footprint: glyph_field::Footprint::Hardware,"
+expect = "a_still_oblique_frame_repeats_in_one_process_in_every_mode"
+
+[[mutation]]
+name = "analytic-footprint-keeps-fwidth"
+gate = "cargo-test"
+why = "C35 (2026-10-24): the analytic footprint is derived from each glyph shader by anchored substitution, and its whole point is that the coverage footprint reads no quad-mate lane. Leaving `fwidth(in.glyph_uv)` in place (the coverage edit made a no-op) keeps the Metal pipeline on the scheduling-dependent derivative while every anchor still matches. CONSUMED BY: analytic_source's coverage edit (crates/glyph-field/src/footprint.rs), judged on every host first by glyph-field's own every_anchor_is_replaced_and_the_helpers_appended (no `= fwidth(` may survive the substitution), which runs first and so is the expected failure, then by both mode crates' tests/wgsl.rs, which count naga Derivative and implicit-gradient ImageSample expressions in the analytic form and require zero (and, on metal-apple, by oblique_repeat)"
+file = "crates/glyph-field/src/footprint.rs"
+op = "replace"
+find = "            to: \"    let fw = foot_fwidth(in);\".to_string(),"
+with = "            to: \"    let fw = fwidth(in.glyph_uv);\".to_string(),"
+expect = "every_anchor_is_replaced_and_the_helpers_appended"
+
+[[mutation]]
+name = "profiler-pending-cap-restored"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C36 (2026-10-24): every frame the profiler holds before its timestamps are read back keeps a query set alive, and on Metal a query set is an MTLCounterSampleBuffer, of which the M2 allocates 32 at most. At the old cap of 64, an offscreen run that outpaced the GPU asked for a 33rd, the allocation failed and took the device with it, and the screenshot readback panicked with BufferAsyncError (measured: 32 frames clean, 33 panicked). Restoring 64 takes the offscreen wait's threshold up with it, so the loop never waits before the M2 runs out. CONSUMED BY: GpuProfilerSettings::max_num_pending_frames and the offscreen loop's wait (offscreen.rs), judged by native/tests/profile_offscreen.rs (a 60-frame GLYPH_PROFILE run exits 0 and measures every frame). Scoped to metal-apple: a host with more query sets to give runs 64 pending frames clean"
+file = "native/src/gpu.rs"
+op = "replace"
+find = "pub const PROFILER_PENDING_FRAMES: usize = 8;"
+with = "pub const PROFILER_PENDING_FRAMES: usize = 64;"
+expect = "a_profiled_offscreen_run_measures_every_frame"
+
+[[mutation]]
+name = "profiler-offscreen-wait-dropped"
+gate = "cargo-test"
+gpu = "metal-apple"
+why = "C36 (2026-10-24): at the pending-frame cap the profiler drops frames unmeasured, and offscreen encodes far faster than the GPU draws, so the loop waits for the oldest profiled frame whenever the cap is reached. Without the wait the run survives (the cap still bounds the query sets) but the profile measures a fraction of its frames, and its means describe whichever frames happened to finish. CONSUMED BY: the offscreen frame loop's profiler drain (offscreen.rs), judged by native/tests/profile_offscreen.rs (measured == 60). Scoped to metal-apple, where the loop is measured outrunning the GPU; whether another host's GPU keeps up unaided was not measured"
+file = "native/src/offscreen.rs"
+op = "replace"
+find = "                if profiled_in_flight.len() < crate::gpu::PROFILER_PENDING_FRAMES {"
+with = "                if profiled_in_flight.len() < usize::MAX {"
+expect = "a_profiled_offscreen_run_measures_every_frame"
 
 [[mutation]]
 name = "lod-ignores-group-scale"

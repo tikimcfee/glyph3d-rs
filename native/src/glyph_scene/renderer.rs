@@ -146,8 +146,14 @@ impl GlyphRenderer {
             emoji_sampler: &emoji_sampler,
             glyph_advances: &atlas_gpu.glyph_advances,
         };
-        // Stage L (L3): the glyph pipeline renders into the POOL format.
-        let targets = FieldTargets { color_format: POOL_FORMAT, depth_format: DEPTH_FORMAT, sample_count: SCENE_SAMPLE_COUNT };
+        // Stage L (L3): the glyph pipeline renders into the POOL format. The
+        // AA footprint is the adapter's: analytic on Apple TBDR (C35).
+        let targets = FieldTargets {
+            color_format: POOL_FORMAT,
+            depth_format: DEPTH_FORMAT,
+            sample_count: SCENE_SAMPLE_COUNT,
+            footprint: ctx.profile.glyph_footprint(),
+        };
         let field: Box<dyn GlyphFieldGpu> = match scene.field.mode() {
             GlyphFieldMode::Derived => Box::new(DerivedFieldGpu::new(device, &ctx.queue, &*scene.field, &resources, targets)),
         };
