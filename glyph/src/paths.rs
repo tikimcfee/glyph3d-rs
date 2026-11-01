@@ -79,6 +79,16 @@ pub(crate) fn renderer() -> PathBuf {
         .unwrap_or_else(|| root().join("target/release/glyph3d-native"))
 }
 
+/// The env var `glyph test --relax` sets for its gates: how many relax
+/// processes cargo-test's suite runs at once. Its presence is the mode.
+pub(crate) const UNDER_RELAX: &str = "GLYPH_UNDER_RELAX";
+
+/// Whether this run is `glyph test --relax`, and its suite's job count: the
+/// gates read the tree from source under relax, and no product is built.
+pub(crate) fn under_relax() -> Option<usize> {
+    std::env::var(UNDER_RELAX).ok().and_then(|v| v.parse().ok()).filter(|&j| j > 0)
+}
+
 /// Every external command goes through here so failures look the same.
 pub(crate) fn sh(cmd: &str, cwd: &Path) -> (bool, String) {
     let out = Command::new("bash").arg("-c").arg(cmd).current_dir(cwd).env("GLYPH_RENDERER", renderer()).output();

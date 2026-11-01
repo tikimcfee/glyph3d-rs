@@ -81,7 +81,7 @@ fn relax_bin() -> PathBuf {
 }
 
 /// Whether the relax binary runs; Err says what is missing and how to get it.
-fn relax_available() -> Result<(), String> {
+pub(crate) fn relax_available() -> Result<(), String> {
     let bin = relax_bin();
     match Command::new(&bin).arg("--version").stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => Ok(()),
@@ -379,7 +379,7 @@ fn test_lines(out: &str, name: &str) -> Vec<(String, String)> {
 /// The renderer under relax, as one executable for `GLYPH_RENDERER`: the
 /// gates spawn it from their own directories, and relax finds the workspace
 /// above them.
-fn relax_renderer() -> std::io::Result<PathBuf> {
+pub(crate) fn relax_renderer() -> std::io::Result<PathBuf> {
     let path = root().join("target/prove-relax/glyph3d-native-relax");
     std::fs::create_dir_all(path.parent().unwrap_or(&root()))?;
     let relax = relax_bin().to_string_lossy().replace('\'', "'\\''");
@@ -397,11 +397,23 @@ fn spawns_relax(r: &Route) -> bool {
     }
 }
 
-/// One `relax test` run.
+/// The directory `relax test` runs a package's tests from: the package's
+/// own, as cargo runs a test binary (and as the cargo-test gate does), so a
+/// test's relative paths mean the same under both. relax runs a test in the
+/// directory it was started from; from the workspace root,
+/// `tests/oblique_repeat.rs` loaded no `fixtures/g-pick-repo`, rendered an
+/// empty frame and failed "0 non-background px" under relax only, which
+/// read as a JIT rendering gap until 2026-11-01. relax finds the workspace
+/// above the package.
+fn package_dir(package: &str) -> PathBuf {
+    workspace_packages().into_iter().find(|(name, _)| name == package).map_or_else(root, |(_, dir)| dir)
+}
+
+/// One `relax test` run, from the package's directory (`package_dir`).
 fn relax_test(package: &str, target: &[String], filters: &[&str], env: &[(&str, OsString)]) -> (bool, String) {
     let mut c = Command::new(relax_bin());
     c.arg("--allow-c").arg("test").arg(package).args(target).arg("--").args(filters);
-    c.current_dir(root()).envs(env.iter().map(|(k, v)| (k, v)));
+    c.current_dir(package_dir(package)).envs(env.iter().map(|(k, v)| (k, v)));
     output(&mut c)
 }
 
@@ -454,6 +466,13 @@ fn run(m: &Manifest, r: &Route, renderer: &Path, env: &[(&str, OsString)], jobs:
             gate_output_with(gate, &all)
         }
     }
+}
+
+/// The whole suite under relax on the tree as it is, judged by the
+/// cargo-test gate's rule: `glyph test --relax`'s cargo-test (2026-11-01),
+/// the run prove's suite route makes with no mutant.
+pub(crate) fn suite(m: &Manifest, jobs: usize) -> (bool, String) {
+    run(m, &Route::Suite, Path::new(""), &[], jobs)
 }
 
 /// What two runs of one gate are compared by: its result lines, PASS/FAIL

@@ -70,7 +70,9 @@
 # 384 -> 391 (2026-11-01): static dictionaries' seven (their sense split,
 # inflections and cross-references, the store's dictionaries dir; a sense
 # taken before any answer, in the run, the view and through the CLI).
-test_floor = 391
+# 391 -> 393 (2026-11-01): `glyph test --relax`'s two (its verdict is never a
+# landing run; its flags parse as declared).
+test_floor = 393
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
