@@ -73,5 +73,3 @@ pub use transcode::{transcode_host_slots, SlotRecord, SlotSource, Transcode};
 /// flight is at most two of these (`SlotStorage::from_host_slots`). Here,
 /// not in the wgpu storage, because the load's memory budget counts it.
 pub const UPLOAD_BATCH_BYTES: usize = 256 * 1024 * 1024;
-#[cfg(target_os = "macos")]
-pub use upload::create_mapped_slot_buffer;
