@@ -134,6 +134,13 @@ pub trait SceneLike {
     fn selected_group_id(&self) -> Option<u32> {
         None
     }
+    /// The glyph the last pick hit, while its selection is active: the
+    /// view's `rel_path` and the glyph's byte offset in that view's text
+    /// (2026-10-31; a host turns a click into a word with it, rather than
+    /// parsing the pick's log line).
+    fn picked_glyph(&self) -> Option<(String, usize)> {
+        None
+    }
     /// S3 spike (`experiments/zedspike`): apply a Zed-pipeline highlight
     /// sidecar to per-glyph instance colors (`--highlight`, repo scenes
     /// only); returns a log line. Default: scene doesn't support it.

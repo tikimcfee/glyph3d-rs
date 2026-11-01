@@ -63,7 +63,10 @@
 # 353 -> 377 (2026-10-31): the definition-engine crate's 24 (22 unit: spans
 # store and its pending wait, the layers; 2 driving the `defn` binary
 # through the whole loop).
-test_floor = 377
+# 377 -> 380 (2026-10-31): the host-placed texts' three
+# (native/tests/text_scene.rs: offsets, refusals, a pick's text and byte
+# from memory).
+test_floor = 380
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
