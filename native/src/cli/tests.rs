@@ -360,6 +360,41 @@ fn pick_row_after_verb_panics() {
 }
 
 #[test]
+fn carrel_window_flags_reach_the_session_choice() {
+    // Every slider of the Carrel window has a flag (2026-10-24: the workdesk's
+    // file-stack cap was the one without, hardcoded 20 at launch), so any
+    // value a slider sets can be launched with.
+    let options = |args: &[&str]| {
+        let CliCommand::Render(plan) = parse(args).action() else { panic!("an --agent-session run renders") };
+        let SceneChoice::AgentSession { layout_options, .. } = plan.choice else { panic!("an agent-session scene") };
+        layout_options
+    };
+    let defaults = options(&["--agent-session", "/s.jsonl"]);
+    assert_eq!(defaults, crate::spatial_scene::CarrelLayoutOptions::default());
+    let set = options(&[
+        "--agent-session", "/s.jsonl", "--deck-window-limit", "7", "--deck-scroll-offset", "2",
+        "--desk-revision-limit", "9", "--max-file-stacks", "11",
+    ]);
+    assert_eq!(
+        (set.deck_window_limit, set.deck_scroll_offset, set.desk_revision_limit, set.max_file_stacks),
+        (7, 2, 9, 11)
+    );
+}
+
+#[test]
+fn every_verb_head_is_one_parse_verb_knows() {
+    // VERB_HEADS builds parse_verb's usage line and is what a host lists;
+    // a head parse_verb does not match would answer with that usage line.
+    for head in VERB_HEADS {
+        if let Err(e) = parse_verb(head) {
+            assert!(!e.contains("unknown/malformed"), "{head}: {e}");
+        }
+    }
+    let usage = parse_verb("frobnicate").expect_err("an unknown head is refused");
+    assert!(usage.ends_with(&VERB_HEADS.join("|")), "{usage}");
+}
+
+#[test]
 fn unknown_flag_errors() {
     let err = try_parse(&["--bogus"]).err().expect("--bogus must fail");
     assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);

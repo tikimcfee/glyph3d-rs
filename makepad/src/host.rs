@@ -192,16 +192,7 @@ impl EngineHost {
         let viewport = (glyph3d_native::OFFSCREEN_WIDTH, glyph3d_native::OFFSCREEN_HEIGHT);
         scene.set_viewport(viewport.0, viewport.1);
         for op in ops {
-            let line = match op {
-                Op::Pick(p) => scene.apply_pick(p),
-                Op::Verb(v) => scene.apply_verb(v),
-                Op::CamPose(eye, yaw, pitch) => {
-                    scene.set_cam_pose(*eye, *yaw, *pitch);
-                    None
-                }
-                Op::Highlight(p) => scene.apply_highlight_sidecar(p),
-            };
-            if let Some(line) = line {
+            if let Some(line) = glyph3d_native::apply_op(scene.as_mut(), op) {
                 println!("{line}");
             }
         }
