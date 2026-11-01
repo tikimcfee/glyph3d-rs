@@ -66,10 +66,16 @@ pub struct Request {
 }
 
 impl Request {
-    /// The context with the word marked `⟦word⟧`, where it stands.
+    /// The context with the word marked `⟦word⟧`, where it stands: brackets
+    /// no passage is likely to hold, for an agent to read.
     pub fn marked_context(&self) -> String {
+        self.marked_context_with("⟦", "⟧")
+    }
+
+    /// The context with the word between `open` and `close`.
+    pub fn marked_context_with(&self, open: &str, close: &str) -> String {
         let end = self.word_offset + self.word.len();
-        format!("{}⟦{}⟧{}", &self.context[..self.word_offset], self.word, &self.context[end..])
+        format!("{}{open}{}{close}{}", &self.context[..self.word_offset], self.word, &self.context[end..])
     }
 }
 

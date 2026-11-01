@@ -66,7 +66,10 @@
 # 377 -> 380 (2026-10-31): the host-placed texts' three
 # (native/tests/text_scene.rs: offsets, refusals, a pick's text and byte
 # from memory).
-test_floor = 380
+# 380 -> 384 (2026-10-31): the definition view's four (definition_engine::view:
+# the loop by taps, the panels' estimated layout, card wrapping, taps on
+# nothing).
+test_floor = 384
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

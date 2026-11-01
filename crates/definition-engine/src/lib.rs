@@ -18,6 +18,8 @@
 //!   loaded run is held to.
 //! - [`store`]: runs on disk, one JSON file each. The store directory is
 //!   the shared state between the `defn` CLI, an agent and a renderer.
+//! - [`view`]: a run as panels in space (the passage, the options, the
+//!   card stack) and what a tap on each means; a host draws and picks.
 //! - [`layers`]: what a tree holds, by layer: code, raw binaries,
 //!   directories and extension-named files. A path can sit in several.
 //!
@@ -32,6 +34,7 @@ pub mod layers;
 pub mod run;
 pub mod store;
 pub mod text;
+pub mod view;
 
 pub use expansion::{Expansion, Sense, Topic, Translation};
 pub use layers::{Layer, LayerSet};
