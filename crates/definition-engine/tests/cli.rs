@@ -52,6 +52,8 @@ fn the_definition_loop_through_the_command_line() {
     let pending = store.json(&["pending"]);
     assert_eq!(pending.as_array().unwrap().len(), 1);
     assert_eq!(pending[0]["word"], "ephemeral");
+    assert_eq!(pending[0]["marked"], "An ⟦ephemeral⟧ grief.");
+    assert_eq!(pending[0]["version"], 0);
 
     store.ok(&["answer", &run, "q1", r#"{"substitutes": ["fleeting", "brief"], "related": [{"name": "impermanence", "category": "philosophy"}]}"#]);
     assert_eq!(store.json(&["pending"]).as_array().unwrap().len(), 0);

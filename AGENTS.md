@@ -88,12 +88,15 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `defn` CLI, an agent and a renderer share: no socket, no provider protocol.
   It also files a tree by layer (code, binary, directory, extension-named; a
   path sits in each it belongs to). Nothing in the renderer reads it yet.
+  An agent answers through `defn pending --wait` (blocks until a reader
+  asks), per the `definition-engine` skill.
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
-- `.agents/` — agent house rules (`rules/rust-engineering.md`) and operational testing skill
-  (`skills/glyph-engine-testing/SKILL.md`).
+- `.agents/` — agent house rules (`rules/rust-engineering.md`), the operational testing skill
+  (`skills/glyph-engine-testing/SKILL.md`), and the definition engine's
+  answering skill (`skills/definition-engine/SKILL.md`, 2026-10-31).
 - `assets/atlas/` — prebaked glyph-geometry binaries (+ `FORMAT.md`).
 - `schema/glyph-identity.json` — layout source of truth (vendored, hash-pinned).
 - `out/` — the live board (`MAINTENANCE-NOTES-2026-10-08.md`),

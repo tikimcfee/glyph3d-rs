@@ -17,6 +17,11 @@ use crate::run::{Request, Run, Source};
 /// The environment variable that names the store root, over the default.
 pub const STORE_ENV: &str = "DEFN_STORE";
 
+/// How often [`Store::wait_for_pending`] looks. A look reads only the runs
+/// directory's listing and modification times until one moved, so a short
+/// period costs nothing while the store is quiet.
+pub const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub struct Store {
     root: PathBuf,
 }
@@ -187,6 +192,45 @@ impl Store {
         Ok(summaries)
     }
 
+    /// The runs directory's listing with each file's modification time and
+    /// length: what changes when any run is created or saved (a save renames
+    /// a whole new file over the run).
+    fn fingerprint(&self) -> Result<Vec<(String, Option<std::time::SystemTime>, u64)>, String> {
+        let runs = self.root.join("runs");
+        let mut entries: Vec<_> = fs::read_dir(&runs)
+            .map_err(|e| format!("cannot list {}: {e}", runs.display()))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let metadata = entry.metadata().ok()?;
+                Some((entry.file_name().into_string().ok()?, metadata.modified().ok(), metadata.len()))
+            })
+            .collect();
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// Block until at least one request is pending, then return them all;
+    /// after `timeout` with none, return none. Looks every `poll`, and reads
+    /// the runs only when the directory's fingerprint moved.
+    pub fn wait_for_pending(&self, timeout: Option<std::time::Duration>, poll: std::time::Duration) -> Result<Vec<(String, Request)>, String> {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut seen = None;
+        loop {
+            let now = self.fingerprint()?;
+            if seen.as_ref() != Some(&now) {
+                let pending = self.pending()?;
+                if !pending.is_empty() {
+                    return Ok(pending);
+                }
+                seen = Some(now);
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
     /// Every request no agent has answered yet, with its run's id: the
     /// agent's work queue.
     pub fn pending(&self) -> Result<Vec<(String, Request)>, String> {
@@ -250,6 +294,28 @@ pub(crate) mod tests {
         let error = store.load(&run.id).unwrap_err();
         assert!(error.contains(&path.display().to_string()) && error.contains("head 3"), "{error}");
         assert!(store.load("../etc").is_err());
+    }
+
+    #[test]
+    fn waiting_wakes_when_a_reader_asks_and_times_out_when_none_does() {
+        let scratch = ScratchDir::new("wait");
+        let store = Store::open(&scratch.0).unwrap();
+        let run = store.create("w", Source::Inline, "a word".into()).unwrap();
+        let quiet = store.wait_for_pending(Some(std::time::Duration::from_millis(50)), std::time::Duration::from_millis(5)).unwrap();
+        assert!(quiet.is_empty());
+
+        let root = scratch.0.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let store = Store::open(root).unwrap();
+            let mut run = store.load(&run.id).unwrap();
+            run.expand(Span { start: 2, end: 6 }, 1).unwrap();
+            store.save(&run).unwrap();
+        });
+        let woken = store.wait_for_pending(Some(std::time::Duration::from_secs(10)), std::time::Duration::from_millis(5)).unwrap();
+        reader.join().unwrap();
+        assert_eq!(woken.len(), 1);
+        assert_eq!(woken[0].1.word, "word");
     }
 
     #[test]
