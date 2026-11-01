@@ -73,6 +73,17 @@ enum Cmd {
         /// without this flag runs every tier, and is the one to land on.
         #[arg(long)]
         inner: bool,
+        /// The inner tier under makepad's relax JIT, with no native build:
+        /// cargo-test is every test target under `relax test`, and the
+        /// renderer gates run the renderer under `relax run`
+        /// (`GLYPH_RELAX` names the binary). For iterating; never a landing
+        /// run, which stays the native `glyph test`.
+        #[arg(long, conflicts_with = "frozen")]
+        relax: bool,
+        /// With --relax: how many `relax test` processes cargo-test runs at
+        /// once. One peaks near 3 GB on the renderer's graph; size it to RAM.
+        #[arg(long, default_value_t = 4, requires = "relax")]
+        jobs: usize,
     },
     /// Bring the renderer up to date, then launch it. Arguments are passed
     /// through; none at all opens its launcher.
@@ -161,10 +172,48 @@ fn cmd_run(m: &Manifest, args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool, inner: bool) -> bool {
+/// `glyph test --relax` (2026-11-01): the gates read the tree from source
+/// under relax, so nothing is built. Exports the mode to the gates, which run
+/// as child `glyph gate`s: `GLYPH_RENDERER` is the renderer under `relax
+/// run` and `GLYPH_UNDER_RELAX` carries the suite's job count
+/// (`paths::under_relax`). Set here, before any thread is spawned.
+fn enter_relax(jobs: usize) -> bool {
+    step("relax: the tree under makepad's relax JIT, nothing built natively");
+    if let Err(e) = prove_relax::relax_available() {
+        println!("FAIL  relax does not run: {e}");
+        println!("      build one in a makepad checkout (cargo build --release -p relax-runner --bin relax)");
+        println!("      and name it with GLYPH_RELAX=<makepad>/target/release/relax");
+        return false;
+    }
+    match prove_relax::relax_renderer() {
+        Ok(wrapper) => {
+            std::env::set_var("GLYPH_RENDERER", &wrapper);
+            std::env::set_var(paths::UNDER_RELAX, jobs.max(1).to_string());
+            println!("PASS  relax runs; the renderer is {} (relax run), the suite {} at once", wrapper.display(), jobs.max(1));
+            true
+        }
+        Err(e) => {
+            println!("FAIL  the relax renderer wrapper could not be written: {e}");
+            false
+        }
+    }
+}
+
+fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool, inner: bool, relax: Option<usize>) -> bool {
     let t_run = std::time::Instant::now();
-    step(if frozen { "products: asserting currency (--frozen)" } else { "products" });
-    let mut ok = ensure_products(m, frozen);
+    // --relax is the inner tier: the merge tier is the compiler's
+    // diagnostics (rustc, clippy, rustdoc), which relax is not.
+    let inner = inner || relax.is_some();
+    let mut ok = if let Some(jobs) = relax {
+        if !enter_relax(jobs) {
+            println!("\nCHECK: FAILURES — see above");
+            return false;
+        }
+        true
+    } else {
+        step(if frozen { "products: asserting currency (--frozen)" } else { "products" });
+        ensure_products(m, frozen)
+    };
     let products = t_run.elapsed().as_secs_f64();
     if !ok && frozen {
         // Everything below would test an artifact we just said is wrong.
@@ -192,7 +241,7 @@ fn cmd_test(m: &Manifest, scope: Option<Scope>, frozen: bool, inner: bool) -> bo
     }
     let ran = run_gates(m, &selected, inner);
     ok &= ran.iter().all(|r| r.ok);
-    let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, inner, ok);
+    let (ok, verdict) = test_verdict(selected.len(), m.gate.len(), scope, inner, relax.is_some(), ok);
     println!();
     println!("{}", time_line(&selected, &ran, products, t_run.elapsed().as_secs_f64()));
     println!("{verdict}");
@@ -210,12 +259,14 @@ fn scope_name(s: Scope) -> String {
 /// fail shape AGENTS.md warns about. Every verdict also says how many gates
 /// ran, so a reader (or an agent) can see an unexpected count even when the
 /// run is green.
-fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, inner: bool, ok: bool) -> (bool, String) {
+fn test_verdict(selected: usize, total: usize, scope: Option<Scope>, inner: bool, relax: bool, ok: bool) -> (bool, String) {
     let mut which = format!("{selected} of {total} gates ran");
     if let Some(s) = scope {
         which.push_str(&format!(", scope {}", scope_name(s)));
     }
-    if inner {
+    if relax {
+        which.push_str(", tier inner under relax — not a landing run");
+    } else if inner {
         which.push_str(", tier inner — not a landing run");
     }
     if selected == 0 {
@@ -267,7 +318,7 @@ fn main() -> ExitCode {
             ok &= verify_committed(&m);
             ok
         }
-        Cmd::Test { scope, frozen, inner } => cmd_test(&m, scope, frozen, inner),
+        Cmd::Test { scope, frozen, inner, relax, jobs } => cmd_test(&m, scope, frozen, inner, relax.then_some(jobs)),
         Cmd::Run { args } => cmd_run(&m, &args),
         Cmd::Prove { gate, mutations, changed, since, list, jobs } => {
             let since = if changed { Some("HEAD") } else { since.as_deref() };
@@ -371,7 +422,7 @@ mod tests {
 
     #[test]
     fn empty_gate_selection_is_refused() {
-        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), false, true);
+        let (ok, line) = test_verdict(0, 9, Some(Scope::Corpus), false, false, true);
         assert!(!ok, "a run that selected no gate must not pass");
         assert!(line.starts_with("CHECK-ALL: NOTHING RAN"), "{line}");
         assert!(line.contains("0 of 9 gates ran, scope corpus"), "{line}");
@@ -380,17 +431,42 @@ mod tests {
     #[test]
     fn verdict_reports_how_many_gates_ran() {
         assert_eq!(
-            test_verdict(4, 9, Some(Scope::Rust), false, true),
+            test_verdict(4, 9, Some(Scope::Rust), false, false, true),
             (true, "CHECK-ALL: ALL GATES GREEN — 4 of 9 gates ran, scope rust".to_string())
         );
         assert_eq!(
-            test_verdict(12, 17, None, true, true),
+            test_verdict(12, 17, None, true, false, true),
             (true, "CHECK-ALL: ALL GATES GREEN — 12 of 17 gates ran, tier inner — not a landing run".to_string())
         );
         assert_eq!(
-            test_verdict(9, 9, None, false, false),
+            test_verdict(9, 9, None, false, false, false),
             (false, "CHECK-ALL: FAILURES — see above (9 of 9 gates ran)".to_string())
         );
+    }
+
+    /// A run under relax says so in its verdict, and never reads as a
+    /// landing run: the landing bar stays the native `glyph test`.
+    #[test]
+    fn a_relax_run_is_never_a_landing_run() {
+        assert_eq!(
+            test_verdict(6, 15, None, true, true, true),
+            (true, "CHECK-ALL: ALL GATES GREEN — 6 of 15 gates ran, tier inner under relax — not a landing run".to_string())
+        );
+        let (ok, line) = test_verdict(6, 15, None, true, true, false);
+        assert!(!ok);
+        assert!(line.ends_with("(6 of 15 gates ran, tier inner under relax — not a landing run)"), "{line}");
+    }
+
+    /// --relax builds nothing, so it cannot be --frozen's currency check, and
+    /// --jobs means nothing without it.
+    #[test]
+    fn relax_flags_parse_as_declared() {
+        assert!(Cli::try_parse_from(["glyph", "test", "--relax", "--frozen"]).is_err());
+        assert!(Cli::try_parse_from(["glyph", "test", "--jobs", "2"]).is_err());
+        match Cli::try_parse_from(["glyph", "test", "rust", "--relax", "--jobs", "2"]).map(|c| c.cmd) {
+            Ok(Cmd::Test { scope, relax, jobs, .. }) => assert_eq!((scope, relax, jobs), (Some(Scope::Rust), true, 2)),
+            _ => panic!("glyph test rust --relax --jobs 2 parses"),
+        }
     }
 
     /// The doubled alias of a nested worktree is stripped, at any depth, and

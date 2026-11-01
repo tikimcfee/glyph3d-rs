@@ -3,7 +3,7 @@
 use crate::artifacts::verify_committed;
 use crate::golden::verify_golden;
 use crate::manifest::{Class, Gate, Kind, Manifest};
-use crate::paths::{expand, keep, resolve_gpu, root, sh};
+use crate::paths::{expand, keep, resolve_gpu, root, sh, under_relax};
 use crate::test_build::test_build;
 use std::process::Command;
 
@@ -114,6 +114,9 @@ fn run_test_jobs(jobs: Vec<TestJob>) -> Vec<(String, bool, String)> {
 /// `cargo test --doc` for the doctests, all at once. A failing binary no
 /// longer stops the ones after it, and every binary must report a result.
 fn gate_cargo_test(m: &Manifest) -> bool {
+    if let Some(jobs) = under_relax() {
+        return gate_cargo_test_under_relax(m, jobs);
+    }
     let units = match test_build() {
         Ok(u) => u,
         Err(rendered) => {
@@ -177,6 +180,23 @@ fn gate_cargo_test(m: &Manifest) -> bool {
     let (passed, verdict) = floor_verdict(m, binaries, total);
     print!("{verdict}");
     passed
+}
+
+/// cargo-test under `glyph test --relax`: every test target of the
+/// workspace under `relax test`, `jobs` at once, judged by this gate's own
+/// rule (`judge_tests`: every target green, then the floor). The same run
+/// prove's suite route makes (`prove_relax::suite`). relax runs no doctests.
+fn gate_cargo_test_under_relax(m: &Manifest, jobs: usize) -> bool {
+    let (ok, out) = crate::prove_relax::suite(m, jobs);
+    for l in out.lines().filter(|l| {
+        l.contains("test result") || l.starts_with("PASS ") || l.starts_with("FAIL ") || l.starts_with("NOTE ") || l.contains("FAILED")
+    }) {
+        println!("{l}");
+    }
+    if !ok {
+        println!("        its whole output kept: {}", keep("cargo-test under relax", &out));
+    }
+    ok
 }
 
 /// The floor's verdict on a green run: at least two binaries reporting, and
@@ -387,6 +407,12 @@ fn needs_met(g: &Gate, m: &Manifest) -> bool {
         // runner can satisfy — there is no build path, by design. Let the
         // gate see it.
         if a.class == Class::Golden {
+            continue;
+        }
+        // Under `glyph test --relax` the renderer is relax compiling the
+        // tree (`GLYPH_RENDERER`), not the built product, which may be stale
+        // or absent and is not read.
+        if a.class == Class::Product && under_relax().is_some() {
             continue;
         }
         for o in &a.outputs {

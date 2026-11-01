@@ -184,6 +184,8 @@ cargo glyph test           run everything; nonzero if anything is wrong
 cargo glyph test --inner   after each change: every gate but the merge tier
 cargo glyph test rust      only what you changed: rust | render | corpus
 cargo glyph test --frozen  assert currency instead of building it
+cargo glyph test --relax   the inner tier under makepad's relax JIT, nothing
+                           built natively; never a landing run
 cargo glyph run --demo     build if stale, then launch the renderer; arguments
                            pass through, and none opens its terminal launcher
 ```
@@ -252,6 +254,28 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
 - **`test` builds; `--frozen` refuses to.** Building is the iterating intent.
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
+- **`test --relax` runs the tree under relax instead of building it**
+  (2026-11-01, `GLYPH_RELAX` as for prove). The inner tier only, since the
+  merge tier is rustc's, clippy's and rustdoc's diagnostics: cargo-test is
+  every test target under `relax test`, `--jobs` (default 4) at once, judged
+  by the same floor, and the renderer gates run `GLYPH_RENDERER` = the
+  renderer under `relax run`. Its verdict says "under relax — not a landing
+  run": land on the native `glyph test`. What it is for is fidelity and a
+  tree with no native build, NOT speed. Measured on the M2 under sibling load
+  (8-40), after a one-line edit in `native/src`: the native `--inner`
+  420 s (401 s of it the release build, 18 s the gates), `--relax` 836 s,
+  green, every metal-apple frame BYTE-EQUAL and every gate volume the
+  native one's. relax pays a process boot and baseline-JIT speed per
+  renderer launch, and pick-oracle and pixel-ab launch many. The fast loop
+  under relax is one target or one test (`relax --allow-c test <pkg> --lib
+  -- <filter>` from the package's directory: 4.5-30 s after an edit), one
+  render (`relax --allow-c run glyph3d-native -- <args>`, 18 s warm), and
+  the makepad host's live session (`makepad/README.md`).
+  relax runs a test in the directory it was started in, where cargo starts
+  each test binary in its package's: the runner starts `relax test` there
+  (`prove_relax::package_dir`), or a test's relative path means something
+  else under relax (`tests/oblique_repeat.rs` drew an empty repo and failed
+  as if the JIT rendered nothing).
 - **`cargo glyph prove`** applies each mutation declared in `build.toml`,
   requires the named check to redden for the named reason, and restores
   byte-exact. It reports COVERAGE — which checks have no mutation and are
