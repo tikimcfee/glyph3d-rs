@@ -161,6 +161,11 @@ pub struct EngineHost {
     /// one (`--definition-run`): its panels are the scene, rebuilt when the
     /// run changes, and a click is a tap on them.
     definition: Option<DefinitionView>,
+    /// Under relax: the live-patch counter this host reads
+    /// `std::relax::patched_files` with. Its own, so the platform's (which
+    /// drives `script_mod!` reloads) is undisturbed.
+    #[cfg(relax)]
+    patches_seen: u64,
 }
 
 impl EngineHost {
@@ -222,7 +227,37 @@ impl EngineHost {
             fps: 0.0,
             glyph_envelope,
             definition,
+            // Patches before the host's first look are not news.
+            #[cfg(relax)]
+            patches_seen: {
+                let mut seen = 0;
+                let _ = std::relax::patched_files(&mut seen);
+                seen
+            },
         }
+    }
+
+    /// The files relax patched into the running host since the last look
+    /// (empty under cargo, where nothing is patched live).
+    #[cfg(relax)]
+    fn patched_files(&mut self) -> Vec<String> {
+        std::relax::patched_files(&mut self.patches_seen)
+    }
+
+    #[cfg(not(relax))]
+    fn patched_files(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Lay the definition run out again now (F5): what a live patch does by
+    /// itself under relax, by hand under cargo. False when the window shows
+    /// no run.
+    pub fn refresh_definition(&mut self) -> bool {
+        if self.definition.is_none() {
+            return false;
+        }
+        self.rebuild_definition();
+        true
     }
 
     /// Lay the definition run out again and swap its scene in, the camera
@@ -282,6 +317,17 @@ impl EngineHost {
         self.scene.animate(dt);
         if self.definition.as_mut().is_some_and(|d| d.poll()) {
             self.rebuild_definition();
+        }
+        // A live patch of the code that lays the panels out (view.rs's
+        // compose, this host) is used only when they are built again, which
+        // a tap or a store change would otherwise wait for: build them on
+        // the patch. Any patched file rebuilds (a few ms for a run's panels).
+        if self.definition.is_some() {
+            let patched = self.patched_files();
+            if !patched.is_empty() {
+                log::info!("definition view: rebuilt after a live patch of {}", patched.join(", "));
+                self.rebuild_definition();
+            }
         }
         self.apply_pending_relayout();
     }
