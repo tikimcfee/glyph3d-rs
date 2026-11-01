@@ -72,7 +72,12 @@
 # taken before any answer, in the run, the view and through the CLI).
 # 391 -> 393 (2026-11-01): `glyph test --relax`'s two (its verdict is never a
 # landing run; its flags parse as declared).
-test_floor = 393
+# 393 -> 394 (2026-11-01): VERB_HEADS against parse_verb, ported from the
+# second clone's interface-shell branch (353 -> 354 on that branch).
+# 394 -> 397: the window's three key-routing tests (app::key_tests), ported
+# with route_key.
+# 397 -> 398: --max-file-stacks reaches the session choice, ported with it.
+test_floor = 398
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -1025,6 +1030,26 @@ op = "replace"
 find = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\n#[cfg(feature = \"egui-ui\")]\nfn ui_rgb("
 with = "/// A `[ui]` colour setting (sRGB 0-255) as an egui colour.\nfn ui_rgb("
 expect = "cargo-check-no-ui errored"
+
+[[mutation]]
+name = "key-route-ignores-egui-focus"
+gate = "cargo-test"
+why = "the K2 typing-isolation rule dropped: a key PRESS egui consumed (a focused text field: the debug panel's scratch field, a sessions filter) routes to the scene anyway, so typing WASD flies the camera and h/g/t/x fire verbs on the pick. Window-only behaviour no golden or oracle reaches; the witness is the pure decision's unit test (2026-10-24, ported 2026-11-01). CONSUMED BY: app::route_key, called by the KeyboardInput arm of windowed/app.rs's window_event"
+file = "native/src/windowed/app.rs"
+op = "replace"
+find = "    if egui_consumed {\n        return KeyRoute::Drop;\n    }"
+with = "    if false {\n        return KeyRoute::Drop;\n    }"
+expect = "typing_in_a_field_never_reaches_the_scene"
+
+[[mutation]]
+name = "key-route-drops-consumed-release"
+gate = "cargo-test"
+why = "the latch put back (2026-11-01): a key RELEASE egui consumed is dropped, as it was before 2026-10-24, so W held while a text field takes focus never clears the fly camera's bit and the camera keeps moving. Window-only behaviour no golden or oracle reaches; the witness is the pure decision's unit test. CONSUMED BY: app::route_key, called by the KeyboardInput arm of windowed/app.rs's window_event"
+file = "native/src/windowed/app.rs"
+op = "replace"
+find = "    if !pressed {\n        return KeyRoute::Scene;\n    }"
+with = "    if !pressed && !egui_consumed {\n        return KeyRoute::Scene;\n    }"
+expect = "every_release_reaches_the_scene"
 
 [[mutation]]
 name = "windowed-module-ungated"

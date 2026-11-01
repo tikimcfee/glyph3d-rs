@@ -19,9 +19,12 @@
 //! after the scene pass on the SAME encoder, an egui pass (LoadOp::Load, no
 //! depth attachment) paints the tessellated UI onto the surface. K1 shipped
 //! the plumbing with an EMPTY CentralPanel. K2 input-consumption rules:
-//!   - keys route only when egui hasn't consumed them (a focused egui widget
-//!     swallows keys — typing WASD/h/g/t/x in a text field must not fly the
-//!     camera or fire verbs; Tab is always egui's);
+//!   - key PRESSES route only when egui hasn't consumed them (a focused
+//!     egui widget swallows keys — typing WASD/h/g/t/x in a text field must
+//!     not fly the camera or fire verbs; Tab is always egui's), and never
+//!     while Cmd or Ctrl is held; every key RELEASE reaches the scene, so a
+//!     fly key held as a field takes focus cannot latch (2026-10-24; the
+//!     decision is `app::route_key`);
 //!   - right-press grab and left-click pick route only when egui doesn't
 //!     want the pointer (hovering a panel counts); right-RELEASE always
 //!     ungrabs (consumed releases must not latch the grab);
