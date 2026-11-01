@@ -42,3 +42,46 @@ it against wgpu 30 as pinned today.
 | Tag | `archive/multi-draw-indirect` → `362094e` (base `9299916`) |
 | Branch | `worktree-multi-draw-indirect`, deleted 2026-10-24 |
 | Report | `git show archive/multi-draw-indirect:out/STAGE_K_REPORT.md` |
+
+## `archive/egui-interface-shell` and `archive/egui-interface-m1` (archived 2026-11-01)
+
+The egui window's interface shell, in two forms, both left in the second
+clone (`viz-native/glyph3d-native`) when its `main` was merged here
+(`8df9447`).
+
+**`archive/egui-interface-shell`** → `6d0594b` (base `5d9a2f6`), branch
+`worktree-agent-ac8b5f3d63d95903e`, 2026-10-24/25: nine commits that made
+every action in the egui window a command LINE on one bus (`windowed/bus.rs`,
+`exec.rs`), parsed by the CLI's own parser, with the panels moved into
+`windowed/panels/`, a console (F9) and a Cmd-K palette. Its design note is
+`out/INTERFACE-SHELL-2026-10-24.md` at the tag. The old clone's tag
+`pre-rebase-interface` (`aa0d923`) is the same nine commits before their
+rebase onto `5d9a2f6`. `git range-diff` shows only the `test_floor` numbers
+and the z-dial ceiling change that the rebase absorbed.
+
+**`archive/egui-interface-m1`** → `cf0f1d2` (base `3bf99f2`), branch
+`worktree-interface`, 2026-09-02: "stage-m", the first form (a `ui::Command`
+type, docked panels, inverse formatters). The shell above supersedes it by
+its own account. Its notes are `integration/notes/11-interface-design.md`
+and `out/STAGE_M_REPORT.md` at the tag.
+
+**Why it was not merged.** Two days after the shell was written the
+direction changed: makepad panels are to replace the winit window, the egui
+overlay and the launcher TUI (`out/TEST-DIET-PLAN-2026-10-26.md`, premise 4).
+The window's code was reshaped under the shell too (`SceneKey`, the relayout
+rebuild moved into the engine, a scene that holds no device). Ivan's
+decision (2026-11-01): archive it, and rebuild it in the makepad host, which
+already has most of the panels. The spec for that rebuild is
+`out/INTERFACE-SHELL-SPEC-2026-11-01.md`. The parts that do not belong to
+the window were ported on 2026-11-01 (`worktree-stranded`):
+`cli::apply_op`, the one op applier, now shared by offscreen, the window and
+the makepad host; `cli::VERB_HEADS`; `--max-file-stacks`; and the window's
+key-routing fix (a fly key released inside a focused field no longer
+latches, and Cmd/Ctrl chords no longer fly).
+
+| | |
+|---|---|
+| Tags | `archive/egui-interface-shell` → `6d0594b`; `archive/egui-interface-m1` → `cf0f1d2` |
+| Branches | `worktree-agent-ac8b5f3d63d95903e` and `worktree-interface`, and the tag `pre-rebase-interface`, in the old clone |
+| Design | `git show archive/egui-interface-shell:out/INTERFACE-SHELL-2026-10-24.md` |
+| Rebuild spec | `out/INTERFACE-SHELL-SPEC-2026-11-01.md` |
