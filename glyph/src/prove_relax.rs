@@ -1103,7 +1103,7 @@ mod tests {
     fn workspace_packages_are_the_members_alone() {
         let mut names: Vec<String> = workspace_packages().into_iter().map(|(n, _)| n).collect();
         names.sort();
-        assert_eq!(names, ["glyph", "glyph-field", "glyph-field-derived", "glyph-scene-graph", "glyph3d-native"]);
+        assert_eq!(names, ["definition-engine", "glyph", "glyph-field", "glyph-field-derived", "glyph-scene-graph", "glyph3d-native"]);
     }
 
     #[test]

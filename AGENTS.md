@@ -78,6 +78,16 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   where gomuxai looks is the launch config's `claude_projects_dir`,
   `agy_brain_dir` and `kimi_sessions_dir`, passed to it as its app config
   (`launch_config.example.toml`).
+- `crates/definition-engine` (2026-10-31) — the definition engine's core,
+  UI-free (the note `definition-engine-root`): a definition-run is a passage,
+  the words selected in it (a tap's byte resolves to its word), their
+  expansions (definitions, translations, related topics, substitutes,
+  answered by an agent), and the stack of substitution diffs, each a card;
+  any version can be checked out or forked into a run of its own. Runs live
+  as JSON files in a store directory (`$DEFN_STORE`), the one state its
+  `defn` CLI, an agent and a renderer share: no socket, no provider protocol.
+  It also files a tree by layer (code, binary, directory, extension-named; a
+  path sits in each it belongs to). Nothing in the renderer reads it yet.
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
