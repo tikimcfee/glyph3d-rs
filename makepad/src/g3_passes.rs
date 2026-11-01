@@ -451,6 +451,14 @@ script_mod! {
         u_greek_onset_px: uniform(10.0)
         // 1.0 in the selection-mask pass: the output is coverage, as data.
         u_mask_mode: uniform(0.0)
+        // Where the AA footprint comes from (C35, glyph-field footprint.rs):
+        // 0 the hardware quad derivative, 1 the quad's projective map. On
+        // Apple TBDR a quad derivative here depends on GPU timing (a hidden
+        // quad-mate lane is depth-rejected before or after shading), so a
+        // still frame flickered at delta 1; measured in this host too.
+        u_footprint: uniform(0.0)
+        // The pass's target in physical px: NDC to pixels for the map.
+        u_viewport_px: uniform(vec2(1.0, 1.0))
 
         v_color: varying(vec4f)      // rgb = blended ink colour, a = group alpha
         v_uv: varying(vec4f)         // xy = glyph uv, zw = emoji uv
@@ -460,6 +468,13 @@ script_mod! {
         v_glyph: varying(vec4f)
         v_group_rgb: varying(vec4f)
         v_bg: varying(vec4f)
+        // The quad's projective map in pixel units, (x, y, w): the fragment's
+        // pixel position is p0 + u*pu + v*pv at its glyph uv. Constant over
+        // the quad (no flat varyings here; interpolating a constant is still
+        // a function of the fragment alone, which is the point).
+        v_foot_p0: varying(vec4f)
+        v_foot_pu: varying(vec4f)
+        v_foot_pv: varying(vec4f)
 
         table_uv: fn(idx: u32, width: u32, inv_size: vec2) -> vec2 {
             let row = idx / width
@@ -583,6 +598,25 @@ script_mod! {
             let world = posed + gpos.xyz
             let mut clip = self.draw_pass.camera_projection * (self.draw_pass.camera_view * vec4(world.x, world.y, world.z, 1.0))
 
+            // The analytic footprint's map (glyph-field footprint.rs): the
+            // quad's edges d(world)/du, d(world)/dv through the group's scale
+            // and rotation, projected; C0 is corner (0, 0).
+            let foot_eu = vec3(quad_w, 0.0, 0.0) * gscale.xyz
+            let foot_ev = vec3(0.0, 1.0, 0.0) * gscale.xyz
+            let foot_qu = cross(gquat.xyz, foot_eu) + foot_eu * gquat.w
+            let foot_qv = cross(gquat.xyz, foot_ev) + foot_ev * gquat.w
+            let foot_wu = foot_eu + cross(gquat.xyz, foot_qu) * 2.0
+            let foot_wv = foot_ev + cross(gquat.xyz, foot_qv) * 2.0
+            let foot_cu = self.draw_pass.camera_projection * (self.draw_pass.camera_view * vec4(foot_wu.x, foot_wu.y, foot_wu.z, 0.0))
+            let foot_cv = self.draw_pass.camera_projection * (self.draw_pass.camera_view * vec4(foot_wv.x, foot_wv.y, foot_wv.z, 0.0))
+            let foot_c0 = clip - foot_cu * c.x - foot_cv * c.y
+            // NDC to pixels: x' = x * w/2, y' = -y * h/2 (offsets drop out of a derivative).
+            let foot_sx = self.u_viewport_px.x * 0.5
+            let foot_sy = -self.u_viewport_px.y * 0.5
+            self.v_foot_p0 = vec4(foot_c0.x * foot_sx, foot_c0.y * foot_sy, foot_c0.w, 0.0)
+            self.v_foot_pu = vec4(foot_cu.x * foot_sx, foot_cu.y * foot_sy, foot_cu.w, 0.0)
+            self.v_foot_pv = vec4(foot_cv.x * foot_sx, foot_cv.y * foot_sy, foot_cv.w, 0.0)
+
             // Vertex culls → degenerate to outside-NDC.
             if group_id >= max_groups || gcolor.w <= 0.01 {
                 clip = vec4(2.0, 2.0, 2.0, 1.0)
@@ -705,9 +739,34 @@ script_mod! {
         pixel: fn() {
             // Every derivative first, in uniform control flow: before any
             // branch or discard.
-            let fw = abs(dFdx(self.v_uv.xy)) + abs(dFdy(self.v_uv.xy))
-            let emoji_dx = dFdx(self.v_uv.zw)
-            let emoji_dy = dFdy(self.v_uv.zw)
+            let mut fw = abs(dFdx(self.v_uv.xy)) + abs(dFdy(self.v_uv.xy))
+            let mut emoji_dx = dFdx(self.v_uv.zw)
+            let mut emoji_dy = dFdy(self.v_uv.zw)
+            if self.u_footprint > 0.5 {
+                // The Jacobian of pixel position in glyph uv, inverted:
+                // d(uv)/dx and d(uv)/dy from this fragment's own inputs.
+                let pu = self.v_foot_pu
+                let pv = self.v_foot_pv
+                let p = self.v_foot_p0 + pu * self.v_uv.x + pv * self.v_uv.y
+                let w2 = p.z * p.z
+                let xu = (pu.x * p.z - p.x * pu.z) / w2
+                let xv = (pv.x * p.z - p.x * pv.z) / w2
+                let yu = (pu.y * p.z - p.y * pu.z) / w2
+                let yv = (pv.y * p.z - p.y * pv.z) / w2
+                let mut det = xu * yv - xv * yu
+                // An edge-on quad gets a huge footprint, as fwidth would; never inf/NaN.
+                if abs(det) < 0.000000000000000000000000000001 {
+                    det = 0.000000000000000000000000000001
+                }
+                let uv_dx = vec2(yv, -yu) / det
+                let uv_dy = vec2(-xv, xu) / det
+                fw = abs(uv_dx) + abs(uv_dy)
+                // emoji_uv = (cell + inset + (u, 1 - v) * span) / layer: glyph
+                // uv's gradients, scaled per axis and flipped in v.
+                let emoji_scale = (self.u_emoji_cell - vec2(1.0, 1.0)) / self.u_emoji_layer * vec2(1.0, -1.0)
+                emoji_dx = uv_dx * emoji_scale
+                emoji_dy = uv_dy * emoji_scale
+            }
 
             let glyph_uv = self.v_uv.xy
             let group_alpha = self.v_color.w
@@ -1548,11 +1607,22 @@ pub struct DrawG3Glyph {
 }
 
 impl DrawG3Glyph {
-    /// Tables + params, once per frame before the chunks draw.
-    pub fn prepare(&mut self, cx: &Cx, tables: &G3Tables, params: &Params) {
+    /// Tables + params, once per frame before the chunks draw; `viewport_px`
+    /// is the pass's target in physical px (the analytic footprint's scale).
+    pub fn prepare(&mut self, cx: &Cx, tables: &G3Tables, params: &Params, viewport_px: Vec2d) {
         tables.bind(cx, &mut self.draw_vars);
         g3_set_glyph_params(cx, &mut self.draw_vars, params);
+        self.draw_vars.set_uniform(cx, live_id!(u_footprint), &[if analytic_footprint() { 1.0 } else { 0.0 }]);
+        self.draw_vars.set_uniform(cx, live_id!(u_viewport_px), &[viewport_px.x as f32, viewport_px.y as f32]);
     }
+}
+
+/// Whether the glyph shader takes its AA footprint from the quad's map (C35):
+/// on Apple silicon, where makepad draws through Metal on Apple's TBDR GPU, as
+/// the engine's `GpuProfile::glyph_footprint` chooses for wgpu. Everywhere
+/// else the hardware derivative, unchanged.
+fn analytic_footprint() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 /// The selection-mask variant (`@Ru8`, no blend, no depth,
@@ -1975,6 +2045,9 @@ impl G3Renderer {
         };
         let reverse_z = inputs.reverse_z;
         let c = inputs.clear_color;
+        // The passes' targets in physical px (their size is `rect.size`, in
+        // logical px, at the window's dpi factor).
+        let viewport_px = rect.size * cx.current_dpi_factor();
 
         // ── the scene pass, in glyph3d's phase order ──
         self.pass.set_size(cx, rect.size);
@@ -2010,7 +2083,7 @@ impl G3Renderer {
 
             // The resident blocks the cull draws, each in its own list, in
             // arena order (glyph3d's blend order).
-            draws.glyph.prepare(cxd, tables, &inputs.glyph_params);
+            draws.glyph.prepare(cxd, tables, &inputs.glyph_params, viewport_px);
             let blocks = &mut self.blocks;
             self.glyph_list.draw(cxd, |cx| {
                 for (k, held) in blocks.iter_mut().enumerate() {
@@ -2040,7 +2113,7 @@ impl G3Renderer {
                 let cxd: &mut CxDraw = cx;
                 self.mask_list.begin_always(cxd);
                 let mask = &mut draws.glyph_mask.draw_super;
-                mask.prepare(cxd, tables, &inputs.glyph_params);
+                mask.prepare(cxd, tables, &inputs.glyph_params, viewport_px);
                 for (k, held) in self.blocks.iter_mut().enumerate() {
                     let Some(held) = held else { continue };
                     let Some(ranges) = selection.chunk_ranges.get(k).filter(|r| !r.is_empty()) else {
