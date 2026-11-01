@@ -439,6 +439,11 @@ impl SceneLike for GlyphScene {
         GlyphScene::selected_group_id(self)
     }
 
+    fn picked_glyph(&self) -> Option<(String, usize)> {
+        let hit = self.picked.as_ref().filter(|_| self.selection.is_some())?;
+        Some((hit.rel_path.clone(), hit.glyph.as_ref()?.byte_off))
+    }
+
     fn apply_highlight_sidecar(&self, path: &std::path::Path) -> Option<String> {
         Some(GlyphScene::apply_highlight_sidecar(self, path))
     }

@@ -530,6 +530,54 @@ pub fn load_file(path: &Path, copies: u32, params: &RepoParams, home: Option<&cr
     )
 }
 
+/// Texts held in memory, laid out as a repo load with one view each, every
+/// view at the world offset its caller gives (2026-10-31): the host-built
+/// scenes, the definition engine's passage and its cards first, whose
+/// layout is the caller's, not a shelf's. `rel_path` names each view (a
+/// pick reports it); the root is `.`, and a pick reads the bytes from the
+/// staged pick context's `content`, which `crate::build_text_scene` fills,
+/// never from disk.
+///
+/// Refused, by name, where a walk would skip a text: not UTF-8, or past
+/// [`MAX_FILE_BYTES`]. Paths must be unique: a pick finds a view by it.
+pub fn load_texts(
+    texts: Vec<(String, Vec<u8>)>,
+    offsets: Vec<[f32; 3]>,
+    params: &RepoParams,
+    home: Option<&crate::budget::SlotHome>,
+) -> Result<RepoLoad, String> {
+    let started = Instant::now();
+    if texts.len() != offsets.len() {
+        return Err(format!("{} texts and {} offsets: one offset per text", texts.len(), offsets.len()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (rel_path, bytes) in &texts {
+        if !seen.insert(rel_path.as_str()) {
+            return Err(format!("two texts are named {rel_path}"));
+        }
+        if std::str::from_utf8(bytes).is_err() {
+            return Err(format!("{rel_path} is not valid UTF-8; the layout decodes well-formed UTF-8 only"));
+        }
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(format!("{rel_path} is {} B, past the {MAX_FILE_BYTES} B per-item cap", bytes.len()));
+        }
+    }
+    let mut walk = WalkResult::from_files(texts.into_iter().map(|(rel_path, bytes)| RepoFile::in_memory(rel_path, bytes)).collect());
+    walk.walk_dur = started.elapsed();
+    let file_params = walk.files.iter().map(|f| file_item_params(params, f.bytes.len(), f.newline_count)).collect();
+    let plan = ViewPlan { buffer_of_view: (0..walk.files.len() as u32).collect(), placement: Placement::Given(offsets) };
+    Ok(load_views(
+        Path::new("."),
+        PrefetchedRepo { walk, file_params, hyper_data: None },
+        plan,
+        params,
+        Strategy::default(),
+        home,
+        GlyphArena::new(),
+        None,
+    ))
+}
+
 /// Which walked file each view reads, and how the views are placed
 /// (2026-10-11). A repo load is one view per file, placed by the layout
 /// controller (shelf, carrel or library); `--render-file FILE --copies N`
@@ -546,6 +594,9 @@ enum Placement {
     Controller,
     /// [`tile_views`]: `--render-file`.
     Tiled,
+    /// [`place_views`]: each view at the offset its caller gave
+    /// ([`load_texts`]).
+    Given(Vec<[f32; 3]>),
 }
 
 /// The loader proper, over a [`ViewPlan`].
@@ -798,6 +849,10 @@ fn load_views(
         Placement::Tiled => {
             let pages: Vec<crate::layout::PageExtent> = placements.iter().map(|p| p.page).collect();
             let (rows, bounds_min, bounds_max) = tile_views(&mut file_views, &pages, &ends_in_newline, params.line_height as f32);
+            (None, rows, bounds_min, bounds_max)
+        }
+        Placement::Given(offsets) => {
+            let (rows, bounds_min, bounds_max) = place_views(&mut file_views, &offsets);
             (None, rows, bounds_min, bounds_max)
         }
     };
@@ -1235,6 +1290,27 @@ fn tile_views(
     let total_height = grid_rows as f32 * (block_height + gap) - gap;
     log::info!("layout [tile]: {copies} views, block {block_width:?} x {block_height:?}, field {total_width:?} x {total_height:?}");
     (rows, [0.0, -total_height, depth_min], [total_width, line_height, depth_max])
+}
+
+/// Each view at its given offset, unrotated and unscaled; the bounds are
+/// the union of the views' ink at their offsets (an empty view's ink is
+/// its pen origin).
+fn place_views(views: &mut [FileView], offsets: &[[f32; 3]]) -> (Vec<GroupRow>, [f32; 3], [f32; 3]) {
+    assert_eq!(views.len(), offsets.len(), "one offset per view");
+    let (mut bounds_min, mut bounds_max) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    let mut rows = Vec::with_capacity(views.len());
+    for (view, offset) in views.iter_mut().zip(offsets) {
+        view.offset = *offset;
+        rows.push(GroupRow::identity(*offset));
+        for axis in 0..3 {
+            bounds_min[axis] = bounds_min[axis].min(offset[axis] + view.ink.min[axis]);
+            bounds_max[axis] = bounds_max[axis].max(offset[axis] + view.ink.max[axis]);
+        }
+    }
+    if views.is_empty() {
+        return (rows, [0.0; 3], [0.0; 3]);
+    }
+    (rows, bounds_min, bounds_max)
 }
 
 impl GroupRows {

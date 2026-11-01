@@ -237,6 +237,74 @@ pub fn build_scene_probed(
     build_scene_impl(load, choice, camera_mode, cull_opts, true)
 }
 
+/// A built glyph scene given the options every build applies (file
+/// backgrounds, LOD, greeking, environment) and, when asked, its probe;
+/// then erased. Shared by [`build_scene_impl`] and [`build_text_scene`] so
+/// a host-built scene looks like a command-line one.
+fn configure_glyph_scene(
+    mut scene: GlyphScene,
+    cull_opts: &SceneCullOptions,
+    probe: bool,
+) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
+    scene.set_file_backgrounds(cull_opts.file_backgrounds);
+    scene.set_file_bg_color(cull_opts.file_bg_color);
+    if let Some(lod) = cull_opts.lod_min_px {
+        scene.set_lod_min_px(lod);
+    }
+    let mode = if !cull_opts.greeking {
+        0
+    } else if cull_opts.greek_pure {
+        2
+    } else {
+        1
+    };
+    scene.set_greek_mode(mode);
+    if let Some(onset) = cull_opts.greek_onset_px {
+        scene.set_greek_onset_px(onset);
+    }
+    scene.set_environment(cull_opts.environment, cull_opts.ground_y);
+    let p = probe.then(|| scene.init_ui_probe());
+    (Box::new(scene) as Box<dyn SceneLike>, p)
+}
+
+/// One text a host places in its own scene ([`build_text_scene`]).
+pub struct PlacedText {
+    /// The view's name: what a pick reports, unique in the scene.
+    pub rel_path: String,
+    pub bytes: Vec<u8>,
+    /// Where the text's pen origin sits in the world.
+    pub offset: [f32; 3],
+}
+
+/// A scene of texts held in memory, each at the offset its host gives
+/// (2026-10-31): `repo::load_texts` laid out by the same HyperLayout as a
+/// repo load, with the pick context reading the texts from memory, then
+/// configured as a command-line build is. A host that changes a text builds
+/// again (the texts are small: the definition engine's passage and cards).
+pub fn build_text_scene(
+    load: &SceneLoad,
+    atlas: std::sync::Arc<atlas::Atlas>,
+    texts: Vec<PlacedText>,
+    params: &repo::RepoParams,
+    camera_mode: CameraMode,
+    cull_opts: SceneCullOptions,
+    probe: bool,
+) -> Result<(Box<dyn SceneLike>, Option<glyph_scene::UiProbe>), String> {
+    let content: std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> =
+        texts.iter().map(|t| (t.rel_path.clone(), std::sync::Arc::new(t.bytes.clone()))).collect();
+    let offsets = texts.iter().map(|t| t.offset).collect();
+    let texts = texts.into_iter().map(|t| (t.rel_path, t.bytes)).collect();
+    let params = repo::RepoParams { field_mode: cull_opts.field_mode, ..*params };
+    let loaded = repo::load_texts(texts, offsets, &params, Some(&load.home))?;
+    let mut staged = loaded.into_staged(None, &atlas.slot_ink);
+    if let Some(pick) = &mut staged.pick {
+        pick.content = Some(content);
+    }
+    let mut scene = GlyphScene::new(atlas, staged, camera_mode, cull_opts.cull, cull_opts.field_mode);
+    scene.set_probe_cluster_mode(matches!(params.cluster_mode, fold::ClusterMode::Cluster));
+    Ok(configure_glyph_scene(scene, &cull_opts, probe))
+}
+
 fn build_scene_impl(
     load: &SceneLoad,
     choice: &SceneChoice,
@@ -244,28 +312,7 @@ fn build_scene_impl(
     cull_opts: SceneCullOptions,
     probe: bool,
 ) -> (Box<dyn SceneLike>, Option<glyph_scene::UiProbe>) {
-    let glyph = |scene: GlyphScene| {
-        let mut scene = scene;
-        scene.set_file_backgrounds(cull_opts.file_backgrounds);
-        scene.set_file_bg_color(cull_opts.file_bg_color);
-        if let Some(lod) = cull_opts.lod_min_px {
-            scene.set_lod_min_px(lod);
-        }
-        let mode = if !cull_opts.greeking {
-            0
-        } else if cull_opts.greek_pure {
-            2
-        } else {
-            1
-        };
-        scene.set_greek_mode(mode);
-        if let Some(onset) = cull_opts.greek_onset_px {
-            scene.set_greek_onset_px(onset);
-        }
-        scene.set_environment(cull_opts.environment, cull_opts.ground_y);
-        let p = probe.then(|| scene.init_ui_probe());
-        (Box::new(scene) as Box<dyn SceneLike>, p)
-    };
+    let glyph = |scene: GlyphScene| configure_glyph_scene(scene, &cull_opts, probe);
     let cull = cull_opts.cull;
     let field_mode = cull_opts.field_mode;
     match choice {
