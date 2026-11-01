@@ -57,10 +57,8 @@
 # Derived wgsl validation, the profile's footprint choice, the host-scoped
 # mutation rule, the oblique repeat witness and the profiled offscreen run
 # (there 386 -> 395, counted with the Instanced and Visible crates' share).
-# 353 -> 376 (2026-10-31): the definition-engine crate's 23 (21 unit: spans
-# and the word a tap selects, expansions, runs and their invariants, the
-# store, the layers; 2 driving the `defn` binary through the whole loop).
 # 353 -> 377 (2026-10-31): the definition-engine crate's 24 (22 unit: spans
+# and the word a tap selects, expansions, runs and their invariants, the
 # store and its pending wait, the layers; 2 driving the `defn` binary
 # through the whole loop).
 # 377 -> 380 (2026-10-31): the host-placed texts' three
