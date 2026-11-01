@@ -52,6 +52,9 @@ pub struct Request {
     pub word: String,
     /// The sentence around the word, as [`context_of`] found it.
     pub context: String,
+    /// Where the word starts in `context`: the word can occur in its
+    /// context more than once, and an answer has to fit the right one.
+    pub word_offset: usize,
     pub asked_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expansion: Option<Expansion>,
@@ -60,6 +63,14 @@ pub struct Request {
     /// The step that took one of its answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<String>,
+}
+
+impl Request {
+    /// The context with the word marked `⟦word⟧`, where it stands.
+    pub fn marked_context(&self) -> String {
+        let end = self.word_offset + self.word.len();
+        format!("{}⟦{}⟧{}", &self.context[..self.word_offset], self.word, &self.context[end..])
+    }
 }
 
 /// Which answer a substitution took.
@@ -154,12 +165,14 @@ impl Run {
         if span.of(&text).trim().is_empty() {
             return Err("a selection needs at least one non-blank character".into());
         }
+        let context = context_of(&text, span);
         let request = Request {
             id: format!("q{}", self.requests.len() + 1),
             version: self.head,
             span,
             word: span.of(&text).to_string(),
-            context: context_of(&text, span).of(&text).to_string(),
+            context: context.of(&text).to_string(),
+            word_offset: span.start - context.start,
             asked_at: now,
             expansion: None,
             answered_at: None,
@@ -305,6 +318,9 @@ impl Run {
             if span.of(version) != request.word {
                 return Err(format!("run {} request {}: version {} has {:?}, not {:?}", self.id, request.id, request.version, span.of(version), request.word));
             }
+            if request.context.get(request.word_offset..).is_none_or(|rest| !rest.starts_with(&request.word)) {
+                return Err(format!("run {} request {}: its context does not hold the word at {}", self.id, request.id, request.word_offset));
+            }
             if let Some(expansion) = &request.expansion {
                 expansion.validate().map_err(|e| format!("run {} request {}: {e}", self.id, request.id))?;
             }
@@ -336,6 +352,7 @@ mod tests {
         let span = find_word(&run.head_text(), "ephemeral", 1).unwrap();
         let q1 = run.expand(span, 2).unwrap().id.clone();
         assert_eq!(run.request(&q1).unwrap().context, "An ephemeral joy.");
+        assert_eq!(run.request(&q1).unwrap().marked_context(), "An ⟦ephemeral⟧ joy.");
         run.answer(&q1, answered(&["fleeting"], "lasting a very short time"), 3).unwrap();
         run.substitute(&q1, Choice::Definition { index: 0 }, 4).unwrap();
         assert_eq!(run.head_text(), "An lasting a very short time joy.");
@@ -405,6 +422,10 @@ mod tests {
         let mut rebased = run.clone();
         rebased.base = "uno two".into();
         assert!(rebased.validate().is_err(), "base no longer holds the removed word");
+
+        let mut misplaced = run.clone();
+        misplaced.requests[0].word_offset = 1;
+        assert!(misplaced.validate().unwrap_err().contains("context"), "the word is not where its offset says");
 
         let mut future = run.clone();
         future.format = RUN_FORMAT + 1;

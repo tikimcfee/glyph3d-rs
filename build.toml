@@ -60,7 +60,10 @@
 # 353 -> 376 (2026-10-31): the definition-engine crate's 23 (21 unit: spans
 # and the word a tap selects, expansions, runs and their invariants, the
 # store, the layers; 2 driving the `defn` binary through the whole loop).
-test_floor = 376
+# 353 -> 377 (2026-10-31): the definition-engine crate's 24 (22 unit: spans
+# store and its pending wait, the layers; 2 driving the `defn` binary
+# through the whole loop).
+test_floor = 377
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

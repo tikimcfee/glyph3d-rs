@@ -80,7 +80,15 @@ enum Command {
         span: Option<Vec<usize>>,
     },
     /// Requests no agent has answered, across every run.
-    Pending,
+    Pending {
+        /// Block until there is at least one, then print them and exit:
+        /// run it in the background and the agent wakes when a reader asks.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up after this many seconds and print none.
+        #[arg(long, requires = "wait")]
+        timeout: Option<f64>,
+    },
     /// Answer a request with an expansion's JSON (inline, else stdin).
     Answer { run: String, request: String, expansion: Option<String> },
     /// A request's answers, numbered from 1.
@@ -215,20 +223,34 @@ fn run(cli: Cli) -> Result<(), String> {
             if json {
                 print_json(&serde_json::json!({ "run": run.id, "request": request }));
             } else {
-                println!("{}  {:?}  in: {}", request.id, request.word, request.context);
+                println!("{}  {:?}  in: {}", request.id, request.word, request.marked_context());
             }
         }
-        Command::Pending => {
-            let pending = store.pending()?;
+        Command::Pending { wait, timeout } => {
+            let pending = if wait {
+                let timeout = timeout.map(std::time::Duration::from_secs_f64);
+                store.wait_for_pending(timeout, definition_engine::store::WAIT_POLL)?
+            } else {
+                store.pending()?
+            };
             if json {
                 let items: Vec<_> = pending
                     .iter()
-                    .map(|(run, r)| serde_json::json!({ "run": run, "request": r.id, "word": r.word, "context": r.context }))
+                    .map(|(run, r)| {
+                        serde_json::json!({
+                            "run": run,
+                            "request": r.id,
+                            "word": r.word,
+                            "marked": r.marked_context(),
+                            "version": r.version,
+                            "span": r.span,
+                        })
+                    })
                     .collect();
                 print_json(&items);
             } else {
                 for (run, r) in pending {
-                    println!("{run} {}  {:?}  in: {}", r.id, r.word, r.context);
+                    println!("{run} {}  {:?}  in: {}", r.id, r.word, r.marked_context());
                 }
             }
         }
@@ -258,7 +280,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(request);
                 return Ok(());
             }
-            println!("{}  {:?}  in: {}", request.id, request.word, request.context);
+            println!("{}  {:?}  in: {}", request.id, request.word, request.marked_context());
             let Some(expansion) = &request.expansion else {
                 println!("  (not answered yet)");
                 return Ok(());
