@@ -168,6 +168,11 @@ impl Widget for Glyph3dViewport {
                 self.set_looking(cx, host, on);
             }
             Hit::KeyDown(ke) if ke.key_code == KeyCode::Escape => self.set_looking(cx, host, false),
+            // A definition window lays its run out again (the cargo build's
+            // way to see an edited view; under relax a live patch does it).
+            Hit::KeyDown(ke) if ke.key_code == KeyCode::F5 && !ke.is_repeat && host.refresh_definition() => {
+                ::log::info!("definition view: rebuilt (F5)");
+            }
             Hit::KeyDown(ke) => {
                 if let Some(key) = scene_key(ke.key_code) {
                     if !ke.is_repeat {

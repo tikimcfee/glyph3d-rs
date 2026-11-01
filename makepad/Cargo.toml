@@ -41,4 +41,10 @@ definition-engine = { path = "../crates/definition-engine" }
 log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# `cfg(relax)` is set when makepad's relax JIT builds the host (it reads
+# std::relax there: host.rs's live-patch rebuild). makepad's platform
+# declares it for itself in its build.rs; this crate declares its own.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(relax)"] }
+
 [workspace]
