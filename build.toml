@@ -67,7 +67,10 @@
 # 380 -> 384 (2026-10-31): the definition view's four (definition_engine::view:
 # the loop by taps, the panels' estimated layout, card wrapping, taps on
 # nothing).
-test_floor = 384
+# 384 -> 391 (2026-11-01): static dictionaries' seven (their sense split,
+# inflections and cross-references, the store's dictionaries dir; a sense
+# taken before any answer, in the run, the view and through the CLI).
+test_floor = 391
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);

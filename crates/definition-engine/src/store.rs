@@ -142,6 +142,12 @@ impl Store {
         Ok((modified, metadata.len()))
     }
 
+    /// The dictionaries this store reads: `<root>/dictionaries/*.json`, then
+    /// `$DEFN_DICTIONARY` (`crate::dictionary`).
+    pub fn dictionaries(&self) -> Result<crate::dictionary::Dictionaries, String> {
+        crate::dictionary::Dictionaries::load(&self.root.join("dictionaries"))
+    }
+
     /// Every run id in the store, sorted.
     pub fn ids(&self) -> Result<Vec<String>, String> {
         let runs = self.root.join("runs");
