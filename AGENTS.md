@@ -94,7 +94,10 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   (`--definition-run`, `makepad/src/definition.rs`) through the engine's
   `build_text_scene` (in-memory texts at given offsets, `repo::load_texts`)
   and `SceneLike::picked_glyph` (a pick's view and byte). No golden view
-  renders it.
+  renders it. A store's static dictionaries (`<store>/dictionaries/*.json`,
+  `{word: text}`, e.g. Webster's 1913 from glyph3d-js, linked in, not
+  vendored) answer a selected word at once, before any agent
+  (`definition_engine::dictionary`).
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.

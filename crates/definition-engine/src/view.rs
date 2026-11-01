@@ -150,7 +150,20 @@ pub fn compose(run: &Run, status: Option<&str>, metrics: Metrics) -> View {
         Some(request) => {
             lines.push(format!("{}  {}{}{}", request.id, MARK.0, request.word, MARK.1));
             lines.push(request.marked_context_with(MARK.0, MARK.1));
+            // A dictionary's senses first: they are there the moment the word is.
+            if let Some(entry) = &request.dictionary {
+                lines.push(String::new());
+                lines.push(format!("{} ({}):", entry.source, entry.headword));
+                for (index, sense) in entry.senses.iter().enumerate() {
+                    option_lines.push((lines.len(), Choice::Dictionary { index }));
+                    lines.push(format!("  {sense}"));
+                }
+            }
             match &request.expansion {
+                None if request.dictionary.is_some() => {
+                    lines.push(String::new());
+                    lines.push("the agent may add more…".into());
+                }
                 None => lines.push("waiting for an answer…".into()),
                 Some(expansion) => {
                     let mut section = |title: &str, entries: Vec<(String, Choice)>, lines: &mut Vec<String>| {
@@ -249,14 +262,15 @@ impl View {
 }
 
 /// Apply a tap to the run. Expanding is refused off the tip: an answer to
-/// it could never be taken there (a substitution is made at the tip).
-pub fn apply(run: &mut Run, action: Action, now: u64) -> Result<(), String> {
+/// it could never be taken there (a substitution is made at the tip). An
+/// expansion carries the first of `dictionaries` that knows the word.
+pub fn apply(run: &mut Run, action: Action, now: u64, dictionaries: &crate::dictionary::Dictionaries) -> Result<(), String> {
     match action {
         Action::Expand(span) => {
             if run.head != run.tip() {
                 return Err(format!("reading v{} of {}: tap the front card to return, or fork this version", run.head, run.tip()));
             }
-            run.expand(span, now).map(|_| ())
+            run.expand_with(span, now, dictionaries).map(|_| ())
         }
         Action::Take { request, choice } => run.substitute(&request, choice, now).map(|_| ()),
         Action::Checkout(version) => run.checkout(version),
@@ -271,6 +285,7 @@ mod tests {
     use crate::Expansion;
 
     const METRICS: Metrics = Metrics { cell_width: 0.5, line_height: 1.25, wrap_columns: 100 };
+    static NONE: std::sync::LazyLock<crate::dictionary::Dictionaries> = std::sync::LazyLock::new(Default::default);
 
     fn panel<'a>(view: &'a View, name: &str) -> &'a Panel {
         view.panels.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("no panel {name}"))
@@ -293,7 +308,7 @@ mod tests {
         // A tap inside "ephemeral" asks for it.
         let tap = view.action(&run, PASSAGE, 6).expect("a word");
         assert_eq!(tap, Action::Expand(find_word("An ephemeral joy.", "ephemeral", 1).unwrap()));
-        apply(&mut run, tap, 2).unwrap();
+        apply(&mut run, tap, 2, &NONE).unwrap();
         let view = compose(&run, None, METRICS);
         assert!(panel(&view, OPTIONS).text.contains("waiting for an answer"));
         assert!(panel(&view, OPTIONS).text.contains("An «ephemeral» joy."), "the word marked in its sentence, in glyphs the atlas draws");
@@ -313,7 +328,7 @@ mod tests {
         assert_eq!(view.action(&run, OPTIONS, options.find("impermanence").unwrap()), None, "related topics are not substitutes");
 
         let take = view.action(&run, OPTIONS, brief).unwrap();
-        apply(&mut run, take, 4).unwrap();
+        apply(&mut run, take, 4, &NONE).unwrap();
         assert_eq!(run.head_text(), "An brief joy.");
         let view = compose(&run, None, METRICS);
         assert_eq!(panel(&view, OPTIONS).text, "tap a word to define it", "the taken request leaves focus");
@@ -325,13 +340,35 @@ mod tests {
         assert!(front.text.starts_with("▶ v1  ephemeral → brief"), "{}", front.text);
         assert!(back.offset[2] < front.offset[2] && back.offset[1] > front.offset[1], "older cards sit further back and higher");
         assert_eq!(view.action(&run, "card-v0.txt", 0), Some(Action::Checkout(0)));
-        apply(&mut run, Action::Checkout(0), 5).unwrap();
+        apply(&mut run, Action::Checkout(0), 5, &NONE).unwrap();
         assert_eq!(run.head_text(), "An ephemeral joy.");
 
         // Off the tip a tap on a word is refused, and says how to get back.
         let view = compose(&run, None, METRICS);
         let tap = view.action(&run, PASSAGE, 6).unwrap();
-        assert!(apply(&mut run, tap, 6).unwrap_err().contains("front card"));
+        assert!(apply(&mut run, tap, 6, &NONE).unwrap_err().contains("front card"));
+    }
+
+    #[test]
+    fn a_dictionary_answers_before_the_agent_and_its_senses_are_taps() {
+        let webster = crate::dictionary::Dictionaries::new(vec![crate::dictionary::Dictionary::from_entries(
+            "webster",
+            [("joy".to_string(), "1. The passion excited by\n good. 2. That which causes joy.".to_string())],
+        )]);
+        let mut run = Run::new("r".into(), "t".into(), Source::Inline, "An ephemeral joy.".into(), 1);
+        let view = compose(&run, None, METRICS);
+        let tap = view.action(&run, PASSAGE, 14).expect("joy");
+        apply(&mut run, tap, 2, &webster).unwrap();
+        let view = compose(&run, None, METRICS);
+        let options = &panel(&view, OPTIONS).text;
+        assert!(options.contains("webster (joy):") && options.contains("the agent may add more"), "{options}");
+        assert!(!options.contains("waiting for an answer"));
+        let second = options.find("That which causes joy.").unwrap();
+        assert_eq!(view.action(&run, OPTIONS, second), Some(Action::Take { request: "q1".into(), choice: Choice::Dictionary { index: 1 } }));
+        let first = options.find("The passion excited by good.").expect("one line: whitespace collapsed");
+        let take = view.action(&run, OPTIONS, first).unwrap();
+        apply(&mut run, take, 3, &webster).unwrap();
+        assert_eq!(run.head_text(), "An ephemeral The passion excited by good..");
     }
 
     #[test]

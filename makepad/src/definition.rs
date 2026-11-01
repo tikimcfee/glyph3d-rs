@@ -65,6 +65,9 @@ pub struct DefinitionView {
     params: RepoParams,
     metrics: Metrics,
     view: View,
+    /// The store's dictionaries, read once at open: a tap on a word attaches
+    /// their senses, so the options show them before any agent answers.
+    dictionaries: definition_engine::dictionary::Dictionaries,
     /// The last refusal, shown at the foot of the options panel until the
     /// next change.
     status: Option<String>,
@@ -89,8 +92,18 @@ impl DefinitionView {
             wrap_columns: params.wrap_cols as usize,
         };
         let view = view::compose(&run, None, metrics);
-        log::info!("definition view: run {} at v{} of {} in {}", run.id, run.head, run.tip(), store.root().display());
-        Ok(Self { store, run, stamp, last_poll: Instant::now(), atlas, params, metrics, view, status: None })
+        let loading = Instant::now();
+        let dictionaries = store.dictionaries()?;
+        log::info!(
+            "definition view: run {} at v{} of {} in {}; dictionaries [{}] read in {:.0} ms",
+            run.id,
+            run.head,
+            run.tip(),
+            store.root().display(),
+            dictionaries.names().join(", "),
+            loading.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(Self { store, run, stamp, last_poll: Instant::now(), atlas, params, metrics, view, dictionaries, status: None })
     }
 
     /// The run laid out as a scene, with its probe.
@@ -148,7 +161,7 @@ impl DefinitionView {
         let Some(action) = self.view.action(&self.run, &panel, byte) else { return false };
         log::info!("definition view: tap {panel} byte {byte}: {action:?}");
         let mut run = self.run.clone();
-        match view::apply(&mut run, action, now_seconds()).and_then(|()| self.store.save(&run)) {
+        match view::apply(&mut run, action, now_seconds(), &self.dictionaries).and_then(|()| self.store.save(&run)) {
             Ok(()) => {
                 self.run = run;
                 self.stamp = self.store.stamp(&self.run.id).ok();

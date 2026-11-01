@@ -56,6 +56,10 @@ pub struct Request {
     /// context more than once, and an answer has to fit the right one.
     pub word_offset: usize,
     pub asked_at: u64,
+    /// A static dictionary's senses, attached when the word was selected
+    /// (`Run::expand_with`): takeable before any agent answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dictionary: Option<crate::dictionary::DictionaryEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expansion: Option<Expansion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,8 @@ pub enum Choice {
     Substitute { index: usize },
     Definition { index: usize },
     Translation { index: usize },
+    /// One of the dictionary's senses.
+    Dictionary { index: usize },
     /// The reader's own text.
     Text { text: String },
 }
@@ -180,12 +186,25 @@ impl Run {
             context: context.of(&text).to_string(),
             word_offset: span.start - context.start,
             asked_at: now,
+            dictionary: None,
             expansion: None,
             answered_at: None,
             applied: None,
         };
         self.requests.push(request);
         Ok(self.requests.last().expect("just pushed"))
+    }
+
+    /// [`Run::expand`], with the first of `dictionaries` that knows the word
+    /// attaching its senses to the request.
+    pub fn expand_with(&mut self, span: Span, now: u64, dictionaries: &crate::dictionary::Dictionaries) -> Result<&Request, String> {
+        let index = {
+            let request = self.expand(span, now)?;
+            let entry = dictionaries.lookup(&request.word);
+            (self.requests.len() - 1, entry)
+        };
+        self.requests[index.0].dictionary = index.1;
+        Ok(&self.requests[index.0])
     }
 
     /// Keep an agent's expansion for a request. An answered request can be
@@ -227,6 +246,13 @@ impl Run {
         }
         let inserted = match &choice {
             Choice::Text { text } => text.clone(),
+            Choice::Dictionary { index } => {
+                let senses = found.dictionary.as_ref().map_or(&[][..], |d| &d.senses[..]);
+                senses
+                    .get(*index)
+                    .ok_or_else(|| format!("request {request} has {} dictionary senses, no index {index}", senses.len()))?
+                    .clone()
+            }
             other => {
                 let expansion = found.expansion.as_ref().ok_or_else(|| format!("request {request} has no answer yet; only --text can stand in for it"))?;
                 let pick = |kind: &str, index: usize, len: usize| -> Result<usize, String> {
@@ -236,7 +262,7 @@ impl Run {
                     Choice::Substitute { index } => expansion.substitutes[pick("substitutes", index, expansion.substitutes.len())?].clone(),
                     Choice::Definition { index } => expansion.definitions[pick("definitions", index, expansion.definitions.len())?].text.clone(),
                     Choice::Translation { index } => expansion.translations[pick("translations", index, expansion.translations.len())?].text.clone(),
-                    Choice::Text { .. } => unreachable!("matched above"),
+                    Choice::Text { .. } | Choice::Dictionary { .. } => unreachable!("matched above"),
                 }
             }
         };
@@ -397,6 +423,25 @@ mod tests {
         run.answer(&q1, answered(&["term"], "a unit of language"), 2).unwrap();
         assert!(run.substitute(&q1, Choice::Substitute { index: 1 }, 3).unwrap_err().contains("no index 1"));
         assert!(run.substitute(&q1, Choice::Translation { index: 0 }, 3).is_err());
+    }
+
+    #[test]
+    fn a_dictionary_sense_is_takeable_before_any_answer() {
+        let dictionaries = crate::dictionary::Dictionaries::new(vec![crate::dictionary::Dictionary::from_entries(
+            "webster",
+            [("joy".to_string(), "1. The passion or emotion excited by the acquisition of good. 2. That which causes joy.".to_string())],
+        )]);
+        let mut run = run("An ephemeral joy.");
+        let span = find_word(&run.head_text(), "joy", 1).unwrap();
+        let q = run.expand_with(span, 1, &dictionaries).unwrap();
+        assert_eq!(q.dictionary.as_ref().map(|d| d.senses.len()), Some(2));
+        assert!(q.expansion.is_none(), "still pending for an agent");
+        let q = q.id.clone();
+        assert!(run.substitute(&q, Choice::Dictionary { index: 2 }, 2).unwrap_err().contains("2 dictionary senses"));
+        run.substitute(&q, Choice::Dictionary { index: 1 }, 2).unwrap();
+        assert_eq!(run.head_text(), "An ephemeral That which causes joy..");
+        let span = find_word(&run.head_text(), "ephemeral", 1).unwrap();
+        assert!(run.expand_with(span, 3, &dictionaries).unwrap().dictionary.is_none(), "a word no dictionary knows");
     }
 
     #[test]

@@ -113,6 +113,9 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
     },
+    /// A word in the store's dictionaries (`<store>/dictionaries/*.json`,
+    /// then $DEFN_DICTIONARY), as an expansion would attach it.
+    Lookup { word: String },
     /// Classify a tree by layer: code, binary, directory, named.
     Layers {
         root: PathBuf,
@@ -134,6 +137,9 @@ struct ChoiceArgs {
     /// A translation, numbered from 1.
     #[arg(long)]
     translation: Option<usize>,
+    /// A dictionary sense, numbered from 1.
+    #[arg(long = "dictionary")]
+    dictionary_sense: Option<usize>,
     /// Your own text.
     #[arg(long)]
     text: Option<String>,
@@ -218,7 +224,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 (None, None, Some(span)) => Span::checked(&text, span[0], span[1])?,
                 _ => unreachable!("clap requires exactly one selection"),
             };
-            let request = run.expand(span, now_seconds())?.clone();
+            let request = run.expand_with(span, now_seconds(), &store.dictionaries()?)?.clone();
             store.save(&run)?;
             if json {
                 print_json(&serde_json::json!({ "run": run.id, "request": request }));
@@ -244,6 +250,8 @@ fn run(cli: Cli) -> Result<(), String> {
                             "marked": r.marked_context(),
                             "version": r.version,
                             "span": r.span,
+                            // What a dictionary already gave the reader: answer around it.
+                            "dictionary": r.dictionary.as_ref().map(|d| serde_json::json!({ "source": d.source, "headword": d.headword, "senses": d.senses.len() })),
                         })
                     })
                     .collect();
@@ -281,8 +289,14 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Ok(());
             }
             println!("{}  {:?}  in: {}", request.id, request.word, request.marked_context());
+            if let Some(entry) = &request.dictionary {
+                println!("  {} ({}) (--dictionary N):", entry.source, entry.headword);
+                for (i, sense) in entry.senses.iter().enumerate() {
+                    println!("    {}. {sense}", i + 1);
+                }
+            }
             let Some(expansion) = &request.expansion else {
-                println!("  (not answered yet)");
+                println!("  (no agent answer yet)");
                 return Ok(());
             };
             print_options(expansion);
@@ -291,11 +305,12 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Command::Substitute { run, request, choice } => {
-            let choice = match (choice.pick, choice.definition, choice.translation, choice.text) {
-                (Some(n), None, None, None) => Choice::Substitute { index: index_from(n, "--pick")? },
-                (None, Some(n), None, None) => Choice::Definition { index: index_from(n, "--definition")? },
-                (None, None, Some(n), None) => Choice::Translation { index: index_from(n, "--translation")? },
-                (None, None, None, Some(text)) => Choice::Text { text },
+            let choice = match (choice.pick, choice.definition, choice.translation, choice.dictionary_sense, choice.text) {
+                (Some(n), None, None, None, None) => Choice::Substitute { index: index_from(n, "--pick")? },
+                (None, Some(n), None, None, None) => Choice::Definition { index: index_from(n, "--definition")? },
+                (None, None, Some(n), None, None) => Choice::Translation { index: index_from(n, "--translation")? },
+                (None, None, None, Some(n), None) => Choice::Dictionary { index: index_from(n, "--dictionary")? },
+                (None, None, None, None, Some(text)) => Choice::Text { text },
                 _ => unreachable!("clap requires exactly one choice"),
             };
             let mut run = store.load(&run)?;
@@ -341,6 +356,26 @@ fn run(cli: Cli) -> Result<(), String> {
                 print_json(&serde_json::json!({ "run": fork.id, "from": parent.id, "version": version }));
             } else {
                 println!("{}", fork.id);
+            }
+        }
+        Command::Lookup { word } => {
+            let dictionaries = store.dictionaries()?;
+            if dictionaries.is_empty() {
+                return Err(format!("no dictionaries: put {{word: text}} JSON files in {}/dictionaries, or set DEFN_DICTIONARY", store.root().display()));
+            }
+            let entry = dictionaries.lookup(&word);
+            if json {
+                print_json(&entry);
+            } else {
+                match entry {
+                    Some(entry) => {
+                        println!("{} ({}):", entry.source, entry.headword);
+                        for (i, sense) in entry.senses.iter().enumerate() {
+                            println!("  {}. {sense}", i + 1);
+                        }
+                    }
+                    None => println!("{word:?}: in none of {}", dictionaries.names().join(", ")),
+                }
             }
         }
         Command::Layers { root, all } => {

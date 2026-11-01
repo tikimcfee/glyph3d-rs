@@ -84,6 +84,22 @@ fn the_definition_loop_through_the_command_line() {
 }
 
 #[test]
+fn a_store_dictionary_answers_at_expand_and_is_taken_by_number() {
+    let store = Store::new("dictionary");
+    let dir = store.0.join("dictionaries");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("webster.json"), r#"{"joy": "1. The passion excited by good. 2. That which causes joy."}"#).unwrap();
+    assert!(store.ok(&["lookup", "Joys"]).contains("webster (joy):"));
+    let run = store.json(&["new", "t", "--text", "An ephemeral joy."])["run"].as_str().unwrap().to_string();
+    let asked = store.json(&["expand", &run, "--word", "joy"]);
+    assert_eq!(asked["request"]["dictionary"]["senses"][1], "That which causes joy.");
+    let pending = store.json(&["pending"]);
+    assert_eq!(pending[0]["dictionary"]["senses"], 2, "the agent is told what the reader already has");
+    let taken = store.json(&["substitute", &run, "q1", "--dictionary", "2"]);
+    assert_eq!(taken["text"], "An ephemeral That which causes joy..");
+}
+
+#[test]
 fn the_command_line_refuses_ambiguous_or_zero_numbers() {
     let store = Store::new("refusals");
     let run = store.json(&["new", "t", "--text", "one two"])["run"].as_str().unwrap().to_string();

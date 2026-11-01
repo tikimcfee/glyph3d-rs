@@ -59,7 +59,8 @@ hand edit gets the whole run refused.
 
    `marked` is the sentence or list item the word stands in, with the
    selected occurrence in `⟦ ⟧`. `span` is its byte range in version
-   `version` of the run's text.
+   `version` of the run's text. `dictionary` is what a static dictionary
+   already gave the reader (`null` when none knew the word); see below.
 2. For each item, compose an expansion (below). When the sentence is too
    thin, read around it: `$DEFN show <run> --at <version>` prints the text
    the request was made against.
@@ -80,6 +81,18 @@ hand edit gets the whole run refused.
 Latency is the point: the reader is waiting in a 3D view. Answer the
 pending items before any other work, and keep each answer to what the
 reader needs to choose.
+
+## Around a static dictionary
+
+A store can carry dictionaries (`<store>/dictionaries/*.json`, `{word:
+text}`, such as Webster's 1913 from glyph3d-js's word-wall example). When
+one knows the word, its senses are on the reader's panel the moment they
+tap, before you answer (`defn options <run> <request>` shows them). Then
+do not repeat them. Add only what a dictionary cannot give: the sense the
+word has in this context (a 1913 dictionary has no "software", and its
+"glyph" is a groove in a frieze), substitutes that fit the slot,
+translations, related topics, and the repo's meaning of a word. When
+`dictionary` is `null`, answer in full as below.
 
 ## What a good expansion holds
 

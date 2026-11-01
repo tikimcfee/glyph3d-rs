@@ -13,6 +13,8 @@
 //! is how a reader keeps a personal definition-run.
 //!
 //! - [`text`]: spans, the word a tap selects, the context it is asked in.
+//! - [`dictionary`]: static dictionaries (Webster's 1913 as JSON), whose
+//!   senses a request carries the moment it is made.
 //! - [`expansion`]: what an agent answers with, validated before it is kept.
 //! - [`run`]: a run, its requests and its diff stack, and the invariants a
 //!   loaded run is held to.
@@ -29,6 +31,7 @@
 //! will build the map and hand it to this crate. This crate does not parse
 //! transcripts.
 
+pub mod dictionary;
 pub mod expansion;
 pub mod layers;
 pub mod run;
