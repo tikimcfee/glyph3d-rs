@@ -61,7 +61,8 @@
 # second clone's interface-shell branch.
 # 354 -> 357: the window's three key-routing tests (app::key_tests), ported
 # with route_key.
-test_floor = 357
+# 357 -> 358: --max-file-stacks reaches the session choice, ported with it.
+test_floor = 358
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
