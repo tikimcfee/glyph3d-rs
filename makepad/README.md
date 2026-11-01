@@ -41,6 +41,23 @@ client: `MAKEPAD_HIDE_WINDOWS=1 ./target/release/glyph3d-makepad --remote
 ...`, then `makepad-remote app <pid> snap|grab|key|click|gq` (makepad's
 `docs/agents/app-remote.md`).
 
+## A definition run
+
+`--definition-run <id or prefix>` (with `--definition-store DIR`, else
+`$DEFN_STORE`) shows one run of the definition engine
+(`crates/definition-engine`) instead of the command line's scene: the
+passage, the options for the word in focus to its right, and the stack of
+diff cards to its left. A click on a word asks for its expansion; an agent
+answers it (`defn pending --wait`, the `definition-engine` skill); a click
+on an option's line takes it; a click on a card checks its version out. The
+run's file is the only channel: the window rebuilds when it changes on disk,
+within 100 ms.
+
+```sh
+defn new "Letter" --file letter.txt            # prints the run's id
+./target/release/glyph3d-makepad --definition-run letter
+```
+
 ## Input
 
 Left click picks; WASD flies, E/R up, Q/F down; the right button held, or
