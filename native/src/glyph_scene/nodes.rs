@@ -544,7 +544,7 @@ mod tests {
     /// rows, so a few changed ones stay under the whole-table share.)
     #[test]
     fn flush_uploads_exactly_the_rows_that_changed() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+        let ctx = crate::gpu::test_device::context();
         let rows: Vec<GroupRow> = (0..40)
             .map(|k| {
                 let mut r = rows()[k % 3];
