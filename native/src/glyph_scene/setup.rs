@@ -385,7 +385,7 @@ mod tests {
     /// every buffer equals its block.
     #[test]
     fn derived_host_blocks_follow_every_slot_write() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+        let ctx = crate::gpu::test_device::context();
         let (scene, renderer, _held) = edited_derived_scene(&ctx);
         let device_copy = |k: usize| {
             let host = scene.field.host_slots();
@@ -409,7 +409,7 @@ mod tests {
     /// republished or re-uploaded would go up for nothing.
     #[test]
     fn edits_move_only_the_block_they_touch() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+        let ctx = crate::gpu::test_device::context();
         let (scene, _renderer, held) = edited_derived_scene(&ctx);
         let host = scene.field.host_slots();
         let moved: Vec<usize> = (0..host.blocks().len()).filter(|&k| host.version(k) != 0).collect();
