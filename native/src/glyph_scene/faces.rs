@@ -181,7 +181,7 @@ mod tests {
     /// stale.
     #[test]
     fn the_gpu_tables_hold_the_rows_and_faces_the_tree_composes() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+        let ctx = crate::gpu::test_device::context();
         let s = &crate::config::settings().library;
         let file = |p: &str, w: f32, h: f32| LibFile { rel_path: p.to_string(), ink_min: [0.0, -h, -3.0], ink_max: [w, 0.0, 0.0] };
         let files = vec![

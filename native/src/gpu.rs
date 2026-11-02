@@ -484,6 +484,13 @@ pub fn take_cpu_scope_summary(ctx: &GpuContext) -> String {
 /// under GLYPH_PROFILE=1, TIMESTAMP_QUERY. Panics when no adapter is found —
 /// there is no CPU fallback to recover to.
 pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext {
+    // A unit test that made its own device would tear it down beside the
+    // others (`test_device`): refused, so no new GPU test can forget the lock.
+    #[cfg(test)]
+    assert!(
+        test_device::held_here(),
+        "a unit test makes its device through crate::gpu::test_device::context(), which holds the GPU test lock"
+    );
     // wgpu 30: takes the descriptor by value.
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // PRIMARY backends on macOS resolve to Metal.
@@ -627,6 +634,132 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
         profiler,
         cpu_scopes: RefCell::new(std::collections::BTreeMap::new()),
         prefetch: crate::Prefetch::default(),
+    }
+}
+
+/// The device a unit test runs on, one test at a time (2026-11-01).
+///
+/// libtest runs a binary's tests on many threads, and the lib binary's GPU
+/// tests each made and dropped their own instance and device. On monolith1
+/// (RTX 5090, NVIDIA 615.78.08) one run in about seventy hung for good in
+/// teardown: one test in the driver's `vkDestroyDevice`, a driver thread
+/// spinning in `libnvidia-eglcore`, and the other tests' `vkDestroyDevice`
+/// and `vkDestroyInstance` blocked on the Vulkan loader's mutex behind it
+/// (the stacks: `kept-evidence/teardown-hang-stacks-2026-11-01.log` on
+/// that host). A test takes its device here instead, and holds one lock
+/// from before the device is made until after it is dropped, so no two
+/// devices of this binary are ever made or torn down at once. `init`
+/// refuses a test thread that does not hold it.
+///
+/// Not the integration tests: none makes a device in its own process (each
+/// that draws runs the renderer binary, a process of its own).
+#[cfg(test)]
+pub(crate) mod test_device {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    /// How many holders there are, counted inside the lock: never past one,
+    /// unless the lock locks nothing (`gpu_test_sections_never_overlap`).
+    static HOLDERS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static HELD_HERE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether this thread holds the lock: what `init` asks.
+    pub(crate) fn held_here() -> bool {
+        HELD_HERE.with(Cell::get)
+    }
+
+    /// The lock, held until dropped. A test that panicked holding it
+    /// poisons it, and the next one takes it regardless: the panic is that
+    /// test's failure, not the next one's.
+    pub(crate) struct Section {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn section() -> Section {
+        let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let others = HOLDERS.fetch_add(1, Ordering::SeqCst);
+        if others != 0 {
+            HOLDERS.fetch_sub(1, Ordering::SeqCst);
+            panic!("two GPU test sections overlap ({} other holder(s)): the GPU test lock locks nothing", others);
+        }
+        HELD_HERE.with(|h| h.set(true));
+        Section { _guard: guard }
+    }
+
+    impl Drop for Section {
+        // Runs before `_guard` drops, so the count falls inside the lock.
+        fn drop(&mut self) {
+            HELD_HERE.with(|h| h.set(false));
+            HOLDERS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A unit test's device, behind the lock: derefs to the `GpuContext`.
+    pub(crate) struct TestGpu {
+        ctx: Option<super::GpuContext>,
+        _section: Section,
+    }
+
+    impl std::ops::Deref for TestGpu {
+        type Target = super::GpuContext;
+        fn deref(&self) -> &super::GpuContext {
+            self.ctx.as_ref().expect("the context lives until drop")
+        }
+    }
+
+    impl Drop for TestGpu {
+        // The device and instance go first, the lock after them (a field
+        // drops after `drop` returns): the teardown is inside the section.
+        fn drop(&mut self) {
+            drop(self.ctx.take());
+        }
+    }
+
+    /// The device for one unit test, made and dropped under the lock. Bind
+    /// it before anything made on it, so all of that drops first.
+    pub(crate) fn context() -> TestGpu {
+        let section = section();
+        TestGpu { ctx: Some(pollster::block_on(super::init(None))), _section: section }
+    }
+
+    /// The lock serializes what it guards: eight threads, each taking it
+    /// twenty times and holding it across a sleep, never see another holder
+    /// (`section` counts them). A lock that locks nothing panics on the
+    /// first overlap, which the sleep all but guarantees. No device is made:
+    /// this proves the lock, not the driver.
+    #[test]
+    fn gpu_test_sections_never_overlap() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..20 {
+                        let _section = section();
+                        assert!(held_here());
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    assert!(!held_here());
+                })
+            })
+            .collect();
+        let overlapped = threads.into_iter().map(std::thread::JoinHandle::join).filter(Result::is_err).count();
+        assert_eq!(overlapped, 0, "{overlapped} of 8 threads saw another GPU test section inside their own");
+    }
+
+    /// `init` refuses a test thread that does not hold the lock, so a new
+    /// GPU test that makes its device itself fails at once instead of
+    /// joining the teardown race.
+    #[test]
+    fn a_device_made_without_the_lock_is_refused() {
+        let made = std::thread::spawn(|| pollster::block_on(super::init(None))).join();
+        let message = match made {
+            Ok(_) => panic!("init made a device on a test thread that does not hold the GPU test lock"),
+            Err(p) => p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default(),
+        };
+        assert!(message.contains("test_device::context()"), "{message}");
     }
 }
 
@@ -843,7 +976,7 @@ fn main() {
     /// limit and not a broken device.
     #[test]
     fn a_wait_past_its_limit_panics_naming_the_wait() {
-        let ctx = pollster::block_on(crate::gpu::init(None));
+        let ctx = crate::gpu::test_device::context();
         let device = &ctx.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("busy test"),

@@ -198,6 +198,14 @@ rebuilt, put one back.
   `PollType::Wait { timeout: None }` (or `wait_indefinitely()`): on
   monolith1 a GPU test that never finished held the check battery 353 s
   until killed by hand.
+- **A unit test takes its device from `crate::gpu::test_device::context()`**
+  (2026-11-01), never `gpu::init` (which refuses a test thread that does
+  not hold the lock): one lock, held from before the device is made until
+  after it drops, so the lib binary's GPU tests make and tear down their
+  devices one at a time. Bind it before anything made on it. Concurrent
+  teardown hung on monolith1's NVIDIA driver (one test in
+  `vkDestroyDevice`, the rest on the Vulkan loader's mutex; 17 of 100 runs
+  of the GPU tests alone at `--test-threads=8`, none of 400 with the lock).
 - **`cargo fmt`**: the tree is NOT fmt-clean (mostly long-line wrapping). Do not mass-reformat — the diff/review cost
   exceeds the value. Match the local style of the file you're editing.
 - Comments explain WHY (empirical findings, bug history, invariants), not

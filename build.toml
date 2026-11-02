@@ -88,7 +88,11 @@
 # inside it ends as it would have; gates.rs's two: a test binary past its
 # limit is red by name with the tests it never finished and its output
 # kept, and process_timeout_secs is declared and validated).
-test_floor = 407
+# 407 -> 410 (2026-11-01): the GPU test lock's two (gpu::test_device: the
+# sections never overlap; init refuses a test thread without the lock) and
+# the product build's touch of inputs put back with an older mtime
+# (products: an_input_put_back_with_an_older_mtime_is_touched_before_the_build).
+test_floor = 410
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target prove runs under relax, each golden render, each kind = "cmd"
@@ -680,6 +684,36 @@ op = "replace"
 find = "timeout: Some(limit) })"
 with = "timeout: None })"
 expect = "a_wait_past_its_limit_panics_naming_the_wait"
+
+[[mutation]]
+name = "gpu-test-lock-locks-nothing"
+gate = "cargo-test"
+why = "2026-11-01: the renderer's unit tests that make a GPU device ran at once and tore their devices down at once; on monolith1 (NVIDIA 615.78.08) one in seventy full runs hung for good, one test in the driver's vkDestroyDevice and the rest blocked on the Vulkan loader's mutex behind it (and 17 of 100 runs of those tests alone at --test-threads=8, 0 of 400 with the lock). Every such test now holds one lock from device creation through drop (gpu::test_device). A lock that locks nothing is that race again. CONSUMED BY: test_device::section in native/src/gpu.rs, via its unit test (eight threads taking the section must never see another holder)"
+file = "native/src/gpu.rs"
+op = "replace"
+find = "        let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);\n"
+with = "        let guard = Box::leak(Box::new(Mutex::new(()))).lock().unwrap_or_else(PoisonError::into_inner);\n"
+expect = "gpu_test_sections_never_overlap"
+
+[[mutation]]
+name = "gpu-test-device-unguarded"
+gate = "cargo-test"
+why = "The lock only serializes the tests that take it: a new GPU unit test that called gpu::init itself would make and drop its device beside the others, the teardown race the lock exists to stop. init refuses a test thread that does not hold it. CONSUMED BY: the cfg(test) assertion at the top of gpu::init, via its unit test"
+file = "native/src/gpu.rs"
+op = "replace"
+find = "        test_device::held_here(),\n"
+with = "        true || test_device::held_here(),\n"
+expect = "a_device_made_without_the_lock_is_refused"
+
+[[mutation]]
+name = "stale-input-untouched"
+gate = "cargo-test"
+why = "2026-11-01: cargo judges freshness by mtime, the stamp by content. An input put back with an OLDER mtime than the last build (rsync -a, cp -p, tar x) made the stamp say rebuild and cargo say fresh, and the stamp then vouched for a binary built from the other content (on monolith1 a test binary kept a branch's scratch tests). The product build now moves every input whose content differs from its record to now first; not moving them is that hazard again. CONSUMED BY: bring_forward in glyph/src/products.rs, via its unit test"
+file = "glyph/src/products.rs"
+op = "replace"
+find = "    let unmoved = touch(base, &changed);\n"
+with = "    let unmoved = touch(base, &[]);\n"
+expect = "an_input_put_back_with_an_older_mtime_is_touched_before_the_build"
 
 [[mutation]]
 name = "prove-restale-blind"
