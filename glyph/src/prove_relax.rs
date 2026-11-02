@@ -411,12 +411,24 @@ fn package_dir(package: &str) -> PathBuf {
     workspace_packages().into_iter().find(|(name, _)| name == package).map_or_else(root, |(_, dir)| dir)
 }
 
-/// One `relax test` run, from the package's directory (`package_dir`).
-fn relax_test(package: &str, target: &[String], filters: &[&str], env: &[(&str, OsString)]) -> (bool, String) {
+/// One `relax test` run, from the package's directory (`package_dir`),
+/// bounded by `[settings] process_timeout_secs` as the cargo-test gate
+/// bounds a test binary (2026-11-01): past it the run is killed and fails
+/// with a `FAILED ... timed out` line the judge and the report carry.
+fn relax_test(m: &Manifest, package: &str, target: &[String], filters: &[&str], env: &[(&str, OsString)]) -> (bool, String) {
     let mut c = Command::new(relax_bin());
     c.arg("--allow-c").arg("test").arg(package).args(target).arg("--").args(filters);
     c.current_dir(package_dir(package)).envs(env.iter().map(|(k, v)| (k, v)));
-    output(&mut c)
+    let limit = m.settings.process_timeout();
+    let o = crate::bounded::run_within(&mut c, limit, true);
+    match o.timed_out {
+        None => (o.ok, o.out),
+        Some(record) => {
+            let line = format!("FAILED  relax test {package} {}: timed out after {} s", target.join(" "), limit.as_secs());
+            let kept = crate::paths::keep(&format!("relax test {package} timed out"), &format!("{}\n\n{line}\n{record}", o.out));
+            (false, format!("{}\n      {line}\n        its output and stacks kept: {kept}\n", o.out))
+        }
+    }
 }
 
 /// Runs a route under relax with `env` added. The suite's verdict is the
@@ -425,7 +437,7 @@ fn relax_test(package: &str, target: &[String], filters: &[&str], env: &[(&str, 
 /// reads (`member_overlays`).
 fn run(m: &Manifest, r: &Route, renderer: &Path, env: &[(&str, OsString)], jobs: usize) -> (bool, String) {
     match r {
-        Route::Test(t) => relax_test(&t.package, &t.target, &[&t.name], env),
+        Route::Test(t) => relax_test(m, &t.package, &t.target, &[&t.name], env),
         Route::Suite => {
             let targets = workspace_test_targets();
             let per_member = member_overlays(&targets, env);
@@ -438,7 +450,7 @@ fn run(m: &Manifest, r: &Route, renderer: &Path, env: &[(&str, OsString)], jobs:
                     s.spawn(|| loop {
                         let Some((package, target)) = tasks.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
                         let env = per_member.get(package).map_or(env, Vec::as_slice);
-                        let (ok, out) = relax_test(package, target, &[], env);
+                        let (ok, out) = relax_test(m, package, target, &[], env);
                         // A target that fails without a libtest FAILED line
                         // (relax refused it, or it died before reporting)
                         // would leave the judge's bare `FAIL  cargo test`
@@ -996,7 +1008,7 @@ pub(crate) fn prove_selected(
         queue(seed.into_iter().map(Task::Clean).collect(), jobs, |task| match task {
             Task::Clean(j) => {
                 let relax = match &jobs_list[j] {
-                    Job::Tests((package, target), names) => timed(|| relax_test(package, target, names, &pristine_env)),
+                    Job::Tests((package, target), names) => timed(|| relax_test(m, package, target, names, &pristine_env)),
                     Job::Suite => timed(|| run(m, &Route::Suite, &renderer, &pristine_env, jobs)),
                     Job::Gate(g) => {
                         let mut env = pristine_env.clone();

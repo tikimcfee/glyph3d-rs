@@ -11,7 +11,9 @@
 //!
 //! What this cannot bound: the waits inside wgpu itself (a queue waits for
 //! its device to go idle when it drops, and adapter and device creation
-//! block in the driver).
+//! block in the driver). The check battery's own backstop is the runner's
+//! limit on every process a gate runs (build.toml `[settings]
+//! process_timeout_secs`).
 
 use std::time::Duration;
 
