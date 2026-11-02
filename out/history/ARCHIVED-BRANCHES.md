@@ -85,3 +85,22 @@ latches, and Cmd/Ctrl chords no longer fly).
 | Branches | `worktree-agent-ac8b5f3d63d95903e` and `worktree-interface`, and the tag `pre-rebase-interface`, in the old clone |
 | Design | `git show archive/egui-interface-shell:out/INTERFACE-SHELL-2026-10-24.md` |
 | Rebuild spec | `out/INTERFACE-SHELL-SPEC-2026-11-01.md` |
+
+## The second clone, retired (2026-11-01)
+
+`~/localdev/viz-native/glyph3d-native` was a second checkout of this repo.
+Unpushed work stranded there twice: C35/C36 (merged on 2026-10-31) and the
+interface shell (above). Ivan retired it on 2026-11-01. Every ref it held
+that no remote had is tagged here. Its gitignored local files and the notes
+around it moved to `~/localdev/archive/viz-native-2026-11-01/`.
+
+| Tag | Was | What |
+|---|---|---|
+| `archive/segment-entry-chain` → `7f0bc3e` | branch `exp/segment-entry-chain` | the retired CubeCL engine: a segment-entry chain for `apply_and_emit`, bit-exact, no measurable speedup; "kept for reference; not merged" |
+| `archive/stash-2026-10-07-cubecl-prewarm` → `415144a` | stash on `perf/cubecl-prewarm-sram-sub100ms` | CubeCL prewarm WIP (engine retired 2026-10-09) |
+| `archive/stash-2026-10-02-agent-books-handoff` → `ae072ee` | stash on `worktree-workspace-random-experiments` | "handoff for agent books" |
+| `archive/stash-2026-10-02-random-experiments` → `502842c` | stash on `worktree-workspace-random-experiments` | WIP after the per-frame mesh re-upload fix |
+| `archive/stash-2026-10-01-removed-mojo` → `f449f58` | stash on `main` | "removed mojo" |
+
+A stash tag points at the stash's merge commit: `git show <tag>` shows the
+working-tree diff, and `git show <tag>^2` the index.
