@@ -39,5 +39,13 @@ allow_attributes = "warn"
 undocumented_unsafe_blocks = "warn"
 
 [profile.release]
-# Keep debug info in release so future profiling stages stay sane.
-debug = true
+# Fast edit loops (2026-11-01): measured on both hosts, each landing on these
+# same three, every golden byte-equal. One-line edit to `cargo glyph test
+# --inner`: monolith1 29 -> 13 s, IL-Air-M2 75-109 -> 14-15 s (the rebuild
+# inside it 62-96 -> 3-4 s). Line tables keep backtraces and profilers
+# usable; full debug info for a debugger is CARGO_PROFILE_RELEASE_DEBUG=true.
+# Rejected there: -Zthreads, target-cpu=native, debug = false, packed or no
+# split debuginfo, dependencies at opt-level 1, fewer jobs.
+incremental = true
+debug = "line-tables-only"
+lto = "off"

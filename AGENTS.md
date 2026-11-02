@@ -170,18 +170,21 @@ the Instanced field's, was retired with it on 2026-10-31).
   pipeline, WGSL — lives behind the `GlyphField` trait in `crates/` (one crate per
   render mode, chosen with `--field-mode`; the scene never touches slot bytes).
 
-**Per-host build profiles** (2026-11-01). `Cargo.toml`'s profiles are every
-host's. What suits one machine lives in `.cargo/hosts/<host>.toml` (`hostname
--s`), selected per checkout by an untracked symlink, `ln -s
-hosts/<host>.toml .cargo/host.toml`, which `.cargo/config.toml` includes
-(optional: absent, the build is the shared profile alone). A worktree nested
-in a checkout inherits the checkout's selection through cargo's ancestor
-configs; a sibling worktree needs its own link, and `cargo glyph` prints a
-NOTE when this host has a profile its checkout does not select. A host file
-may change how the build is made, never what it computes: it lands with a full
-`cargo glyph test` green on that host, every golden byte-equal, and says what
-it measured. `monolith1.toml` (incremental release, line tables, no LTO) took
-the edit loop's build from 18 s to 2 s there.
+**Build profiles** (2026-11-01). `Cargo.toml`'s `[profile.release]` is
+incremental, with line tables and no LTO: measured separately on monolith1 and
+the M2, both landed on those three, every golden byte-equal, and a one-line
+edit's build went from 18 s to 2 s (monolith1) and 62-96 s to 3-4 s (M2).
+Full debug info for a debugger: `CARGO_PROFILE_RELEASE_DEBUG=true`, which
+marks the products stale. A machine that ever needs different settings gets
+`.cargo/hosts/<host>.toml` (`hostname -s`), selected per checkout by an
+untracked symlink, `ln -s hosts/<host>.toml .cargo/host.toml`, which
+`.cargo/config.toml` includes (optional). A worktree nested in a checkout
+inherits the checkout's selection through cargo's ancestor configs; a sibling
+worktree needs its own link, and `cargo glyph` prints a NOTE when this host
+has a profile its checkout does not select. None exists today. A host file
+may change how the build is made, never what it computes: it lands with a
+full `cargo glyph test` green on that host, every golden byte-equal, and says
+what it measured.
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
 build command, class) and executed by `glyph` (`glyph/src/`: `manifest.rs` the
