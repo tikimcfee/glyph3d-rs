@@ -438,7 +438,16 @@ stale binary makes every gate below a statement about the wrong build. Blind
 to an input the list does not name: until 2026-10-09 it named a lockfile that
 no longer existed and omitted the real one, so a dependency bump left the
 renderer "current" (measured). `manifest` now refuses an input that matches no
-file.
+file. Nor is the tree all cargo builds from: since 2026-11-01 the stamp also
+hashes the build environment (`glyph/src/build_env.rs`): every cargo config
+file cargo reads for the checkout (`.cargo/config.toml` in it and its
+ancestors, `$CARGO_HOME`'s, and what each `include`s, the host's build profile
+among them), the `CARGO_PROFILE_*`, `CARGO_TARGET_*`, `CARGO_BUILD_*`,
+`RUSTFLAGS` and `RUSTC*` variables, and `rustc -vV`. A profile, flag or
+toolchain changed outside the tree stales the renderer like an edit, and the
+products step prints what moved. Blind to a `--config` argument (no product
+build passes one). `stamp-blind-to-build-env` and
+`build-env-includes-unfollowed` prove it.
 
 **manifest.** `build.toml` against itself: every `needs` resolves and orders,
 every gate and mutation names a real target, every golden output is keyed by
