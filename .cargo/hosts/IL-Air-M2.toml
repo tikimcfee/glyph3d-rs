@@ -1,0 +1,70 @@
+# IL-Air-M2's build profile (2026-11-01): macOS, Apple M2 (MacBook Air),
+# 8 cores, 16 GB unified memory, Homebrew rustc 1.98, the Apple linker.
+# Selected per checkout by `.cargo/host.toml` (.cargo/config.toml says how);
+# overrides Cargo.toml's [profile.release] on this host only. The same three
+# settings as monolith1's, measured here rather than copied.
+#
+# Measured with `cargo glyph` against the shared profile alone, on a host
+# shared with other sessions (1-min load 4-6 at each start; this build's
+# own runs push it to 20-45), every metal-apple golden byte-equal in every
+# full run. Cold is `cargo glyph build` wall in a fresh target/ (the runner,
+# the renderer and its test binaries, the committed-artifact checks); the
+# rest is each run's TIME line after a one-line comment edit in
+# native/src/fold.rs:
+#                               shared profile   this file
+#   cold `cargo glyph build`        265 s         143-194 s
+#   products after the edit         62-96 s        3-4 s
+#   `cargo glyph test --inner`      75-109 s       14-15 s
+#   `cargo glyph test` (full)       83 s           20-21 s
+# (The 96/109 s pair started at load 32; 65/75 s at load 5.6.) What is left
+# of the loop is the gates themselves: cargo-test, pick-oracle and
+# hyper-oracle at 5-7 s each, pixel-ab 2 s. The one run that got slower is
+# the first full run after a cold build (clippy, rustdoc and the no-ui check
+# compiling the workspace from nothing, at once): 98 s shared, 123-168 s
+# here, paid once per fresh target/. Memory: the edit loop stays at 51-74%
+# free (some runs page out up to 260 MB); that first full run dips to 35-52%.
+#
+# Incremental alone makes the whole edit-loop gain (an edited build 4-5 s)
+# but costs the cold build: 412 s, with full DWARF and the thin-local LTO
+# pass over 256 codegen units. The other two take it back down.
+#
+# Not here, measured and not worth it on this host (each on top of the
+# three settings below):
+# - `debug = false`: cold 184 s, an edited build the same 4 s; line tables
+#   keep file:line in backtraces and profiles for nothing measurable.
+# - `split-debuginfo = "packed"`: runs dsymutil over every binary; cold
+#   220 s, an edited build 7 s against 4. The default on macOS is
+#   "unpacked" (debug info stays in target/release/deps/*.o; no dsymutil).
+# - `split-debuginfo = "off"`: cold 268 s, an edited build 4-5 s; nothing.
+# - `[profile.release.package."*"] opt-level = 1`: byte-equal, but cold
+#   241 s and the edit loop unmoved (an edit rebuilds no dependency), while
+#   every dependency (wgpu, naga, rayon, png) would run slower.
+# - `[build] jobs = 4`: the edit loop is never short of memory (free >= 51%).
+#   Only the first full run after a cold build is, its four cargos (clippy,
+#   doc, no-ui check, test) compiling at once: min free 35-52% at 8 jobs
+#   (6% in the opt-level-1 run above), 66% at 4, its wall no worse (117 s
+#   against 123-168 s), but the cold build went from 194 s to 267 s.
+# - codegen-units: incremental release already splits the workspace crates
+#   into 256; dependencies keep release's 16 and build in parallel anyway.
+#
+# The makepad host (makepad/, its own workspace) gets this file too: cargo
+# finds .cargo/config.toml from the directory it runs in, not from the
+# workspace, and incremental reaches its path dependencies (the engine,
+# makepad's crates). `cd makepad && cargo check --release` after the same
+# edit: 2.8 s shared, 0.8 s here (cold 30 s either way). Its release build
+# gains line tables (its workspace sets no profile: none before). relax's
+# `check glyph3d-makepad` takes 5 s either way; only its `--allow-c` native
+# dependencies are built by cargo, so selecting or dropping this file
+# rebuilds those once (8 s).
+
+[profile.release]
+# The edit loop's build is one crate, the renderer, and what links it (its
+# cfg(test) twin, two bins, the integration tests). Incremental reuses every
+# codegen unit an edit did not touch.
+incremental = true
+# Line tables, not full DWARF: backtraces and profilers keep file:line, and
+# the object files every binary's debug map points at shrink. For a
+# debugger session, CARGO_PROFILE_RELEASE_DEBUG=true for that build.
+debug = "line-tables-only"
+# No thin-local LTO pass.
+lto = "off"
