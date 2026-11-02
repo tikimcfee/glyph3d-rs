@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::manifest::{Class, Manifest, Mutation};
-use crate::paths::{root, sh, stamps, step};
-use crate::products::{ensure_products, products_reading};
+use crate::paths::{root, sh, step};
+use crate::products::{ensure_products, forget, products_reading};
 
 //
 // A gate's value is what it REJECTS; its green only repeats what you already
@@ -546,10 +546,14 @@ pub(crate) fn prove_cargo(m: &Manifest, selected: &[&Mutation]) -> bool {
         // `tail-pads-zero` left a mutated renderer behind a stamp reading
         // current). A file no product reads (the runner's own sources) is
         // rebuilt at once: every later gate is spawned from that binary.
+        // The file is forgotten in the product's record of what it was built
+        // from too (2026-11-01), so that rebuild moves its mtime: the
+        // record cannot say whether a gate built a mutant from it, and cargo
+        // judges by mtime alone.
         let stale = products_reading(m, &mu.file);
         if !stale.is_empty() {
             for name in &stale {
-                let _ = std::fs::remove_file(stamps().join(format!("{name}.sha256")));
+                forget(name, &mu.file);
             }
             restore_pending = true;
         } else if let Some(rb) = &mu.rebuild {
