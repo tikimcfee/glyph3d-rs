@@ -404,7 +404,9 @@ fn spawns_relax(r: &Route) -> bool {
 /// `tests/oblique_repeat.rs` loaded no `fixtures/g-pick-repo`, rendered an
 /// empty frame and failed "0 non-background px" under relax only, which
 /// read as a JIT rendering gap until 2026-11-01. relax finds the workspace
-/// above the package.
+/// above the package. relax itself starts each test in its package since
+/// makepad `5da44646f` (the fork's `work`; upstream PR pending). This stays,
+/// so a prove run under an older relax still means what it says.
 fn package_dir(package: &str) -> PathBuf {
     workspace_packages().into_iter().find(|(name, _)| name == package).map_or_else(root, |(_, dir)| dir)
 }
