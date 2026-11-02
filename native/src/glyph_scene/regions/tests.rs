@@ -265,7 +265,7 @@ fn the_region_pick_is_the_innermost_region_the_ray_enters() {
 /// tracking missed reads back stale.
 #[test]
 fn the_gpu_draws_the_regions_the_tree_composes() {
-    let ctx = pollster::block_on(crate::gpu::init(None));
+    let ctx = crate::gpu::test_device::context();
     let spec = spec();
     let mut t = NodeTables::default();
     let mut fx = fixture(&mut t);
