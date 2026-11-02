@@ -47,3 +47,6 @@ native/launch_config.toml
 # experiments/zed is a per-machine symlink to a Zed checkout (experiments/Cargo.toml)
 /experiments/zed
 
+
+# A host's selection of its build profile (.cargo/config.toml), per checkout
+.cargo/host.toml
