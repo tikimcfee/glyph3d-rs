@@ -26,9 +26,17 @@ pub struct DerivedFieldGpu {
 
 impl DerivedFieldGpu {
     /// Upload `field`'s blocks, item table and overrides, and build the
-    /// pipelines over them.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, field: &dyn GlyphField, resources: &FieldResources<'_>, targets: FieldTargets) -> Self {
-        let storage = SlotStorage::from_host_slots(device, queue, &field.host_slots(), &LABELS);
+    /// pipelines over them. A wait on the device during the upload takes
+    /// at most `wait_limit` ([`glyph_field::wait_for`]).
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        field: &dyn GlyphField,
+        resources: &FieldResources<'_>,
+        targets: FieldTargets,
+        wait_limit: std::time::Duration,
+    ) -> Self {
+        let storage = SlotStorage::from_host_slots(device, queue, &field.host_slots(), &LABELS, wait_limit);
         let item_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("derived item table"),
             contents: bytemuck::cast_slice(field.item_table()),
@@ -83,7 +91,7 @@ impl GlyphFieldGpu for DerivedFieldGpu {
         self.core.record_draws(pass, draws);
     }
 
-    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
-        self.core.read_slot_words(device, queue, slot, out);
+    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32], wait_limit: std::time::Duration) {
+        self.core.read_slot_words(device, queue, slot, out, wait_limit);
     }
 }
