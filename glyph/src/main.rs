@@ -25,6 +25,7 @@
 //! declared and read by nothing.
 
 mod artifacts;
+mod build_env;
 mod gates;
 mod golden;
 mod manifest;
