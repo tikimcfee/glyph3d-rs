@@ -119,8 +119,8 @@ pub trait GlyphFieldGpu {
 
     /// Read back `out.len()` raw 32-bit words of the DEVICE copy starting at
     /// `slot`'s first byte, in the mode's own format (GLYPH_G_DUMP: what the
-    /// sync actually put there).
-    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]);
+    /// sync actually put there), waiting at most `wait_limit` for the device.
+    fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32], wait_limit: std::time::Duration);
 }
 
 /// Split the global slot run `first_slot .. first_slot + count` into

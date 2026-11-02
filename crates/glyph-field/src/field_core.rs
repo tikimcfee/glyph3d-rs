@@ -142,8 +142,9 @@ impl<S: SlotRecord> FieldCore<S> {
     }
 
     /// Copy `out.len()` words starting at `slot` back from the device
-    /// (blocking; a verification readback, not a frame path).
-    pub fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32]) {
+    /// (blocking for at most `wait_limit`; a verification readback, not a
+    /// frame path).
+    pub fn read_slot_words(&self, device: &wgpu::Device, queue: &wgpu::Queue, slot: u32, out: &mut [u32], wait_limit: std::time::Duration) {
         let p = self.label_prefix;
         let size = (out.len() * 4) as u64;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -159,17 +160,7 @@ impl<S: SlotRecord> FieldCore<S> {
         encoder.copy_buffer_to_buffer(buffer, offset, &readback, 0, size);
         queue.submit([encoder.finish()]);
         let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .expect("debug dump poll failed");
-        rx.recv().expect("dump cb dropped").expect("dump map failed");
+        crate::map_read(device, &slice, wait_limit, "the slot dump's readback");
         let data = slice.get_mapped_range().expect("dump range");
         out.copy_from_slice(bytemuck::cast_slice(&data[..size as usize]));
         drop(data);

@@ -275,16 +275,7 @@ impl WindowState {
         ctx.queue.submit([encoder.finish()]);
 
         let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        ctx.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .expect("device poll failed during windowed-shot readback");
-        rx.recv()
-            .expect("windowed-shot map_async callback dropped")
-            .expect("windowed-shot buffer map failed");
+        glyph_field::map_read(&ctx.device, &slice, crate::config::settings().gpu.wait_limit(), "the windowed shot's readback");
 
         let data = slice.get_mapped_range().expect("windowed-shot range not mapped");
         let mut pixels = Vec::with_capacity((unpadded_bpr * h) as usize);

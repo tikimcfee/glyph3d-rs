@@ -6,7 +6,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::manifest::{Artifact, Class, GoldenView, Manifest};
-use crate::paths::{gpu_key, gpu_profile, keep, keep_file, native, resolve_gpu, root, sh, step, sweep};
+use crate::bounded::sh_within;
+use crate::paths::{gpu_key, gpu_profile, keep, keep_file, native, resolve_gpu, root, step, sweep};
 
 /// A golden equivalent's file-name tag: its arguments' alphanumerics, runs
 /// of anything else collapsed to one `-` (`--field-mode derived` →
@@ -65,7 +66,9 @@ fn render_views(m: &Manifest, equivalents: &[&str]) -> bool {
     for v in views {
         for eq in &variants {
             let shot = shot_path(&v.name, *eq);
-            let (good, out) = sh(
+            // Each render bounded by process_timeout_secs (2026-11-01).
+            let limit = m.settings.process_timeout();
+            let o = sh_within(
                 &format!(
                     "\"$GLYPH_RENDERER\" {} {} --screenshot {}",
                     v.cmd,
@@ -73,11 +76,17 @@ fn render_views(m: &Manifest, equivalents: &[&str]) -> bool {
                     shot.to_string_lossy()
                 ),
                 &native(),
+                limit,
             );
-            if !good {
-                let under = eq.map(|e| format!(" under {e}")).unwrap_or_default();
-                println!("FAIL  {}{under} render errored — {}", v.name, out.lines().last().unwrap_or(""));
-                println!("      output kept: {}", keep(&format!("{}{under}", v.name), &out));
+            let under = eq.map(|e| format!(" under {e}")).unwrap_or_default();
+            if let Some(record) = &o.timed_out {
+                let evidence = format!("{}\n\n== timed out after {} s; where it was, before the kill\n{record}", o.out, limit.as_secs());
+                println!("FAIL  {}{under} render timed out after {} s", v.name, limit.as_secs());
+                println!("      its output and stacks kept: {}", keep(&format!("{}{under} timed out", v.name), &evidence));
+                ok = false;
+            } else if !o.ok {
+                println!("FAIL  {}{under} render errored — {}", v.name, o.out.lines().last().unwrap_or(""));
+                println!("      output kept: {}", keep(&format!("{}{under}", v.name), &o.out));
                 ok = false;
             }
         }

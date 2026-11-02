@@ -813,3 +813,83 @@ mod error_tracker_tests {
         assert!(milestone.contains("100x"), "{milestone}");
     }
 }
+
+// ── Bounded device waits (2026-11-01, glyph_field::wait_for) ──────────────
+#[cfg(test)]
+mod wait_tests {
+    use std::time::Duration;
+
+    /// One invocation of a dependent float chain, its length read from the
+    /// buffer so no compiler can fold it: tens to hundreds of milliseconds
+    /// of GPU on any device this runs on (1e8 steps), never a hang.
+    const BUSY_WGSL: &str = "
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+@compute @workgroup_size(1)
+fn main() {
+    let n = bitcast<u32>(data[0]);
+    var x = data[1];
+    for (var i = 0u; i < n; i = i + 1u) {
+        x = x * 0.999 + 1.0;
+    }
+    data[2] = x;
+}
+";
+
+    /// A wait past its limit fails loudly, naming what it waited for, where
+    /// it once waited forever (2026-11-01: a GPU test spun until killed at
+    /// 353 s): a submission that runs for tens of milliseconds, waited on
+    /// for one, must panic with the wait's name; and the same submission,
+    /// waited on with the configured limit, completes, so the panic was the
+    /// limit and not a broken device.
+    #[test]
+    fn a_wait_past_its_limit_panics_naming_the_wait() {
+        let ctx = pollster::block_on(crate::gpu::init(None));
+        let device = &ctx.device;
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("busy test"),
+            source: wgpu::ShaderSource::Wgsl(BUSY_WGSL.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("busy test"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let steps: u32 = 100_000_000;
+        let words: [f32; 4] = [f32::from_bits(steps), 0.5, 0.0, 0.0];
+        let buffer = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("busy test"),
+                contents: bytemuck::cast_slice(&words),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
+        );
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("busy test"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("busy test") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("busy test"), timestamp_writes: None });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let busy = ctx.queue.submit([encoder.finish()]);
+
+        let short = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            glyph_field::wait_for(device, Some(busy.clone()), Duration::from_millis(1), "the busy test dispatch");
+        }));
+        // Settle the device before judging, so it drops idle either way.
+        glyph_field::wait_for(device, Some(busy), crate::config::settings().gpu.wait_limit(), "the busy test dispatch, settling");
+        let message = match short {
+            Ok(()) => panic!("a wait of 1 ms on 1e8 dependent GPU steps returned: the limit did not bound it"),
+            Err(p) => p.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(message.contains("GPU wait timed out after 0.001 s: the busy test dispatch"), "{message}");
+    }
+}

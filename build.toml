@@ -80,7 +80,33 @@
 # 398 -> 401 (2026-11-01): the build environment in the product stamp
 # (build_env's two: the variables, the config files and their includes;
 # products' one: the environment stales a product).
-test_floor = 401
+# 401 -> 403 (2026-11-01): the bounded device waits' two (a 1 ms wait on a
+# busy dispatch panics naming the wait; [gpu] wait_timeout_secs overrides
+# and is refused out of range).
+# 403 -> 407 (2026-11-01): the runner's process limit's four (bounded.rs's
+# two: a process past its limit is killed with everything under it, one
+# inside it ends as it would have; gates.rs's two: a test binary past its
+# limit is red by name with the tests it never finished and its output
+# kept, and process_timeout_secs is declared and validated).
+test_floor = 407
+# The longest any one process a gate runs may take, in seconds
+# (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
+# test target prove runs under relax, each golden render, each kind = "cmd"
+# gate's command. Past it the process is killed with everything under it,
+# the gate goes red naming it ("FAIL  <binary> timed out after N s", and
+# the tests it never finished), and its output is kept under
+# target/glyph-scratch/kept/ with, on Linux, its threads and a core dump's
+# stacks. Until then nothing was bounded: on monolith1 on 2026-11-01 the
+# renderer's unit-test binary stopped making progress four times in half an
+# hour, and one run held the battery 353 s until killed by hand.
+# Chosen against the slowest healthy runs seen: on monolith1 the whole
+# cargo-test gate takes 6-24 s (the renderer's lib binary is the longest);
+# on the M2 under load it took 44-76 s in full runs and once 205 s (an
+# --inner run, load ~34), and under relax one target took 96 s. 600 is
+# about three times the worst of those and still bounds a hang at ten
+# minutes. The GPU's own waits panic first, at [gpu] wait_timeout_secs (60,
+# config/defaults.toml), naming the wait.
+process_timeout_secs = 600
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -614,6 +640,46 @@ op = "replace"
 find = "    for path in included(table.get(\"include\")) {"
 with = "    for path in included(table.get(\"include-not\")) {"
 expect = "config_files_follow_ancestors_home_and_includes"
+
+[[mutation]]
+name = "test-binary-limit-ignored"
+gate = "cargo-test"
+why = "2026-11-01: the cargo-test gate waited on every test binary with no limit, and a GPU test that stopped making progress on monolith1 held the battery until killed by hand at 353 s. A gate that ignores settings.process_timeout_secs is that again: the binary runs as long as it likes. CONSUMED BY: judge_jobs in glyph/src/gates.rs, via its unit test (a binary sleeping 30 s under a 1 s limit)"
+file = "glyph/src/gates.rs"
+op = "replace"
+find = "    let limit = m.settings.process_timeout();\n    let results = run_test_jobs(jobs, limit, stacks);\n"
+with = "    let limit = std::time::Duration::from_secs(3600);\n    let results = run_test_jobs(jobs, limit, stacks);\n"
+expect = "a_test_binary_past_its_limit_is_red_by_name_and_its_output_kept"
+
+[[mutation]]
+name = "bounded-run-waits-forever"
+gate = "cargo-test"
+why = "2026-11-01: every process a gate runs (test binaries, golden renders, cmd gates, relax test runs) is waited on for at most its limit. A wait that ignores the limit is the unbounded wait the battery hung on. CONSUMED BY: run_within in glyph/src/bounded.rs, via its unit test"
+file = "glyph/src/bounded.rs"
+op = "replace"
+find = "    let (status, timed_out) = match status_rx.recv_timeout(limit) {"
+with = "    let (status, timed_out) = match status_rx.recv() {"
+expect = "a_process_past_its_limit_is_killed_with_everything_under_it"
+
+[[mutation]]
+name = "bounded-kills-only-the-child"
+gate = "cargo-test"
+why = "A timed-out process is killed with everything under it: a test binary's renderer, a gate script's python and the renderer under it. Killing the direct child alone leaves the process that hung running, holding the GPU and the output pipes. CONSUMED BY: end_tree in glyph/src/bounded.rs, via its unit test (bash's own sleep must be gone)"
+file = "glyph/src/bounded.rs"
+op = "replace"
+find = "    tree.extend(descendants(root));\n"
+with = "    let _ = descendants;\n"
+expect = "a_process_past_its_limit_is_killed_with_everything_under_it"
+
+[[mutation]]
+name = "gpu-wait-unbounded"
+gate = "cargo-test"
+why = "2026-11-01: every blocking wait on the device took timeout: None, so a device that never finished held its thread forever (on monolith1 on 2026-11-01 a GPU test spun until killed at 353 s). A wait that drops its limit waits forever again. CONSUMED BY: glyph_field::wait_for (crates/glyph-field/src/wait.rs), which every readback, the host-block upload and the profiled frames wait through, via the renderer's unit test (a 1 ms wait on a GPU dispatch of 1e8 dependent steps must panic naming the wait)"
+file = "crates/glyph-field/src/wait.rs"
+op = "replace"
+find = "timeout: Some(limit) })"
+with = "timeout: None })"
+expect = "a_wait_past_its_limit_panics_naming_the_wait"
 
 [[mutation]]
 name = "prove-restale-blind"

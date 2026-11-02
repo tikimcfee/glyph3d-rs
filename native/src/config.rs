@@ -38,6 +38,7 @@ pub struct Settings {
     pub verbs: VerbSettings,
     pub quad_demo: QuadDemoSettings,
     pub library: LibrarySettings,
+    pub gpu: GpuSettings,
 }
 
 /// The glyph field view (`--render-file`, `--load-repo`, windowed).
@@ -419,6 +420,25 @@ pub struct LibrarySettings {
     pub region_picked_edge_opacity: f32,
 }
 
+/// The device (2026-11-01).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuSettings {
+    /// The longest any blocking wait on the device may take (a readback,
+    /// the host-block upload's batches, a profiled frame), in seconds,
+    /// before it panics naming the wait (`glyph_field::wait_for`).
+    /// 1..=86400.
+    pub wait_timeout_secs: u32,
+}
+
+impl GpuSettings {
+    /// `wait_timeout_secs` as the limit every wait passes to
+    /// `glyph_field::wait_for` and `glyph_field::map_read`.
+    pub fn wait_limit(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.wait_timeout_secs))
+    }
+}
+
 impl Settings {
     /// The compiled defaults alone.
     pub fn defaults() -> Result<Self, String> {
@@ -442,6 +462,9 @@ impl Settings {
         }
         if !(1..=1 << 24).contains(&s.glyph_scene.derived_block_slots) {
             return Err("[glyph_scene] derived_block_slots must be 1..=16777216".into());
+        }
+        if !(1..=86_400).contains(&s.gpu.wait_timeout_secs) {
+            return Err("[gpu] wait_timeout_secs must be 1..=86400".into());
         }
         crate::fold::TabWidth::new(s.layout.tab_width_cells).map_err(|e| format!("[layout] tab_width_cells: {e}"))?;
         crate::fold::TabWidth::new(s.layout.render_file_tab_width_cells)
@@ -686,6 +709,21 @@ mod tests {
         let over: toml::Table = toml::from_str("[repo]\ndir_tints = []\n").unwrap();
         let err = Settings::with_overrides(over).unwrap_err();
         assert!(err.contains("dir_tints"), "{err}");
+    }
+
+    /// `[gpu] wait_timeout_secs` overrides from a launch config and is the
+    /// limit the waits get; a limit of zero (every wait would fail) or past
+    /// a day is refused at load, naming the key.
+    #[test]
+    fn gpu_wait_timeout_overrides_and_refuses_out_of_range() {
+        assert_eq!(Settings::defaults().unwrap().gpu.wait_limit(), std::time::Duration::from_secs(60));
+        let over: toml::Table = toml::from_str("[gpu]\nwait_timeout_secs = 5\n").unwrap();
+        assert_eq!(Settings::with_overrides(over).unwrap().gpu.wait_limit(), std::time::Duration::from_secs(5));
+        for bad in ["0", "86401"] {
+            let over: toml::Table = toml::from_str(&format!("[gpu]\nwait_timeout_secs = {bad}\n")).unwrap();
+            let err = Settings::with_overrides(over).expect_err("an out-of-range wait limit must be refused");
+            assert!(err.contains("wait_timeout_secs"), "{err}");
+        }
     }
 
     #[test]
