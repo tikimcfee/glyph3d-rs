@@ -1,15 +1,14 @@
 # `cargo glyph <verb>` — the one entry point for building, testing and running
 # this project. See glyph/src/main.rs.
 
-# This host's build profile (2026-11-01): `.cargo/host.toml`, untracked, a
-# symlink to the host's tracked file, `ln -s hosts/<host>.toml .cargo/host.toml`
-# (`hostname -s`; `cargo glyph` prints a NOTE when this host has one and the
-# checkout does not select it). Cargo.toml's profiles are every host's; what
-# suits one machine (incremental release, debug-info level) lives in its file
-# here. This file wins over what it includes, so it sets no profile of its own.
-# glyph's product stamps hash the included file with the rest of the build
-# environment (glyph/src/build_env.rs). Absent, the build is the shared profile
-# alone: slower, never different in what it computes.
+# A host's own build profile, if one ever needs one: `.cargo/host.toml`,
+# untracked, a symlink to a tracked `.cargo/hosts/<host>.toml` (`hostname -s`;
+# `cargo glyph` prints a NOTE when this host has one and the checkout does not
+# select it). None does today: both hosts measured the same three settings,
+# which live in Cargo.toml's [profile.release] (2026-11-01). This file wins
+# over what it includes, so it sets no profile of its own. glyph's product
+# stamps hash the included file with the rest of the build environment
+# (glyph/src/build_env.rs).
 include = [{ path = "host.toml", optional = true }]
 
 [alias]
