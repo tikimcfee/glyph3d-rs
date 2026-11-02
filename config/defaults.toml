@@ -387,6 +387,7 @@ region_picked_edge_opacity = 0.9
 # holding its thread forever (2026-11-01: a GPU test on a contended host
 # spun until killed at 353 s, and held the check battery with it). Every
 # wait a healthy device makes takes milliseconds; 60 is generous for the
-# slowest host under load.
+# slowest host under load and still well inside the check runner's limit on
+# a whole test binary (build.toml [settings] process_timeout_secs).
 # 1..=86400. Moves no pixel: it bounds a wait, never what is drawn.
 wait_timeout_secs = 60

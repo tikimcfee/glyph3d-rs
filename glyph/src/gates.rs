@@ -1,6 +1,7 @@
 //! The gates: how each kind runs, and the order its `needs` enforce.
 
 use crate::artifacts::verify_committed;
+use crate::bounded::{run_within, sh_within};
 use crate::golden::verify_golden;
 use crate::manifest::{Class, Gate, Kind, Manifest};
 use crate::paths::{expand, keep, resolve_gpu, root, sh, under_relax};
@@ -76,30 +77,67 @@ fn gate_cargo(g: &Gate) -> bool {
 struct TestJob {
     label: String,
     cmd: Command,
+    /// The harness binary, asked for its test list when it times out (the
+    /// doctests have none).
+    list: Option<Command>,
 }
 
-/// Every job at once, each in its own thread; outputs back in job order.
-/// cargo test runs its binaries one after another, so the eight GPU
-/// integration binaries (1-4 s each) queued behind the renderer's unit
-/// tests: 29 s run serially, 22 s at once (measured 2026-10-26, under
-/// sibling load).
-fn run_test_jobs(jobs: Vec<TestJob>) -> Vec<(String, bool, String)> {
+/// One job's end: its label, success, output, seconds, and on a timeout
+/// what was recorded of it (`bounded::Outcome`).
+struct JobRun {
+    label: String,
+    ok: bool,
+    out: String,
+    secs: f64,
+    timed_out: Option<String>,
+    list: Option<Command>,
+}
+
+/// Every job at once, each in its own thread, each bounded by `limit`
+/// (2026-11-01: a test binary that stopped making progress held the
+/// battery until killed by hand); outputs back in job order. cargo test
+/// runs its binaries one after another, so the eight GPU integration
+/// binaries (1-4 s each) queued behind the renderer's unit tests: 29 s run
+/// serially, 22 s at once (measured 2026-10-26, under sibling load).
+/// `stacks`: on a timeout, record the stuck binary's threads and stacks
+/// first (`bounded::run_within`).
+fn run_test_jobs(jobs: Vec<TestJob>, limit: std::time::Duration, stacks: bool) -> Vec<JobRun> {
     std::thread::scope(|s| {
         let handles: Vec<_> = jobs
             .into_iter()
             .map(|mut j| {
-                s.spawn(move || match j.cmd.output() {
-                    Ok(o) => {
-                        let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
-                        out.push_str(&String::from_utf8_lossy(&o.stderr));
-                        (j.label, o.status.success(), out)
+                s.spawn(move || {
+                    // A panic's stack in its report: a bounded GPU wait that
+                    // times out panics where it waited.
+                    if std::env::var_os("RUST_BACKTRACE").is_none() {
+                        j.cmd.env("RUST_BACKTRACE", "1");
                     }
-                    Err(e) => (j.label, false, format!("could not spawn: {e}")),
+                    let o = run_within(&mut j.cmd, limit, stacks);
+                    JobRun { label: j.label, ok: o.ok, out: o.out, secs: o.secs, timed_out: o.timed_out, list: j.list }
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("a test job thread panicked")).collect()
     })
+}
+
+/// The tests a timed-out binary started and never finished: its list,
+/// less every test its output reports an outcome for.
+fn unfinished(list: Option<Command>, out: &str) -> Vec<String> {
+    let Some(mut list) = list else { return Vec::new() };
+    let Ok(o) = list.args(["--list", "--format", "terse"]).stdin(std::process::Stdio::null()).output() else {
+        return Vec::new();
+    };
+    let reported: std::collections::BTreeSet<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("test ")?.split_once(" ... ").map(|(n, _)| n.trim_end_matches(" - should panic")))
+        .collect();
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .filter(|n| !reported.contains(n))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The floor is a RATCHET, not an equality: tests are added constantly, so an
@@ -113,6 +151,7 @@ fn run_test_jobs(jobs: Vec<TestJob>) -> Vec<(String, bool, String)> {
 /// package's directory with `CARGO_MANIFEST_DIR` set as cargo sets it, plus
 /// `cargo test --doc` for the doctests, all at once. A failing binary no
 /// longer stops the ones after it, and every binary must report a result.
+/// Since 2026-11-01 each is bounded by `[settings] process_timeout_secs`.
 fn gate_cargo_test(m: &Manifest) -> bool {
     if let Some(jobs) = under_relax() {
         return gate_cargo_test_under_relax(m, jobs);
@@ -132,23 +171,41 @@ fn gate_cargo_test(m: &Manifest) -> bool {
         .iter()
         .filter(|u| u.harness)
         .filter_map(|u| {
-            let mut cmd = Command::new(u.executable.as_ref()?);
-            cmd.current_dir(&u.package_dir).env("CARGO_MANIFEST_DIR", &u.package_dir);
-            Some(TestJob { label: u.label(), cmd })
+            let exe = u.executable.as_ref()?;
+            let at = |c: &mut Command| {
+                c.current_dir(&u.package_dir).env("CARGO_MANIFEST_DIR", &u.package_dir);
+            };
+            let (mut cmd, mut list) = (Command::new(exe), Command::new(exe));
+            at(&mut cmd);
+            at(&mut list);
+            Some(TestJob { label: u.label(), cmd, list: Some(list) })
         })
         .collect();
     let mut doc = Command::new("cargo");
     doc.args(["test", "--release", "--doc"]).current_dir(root());
-    jobs.push(TestJob { label: "doctests".into(), cmd: doc });
-    let results = run_test_jobs(jobs);
+    jobs.push(TestJob { label: "doctests".into(), cmd: doc, list: None });
+    let (passed, report) = judge_jobs(m, jobs, true);
+    print!("{report}");
+    passed
+}
 
+/// Run `jobs`, each bounded by the manifest's `process_timeout_secs`, and
+/// judge them as the gate does: every binary green and reporting, a timed
+/// out one red by name with its evidence kept, then the floor. Returns the
+/// verdict and the report to print.
+fn judge_jobs(m: &Manifest, jobs: Vec<TestJob>, stacks: bool) -> (bool, String) {
+    let limit = m.settings.process_timeout();
+    let results = run_test_jobs(jobs, limit, stacks);
+    let mut r = String::new();
     let mut good = true;
     let mut binaries = 0;
     let mut total: u32 = 0;
-    for (label, ok, out) in &results {
+    let slowest = results.iter().map(|j| (j.secs, j.label.clone())).max_by(|a, b| a.0.total_cmp(&b.0));
+    for j in results {
+        let JobRun { label, ok, out, timed_out, list, .. } = j;
         let summaries: Vec<&str> = out.lines().filter(|l| l.contains("test result")).collect();
         for l in &summaries {
-            println!("{l}");
+            r.push_str(&format!("{l}\n"));
         }
         binaries += summaries.iter().filter(|l| l.contains("test result: ok")).count();
         total += summaries
@@ -157,29 +214,52 @@ fn gate_cargo_test(m: &Manifest) -> bool {
             .filter(|(_, w)| w.starts_with("passed"))
             .filter_map(|(n, _)| n.parse::<u32>().ok())
             .sum::<u32>();
+        if let Some(record) = &timed_out {
+            good = false;
+            r.push_str(&format!("FAIL  {label} timed out after {} s\n", limit.as_secs()));
+            let running = unfinished(list, &out);
+            for t in &running {
+                r.push_str(&format!("      still running: {t}\n"));
+            }
+            for l in out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+                r.push_str(&format!("      {l}\n"));
+            }
+            let mut evidence = out.clone();
+            evidence.push_str(&format!("\n\n== {label}: timed out after {} s\n", limit.as_secs()));
+            for t in &running {
+                evidence.push_str(&format!("still running: {t}\n"));
+            }
+            evidence.push_str(&format!("\n== where it was, before the kill\n{record}"));
+            r.push_str(&format!("        its output and stacks kept: {}\n", keep(&format!("cargo-test {label} timed out"), &evidence)));
+            continue;
+        }
         if !ok || summaries.is_empty() {
             good = false;
             // Name the failing tests: printing only the summary discards WHY it
             // reddened, and a mutation's `expect` needs the reason in the text.
             for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
-                println!("      {l}");
+                r.push_str(&format!("      {l}\n"));
             }
             if summaries.is_empty() {
                 for l in out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
-                    println!("      {l}");
+                    r.push_str(&format!("      {l}\n"));
                 }
             }
-            println!("      ^ {label}{}", if summaries.is_empty() { " reported no result" } else { "" });
-            println!("        its whole output kept: {}", keep(&format!("cargo-test {label}"), out));
+            r.push_str(&format!("      ^ {label}{}\n", if summaries.is_empty() { " reported no result" } else { "" }));
+            r.push_str(&format!("        its whole output kept: {}\n", keep(&format!("cargo-test {label}"), &out)));
         }
     }
     if !good {
-        println!("FAIL  cargo test");
-        return false;
+        r.push_str("FAIL  cargo test\n");
+        return (false, r);
     }
     let (passed, verdict) = floor_verdict(m, binaries, total);
-    print!("{verdict}");
-    passed
+    r.push_str(&verdict);
+    // The figure the limit is chosen against, on every green run.
+    if let Some((secs, label)) = slowest {
+        r.push_str(&format!("      slowest: {label} {secs:.1} s, of its {} s limit\n", limit.as_secs()));
+    }
+    (passed, r)
 }
 
 /// cargo-test under `glyph test --relax`: every test target of the
@@ -333,9 +413,23 @@ fn gate_orphans() -> bool {
     ok
 }
 
-fn gate_cmd(g: &Gate) -> bool {
+/// A `kind = "cmd"` gate: its command, bounded by `process_timeout_secs`
+/// (2026-11-01; pick-oracle, reference-port and hyper-oracle run the
+/// renderer).
+fn gate_cmd(g: &Gate, m: &Manifest) -> bool {
     let cmd = g.cmd.as_deref().unwrap_or_default();
-    let (good, out) = sh(cmd, &root());
+    let limit = m.settings.process_timeout();
+    let o = sh_within(cmd, &root(), limit);
+    if let Some(record) = &o.timed_out {
+        for l in o.out.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+            println!("      {l}");
+        }
+        let evidence = format!("{}\n\n== timed out after {} s; where it was, before the kill\n{record}", o.out, limit.as_secs());
+        println!("      its output and stacks kept: {}", keep(&format!("{} timed out", g.name), &evidence));
+        println!("FAIL  {} timed out after {} s", g.name, limit.as_secs());
+        return false;
+    }
+    let (good, out) = (o.ok, o.out);
     let passed = match &g.pass_line {
         Some(p) => good && out.contains(p.as_str()),
         None => good,
@@ -443,7 +537,7 @@ pub(crate) fn run_gate(g: &Gate, m: &Manifest, inner: bool) -> bool {
     }
     match g.kind {
         Kind::VerifyCommitted => verify_committed(m),
-        Kind::Cmd => gate_cmd(g),
+        Kind::Cmd => gate_cmd(g, m),
         Kind::Cargo => gate_cargo(g),
         Kind::CargoTest => gate_cargo_test(m),
         Kind::Orphans => gate_orphans(),
@@ -485,6 +579,61 @@ mod tests {
         let doc = cargo_cmd(Some("doc")).expect("the doc gate's command");
         assert!(doc.contains("--workspace"), "{doc}");
         assert!(cargo_cmd(Some("nonsense")).is_none());
+    }
+
+    /// The cargo-test gate's limit (2026-11-01): a binary past the
+    /// manifest's `process_timeout_secs` is killed, red by name with the
+    /// tests it never finished and the output it printed, kept; a binary
+    /// beside it that finished is judged as before. Before this a binary
+    /// that stopped making progress held the battery until killed by hand
+    /// (353 s, monolith1).
+    #[test]
+    fn a_test_binary_past_its_limit_is_red_by_name_and_its_output_kept() {
+        let mut m = crate::manifest::load().expect("build.toml loads");
+        m.settings.process_timeout_secs = 1;
+        let bash = |script: &str| {
+            let mut c = Command::new("bash");
+            c.arg("-c").arg(script);
+            c
+        };
+        let hung = TestJob {
+            label: "hung binary".into(),
+            cmd: bash("echo 'test fast ... ok'; echo 'test refused - should panic ... ok'; sleep 30"),
+            list: Some(bash("printf 'fast: test\\nrefused: test\\nslow: test\\n'")),
+        };
+        let done = TestJob {
+            label: "done binary".into(),
+            cmd: bash("echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'"),
+            list: None,
+        };
+        let t = std::time::Instant::now();
+        let (passed, report) = judge_jobs(&m, vec![hung, done], false);
+        assert!(!passed, "{report}");
+        assert!(t.elapsed().as_secs() < 15, "killed at its limit, not after its 30 s: {report}");
+        assert!(report.contains("FAIL  hung binary timed out after 1 s\n"), "{report}");
+        assert!(report.contains("      still running: slow\n") && report.matches("still running").count() == 1, "{report}");
+        assert!(report.contains("test fast ... ok"), "its output until the kill: {report}");
+        assert!(report.contains("test result: ok. 1 passed") && !report.contains("done binary"), "{report}");
+        let kept = report
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("its output and stacks kept: "))
+            .unwrap_or_else(|| panic!("the evidence is kept: {report}"));
+        let path = root().join(kept);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{kept}: {e}"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("test fast ... ok") && text.contains("timed out after 1 s"), "{text}");
+    }
+
+    /// The limit is declared, and `validate` refuses one that would kill
+    /// every process at once or that is no limit at all.
+    #[test]
+    fn the_process_limit_is_declared_and_validated() {
+        let mut m = crate::manifest::load().expect("build.toml loads");
+        assert!((1..=86_400).contains(&m.settings.process_timeout_secs));
+        for bad in [0, 86_401] {
+            m.settings.process_timeout_secs = bad;
+            assert!(crate::manifest::validate(&m).iter().any(|p| p.contains("process_timeout_secs")), "{bad} is refused");
+        }
     }
 
     /// Dep-info's make syntax: the target before `: `, escaped spaces kept

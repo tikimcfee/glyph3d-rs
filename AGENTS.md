@@ -252,6 +252,36 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   command that failed under it (each failing test binary's, not just its
   FAILED lines), and a diverging pixel-ab frame. A flake seen once can be
   read afterwards; one was lost before this existed.
+- **Every process a gate runs is bounded** (2026-11-01,
+  `glyph/src/bounded.rs`): each test binary, each golden render, each
+  `kind = "cmd"` gate's command (pick-oracle, reference-port, hyper-oracle,
+  the corpus scripts) and each test target prove runs under relax, by
+  `build.toml [settings] process_timeout_secs` (600). Past it the process
+  is killed with every process under it, the gate goes red naming it
+  (`FAIL  <binary> timed out after N s`, then each test it never finished
+  as `still running: <test>`), and its output is kept. On Linux, before the
+  kill, the kept file gets each process's threads (name, state, CPU
+  seconds, the kernel function a sleeping one waits in) and the stacks of
+  every thread of the processes at the bottom of the tree: they are sent
+  SIGABRT and systemd-coredump records the stacks `coredumpctl info`
+  prints. That is how a stack is had where gdb cannot attach (monolith1's
+  `kernel.yama.ptrace_scope` is 1). Until then nothing was bounded: on
+  monolith1 on 2026-11-01 the renderer's unit-test binary stopped making
+  progress four times in half an hour (one GPU test at 100% CPU, four
+  more waiting on it), and a run held the battery 353 s until killed by
+  hand. The device's own waits fail first, at `[gpu] wait_timeout_secs`
+  (60, config/defaults.toml), panicking with the wait's name
+  (`glyph_field::wait_for`). Not bounded: the compiles (products, the
+  cargo gates, the test build), committed-artifacts' generators, and
+  `prove`'s native clean-tree `cargo test`; and inside wgpu, a queue's
+  wait for idle on drop and device creation, which only the process limit
+  reaches. That is where the 2026-11-01 hang was: caught again by this
+  limit the same day, its core showed the renderer lib's GPU tests in
+  TEARDOWN (one in `vkDestroyDevice`, a driver thread of its device
+  spinning at 100% CPU in libnvidia-eglcore under the test's inherited
+  thread name, the rest blocked on the Vulkan loader's mutex in
+  `vkDestroyInstance`): concurrent device teardown in one process, NVIDIA
+  615.78.08, at load 2.
 - **Two tiers, declared per gate.** `tier = "inner"` gates are what
   `--inner` runs after each change; `tier = "merge"` gates run only in a
   full `glyph test`, and `--inner` names each one it skipped. The merge
@@ -626,6 +656,8 @@ at once, measured under load). A failing binary no longer stops the ones
 after it, and a binary that reports no result is red by name. The long
 pole was one test, `hyper_oracle::tests::tab_stops_agree_on_every_tier`:
 a grid of 24 cases run one after another, 11 s; run at once, 2.7 s.
+Each binary is bounded by `process_timeout_secs` (above, 2026-11-01), and
+every green run prints its slowest binary against that limit.
 
 The floor exists because the previous form could not fail. It counted
 `test result: ok` summary lines and required two; at the time there were
