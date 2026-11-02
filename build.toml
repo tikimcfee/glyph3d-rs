@@ -88,9 +88,11 @@
 # inside it ends as it would have; gates.rs's two: a test binary past its
 # limit is red by name with the tests it never finished and its output
 # kept, and process_timeout_secs is declared and validated).
-# 407 -> 409 (2026-11-01): the GPU test lock's two (gpu::test_device: the
-# sections never overlap; init refuses a test thread without the lock).
-test_floor = 409
+# 407 -> 410 (2026-11-01): the GPU test lock's two (gpu::test_device: the
+# sections never overlap; init refuses a test thread without the lock) and
+# the product build's touch of inputs put back with an older mtime
+# (products: an_input_put_back_with_an_older_mtime_is_touched_before_the_build).
+test_floor = 410
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target prove runs under relax, each golden render, each kind = "cmd"
@@ -702,6 +704,16 @@ op = "replace"
 find = "        test_device::held_here(),\n"
 with = "        true || test_device::held_here(),\n"
 expect = "a_device_made_without_the_lock_is_refused"
+
+[[mutation]]
+name = "stale-input-untouched"
+gate = "cargo-test"
+why = "2026-11-01: cargo judges freshness by mtime, the stamp by content. An input put back with an OLDER mtime than the last build (rsync -a, cp -p, tar x) made the stamp say rebuild and cargo say fresh, and the stamp then vouched for a binary built from the other content (on monolith1 a test binary kept a branch's scratch tests). The product build now moves every input whose content differs from its record to now first; not moving them is that hazard again. CONSUMED BY: bring_forward in glyph/src/products.rs, via its unit test"
+file = "glyph/src/products.rs"
+op = "replace"
+find = "    let unmoved = touch(base, &changed);\n"
+with = "    let unmoved = touch(base, &[]);\n"
+expect = "an_input_put_back_with_an_older_mtime_is_touched_before_the_build"
 
 [[mutation]]
 name = "prove-restale-blind"

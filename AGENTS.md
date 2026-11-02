@@ -494,6 +494,20 @@ toolchain changed outside the tree stales the renderer like an edit, and the
 products step prints what moved. Blind to a `--config` argument (no product
 build passes one). `stamp-blind-to-build-env` and
 `build-env-includes-unfollowed` prove it.
+The stamp judges by content and cargo by mtime, so the two can disagree: an
+input put back with an OLDER mtime than the last build (`rsync -a`, `cp -p`,
+`tar x`, some checkouts and stashes) made the stamp say "rebuild" and cargo
+say "fresh", and the stamp then vouched for a binary built from the other
+content (2026-11-01, monolith1: a test binary kept a branch's scratch
+tests). Since then the stamp keeps each input's hash beside it
+(`target/.glyph-stamps/<product>.inputs`), and before a build every input
+whose content differs from that record, or that it does not name (all of
+them, the first time), has its mtime moved to now, so cargo rebuilds what
+reads it and no more; prove forgets a restored file in the record, so the
+rebuild after a mutation moves it too. Blind to a product rebuilt by a cargo
+outside the runner (a hand `cargo build` of other content, then the content
+put back old): the record says what the runner last built, not what is on
+disk. `stale-input-untouched` proves it.
 
 **manifest.** `build.toml` against itself: every `needs` resolves and orders,
 every gate and mutation names a real target, every golden output is keyed by
