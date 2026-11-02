@@ -77,7 +77,10 @@
 # 394 -> 397: the window's three key-routing tests (app::key_tests), ported
 # with route_key.
 # 397 -> 398: --max-file-stacks reaches the session choice, ported with it.
-test_floor = 398
+# 398 -> 401 (2026-11-01): the build environment in the product stamp
+# (build_env's two: the variables, the config files and their includes;
+# products' one: the environment stales a product).
+test_floor = 401
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -110,6 +113,11 @@ golden_equivalents_merge = []
 # the root two, so a dependency bump left the stamp unchanged and `--frozen`
 # called a stale binary current (measured: lockfile edited, "renderer
 # current"). validate() now refuses a literal input that names no file.
+# Cargo also builds from what is NOT in the tree: the user's cargo config and
+# what it includes (a host's build profile, .cargo/host.toml), CARGO_PROFILE_*
+# and the other build variables, and the toolchain. Since 2026-11-01 every
+# product's stamp hashes that build environment too (glyph/src/build_env.rs),
+# so a profile changed outside the tree stales the product as an edit does.
 [artifact.renderer]
 class = "product"
 outputs = ["target/release/glyph3d-native"]
@@ -586,6 +594,26 @@ op = "replace"
 find = "    if selected == 0 {\n        return (false,"
 with = "    if selected == usize::MAX {\n        return (false,"
 expect = "empty_gate_selection_is_refused"
+
+[[mutation]]
+name = "stamp-blind-to-build-env"
+gate = "cargo-test"
+why = "A product's stamp hashed its declared inputs alone, so a release profile, RUSTFLAGS or toolchain changed outside the tree (a host's .cargo/host.toml, ~/.cargo/config.toml, CARGO_PROFILE_RELEASE_*) left the renderer reading current: `--frozen` vouched for a binary built under other settings and `build` skipped the build that would make one (2026-11-01, with the per-host build profiles). CONSUMED BY: digest_with in glyph/src/products.rs, via its unit test"
+file = "glyph/src/products.rs"
+op = "replace"
+find = "    h.update(env.as_bytes());\n"
+with = "    let _ = env;\n"
+expect = "the_build_environment_stales_a_product"
+
+[[mutation]]
+name = "build-env-includes-unfollowed"
+gate = "cargo-test"
+why = "The host's build profile reaches cargo only through an `include` (.cargo/config.toml includes .cargo/host.toml); a stamp that hashed the config files but not what they include would miss every change to a host's profile, the one place this repo keeps per-machine settings. CONSUMED BY: push_with_includes in glyph/src/build_env.rs, via its unit test"
+file = "glyph/src/build_env.rs"
+op = "replace"
+find = "    for path in included(table.get(\"include\")) {"
+with = "    for path in included(table.get(\"include-not\")) {"
+expect = "config_files_follow_ancestors_home_and_includes"
 
 [[mutation]]
 name = "prove-restale-blind"
