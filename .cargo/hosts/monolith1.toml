@@ -1,0 +1,38 @@
+# monolith1's build profile (2026-11-01): Linux x86-64, 32 cores, 60 GB,
+# RTX 5090. Selected per checkout by `.cargo/host.toml` (.cargo/config.toml
+# says how); overrides Cargo.toml's [profile.release] on this host only.
+#
+# Measured with `cargo glyph` against the shared profile alone, on a host
+# shared with other agents (load 10-30), every golden byte-equal on
+# vulkan-nvidia in every run:
+#                               shared profile   this file
+#   cold `cargo glyph build`         56 s           38 s
+#   products after a one-line
+#     edit in native/src/fold.rs     18 s            2 s
+#   `cargo glyph test --inner`       29-30 s        13-15 s
+#   `cargo glyph test` (full)        32 s           16 s
+# What is left of the loop is the gates themselves (cargo-test, then
+# pick-oracle beside pixel-ab: ~11 s).
+#
+# Not here, measured and not worth it on this host:
+# - the linker: rustc links x86_64-unknown-linux-gnu with its bundled
+#   rust-lld by default since 1.90, so it is lld already;
+# - `-Zthreads` (needs RUSTC_BOOTSTRAP=1 on stable): 8 and 16 threads moved
+#   no number past the run-to-run noise;
+# - `-Ctarget-cpu=native`: byte-equal, and nothing faster;
+# - codegen-units: incremental release already splits into 256.
+
+[profile.release]
+# The edit loop's build is one crate, the renderer, and what links it (its
+# cfg(test) twin, two bins, the integration tests). Incremental reuses every
+# codegen unit an edit did not touch: alone it took the products step from
+# 18 s to 3-4 s.
+incremental = true
+# Line tables, not full DWARF: backtraces and profilers keep file:line, and
+# every binary that links the renderer stops carrying ~600 MB of debug info
+# to write and link (alone: cold 56 s -> 42 s, products 18 s -> 13 s). For
+# a debugger session, CARGO_PROFILE_RELEASE_DEBUG=true for that build.
+debug = "line-tables-only"
+# No thin-local LTO pass (alone: cold 56 s -> 45 s; with the two above it
+# takes the cold build from 47 s to 38 s).
+lto = "off"
