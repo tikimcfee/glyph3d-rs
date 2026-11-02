@@ -80,7 +80,10 @@
 # 398 -> 401 (2026-11-01): the build environment in the product stamp
 # (build_env's two: the variables, the config files and their includes;
 # products' one: the environment stales a product).
-test_floor = 401
+# 401 -> 403 (2026-11-01): the bounded device waits' two (a 1 ms wait on a
+# busy dispatch panics naming the wait; [gpu] wait_timeout_secs overrides
+# and is refused out of range).
+test_floor = 403
 # Every golden view is rendered again under each of these and must match the
 # SAME baseline byte for byte (2026-10-09, C20). The plain frames render the
 # Derived field, the default since 2026-10-11 (Instanced retirement step 1);
@@ -614,6 +617,16 @@ op = "replace"
 find = "    for path in included(table.get(\"include\")) {"
 with = "    for path in included(table.get(\"include-not\")) {"
 expect = "config_files_follow_ancestors_home_and_includes"
+
+[[mutation]]
+name = "gpu-wait-unbounded"
+gate = "cargo-test"
+why = "2026-11-01: every blocking wait on the device took timeout: None, so a device that never finished held its thread forever (on monolith1 on 2026-11-01 a GPU test spun until killed at 353 s). A wait that drops its limit waits forever again. CONSUMED BY: glyph_field::wait_for (crates/glyph-field/src/wait.rs), which every readback, the host-block upload and the profiled frames wait through, via the renderer's unit test (a 1 ms wait on a GPU dispatch of 1e8 dependent steps must panic naming the wait)"
+file = "crates/glyph-field/src/wait.rs"
+op = "replace"
+find = "timeout: Some(limit) })"
+with = "timeout: None })"
+expect = "a_wait_past_its_limit_panics_naming_the_wait"
 
 [[mutation]]
 name = "prove-restale-blind"

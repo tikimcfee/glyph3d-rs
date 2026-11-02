@@ -270,12 +270,12 @@ pub fn run_scene(
                     break;
                 }
                 waited = true;
-                device
-                    .poll(wgpu::PollType::Wait {
-                        submission_index: profiled_in_flight.front().cloned(),
-                        timeout: None,
-                    })
-                    .expect("device poll failed waiting on a profiled frame");
+                glyph_field::wait_for(
+                    device,
+                    profiled_in_flight.front().cloned(),
+                    crate::config::settings().gpu.wait_limit(),
+                    "a profiled frame",
+                );
             }
         }
     }
@@ -287,19 +287,7 @@ pub fn run_scene(
     // Block until the copy lands in the readback buffer.
     let map_t0 = std::time::Instant::now();
     let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .expect("device poll failed during readback");
-    rx.recv()
-        .expect("map_async callback dropped")
-        .expect("buffer map failed");
+    glyph_field::map_read(device, &slice, crate::config::settings().gpu.wait_limit(), "the offscreen frame's readback");
     let map_time = map_t0.elapsed();
 
     // Strip row padding and write the PNG.
@@ -465,14 +453,7 @@ pub fn parse_frame_script(spec: &str) -> Result<Vec<(u32, FrameStep)>, String> {
 /// GLYPH_REPEAT_CHECK path; it waits for the GPU).
 fn read_frame(device: &wgpu::Device, readback: &wgpu::Buffer, padded_bpr: u32, unpadded_bpr: u32, height: u32) -> Vec<u8> {
     let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
-    device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-        .expect("device poll failed during repeat readback");
-    rx.recv().expect("map_async callback dropped").expect("buffer map failed");
+    glyph_field::map_read(device, &slice, crate::config::settings().gpu.wait_limit(), "a repeat-check frame's readback");
     let data = slice.get_mapped_range().expect("readback range not mapped");
     let mut px = Vec::with_capacity((unpadded_bpr * height) as usize);
     for row in 0..height {

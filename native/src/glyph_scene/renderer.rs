@@ -155,7 +155,14 @@ impl GlyphRenderer {
             footprint: ctx.profile.glyph_footprint(),
         };
         let field: Box<dyn GlyphFieldGpu> = match scene.field.mode() {
-            GlyphFieldMode::Derived => Box::new(DerivedFieldGpu::new(device, &ctx.queue, &*scene.field, &resources, targets)),
+            GlyphFieldMode::Derived => Box::new(DerivedFieldGpu::new(
+                device,
+                &ctx.queue,
+                &*scene.field,
+                &resources,
+                targets,
+                crate::config::settings().gpu.wait_limit(),
+            )),
         };
         // Stage L (L4): create selection mask pipeline unconditionally so both
         // windowed platforms (Metal Bgra8UnormSrgb and Linux/Vulkan Rgba8UnormSrgb)

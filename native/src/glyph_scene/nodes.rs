@@ -477,8 +477,7 @@ pub(crate) fn read_buffer(ctx: &crate::gpu::GpuContext, src: &wgpu::Buffer, byte
     encoder.copy_buffer_to_buffer(src, 0, &staging, 0, size);
     ctx.queue.submit([encoder.finish()]);
     let slice = staging.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |r| r.expect("test readback: map"));
-    ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("test readback: poll");
+    glyph_field::map_read(&ctx.device, &slice, crate::config::settings().gpu.wait_limit(), "a test's buffer readback");
     let out = slice.get_mapped_range().expect("test readback: range")[..bytes as usize].to_vec();
     staging.unmap();
     out

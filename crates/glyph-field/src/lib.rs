@@ -35,6 +35,8 @@
 //! - [`FieldCore`]: the glyph and mask pipelines, the per-chunk bind groups,
 //!   draw recording and the slot dump; a mode adds its WGSL and any extra
 //!   bindings through a [`FieldShape`].
+//! - [`wait_for`] / [`map_read`]: every blocking wait on the device, bounded
+//!   (2026-11-01); the renderer's waits use them too.
 //!
 //! The one invariant every mode must keep: **each glyph is individually
 //! addressable** — its color and its placement can be edited without
@@ -52,6 +54,8 @@ mod resources;
 #[cfg(feature = "wgpu")]
 mod storage;
 mod transcode;
+#[cfg(feature = "wgpu")]
+mod wait;
 
 pub use field::{split_at_chunks, GlyphField};
 #[cfg(feature = "wgpu")]
@@ -70,6 +74,8 @@ pub use resources::{
 #[cfg(feature = "wgpu")]
 pub use storage::{SlotStorage, UploadLabels};
 pub use transcode::{transcode_host_slots, SlotRecord, SlotSource, Transcode};
+#[cfg(feature = "wgpu")]
+pub use wait::{map_read, wait_for};
 
 /// The host-block upload's batch: the staging wgpu holds for an upload in
 /// flight is at most two of these (`SlotStorage::from_host_slots`). Here,

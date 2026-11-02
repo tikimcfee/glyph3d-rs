@@ -191,6 +191,13 @@ rebuilt, put one back.
 - **Fail-loud panics**: this is a binary, not a library. `expect("...")` /
   `assert!` with a diagnostic message is the documented convention — do NOT
   convert to error-returning style. Bare `unwrap()` only in `#[cfg(test)]`.
+- **Every wait on the device is bounded** (2026-11-01): block on the GPU
+  only through `glyph_field::wait_for` / `glyph_field::map_read`, with
+  `crate::config::settings().gpu.wait_limit()` (`[gpu] wait_timeout_secs`,
+  60). Past it the wait panics naming what it waited for. Never
+  `PollType::Wait { timeout: None }` (or `wait_indefinitely()`): on
+  monolith1 a GPU test that never finished held the check battery 353 s
+  until killed by hand.
 - **`cargo fmt`**: the tree is NOT fmt-clean (mostly long-line wrapping). Do not mass-reformat — the diff/review cost
   exceeds the value. Match the local style of the file you're editing.
 - Comments explain WHY (empirical findings, bug history, invariants), not
