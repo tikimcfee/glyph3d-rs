@@ -23,6 +23,13 @@ pub(crate) struct Manifest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
     pub(crate) test_floor: u32,
+    /// The longest any one process a gate runs may take, in seconds: each
+    /// test binary (cargo-test, and each test target prove runs under
+    /// relax), each golden render (pixel-ab), each `kind = "cmd"` gate's
+    /// command (pick-oracle, reference-port, hyper-oracle, ...). Past it the
+    /// process is killed with everything under it and its gate goes red
+    /// naming it (2026-11-01, `bounded.rs`). 1..=86400.
+    pub(crate) process_timeout_secs: u32,
     /// Argument lists under which every golden view must render its
     /// baseline's exact bytes: each view is rendered again with each list
     /// appended and compared against the SAME baseline. For a variant that
@@ -192,6 +199,13 @@ pub(crate) struct Mutation {
     pub(crate) gpu: Option<String>,
 }
 
+impl Settings {
+    /// `process_timeout_secs` as the limit `bounded::run_within` takes.
+    pub(crate) fn process_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.process_timeout_secs))
+    }
+}
+
 pub(crate) fn load() -> Result<Manifest, String> {
     let p = root().join("build.toml");
     let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -230,6 +244,13 @@ pub(crate) fn provides(kind: Kind, m: &Manifest) -> Vec<&str> {
 
 pub(crate) fn validate(m: &Manifest) -> Vec<String> {
     let mut p = Vec::new();
+    if !(1..=86_400).contains(&m.settings.process_timeout_secs) {
+        p.push(format!(
+            "settings.process_timeout_secs is {}; it must be 1..=86400 (zero would kill every \
+             process a gate runs at once)",
+            m.settings.process_timeout_secs
+        ));
+    }
     let known: BTreeSet<&str> = m.artifact.keys().map(|s| s.as_str()).collect();
     let gates: BTreeSet<&str> = m.gate.iter().map(|g| g.name.as_str()).collect();
 

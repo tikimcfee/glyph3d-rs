@@ -78,7 +78,16 @@ impl<S: SlotRecord> SlotStorage<S> {
     /// created mapped: wgpu zero-fills the latter's on the creating thread,
     /// which made this thread's share 0.21 s of drivers/net's 535 blocks
     /// (field build 0.23 s before, 0.34 s mapped, 0.17 s queued).
-    pub fn from_host_slots(device: &wgpu::Device, queue: &wgpu::Queue, slots: &HostSlots, labels: &UploadLabels) -> Self {
+    ///
+    /// Waiting on the batch before is bounded by `wait_limit`
+    /// ([`crate::wait_for`]).
+    pub fn from_host_slots(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slots: &HostSlots,
+        labels: &UploadLabels,
+        wait_limit: std::time::Duration,
+    ) -> Self {
         assert_eq!(
             slots.slot_words() * 4,
             std::mem::size_of::<S>(),
@@ -128,9 +137,7 @@ impl<S: SlotRecord> SlotStorage<S> {
             // the one before frees that batch's staging buffers.
             let submitted = queue.submit([]);
             if let Some(previous) = in_flight.replace(submitted) {
-                device
-                    .poll(wgpu::PollType::Wait { submission_index: Some(previous), timeout: None })
-                    .expect("the host-block upload's previous batch completes");
+                crate::wait_for(device, Some(previous), wait_limit, "the host-block upload's previous batch");
             }
         }
         let chunk_counts = chunks.iter().map(|c| c.slots).collect();

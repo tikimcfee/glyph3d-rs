@@ -1734,6 +1734,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "glob",
+ "libc",
  "png",
  "serde",
  "serde_json",

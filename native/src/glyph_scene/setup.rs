@@ -390,7 +390,7 @@ mod tests {
         let device_copy = |k: usize| {
             let host = scene.field.host_slots();
             let mut gpu = vec![0u32; host.blocks()[k].len()];
-            renderer.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu);
+            renderer.field.read_slot_words(&ctx.device, &ctx.queue, (k * host.block_slots()) as u32, &mut gpu, crate::config::settings().gpu.wait_limit());
             gpu
         };
         let blocks = scene.field.host_slots().blocks().len();
