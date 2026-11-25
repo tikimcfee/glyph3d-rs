@@ -86,7 +86,6 @@ on screen each frame), was deleted on 2026-10-26; its design log is
 cargo glyph test            # every gate; nonzero if anything is wrong
 cargo glyph test rust       # iterate: rust | render | corpus
 cargo glyph gates           # what each gate compares, and what it cannot see
-cargo glyph prove           # mutate the code; each check must go red for its reason
 ```
 
 The gates hold the production layout engine (HyperLayout) bit-for-bit to an

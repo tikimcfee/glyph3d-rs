@@ -32,10 +32,9 @@ mod golden;
 mod manifest;
 mod paths;
 mod products;
-mod prove;
 mod schedule;
 mod test_build;
-mod prove_relax;
+mod relax;
 
 use clap::{Parser, Subcommand};
 use std::process::{Command, ExitCode};
@@ -47,7 +46,7 @@ use crate::golden::cmd_drift;
 use crate::manifest::{Gate, load, Manifest, Scope, Tier, validate};
 use crate::paths::{resolve_gpu, root, step};
 use crate::products::ensure_products;
-use crate::prove::{cmd_prove, self_exe};
+use crate::paths::self_exe;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
@@ -93,40 +92,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Prove the checks can fail: apply each declared mutation, require its
-    /// gate to redden for its stated reason, restore. A gate that declares
-    /// `relax` has its mutations proven under makepad's relax JIT, in
-    /// parallel and without writing the tree (`GLYPH_RELAX` names the binary;
-    /// prove_relax.rs); the rest on cargo.
-    Prove {
-        /// Only mutations targeting this gate.
-        #[arg(long)]
-        gate: Option<String>,
-        /// Only these mutations (repeatable). The iteration form: prove the
-        /// mutations YOUR change added or moved, not the whole manifest.
-        #[arg(long = "mutation")]
-        mutations: Vec<String>,
-        /// Only mutations whose target file differs from HEAD — "prove what
-        /// I touched" before committing. The same as `--since HEAD`.
-        /// Combines with --gate/--mutation by intersection.
-        #[arg(long, conflicts_with = "since")]
-        changed: bool,
-        /// Only mutations whose target file differs between the working tree
-        /// and the merge-base of REF and HEAD — "prove what this branch
-        /// touched", committed or not — plus every mutation of a gate whose
-        /// own script changed. Combines with --gate/--mutation by intersection.
-        #[arg(long, value_name = "REF")]
-        since: Option<String>,
-        /// Print the selected mutations and their gates, then stop: what a
-        /// run would prove, before paying for it. Builds and mutates nothing.
-        #[arg(long)]
-        list: bool,
-        /// How many relax mutants (and clean-tree runs) go at once. A relax
-        /// process peaks near 3 GB; size it to RAM.
-        #[arg(long, default_value_t = 8)]
-        jobs: usize,
-    },
-    /// Run a single check by name. Used by `prove`, and useful on its own.
+    /// Run a single check by name. Used by `test`, and useful on its own.
     Gate {
         name: String,
         /// As `glyph test --inner` runs it: a gate's own merge-tier parts
@@ -181,13 +147,13 @@ fn cmd_run(m: &Manifest, args: &[String]) -> bool {
 /// (`paths::under_relax`). Set here, before any thread is spawned.
 fn enter_relax(jobs: usize) -> bool {
     step("relax: the tree under makepad's relax JIT, nothing built natively");
-    if let Err(e) = prove_relax::relax_available() {
+    if let Err(e) = relax::relax_available() {
         println!("FAIL  relax does not run: {e}");
         println!("      build one in a makepad checkout (cargo build --release -p relax-runner --bin relax)");
         println!("      and name it with GLYPH_RELAX=<makepad>/target/release/relax");
         return false;
     }
-    match prove_relax::relax_renderer() {
+    match relax::relax_renderer() {
         Ok(wrapper) => {
             std::env::set_var("GLYPH_RENDERER", &wrapper);
             std::env::set_var(paths::UNDER_RELAX, jobs.max(1).to_string());
@@ -322,10 +288,6 @@ fn main() -> ExitCode {
         }
         Cmd::Test { scope, frozen, inner, relax, jobs } => cmd_test(&m, scope, frozen, inner, relax.then_some(jobs)),
         Cmd::Run { args } => cmd_run(&m, &args),
-        Cmd::Prove { gate, mutations, changed, since, list, jobs } => {
-            let since = if changed { Some("HEAD") } else { since.as_deref() };
-            cmd_prove(&m, gate.as_deref(), &mutations, since, list, jobs)
-        }
         Cmd::Drift => cmd_drift(&m),
         Cmd::Tui => cmd_run(&m, &["--launcher".to_string()]),
         Cmd::Gate { name, inner } => match m.gate.iter().find(|g| g.name == name) {
@@ -340,10 +302,9 @@ fn main() -> ExitCode {
             if problems.is_empty() {
                 println!("PASS  build.toml is internally consistent");
                 println!(
-                    "      {} artifacts, {} gates, {} mutations, all `needs` resolved and ordered",
+                    "      {} artifacts, {} gates, all `needs` resolved and ordered",
                     m.artifact.len(),
-                    m.gate.len(),
-                    m.mutation.len()
+                    m.gate.len()
                 );
                 true
             } else {
@@ -384,7 +345,7 @@ fn main() -> ExitCode {
                 }
             }
             println!("\n  test floor: {} (ratchet)", m.settings.test_floor);
-            println!("  {} golden views, {} declared mutations", m.golden_view.len(), m.mutation.len());
+            println!("  {} golden views", m.golden_view.len());
             true
         }
         Cmd::Graph => {

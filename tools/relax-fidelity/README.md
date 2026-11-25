@@ -1,6 +1,7 @@
 # relax-fidelity: does relax compute what rustc computes?
 
-`cargo glyph prove` under makepad's relax JIT only means something if relax
+`cargo glyph test --relax` (and, until 2026-11-24, `cargo glyph prove`)
+under makepad's relax JIT only means something if relax
 computes what the shipped rustc/LLVM release binary computes, and many checks
 here are bit-exact on f32/f64. This directory holds the evidence, measured
 2026-10-26 on an x86-64 host (Ryzen 9 9950X3D with AVX-512 and FMA, glibc

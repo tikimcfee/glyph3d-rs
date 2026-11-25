@@ -29,7 +29,7 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   atlas), and rebuilds one for a layout change with
   `relayout::rebuild_for_relayout`. A scene holds no device type; the wgpu
   drivers build its `SceneRenderer` from it (`SceneLike::make_renderer`).
-- `glyph/` — the build/verify tool: gate runner, mutation prover. (The launcher
+- `glyph/` — the build/verify tool: the gate runner. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
   mode-neutral contract (`GlyphField` trait, `GlyphFieldMode`, the shared records and
@@ -188,9 +188,8 @@ what it measured.
 
 **The dependency graph is declared in `build.toml`** (artifact, input globs,
 build command, class) and executed by `glyph` (`glyph/src/`: `manifest.rs` the
-types, `gates.rs`, `golden.rs`, `prove.rs`, `products.rs`, `main.rs` the CLI). The baseline PNGs are class **golden**: verified,
-never built — the runner refuses. Red on any compiler warning, test failure, gate mismatch,
-or mutation survival.
+types, `gates.rs`, `golden.rs`, `relax.rs`, `products.rs`, `main.rs` the CLI). The baseline PNGs are class **golden**: verified,
+never built — the runner refuses. Red on any compiler warning, test failure or gate mismatch.
 
 ## The tool
 
@@ -258,7 +257,7 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
 - **Every process a gate runs is bounded** (2026-11-01,
   `glyph/src/bounded.rs`): each test binary, each golden render, each
   `kind = "cmd"` gate's command (pick-oracle, reference-port, hyper-oracle,
-  the corpus scripts) and each test target prove runs under relax, by
+  the corpus scripts) and each test target `test --relax` runs, by
   `build.toml [settings] process_timeout_secs` (600). Past it the process
   is killed with every process under it, the gate goes red naming it
   (`FAIL  <binary> timed out after N s`, then each test it never finished
@@ -275,8 +274,8 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   hand. The device's own waits fail first, at `[gpu] wait_timeout_secs`
   (60, config/defaults.toml), panicking with the wait's name
   (`glyph_field::wait_for`). Not bounded: the compiles (products, the
-  cargo gates, the test build), committed-artifacts' generators, and
-  `prove`'s native clean-tree `cargo test`; and inside wgpu, a queue's
+  cargo gates, the test build) and committed-artifacts' generators; and
+  inside wgpu, a queue's
   wait for idle on drop and device creation, which only the process limit
   reaches. That is where the 2026-11-01 hang was: caught again by this
   limit the same day, its core showed the renderer lib's GPU tests in
@@ -301,7 +300,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   `--frozen` is the validating intent: if something is stale, that IS the
   finding, and a check that silently rebuilds could never report it.
 - **`test --relax` runs the tree under relax instead of building it**
-  (2026-11-01, `GLYPH_RELAX` as for prove). The inner tier only, since the
+  (2026-11-01). **It expects a relax built in a makepad checkout**
+  (`cargo build --release -p relax-runner --bin relax`, then
+  `target/release/relax`), named by `GLYPH_RELAX` (default: `relax` on
+  PATH). Stock upstream relax does: this runs no overlay and sets no
+  variable, so no patch to makepad is needed for it. The inner tier only, since the
   merge tier is rustc's, clippy's and rustdoc's diagnostics: cargo-test is
   every test target under `relax test --release` (the cargo-test gate's
   profile: upstream relax honours cargo's profiles, and without the flag
@@ -322,90 +325,24 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   the makepad host's live session (`makepad/README.md`).
   relax runs a test in the directory it was started in, where cargo starts
   each test binary in its package's: the runner starts `relax test` there
-  (`prove_relax::package_dir`), or a test's relative path means something
+  (`relax::package_dir`), or a test's relative path means something
   else under relax (`tests/oblique_repeat.rs` drew an empty repo and failed
   as if the JIT rendered nothing).
-- **`cargo glyph prove`** applies each mutation declared in `build.toml`,
-  requires the named check to redden for the named reason, and restores
-  byte-exact. It reports COVERAGE — which checks have no mutation and are
-  therefore unproven — not a pass count. `cargo glyph prove` prints the live
-  figure, and a new check should arrive with the mutation that proves it.
-  Scoped forms for iteration (2026-09-29):
-  `--mutation <name>` (repeatable) proves exactly the named mutations, and
-  `--changed` proves only mutations whose target file differs from HEAD —
-  "prove what you touched" (a mutation you MOVED keeps its name and is
-  selected by its file). `--since <ref>` (2026-10-11) is the same against the
-  merge-base of `<ref>` and HEAD, committed work included — "prove what this
-  branch touched" — and also selects every mutation of a gate whose own
-  script changed, and every mutation whose `build.toml` declaration, or
-  whose gate's, is new or edited, so a mutation proves itself on the branch
-  that adds it (`--changed` is `--since HEAD`). Since 2026-10-26 "edited"
-  means a field a gate run reads: prose (`compare`, `blind_to`, `why`) and
-  `glyph test`'s own `scope`, `tier` and `gpu` do not count (declaring
-  `tier` on every gate selected all 116). And a mutation is selected when
-  a changed file other than build.toml or prose holds its `expect`: its
-  witness changed (for a cargo-test mutation, the test that must catch it),
-  though its target did not. At the commit that brought both, 116 became
-  29. `--list` prints a
-  selection and stops, so a run's size is known before it is paid for.
-  A scoped run's verdict names its scope ("a scoped
-  run proves its scope, not the manifest"); the unscoped run remains the
-  landing bar. A mutation of a path only one rasterizer takes declares
-  `gpu = "<key>"` (C35, 2026-10-24; the key must name a golden set, or
-  `validate` refuses it): on any other host the prover prints it `N/A` and
-  counts it neither proven nor failed, and a run in which EVERY selected
-  mutation is N/A fails as `NOTHING PROVEN` rather than passing over
-  nothing. Before the field existed, `prove` on the 5090 would have
-  reported a Metal-only mutation as surviving. Where its time goes: every mutation prints its build, gate
-  and restore seconds and the run ends with a TIME line naming the slowest.
-  A test that turns slow is paid once per mutation that reaches its binary
-  (one quadratic test was 48 s of a 62 s cargo-test until 2026-10-11). A mutation whose gate is ALREADY red cannot prove anything and
-  the prover says so — on a host whose pixel set is stale, the pixel-ab
-  mutations are unprovable until the set is re-adopted.
-  A mutation's gate can BUILD a product from the mutated source (`cargo test
-  --release` links the renderer): after restoring, the prover drops the stamp
-  of every product the file feeds and rebuilds it (2026-10-09: before this, a
-  prove left the mutant behind a stamp reading current). Before a gate that
-  `needs` a product, the prover builds it from the mutated tree itself, and a
-  mutant that does not compile is reported and restored. So a mutation
-  declares `rebuild` only when its gate runs something no product covers —
-  today, nothing: since 2026-10-11 no mutation declares one. (The runner's
-  own mutations are seen by its unit tests; `cargo test` never relinks
-  `target/release/glyph`, measured, so a declared runner rebuild only made the
-  mutant runner run its own gate.)
-- **How `prove` runs a mutation is declared per gate** (2026-10-26,
-  `glyph/src/prove_relax.rs`, `out/PROVE-ON-RELAX-2026-10-26.md`). A gate
-  with `relax = "test"` (cargo-test) or `relax = "renderer"` (pick-oracle,
-  reference-port, hyper-oracle, pixel-ab) has its mutations proven under
-  makepad's relax JIT, `--jobs` (default 8) at a time, through relax's
-  source overlay (`RELAX_OVERLAY`): the working tree is never written
-  for them. **It expects a relax built in a makepad checkout**
-  (`cargo build --release -p relax-runner --bin relax`, then
-  `target/release/relax`), named by `GLYPH_RELAX` (default: `relax` on
-  PATH), and one that reads the `RELAX_*` names (makepad since its
-  `makepad run` became `relax`; before that the same variables were
-  `MAKEPAD_RUN_*`, which prove no longer sets). The overlay is the one
-  patch this needs on top of upstream makepad: `tikimcfee/makepad` `work`,
-  upstream's `work` plus our own commits, rebased when upstream moves and not
-  sent upstream (2026-11-24). The older fork relax binaries read only the old names. Without one that runs, prove stops before proving anything; a
-  relax gate's mutation is never handed to cargo. Each route's clean tree
-  runs natively and under relax first, and a disagreement fails loud with
-  the diff (it once caught a gate whose PASS line was a log line). What the
-  route proves is the mutation's claim: the test its `expect` names (the
-  whole suite under relax, judged by the floor, when it names none), the
-  golden view it names. The suite is the root manifest's `[workspace].members`
-  (not every `Cargo.toml`: the excluded makepad host made it red on every
-  tree until 2026-10-31), and each member's run is overlaid with only the
-  files it reads, since relax refuses a run whose overlaid file was never
-  read. A renderer gate's mutation of a file the renderer
-  reads at run time (a fixture) is applied on disk, last and one at a
-  time. Gates with no declaration (the compiler's
-  diagnostics, the corpus gates) are proven on cargo: their Rust mutations
-  beside relax, which reads those files from untouched copies, the rest
-  after it. The renderer a gate runs is the parameter `GLYPH_RENDERER`
-  (default: the built product), which the gate commands, scripts and golden
-  renders read; `GLYPH_SCRATCH`, `GLYPH_SWEEP` and `GLYPH_GOLDEN_VIEWS` move
-  or narrow a run's scratch, renders and views.
+- **Mutation testing is retired** (2026-11-24). `cargo glyph prove` applied
+  each `[[mutation]]` declared in `build.toml` (115 at the end), required its
+  gate to redden for the stated reason, restored byte-exact and reported
+  coverage; from 2026-10-26 it proved most of them in parallel under makepad's
+  relax JIT, through a source overlay (`RELAX_OVERLAY`) that only a patched
+  makepad carried. Ivan retired it (2026-11-24) rather than keep a makepad
+  patch for it: the prover, the mutations, the gates' `relax = ` routes and
+  the overlay went together. The record is git history before that date and
+  `out/PROVE-ON-RELAX-2026-10-26.md`. What it taught still holds (§ Earning a
+  green): a check is a claim about a counterfactual, and the way to know it
+  can fail is to break what it watches and watch it go red, now by hand.
+  `GLYPH_RENDERER` (default: the built product) is still the renderer every
+  gate command, script and golden render reads, and `GLYPH_SCRATCH`,
+  `GLYPH_SWEEP` and `GLYPH_GOLDEN_VIEWS` still move or narrow a run's scratch,
+  renders and views.
 - **`cargo glyph gates`** prints what each check compares and cannot see;
   **`graph`** the artifact graph; **`validate`** the manifest against its schema.
 
@@ -472,6 +409,12 @@ a claim about a counterfactual, and a check whose blind spot you don't know is
 a green you can't price. (Gates were once numbered positions in one shell
 script, `N/9`, renumbered twice; old reports use the numbers — map by name.)
 
+**The mutation names below are history** (mutation testing was retired on
+2026-11-24, § The tool). Where a gate says "`atlas-pin-moved` proves it", the
+name is a defect class that gate was once shown to catch, by a mutation that
+reddened it; its declaration, with its `why`, is in `build.toml` before that
+date. Nothing re-proves it today.
+
 **Products — `glyph build`, and the first thing `test` does.** Not a check, and
 it cannot catch anything; it is here because everything below is a statement
 about an artifact, and a stale one makes every statement false. The renderer
@@ -511,14 +454,13 @@ tests). Since then the stamp keeps each input's hash beside it
 (`target/.glyph-stamps/<product>.inputs`), and before a build every input
 whose content differs from that record, or that it does not name (all of
 them, the first time), has its mtime moved to now, so cargo rebuilds what
-reads it and no more; prove forgets a restored file in the record, so the
-rebuild after a mutation moves it too. Blind to a product rebuilt by a cargo
+reads it and no more. Blind to a product rebuilt by a cargo
 outside the runner (a hand `cargo build` of other content, then the content
 put back old): the record says what the runner last built, not what is on
 disk. `stale-input-untouched` proves it.
 
 **manifest.** `build.toml` against itself: every `needs` resolves and orders,
-every gate and mutation names a real target, every golden output is keyed by
+every gate names a real target, every golden output is keyed by
 `{gpu}`, and every product input — glob or literal — matches at least one
 file. Blind to whether the declared inputs are the RIGHT ones: it proves a
 pattern matches something, never that it matches everything that matters.
@@ -634,12 +576,8 @@ still exist, not that the sentence around them is current.
 value is the runner counting each tool's warnings and running rustdoc over
 the workspace, so the runner's own unit tests hold that
 (`warn_count_counts_each_tools_warnings_once`,
-`the_doc_gate_documents_the_workspace`, f99d8e0)
-rather than mutations. The four mutations that did it (`unused-binding`,
-`clippy-lint`, `dead-doc-link`, `dead-doc-link-crate`) were anchored in
-engine files, so `prove --since` re-proved the warning counter on every
-branch that touched the fold. `cargo glyph prove` lists these three gates
-as uncovered: their proof is a unit test, not a mutation.
+`the_doc_gate_documents_the_workspace`, f99d8e0), which still run in
+cargo-test.
 
 **orphans** (2026-10-11; read off rustc since 2026-10-26). A `.rs` file
 that no `mod` declaration reaches is not compiled at all, and rustc says
@@ -1163,20 +1101,17 @@ and the union is not:
 ### Earning a green
 
 A pass is a claim about a counterfactual, so test the counterfactual: break what
-a check watches and confirm it reddens. Some of that is now mechanical —
-`cargo glyph prove` applies each mutation declared in `build.toml`,
-requires the named gate to go red for the named reason, and restores byte-exact.
-It reports COVERAGE rather than a pass count, so a gate nobody has proven is
-listed as uncovered instead of being counted as working — run it and read that
-line. This paragraph deliberately states no figure: the previous version did,
-went stale, was corrected, gained a caveat saying it had gone stale, and went
-stale again the same week. A number in prose that describes the tree is a
-number that rots; the tool prints the live one. Three times this repo shipped a check
+a check watches and confirm it reddens. From 2026-09 to 2026-11-24 that was
+mechanical (`cargo glyph prove` and its declared mutations, retired: § The
+tool); now it is done by hand, for the check you are adding or changing:
+make the edit that should break it, run the gate, read that it went red for
+the reason you meant, and put the edit back. A number in prose that describes
+the tree is a number that rots; the tool prints the live one. Three times this repo shipped a check
 that could not fail — a gate asserting on float noise, a ceiling constant no test
 protected, and a fixture checksum comparing bytes guaranteed identical before the
 command ran. Every one was caught by execution; not one by inspection.
 
-And **a mutation that produced no failure proves nothing until you know it
+And **a break that produced no failure proves nothing until you know it
 landed.** "I broke it and nothing failed" and "I failed to break it" print
 identically. Assert the edit applied, then read the result. Equally: a source
 scan is worth exactly what its match set is worth — "no grep match" is not "does
@@ -1189,10 +1124,10 @@ There is a THIRD outcome, beyond "landed" and "failed to land": **landed in a
 region nothing reads.** Measured 2026-09-06 — resolving an out-of-range
 codepoint to a real trie block instead of the shared missing block left every
 check green but one, because no fixture in the corpus carries an F5–F7 lead
-byte; only `fixtures/overflow-leads.txt` reaches that branch. So a mutation's
-`why` names the CONSUMER it perturbs, not just the defect it stands for, and
+byte; only `fixtures/overflow-leads.txt` reaches that branch. So a break
+is judged by the CONSUMER it perturbs, not just the defect it stands for, and
 "the gate stayed green" is a claim about the corpus until you have shown the
-mutated line is on a path the corpus walks.
+broken line is on a path the corpus walks.
 
 A cross-form comparison is blind to a fault inside a function both forms
 share. Measured 2026-09-06: the wrap rule counting the terminating newline's
@@ -1215,7 +1150,7 @@ the serial-fold-versus-scan comparison green, because both forms call
 | `native/fixtures/baseline-view.txt` | IMMUTABLE | it is the input to `text.png`; editing it re-baselines that check silently |
 | `native/fixtures/emoji-view.txt` | IMMUTABLE | the input to `emoji.png`, one line per class of bitmap slot the trie carries; same reason |
 | `native/fixtures/g-pick-repo/empty.rs` | IMMUTABLE, zero bytes | the only input that reaches the page-extent origin seed; deleting it removes a check's ability to see its subject without removing the check |
-| `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check that each mutation in its `why` still reddens |
+| `native/fixtures/chunk-cut.txt` | IMMUTABLE | hyper-oracle's only input built for the intra-line chunk-cut classes (C15): a sequence across each 64 KiB cut target, non-ASCII advances before each cut, a continuation wider than every ASCII row past the first page. Its cut positions are planned against the 64 KiB threshold and the cut rule, so changing either (or the file) can move a target off its sequence and silently weaken the gate — re-check by hand that each cut still lands where hyper-oracle needs it |
 | `native/fixtures/highlight-alpha.tsv` | IMMUTABLE | the input to `repo-highlight.png`; DELIBERATELY out of byte order (the `1` span after the string span) — sorting it removes the frame's only witness for `sidecar-runs-unsorted` |
 | `native/fixtures/chunk-cut-paint.txt` | IMMUTABLE | built as hyper-oracle's paint-tier input (C17; the tier was retired with the syntax heuristic on 2026-10-11, and the file's own header still says paint-tier): a `return` across every intra-line cut, one pure-ASCII cut line and one not. Still read as an intra-line-cut input by hyper-oracle's layout tiers, `windowed_emission_matches_unwindowed` (several chunks of one item: the witness `windowed-chunk-order-reversed` names); editing it moves its cuts and the gate's quoted volumes |
 | `native/fixtures/tab-stops/` | IMMUTABLE | the tab-stop runs' corpus (hyper-oracle at `--tab-width` 4 and 8) and `tests/tab_stops.rs`'s frame (2026-10-11): tabs at a line's start, after non-ASCII and double-width glyphs, back to back, in wrapped rows and around a keycap (the strict run's ASCII-led head), and `long-line.txt`, a long tabbed line (built to put tabs on both sides of the deleted Visible field's segment seeds) |

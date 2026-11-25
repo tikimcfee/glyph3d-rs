@@ -15,8 +15,6 @@ pub(crate) struct Manifest {
     pub(crate) artifact: BTreeMap<String, Artifact>,
     pub(crate) golden_view: Vec<GoldenView>,
     pub(crate) gate: Vec<Gate>,
-    #[serde(default)]
-    pub(crate) mutation: Vec<Mutation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,8 +22,8 @@ pub(crate) struct Manifest {
 pub(crate) struct Settings {
     pub(crate) test_floor: u32,
     /// The longest any one process a gate runs may take, in seconds: each
-    /// test binary (cargo-test, and each test target prove runs under
-    /// relax), each golden render (pixel-ab), each `kind = "cmd"` gate's
+    /// test binary (cargo-test, and each test target `test --relax` runs),
+    /// each golden render (pixel-ab), each `kind = "cmd"` gate's
     /// command (pick-oracle, reference-port, hyper-oracle, ...). Past it the
     /// process is killed with everything under it and its gate goes red
     /// naming it (2026-11-01, `bounded.rs`). 1..=86400.
@@ -157,46 +155,6 @@ pub(crate) struct Gate {
     pub(crate) pass_line: Option<String>,
     pub(crate) compare: Option<String>,
     pub(crate) blind_to: Option<String>,
-    /// How `prove` proves this gate's mutations: under makepad's relax JIT,
-    /// in parallel and through its source overlay (prove_relax.rs). Declared,
-    /// never inferred: a gate without one is proven on cargo.
-    pub(crate) relax: Option<Relax>,
-}
-
-/// How `prove` runs a gate's mutations under relax.
-#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Relax {
-    /// cargo-test: the test a mutation's `expect` names, under `relax test`;
-    /// the whole suite, judged as the gate judges it, when it names none.
-    Test,
-    /// a gate that runs the renderer: the gate itself, with the renderer
-    /// under `relax run` (`GLYPH_RENDERER`).
-    Renderer,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Mutation {
-    pub(crate) name: String,
-    pub(crate) gate: String,
-    pub(crate) why: Option<String>,
-    pub(crate) file: String,
-    pub(crate) op: String,
-    pub(crate) expect: String,
-    pub(crate) arg: Option<String>,
-    pub(crate) find: Option<String>,
-    #[serde(rename = "with")]
-    pub(crate) with_: Option<String>,
-    pub(crate) rebuild: Option<String>,
-    /// The golden-set key (`<backend>-<vendor>`, e.g. `metal-apple`) of the
-    /// only rasterizer on which this mutation is observable: a defect in a
-    /// path that only that hardware takes (C35, 2026-10-24: the analytic
-    /// glyph footprint is Apple-TBDR-only). On any other host the prover
-    /// reports it NOT APPLICABLE: neither proven nor failed, and never
-    /// counted as reddening. Without the field, `prove` on the 5090 reported
-    /// a Metal-only mutation as surviving.
-    pub(crate) gpu: Option<String>,
 }
 
 impl Settings {
@@ -213,18 +171,6 @@ pub(crate) fn load() -> Result<Manifest, String> {
 }
 
 // ── validation (see `glyph validate`) ────────────────────────────────────
-
-/// Whether `key` has a golden set: some golden output, with `{gpu}` read as
-/// `key`, exists. A key must also be path-safe, as `paths::gpu_key` demands.
-fn golden_set_exists(m: &Manifest, key: &str) -> bool {
-    let safe = !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    safe && m
-        .artifact
-        .values()
-        .filter(|a| a.class == Class::Golden)
-        .flat_map(|a| a.outputs.iter())
-        .any(|o| root().join(o.replace("{gpu}", key)).exists())
-}
 
 /// Which artifacts a gate makes usable by the gates after it. Derived from
 /// `kind` rather than declared: a `provides` field would be one more thing that
@@ -337,17 +283,6 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
                 p.push(format!("gate {} is apart_from '{a}', which is not another declared gate", g.name));
             }
         }
-        match g.relax {
-            Some(Relax::Test) if g.kind != Kind::CargoTest => {
-                p.push(format!("gate {} declares relax = \"test\" but is not kind=cargo-test", g.name));
-            }
-            Some(Relax::Renderer)
-                if !g.needs.iter().any(|n| m.artifact.get(n).is_some_and(|a| a.class == Class::Product)) =>
-            {
-                p.push(format!("gate {} declares relax = \"renderer\" but needs no product to run", g.name));
-            }
-            _ => {}
-        }
         if g.kind == Kind::Cmd && g.cmd.is_none() {
             p.push(format!("gate {} is kind=cmd but declares no cmd", g.name));
         }
@@ -416,58 +351,5 @@ pub(crate) fn validate(m: &Manifest) -> Vec<String> {
         }
     }
 
-    for mu in &m.mutation {
-        if !gates.contains(mu.gate.as_str()) {
-            p.push(format!("mutation {} targets gate '{}', which does not exist", mu.name, mu.gate));
-        }
-        if !root().join(&mu.file).exists() {
-            p.push(format!("mutation {} targets {}, which does not exist", mu.name, mu.file));
-        }
-        if mu.expect.trim().is_empty() {
-            p.push(format!(
-                "mutation {} declares no expected text; it would accept ANY red, including \
-                 one from an unrelated cause",
-                mu.name
-            ));
-        }
-        match mu.op.as_str() {
-            "replace" => {
-                if mu.find.is_none() {
-                    p.push(format!("mutation {} is op=replace with no find text", mu.name));
-                } else if mu.find.as_deref() == mu.with_.as_deref() {
-                    p.push(format!("mutation {} replaces text with itself and can never land", mu.name));
-                }
-            }
-            "append" => {
-                if mu.arg.as_deref().unwrap_or("").is_empty() {
-                    p.push(format!("mutation {} is op=append with nothing to append", mu.name));
-                }
-            }
-            "remove" => {}
-            other => p.push(format!("mutation {} has unknown op '{other}'", mu.name)),
-        }
-        if mu.why.as_deref().unwrap_or("").trim().is_empty() {
-            p.push(format!(
-                "mutation {} has no `why`; a mutation whose motivating defect is unstated \
-                 cannot be judged when it later fails",
-                mu.name
-            ));
-        }
-        if mu.rebuild.as_deref().map(str::trim) == Some("") {
-            p.push(format!("mutation {} has an empty rebuild command", mu.name));
-        }
-        // A host scope must name a rasterizer that has a golden set here: a
-        // misspelt key would make the mutation NOT APPLICABLE everywhere,
-        // which is an unproven claim that reads as a scoped one.
-        if let Some(key) = &mu.gpu {
-            if !golden_set_exists(m, key) {
-                p.push(format!(
-                    "mutation {} is scoped to gpu '{key}', which names no golden set \
-                     (no baseline under that key); it would be NOT APPLICABLE on every host",
-                    mu.name
-                ));
-            }
-        }
-    }
     p
 }

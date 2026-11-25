@@ -34,9 +34,8 @@ fn shot_path(name: &str, equivalent: Option<&str>) -> PathBuf {
 }
 
 /// The views the gate renders and judges: every declared one, or the ones
-/// `GLYPH_GOLDEN_VIEWS` names (comma-separated). prove's relax route names the view
-/// a mutation's `expect` claims diverges, so a mutant renders that frame and
-/// not thirty. Err names a view that is not declared: a filter that selects
+/// `GLYPH_GOLDEN_VIEWS` names (comma-separated), to render one frame rather
+/// than all of them while iterating. Err names a view that is not declared: a filter that selects
 /// nothing must not pass.
 fn views(m: &Manifest) -> Result<Vec<&GoldenView>, String> {
     let Some(names) = std::env::var("GLYPH_GOLDEN_VIEWS").ok().filter(|n| !n.is_empty()) else {

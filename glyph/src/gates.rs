@@ -236,7 +236,7 @@ fn judge_jobs(m: &Manifest, jobs: Vec<TestJob>, stacks: bool) -> (bool, String) 
         if !ok || summaries.is_empty() {
             good = false;
             // Name the failing tests: printing only the summary discards WHY it
-            // reddened, and a mutation's `expect` needs the reason in the text.
+            // reddened.
             for l in out.lines().filter(|l| l.contains("FAILED") || l.starts_with("panicked")) {
                 r.push_str(&format!("      {l}\n"));
             }
@@ -264,10 +264,10 @@ fn judge_jobs(m: &Manifest, jobs: Vec<TestJob>, stacks: bool) -> (bool, String) 
 
 /// cargo-test under `glyph test --relax`: every test target of the
 /// workspace under `relax test`, `jobs` at once, judged by this gate's own
-/// rule (`judge_tests`: every target green, then the floor). The same run
-/// prove's suite route makes (`prove_relax::suite`). relax runs no doctests.
+/// rule (`judge_tests`: every target green, then the floor) (`relax::suite`).
+/// relax runs no doctests.
 fn gate_cargo_test_under_relax(m: &Manifest, jobs: usize) -> bool {
-    let (ok, out) = crate::prove_relax::suite(m, jobs);
+    let (ok, out) = crate::relax::suite(m, jobs);
     for l in out.lines().filter(|l| {
         l.contains("test result") || l.starts_with("PASS ") || l.starts_with("FAIL ") || l.starts_with("NOTE ") || l.contains("FAILED")
     }) {
@@ -304,7 +304,7 @@ fn floor_verdict(m: &Manifest, binaries: usize, total: u32) -> (bool, String) {
     (true, s)
 }
 
-/// This gate's verdict on the suite as relax ran it (prove's suite route):
+/// This gate's verdict on the suite as relax ran it (`test --relax`):
 /// every target green, then the floor, by the same rule as the gate's own
 /// run. `good` is whether every target exited green.
 pub(crate) fn judge_tests(m: &Manifest, good: bool, out: &str) -> (bool, String) {

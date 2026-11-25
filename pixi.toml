@@ -22,7 +22,6 @@ build = "cargo glyph build"
 # `pixi run check rust` passes the scope through: rust | render | corpus.
 check = "cargo glyph test"
 verify = "cargo glyph test --frozen"
-prove = "cargo glyph prove"
 gen-schema = "python3 tools/gen_schema.py"
 # The emoji tools read the vendored colour font with fontTools, which lives in
 # THIS env (pinned below) rather than whatever the host's python3 has.

@@ -18,8 +18,8 @@ pub(crate) fn stamps() -> PathBuf {
 /// its paths were shared by every worktree, and a gate that `rm -rf`s its
 /// scratch first ate another worktree's mid-run (2026-10-26, when gates
 /// started running in parallel across helpers).
-/// `GLYPH_SCRATCH` overrides it: prove's relax route gives each mutant its
-/// own, so mutants running one gate at once never share its scratch.
+/// `GLYPH_SCRATCH` overrides it, so two runs of one gate at once (by hand)
+/// never share its scratch.
 pub(crate) fn scratch() -> PathBuf {
     std::env::var_os("GLYPH_SCRATCH").map(PathBuf::from).unwrap_or_else(|| root().join("target/glyph-scratch"))
 }
@@ -62,14 +62,14 @@ pub(crate) fn keep_file(what: &str, file: &Path) -> String {
     shown(&path, r)
 }
 
-/// Where the golden renders land: `GLYPH_SWEEP` when set (prove's relax route gives
-/// each mutant its own, so mutants rendering at once never share a frame),
-/// otherwise the battery's untracked sweep directory.
+/// Where the golden renders land: `GLYPH_SWEEP` when set (so two runs
+/// rendering at once never share a frame), otherwise the battery's untracked
+/// sweep directory.
 pub(crate) fn sweep() -> PathBuf {
     std::env::var_os("GLYPH_SWEEP").map(PathBuf::from).unwrap_or_else(|| root().join("out/tooling-ab/sweep"))
 }
 
-/// The renderer the gates run: `GLYPH_RENDERER` when it is set (prove's relax route
+/// The renderer the gates run: `GLYPH_RENDERER` when it is set (`test --relax`
 /// sets it to the renderer under relax), otherwise the built product. Every
 /// gate reaches the renderer through this one path; `sh` exports it, so a
 /// gate's command and scripts read `$GLYPH_RENDERER`.
@@ -154,4 +154,19 @@ pub(crate) fn resolve_gpu(path: &str) -> Option<String> {
     } else {
         Some(path.to_string())
     }
+}
+
+/// Our own path, read ONCE at startup. Cargo keeps two `glyph` artifacts —
+/// the workspace build and the `-p glyph` build the `cargo glyph` alias makes
+/// resolve different feature sets — and re-points `target/release/glyph` at
+/// whichever was asked for last, without recompiling. The cargo-build gate
+/// runs the workspace build, so mid-run the file this process was started
+/// from can be unlinked and replaced. On Linux `current_exe()` then reads
+/// `/proc/self/exe` as `.../glyph (deleted)` and every later spawn fails with
+/// ENOENT (measured 2026-09-07, under the since-retired `prove`). Reading the
+/// path before any gate runs makes each child `glyph gate` spawn whichever
+/// artifact is there now, which is built from the same source.
+pub(crate) fn self_exe() -> &'static Path {
+    static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("glyph")))
 }

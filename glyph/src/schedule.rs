@@ -3,7 +3,7 @@
 //! nothing changed and 111 s after a one-line edit, most of it gates that
 //! wait on nothing but a CPU or the GPU.
 //!
-//! Each gate runs as a child `glyph gate <name>`, as prove runs one, so its
+//! Each gate runs as a child `glyph gate <name>`, so its
 //! output is its own; the blocks are printed in manifest order as each one
 //! finishes, so a run reads the same as a serial one. A gate starts when
 //! every earlier gate that provides an artifact it `needs` has finished (the
@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use crate::manifest::{provides, Gate, Manifest};
 use crate::paths::{keep, root, scratch, step};
-use crate::prove::self_exe;
+use crate::paths::self_exe;
 
 /// What one gate did.
 pub(crate) struct Ran {
@@ -29,7 +29,7 @@ pub(crate) struct Ran {
 
 /// The runner, at a path no build moves. The workspace build and the `-p
 /// glyph` build the alias makes link different `glyph` binaries and re-point
-/// `target/release/glyph` at whichever ran last (prove's `self_exe` has the
+/// `target/release/glyph` at whichever ran last (`paths::self_exe` has the
 /// history); with gates running at once, cargo-build can do that while a
 /// child is being spawned. A hard link keeps this binary's inode.
 fn stable_runner() -> PathBuf {
