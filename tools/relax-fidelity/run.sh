@@ -5,9 +5,9 @@
 #   relax       a warm run (the cache's O2 code links at start)
 #   relax-cold  a cold cache and 16 repetitions: baseline code first, O2/O3 builds
 #               installed while it runs (the per-repetition self-check shows any change)
-#   relax-sse   MAKEPAD_RUN_NO_AVX=1: the SSE encodings, and mul_add through the C fma
+#   relax-sse   RELAX_NO_AVX=1: the SSE encodings, and mul_add through the C fma
 #               instead of vfmadd (relax's fma_native() is false without AVX)
-#   relax-interp  MAKEPAD_RUN_INTERP=all: the interpreter tier (aarch64 only; on x86-64
+#   relax-interp  RELAX_INTERP=all: the interpreter tier (aarch64 only; on x86-64
 #               relax has no interpreter and this configuration is skipped)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,11 +25,11 @@ run relax RELAX_FIDELITY_REPS=3
 run relax-cold RELAX_FIDELITY_REPS=16
 # its own clean cache: a cached build made with AVX must not stand in for it
 "$RELAX" clean -p relax-fidelity > /dev/null 2>&1
-run relax-sse RELAX_FIDELITY_REPS=3 MAKEPAD_RUN_NO_AVX=1
+run relax-sse RELAX_FIDELITY_REPS=3 RELAX_NO_AVX=1
 "$RELAX" clean -p relax-fidelity > /dev/null 2>&1
 configs=(relax relax-cold relax-sse)
 if [ "$(uname -m)" = aarch64 ] || [ "$(uname -m)" = arm64 ]; then
-  run relax-interp RELAX_FIDELITY_REPS=3 MAKEPAD_RUN_INTERP=all
+  run relax-interp RELAX_FIDELITY_REPS=3 RELAX_INTERP=all
   configs+=(relax-interp)
 fi
 for f in rustc "${configs[@]}"; do

@@ -12,7 +12,7 @@
 //!   renderer  — a gate that runs the renderer: the gate itself, with
 //!               `GLYPH_RENDERER` pointing at the renderer under `relax run`
 //! A mutation of a file relax's compiler reads (Rust, or WGSL an
-//! `include_str!` pulls in) is served through `MAKEPAD_RUN_OVERLAY`. A
+//! `include_str!` pulls in) is served through `RELAX_OVERLAY`. A
 //! renderer gate's mutation of a file the renderer reads at RUN time (a
 //! fixture, the atlas) is applied on disk, after everything else and one at a
 //! time, with its gate still under relax. A mutation of a relax gate that
@@ -44,12 +44,12 @@
 //! (`GLYPH_SCRATCH`).
 //! A route's mutants start the moment its own clean check agrees. relax's
 //! code cache is content-keyed. A mutant that is one relax process reads the
-//! shared clean cache read-only (`MAKEPAD_RUN_CACHE=readonly`), so the clean
+//! shared clean cache read-only (`RELAX_CACHE=readonly`), so the clean
 //! cache never holds a mutant. A mutant that is many processes — a renderer
 //! gate (pixel-ab renders frames, reference-port runs five instruments), a
 //! test that spawns the renderer (`CARGO_BIN_EXE_*`), the suite — would
 //! compile the mutant again in each, so it runs on its own copy-on-write
-//! clone of the clean cache (`MAKEPAD_RUN_CACHE_DIR`, `clone_dir`),
+//! clone of the clean cache (`RELAX_CACHE_DIR`, `clone_dir`),
 //! deleted with the mutant. Only `cache/` is cloned: since makepad
 //! a5299abd2 a redirected run dir keeps its build outputs at the
 //! workspace's. Before then a clone's first process re-collected 334 crates
@@ -92,7 +92,7 @@ pub(crate) fn relax_available() -> Result<(), String> {
 
 /// relax's run directory for this workspace: its code cache, among the rest.
 fn relax_run_dir() -> PathBuf {
-    root().join("target/makepad-run")
+    root().join("target/relax")
 }
 
 /// One test, as both compilers run it: the package, the target selection,
@@ -199,7 +199,7 @@ fn packages_reading(file: &Path) -> std::collections::BTreeSet<String> {
     }
 }
 
-/// Per member of the suite's `targets`, its env with `MAKEPAD_RUN_OVERLAY`
+/// Per member of the suite's `targets`, its env with `RELAX_OVERLAY`
 /// narrowed to the overlay list's files that member reads
 /// (`packages_reading`), or dropped when it reads none of them; a member
 /// whose env would not change is absent (2026-10-31). relax refuses a run
@@ -208,7 +208,7 @@ fn packages_reading(file: &Path) -> std::collections::BTreeSet<String> {
 /// renderer is built on.
 fn member_overlays<'e>(targets: &[(String, Vec<String>)], env: &[(&'e str, OsString)]) -> BTreeMap<String, Vec<(&'e str, OsString)>> {
     let mut out = BTreeMap::new();
-    let Some(list) = env.iter().find(|(k, _)| *k == "MAKEPAD_RUN_OVERLAY").map(|(_, v)| PathBuf::from(v)) else { return out };
+    let Some(list) = env.iter().find(|(k, _)| *k == "RELAX_OVERLAY").map(|(_, v)| PathBuf::from(v)) else { return out };
     let Ok(text) = std::fs::read_to_string(&list) else { return out };
     let entries: Vec<(&str, std::collections::BTreeSet<String>)> = text
         .lines()
@@ -221,11 +221,11 @@ fn member_overlays<'e>(targets: &[(String, Vec<String>)], env: &[(&'e str, OsStr
         if kept.len() == lines.len() {
             continue;
         }
-        let mut narrowed: Vec<(&'e str, OsString)> = env.iter().filter(|(k, _)| *k != "MAKEPAD_RUN_OVERLAY").cloned().collect();
+        let mut narrowed: Vec<(&'e str, OsString)> = env.iter().filter(|(k, _)| *k != "RELAX_OVERLAY").cloned().collect();
         if !kept.is_empty() {
             let path = list.with_file_name(format!("overlay.{package}.tsv"));
             if std::fs::write(&path, kept.iter().map(|l| format!("{l}\n")).collect::<String>()).is_ok() {
-                narrowed.push(("MAKEPAD_RUN_OVERLAY", path.into()));
+                narrowed.push(("RELAX_OVERLAY", path.into()));
             }
         }
         out.insert(package.clone(), narrowed);
@@ -659,13 +659,13 @@ fn scratch_env(mu: &Mutation, r: &Route, dir: &Path) -> Result<Vec<(&'static str
         // outputs (build/, build-scripts/, native/) at the workspace's own
         // (makepad a5299abd2), so the clone shares them.
         clone_dir(&relax_run_dir().join("cache"), &cache.join("cache")).map_err(|e| format!("the relax cache did not clone: {e}"))?;
-        env.push(("MAKEPAD_RUN_CACHE_DIR", cache.into()));
+        env.push(("RELAX_CACHE_DIR", cache.into()));
         env.push(("GLYPH_SWEEP", dir.join("sweep").into()));
         if let Some(view) = expect_view(&mu.expect) {
             env.push(("GLYPH_GOLDEN_VIEWS", view.into()));
         }
     } else {
-        env.push(("MAKEPAD_RUN_CACHE", "readonly".into()));
+        env.push(("RELAX_CACHE", "readonly".into()));
     }
     Ok(env)
 }
@@ -739,7 +739,7 @@ fn prove_one(m: &Manifest, mu: &Mutation, r: &Route, renderer: &Path, pristine: 
     if let Err(e) = written {
         return fail(s, format!("the overlay did not write: {e}"));
     }
-    env.push(("MAKEPAD_RUN_OVERLAY", list.into()));
+    env.push(("RELAX_OVERLAY", list.into()));
     let (ok, out) = run(m, r, renderer, &env, jobs);
     let took = t.elapsed();
     let _ = std::fs::remove_dir_all(dir.join("run-dir"));
@@ -957,7 +957,7 @@ pub(crate) fn prove_selected(
         }
     }
     let pristine_env: Vec<(&str, OsString)> =
-        pristine.list.iter().map(|l| ("MAKEPAD_RUN_OVERLAY", l.clone().into())).collect();
+        pristine.list.iter().map(|l| ("RELAX_OVERLAY", l.clone().into())).collect();
     // From here the cargo route's Rust mutations run beside relax: its
     // native clean-tree runs are done, and relax reads their files from
     // the shielded copies.

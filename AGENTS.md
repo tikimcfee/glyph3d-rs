@@ -375,11 +375,15 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   with `relax = "test"` (cargo-test) or `relax = "renderer"` (pick-oracle,
   reference-port, hyper-oracle, pixel-ab) has its mutations proven under
   makepad's relax JIT, `--jobs` (default 8) at a time, through relax's
-  source overlay (`MAKEPAD_RUN_OVERLAY`): the working tree is never written
+  source overlay (`RELAX_OVERLAY`): the working tree is never written
   for them. **It expects a relax built in a makepad checkout**
   (`cargo build --release -p relax-runner --bin relax`, then
   `target/release/relax`), named by `GLYPH_RELAX` (default: `relax` on
-  PATH). Without one that runs, prove stops before proving anything; a
+  PATH), and one that reads the `RELAX_*` names (makepad since its
+  `makepad run` became `relax`; before that the same variables were
+  `MAKEPAD_RUN_*`, which prove no longer sets). The overlay is the one
+  patch this needs on top of upstream makepad (branch `relax-glyph3d` until
+  it lands; 2026-11-24). Without one that runs, prove stops before proving anything; a
   relax gate's mutation is never handed to cargo. Each route's clean tree
   runs natively and under relax first, and a disagreement fails loud with
   the diff (it once caught a gate whose PASS line was a log line). What the
