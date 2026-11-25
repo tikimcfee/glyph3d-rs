@@ -39,6 +39,9 @@ definition-engine = { path = "../crates/definition-engine" }
 # engine's (filtered as the engine's binary filters: GLYPH_TRACE, RUST_LOG).
 # Both already in the graph through the engine.
 log = "0.4"
+# BC7 encoding of the emoji sheet across every core (frame_feed.rs); the
+# version the engine resolves.
+rayon = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # `cfg(relax)` is set when makepad's relax JIT builds the host (it reads
