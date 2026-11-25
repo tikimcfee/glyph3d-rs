@@ -7,7 +7,6 @@
 #                              validate a commit, so a forgotten rebuild fails
 #                              here rather than passing
 #   cargo glyph run  [args]    launch the renderer
-#   cargo glyph prove          break each check on purpose, require it to notice
 #   cargo glyph gates          what each check compares, and cannot see
 #
 # This script exists so old muscle memory and any external caller keep working.

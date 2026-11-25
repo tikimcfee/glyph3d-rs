@@ -109,17 +109,6 @@ fn bring_forward(base: &Path, record: Option<&BTreeMap<String, String>>, now: &B
     (changed, unmoved)
 }
 
-/// Drop `name`'s stamp and forget `file` in its record, so the next build
-/// moves the file's mtime whatever it is: prove, after restoring a file a
-/// gate may have built a mutant from, outside the record's knowledge.
-pub(crate) fn forget(name: &str, file: &str) {
-    let _ = std::fs::remove_file(stamps().join(format!("{name}.sha256")));
-    if let Some(mut record) = record_of(name) {
-        record.remove(file);
-        let _ = std::fs::write(record_path(name), record_text(&record));
-    }
-}
-
 fn stamp_of(name: &str) -> Option<String> {
     std::fs::read_to_string(stamps().join(format!("{name}.sha256"))).ok()
 }
@@ -143,20 +132,6 @@ fn env_moved(name: &str) -> Vec<String> {
     let gone = was.lines().filter(|l| !now.lines().any(|n| n == *l)).map(|l| format!("- {l}"));
     let new = now.lines().filter(|l| !was.lines().any(|w| w == *l)).map(|l| format!("+ {l}"));
     gone.chain(new).collect()
-}
-
-/// The products that read `file` (repo-relative). A mutation of one of those
-/// files, built by its gate under a name the stamp does not cover (`cargo test
-/// --release` links the renderer for the integration tests), leaves a MUTATED
-/// artifact behind an unchanged input hash once the file is restored.
-pub(crate) fn products_reading<'m>(m: &'m Manifest, file: &str) -> Vec<&'m str> {
-    let f = root().join(file);
-    m.artifact
-        .iter()
-        .filter(|(_, a)| a.class == Class::Product)
-        .filter(|(_, a)| a.inputs.iter().any(|pat| expand(pat).contains(&f)))
-        .map(|(name, _)| name.as_str())
-        .collect()
 }
 
 /// Current: the stamp is this content in this environment, and the record
@@ -239,16 +214,6 @@ pub(crate) fn ensure_products(m: &Manifest, frozen: bool) -> bool {
 mod tests {
     use super::*;
     use crate::load;
-
-    /// prove re-stales exactly the products a restored file feeds: a renderer
-    /// source and a crate source do, a check script does not.
-    #[test]
-    fn mutated_inputs_name_the_products_they_feed() {
-        let m = load().expect("build.toml loads");
-        assert_eq!(products_reading(&m, "native/src/main.rs"), ["renderer"]);
-        assert_eq!(products_reading(&m, "crates/glyph-field/src/host_slots.rs"), ["renderer"]);
-        assert!(products_reading(&m, "tools/check-pick-oracle.sh").is_empty());
-    }
 
     /// A product built under other cargo settings is not current: the build
     /// environment is part of the stamp, so a profile, flag or toolchain
