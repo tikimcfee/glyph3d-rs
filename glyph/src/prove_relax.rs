@@ -415,9 +415,17 @@ fn package_dir(package: &str) -> PathBuf {
 /// bounded by `[settings] process_timeout_secs` as the cargo-test gate
 /// bounds a test binary (2026-11-01): past it the run is killed and fails
 /// with a `FAILED ... timed out` line the judge and the report carry.
+///
+/// `--release`, as the cargo-test gate runs: upstream relax builds a test
+/// under cargo's profile as cargo does (`test`, inheriting `dev`, without
+/// it), so with no flag every `debug_assert!` is live under relax and
+/// compiled out natively, and the two runs judge different programs. Seen
+/// 2026-11-24: `tab_stops_agree_on_every_tier` panicked under relax only,
+/// on `pack_row`'s column-page assertion (release saturates it). The fork
+/// relax ignored the profile and always built as release.
 fn relax_test(m: &Manifest, package: &str, target: &[String], filters: &[&str], env: &[(&str, OsString)]) -> (bool, String) {
     let mut c = Command::new(relax_bin());
-    c.arg("--allow-c").arg("test").arg(package).args(target).arg("--").args(filters);
+    c.arg("--allow-c").arg("test").arg(package).arg("--release").args(target).arg("--").args(filters);
     c.current_dir(package_dir(package)).envs(env.iter().map(|(k, v)| (k, v)));
     let limit = m.settings.process_timeout();
     let o = crate::bounded::run_within(&mut c, limit, true);
