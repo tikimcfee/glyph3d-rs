@@ -303,8 +303,11 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
 - **`test --relax` runs the tree under relax instead of building it**
   (2026-11-01, `GLYPH_RELAX` as for prove). The inner tier only, since the
   merge tier is rustc's, clippy's and rustdoc's diagnostics: cargo-test is
-  every test target under `relax test`, `--jobs` (default 4) at once, judged
-  by the same floor, and the renderer gates run `GLYPH_RENDERER` = the
+  every test target under `relax test --release` (the cargo-test gate's
+  profile: upstream relax honours cargo's profiles, and without the flag
+  builds tests under `test`, so every `debug_assert!` ran live under relax
+  and compiled out natively; 2026-11-24), `--jobs` (default 4) at once,
+  judged by the same floor, and the renderer gates run `GLYPH_RENDERER` = the
   renderer under `relax run`. Its verdict says "under relax — not a landing
   run": land on the native `glyph test`. What it is for is fidelity and a
   tree with no native build, NOT speed. Measured on the M2 under sibling load
@@ -375,11 +378,16 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   with `relax = "test"` (cargo-test) or `relax = "renderer"` (pick-oracle,
   reference-port, hyper-oracle, pixel-ab) has its mutations proven under
   makepad's relax JIT, `--jobs` (default 8) at a time, through relax's
-  source overlay (`MAKEPAD_RUN_OVERLAY`): the working tree is never written
+  source overlay (`RELAX_OVERLAY`): the working tree is never written
   for them. **It expects a relax built in a makepad checkout**
   (`cargo build --release -p relax-runner --bin relax`, then
   `target/release/relax`), named by `GLYPH_RELAX` (default: `relax` on
-  PATH). Without one that runs, prove stops before proving anything; a
+  PATH), and one that reads the `RELAX_*` names (makepad since its
+  `makepad run` became `relax`; before that the same variables were
+  `MAKEPAD_RUN_*`, which prove no longer sets). The overlay is the one
+  patch this needs on top of upstream makepad: `tikimcfee/makepad` `work`,
+  upstream's `work` plus that commit, the head of the one PR it goes upstream
+  by (2026-11-24). The older fork relax binaries read only the old names. Without one that runs, prove stops before proving anything; a
   relax gate's mutation is never handed to cargo. Each route's clean tree
   runs natively and under relax first, and a disagreement fails loud with
   the diff (it once caught a gate whose PASS line was a log line). What the

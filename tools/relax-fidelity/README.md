@@ -22,7 +22,7 @@ in `$RELAX`. Relax runs the renderer as
 because wayland-backend builds C. Its tests run as
 `relax test --quiet --allow-c <package> [--lib|--tests]`. The renderer's first
 cold compile under relax takes about three minutes; later runs reuse
-`target/makepad-run`.
+`target/relax`.
 
 - `src/main.rs` runs float kernels over adversarial inputs (±0, subnormals, quiet
   and signalling NaNs with payloads, ties, cast edges, 2^k boundaries) and over
@@ -62,7 +62,7 @@ backends in `backend/src/{x64,arm64}.rs`; passes in `codegen/src/{opt,loops}.rs`
 and `backend/src/passes.rs`; relax's own core in `compiler/std/core`) and from
 the harness. "Identical" means bit-identical on every input the harness tried,
 in every configuration: warm, cold cache with 16 repetitions, and
-`MAKEPAD_RUN_NO_AVX=1` (the SSE encodings, with `mul_add` through the C `fma`).
+`RELAX_NO_AVX=1` (the SSE encodings, with `mul_add` through the C `fma`).
 
 | Operation class | Verdict | Notes |
 |---|---|---|
@@ -70,9 +70,9 @@ in every configuration: warm, cold cache with 16 repetitions, and
 | `a*b + c` written out (all four operand orders) | identical | **no contraction**: relax makes `FMulAdd` only from the `fma` intrinsic (lower.rs) and `simd_fma` (lower/simd.rs). 6,000 triples chosen so that fused and unfused results must differ came out unfused |
 | `mul_add` (f32, f64; negated operands) | identical values | relax core: `fma_native()` ? `vfmadd` : C `fma`/`fmaf`; rustc links compiler-builtins' `fmaf`/`fma`. All are correctly rounded |
 | `sqrt` | identical | `sqrtss`/`sqrtsd` |
-| identity folds `x*1`, `1*x`, `x/1`, `x-0.0`, `x+(-0.0)` (and `x+0.0`, which must not fold) | identical values | relax has the fold (`backend/src/passes.rs:1588-1607`, off under `MAKEPAD_RUN_NAN_EXACT`), but in the harness's closures it never fired on any tier: a signalling NaN came back quieted, which only the instruction does. rustc folds (LLVM instsimplify) and keeps the sNaN. So the difference is sNaN bits, in the opposite direction to the audit's reading. `x * -1.0`: rustc folds to a sign flip (`0xff800001`), relax multiplies (`0x7fc00001`). `x + 0.0` on `-0.0` gives `+0.0` on both, so neither folds it |
+| identity folds `x*1`, `1*x`, `x/1`, `x-0.0`, `x+(-0.0)` (and `x+0.0`, which must not fold) | identical values | relax has the fold (`backend/src/passes.rs:1588-1607`, off under `RELAX_NAN_EXACT`), but in the harness's closures it never fired on any tier: a signalling NaN came back quieted, which only the instruction does. rustc folds (LLVM instsimplify) and keeps the sNaN. So the difference is sNaN bits, in the opposite direction to the audit's reading. `x * -1.0`: rustc folds to a sign flip (`0xff800001`), relax multiplies (`0x7fc00001`). `x + 0.0` on `-0.0` gives `+0.0` on both, so neither folds it |
 | `x / c` with `1/c` an exact power of two (2, 0.5, 2^±126, 2^127, 2^-149; f64 2^1022, 2^1023, 2^-1074) | identical | each beside the same division by a `black_box`ed constant, over the subnormal and NaN inputs too |
-| `mul_add` at its edges: exact ties (13-bit operands, addend 0, ±tiny, ±half an ulp), products past `MAX` brought back by the addend, subnormal products | identical | 21,000 f32 and 21,000 f64 triples, under AVX (`vfmadd`) and under `MAKEPAD_RUN_NO_AVX=1` (C `fma`) |
+| `mul_add` at its edges: exact ties (13-bit operands, addend 0, ±tiny, ±half an ulp), products past `MAX` brought back by the addend, subnormal products | identical | 21,000 f32 and 21,000 f64 triples, under AVX (`vfmadd`) and under `RELAX_NO_AVX=1` (C `fma`) |
 | wasm-export FMA (the f32-via-f64 double rounding and the f64 Dekker emulation, `backend/src/wasm.rs`) | **not covered** | only the native JIT was run; a native prove never reaches the wasm backend |
 | `std::simd` `mul_add` (`simd_fma`, emitted without a `cpu.fma` check) | **not covered** | `std::simd` is unstable on rustc 1.98, so there's no rustc side to compare; this host has FMA |
 | `floor ceil trunc round round_ties_even fract` | identical values | relax inlines `roundss` (and its own `round`); rustc calls compiler-builtins. Only a signalling NaN differs: relax quiets it |
