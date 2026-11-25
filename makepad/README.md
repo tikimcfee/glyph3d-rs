@@ -16,9 +16,10 @@ It expects a makepad checkout beside this repository:
 ```
 
 The checkout is `tikimcfee/makepad` `work` (since 2026-11-24): upstream
-makepad's `work` plus our commits, the head of the one PR they go upstream
-by. The host needs one of them, per-pass reverse-Z (`DrawPass::set_reverse_z`);
-until it lands upstream, a plain upstream checkout does not build the host.
+makepad's `work` plus our own commits, rebased when upstream moves; they
+are not going upstream. The host needs two of them, per-pass reverse-Z
+(`DrawPass::set_reverse_z`) and `blend_op: @Over`, so a plain upstream
+checkout does not build it, or draws its far glyphs wrong.
 The old fork (`fork-work-2026-11`, tag `archive/fork-work-2026-11-24`) is
 retired.
 

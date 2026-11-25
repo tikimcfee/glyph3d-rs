@@ -386,8 +386,8 @@ day. `tools/check-all.sh` still works; it is a thin door onto `cargo glyph test`
   `makepad run` became `relax`; before that the same variables were
   `MAKEPAD_RUN_*`, which prove no longer sets). The overlay is the one
   patch this needs on top of upstream makepad: `tikimcfee/makepad` `work`,
-  upstream's `work` plus that commit, the head of the one PR it goes upstream
-  by (2026-11-24). The older fork relax binaries read only the old names. Without one that runs, prove stops before proving anything; a
+  upstream's `work` plus our own commits, rebased when upstream moves and not
+  sent upstream (2026-11-24). The older fork relax binaries read only the old names. Without one that runs, prove stops before proving anything; a
   relax gate's mutation is never handed to cargo. Each route's clean tree
   runs natively and under relax first, and a disagreement fails loud with
   the diff (it once caught a gate whose PASS line was a log line). What the
