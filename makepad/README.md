@@ -15,6 +15,13 @@ It expects a makepad checkout beside this repository:
 <dir>/makepad/      the makepad checkout
 ```
 
+The checkout is `tikimcfee/makepad` `work` (since 2026-11-24): upstream
+makepad's `work` plus our commits, the head of the one PR they go upstream
+by. The host needs one of them, per-pass reverse-Z (`DrawPass::set_reverse_z`);
+until it lands upstream, a plain upstream checkout does not build the host.
+The old fork (`fork-work-2026-11`, tag `archive/fork-work-2026-11-24`) is
+retired.
+
 A worktree nested under `.claude/worktrees/` is two levels deeper, so give it
 the same sibling with a symlink (untracked): `ln -s <dir>/makepad
 .claude/worktrees/makepad`.

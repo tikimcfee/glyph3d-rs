@@ -12,7 +12,8 @@
 //! | composite.wgsl (fs_tint)         | `DrawG3Composite`                    |
 //!
 //! Every scene shader renders linear, premultiplied colour into a
-//! `RenderRGBAf16` target (`color_format: @Rgba16F`), so blending happens in
+//! `RenderRGBAf16` target (`color_format: @Rgba16F`; the blended ones declare
+//! `blend_op: @Over`, without which makepad writes a float target raw), so blending happens in
 //! linear light as it does in glyph3d's `Rgba8UnormSrgb` pool; the composite
 //! encodes linear → sRGB into the UI. The selection mask renders into a
 //! `RenderRu8` target (`@Ru8`, coverage in `.x`).
@@ -204,6 +205,7 @@ script_mod! {
     mod.draw.DrawG3Backdrop = mod.std.set_type_default() do #(DrawG3Backdrop::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
+        blend_op: @Over
         depth_write: true
         backface_culling: false
         vertex_pos: vertex_position(vec4f)
@@ -243,6 +245,7 @@ script_mod! {
     mod.draw.DrawG3Mesh = mod.std.set_type_default() do #(DrawG3Mesh::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
+        blend_op: @Over
         depth_write: true
         backface_culling: true
         vertex_pos: vertex_position(vec4f)
@@ -297,6 +300,7 @@ script_mod! {
     mod.draw.DrawG3GroupFace = mod.std.set_type_default() do #(DrawG3GroupFace::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
+        blend_op: @Over
         depth_write: true
         backface_culling: true
         vertex_pos: vertex_position(vec4f)
@@ -355,6 +359,7 @@ script_mod! {
     mod.draw.DrawG3Region = mod.std.set_type_default() do #(DrawG3Region::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
+        blend_op: @Over
         depth_write: false
         backface_culling: false
         vertex_pos: vertex_position(vec4f)
@@ -406,6 +411,7 @@ script_mod! {
     mod.draw.DrawG3Glyph = mod.std.set_type_default() do #(DrawG3Glyph::script_shader(vm)){
         color_format: @Rgba16F
         alpha_blend: true
+        blend_op: @Over
         depth_write: true
         backface_culling: false
         vertex_pos: vertex_position(vec4f)
@@ -1513,7 +1519,7 @@ impl G3Tables {
                 height: sheet.height,
                 layers: sheet.layers,
                 format: CompressedTextureFormat::Bc7,
-                data: Some(bc7),
+                data: Some(bc7.into()),
                 max_level: Some(sheet.max_level),
                 wrap: TextureWrap::ClampToEdge,
                 updated: TextureUpdated::Full,
@@ -1522,7 +1528,7 @@ impl G3Tables {
                 width: sheet.width,
                 height: sheet.height,
                 layers: sheet.layers,
-                data: Some(bgra),
+                data: Some(bgra.into()),
                 max_level: Some(sheet.max_level),
                 wrap: TextureWrap::ClampToEdge,
                 updated: TextureUpdated::Full,

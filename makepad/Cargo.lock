@@ -1077,6 +1077,7 @@ dependencies = [
  "log",
  "makepad-texcomp",
  "makepad-widgets",
+ "rayon",
  "tracing-subscriber",
 ]
 
@@ -1363,8 +1364,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-base64"
+version = "1.0.0"
+
+[[package]]
 name = "makepad-byteorder-lite"
 version = "0.1.0"
+
+[[package]]
+name = "makepad-civil-time"
+version = "0.1.0"
+
+[[package]]
+name = "makepad-core-util"
+version = "0.1.0"
+
+[[package]]
+name = "makepad-cpu-budget"
+version = "1.0.0"
+dependencies = [
+ "relax-api",
+]
 
 [[package]]
 name = "makepad-dbus-wire"
@@ -1399,16 +1419,13 @@ version = "2.0.0"
 dependencies = [
  "fxhash",
  "makepad-font-core",
- "makepad-gif",
+ "makepad-image-decode",
  "makepad-live-id",
  "makepad-math",
  "makepad-platform",
  "makepad-svg",
- "makepad-webp",
- "makepad-zune-bmp",
  "makepad-zune-jpeg",
  "makepad-zune-png",
- "makepad-zune-qoi",
  "rustybuzz",
  "ttf-parser",
  "unicode-bidi",
@@ -1479,20 +1496,23 @@ dependencies = [
  "makepad-a11y",
  "makepad-apple-sys",
  "makepad-atspi",
+ "makepad-core-util",
+ "makepad-cpu-budget",
  "makepad-dbus-wire",
  "makepad-font-core",
  "makepad-gpu-trace",
  "makepad-jni-sys",
  "makepad-key-code",
+ "makepad-lock-free",
  "makepad-math",
  "makepad-micro-serde",
  "makepad-objc-sys",
- "makepad-relax-api",
  "makepad-remote",
  "makepad-studio-protocol",
  "makepad-vulkan",
  "makepad-windows-sys",
  "makepad-zune-jpeg",
+ "relax-api",
  "wayland-client",
  "wayland-protocols",
 ]
@@ -1505,8 +1525,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-image-decode"
+version = "0.1.0"
+dependencies = [
+ "makepad-gif",
+ "makepad-webp",
+ "makepad-zune-bmp",
+ "makepad-zune-jpeg",
+ "makepad-zune-png",
+ "makepad-zune-qoi",
+]
+
+[[package]]
 name = "makepad-jni-sys"
 version = "0.4.0"
+
+[[package]]
+name = "makepad-jobs"
+version = "1.0.0"
 
 [[package]]
 name = "makepad-key-code"
@@ -1520,7 +1556,7 @@ name = "makepad-live-id"
 version = "1.0.0"
 dependencies = [
  "makepad-live-id-macros",
- "makepad-relax-api",
+ "relax-api",
 ]
 
 [[package]]
@@ -1543,6 +1579,10 @@ version = "0.1.0"
 dependencies = [
  "makepad-filesystem-watcher",
 ]
+
+[[package]]
+name = "makepad-lock-free"
+version = "0.1.0"
 
 [[package]]
 name = "makepad-math"
@@ -1584,6 +1624,7 @@ name = "makepad-network"
 version = "1.0.0"
 dependencies = [
  "makepad-apple-sys",
+ "makepad-civil-time",
  "makepad-error-log",
  "makepad-live-id",
  "makepad-micro-serde",
@@ -1604,17 +1645,20 @@ dependencies = [
  "makepad-alloc-epoch",
  "makepad-android-state",
  "makepad-apple-sys",
+ "makepad-core-util",
+ "makepad-cpu-budget",
  "makepad-futures",
  "makepad-gpu-trace",
  "makepad-hal",
  "makepad-jni-sys",
  "makepad-key-code",
  "makepad-live-reload-core",
+ "makepad-lock-free",
+ "makepad-micro-serde",
  "makepad-network",
  "makepad-objc-sys",
  "makepad-platform-video",
  "makepad-prof-stream",
- "makepad-relax",
  "makepad-remote",
  "makepad-script",
  "makepad-script-census",
@@ -1623,12 +1667,14 @@ dependencies = [
  "makepad-stack",
  "makepad-studio-protocol",
  "makepad-tsdf",
+ "makepad-tween",
  "makepad-vulkan",
  "makepad-wasm-bridge",
  "makepad-web-manifest",
  "makepad-windows-sys",
  "makepad-zune-jpeg",
  "makepad-zune-png",
+ "relax-attr",
  "smallvec 1.15.1",
 ]
 
@@ -1655,34 +1701,11 @@ name = "makepad-regex"
 version = "0.1.0"
 
 [[package]]
-name = "makepad-relax"
-version = "1.0.0"
-
-[[package]]
-name = "makepad-relax-api"
-version = "1.0.0"
-dependencies = [
- "makepad-relax-api-macro",
-]
-
-[[package]]
-name = "makepad-relax-api-macro"
-version = "1.0.0"
-dependencies = [
- "makepad-relax-api-macro-impl",
-]
-
-[[package]]
-name = "makepad-relax-api-macro-impl"
-version = "1.0.0"
-dependencies = [
- "makepad-micro-proc-macro",
-]
-
-[[package]]
 name = "makepad-remote"
 version = "0.1.0"
 dependencies = [
+ "makepad-base64",
+ "makepad-core-util",
  "makepad-network",
  "makepad-strict-json",
  "makepad-toml-parser",
@@ -1699,18 +1722,18 @@ dependencies = [
  "makepad-live-id",
  "makepad-math",
  "makepad-regex",
- "makepad-relax",
- "makepad-relax-api",
  "makepad-script-derive",
  "makepad-shader",
+ "relax-api",
+ "relax-attr",
 ]
 
 [[package]]
 name = "makepad-script-census"
 version = "1.0.0"
 dependencies = [
- "makepad-relax-api",
  "makepad-script",
+ "relax-api",
 ]
 
 [[package]]
@@ -1734,8 +1757,8 @@ version = "1.0.0"
 dependencies = [
  "makepad-live-id",
  "makepad-network",
- "makepad-relax-api",
  "makepad-script",
+ "relax-api",
 ]
 
 [[package]]
@@ -1743,7 +1766,7 @@ name = "makepad-shader"
 version = "1.0.0"
 dependencies = [
  "makepad-live-id",
- "makepad-relax-api",
+ "relax-api",
 ]
 
 [[package]]
@@ -1834,6 +1857,7 @@ dependencies = [
  "makepad-app-icons",
  "makepad-derive-widget",
  "makepad-draw",
+ "makepad-jobs",
  "makepad-tween",
  "ttf-parser",
  "unicode-segmentation 1.12.0",
@@ -2422,6 +2446,36 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relax-api"
+version = "1.0.0"
+dependencies = [
+ "relax-api-macro",
+ "relax-api-phase",
+]
+
+[[package]]
+name = "relax-api-macro"
+version = "1.0.0"
+dependencies = [
+ "relax-api-macro-impl",
+]
+
+[[package]]
+name = "relax-api-macro-impl"
+version = "1.0.0"
+dependencies = [
+ "makepad-micro-proc-macro",
+]
+
+[[package]]
+name = "relax-api-phase"
+version = "1.0.0"
+
+[[package]]
+name = "relax-attr"
+version = "1.0.0"
 
 [[package]]
 name = "rgb"

@@ -36,9 +36,16 @@ fn emoji_sheet_of(atlas: &Atlas, use_bc7: bool) -> G3EmojiSheet {
             bc7_len += makepad_texcomp::bc7::encoded_len(w, h);
         });
         let mut bc7 = Vec::with_capacity(bc7_len);
+        // makepad's encoders take an executor (texcomp `run_inline`'s contract:
+        // every chunk index once, returning when all are done); the fork's
+        // `threads = 0` meant all cores, which rayon's pool is.
+        let all_cores = |chunks: usize, work: &(dyn Fn(usize) + Sync)| {
+            use rayon::prelude::*;
+            (0..chunks).into_par_iter().for_each(work)
+        };
         let t0 = std::time::Instant::now();
         atlas.emoji.for_each_level(|_, _, w, h, rgba| {
-            makepad_texcomp::bc7::encode_image_into(rgba, w, h, 0, &mut bc7)
+            makepad_texcomp::bc7::encode_image_into(rgba, w, h, &all_cores, &mut bc7)
                 .expect("emoji sheet level dimensions match RGBA8 slice");
         });
         makepad_widgets::log!(
