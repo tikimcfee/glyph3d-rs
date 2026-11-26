@@ -53,7 +53,7 @@ pub const MAP_LABEL_PAD_X_PX: f64 = 6.0;
 
 /// Approximate character advance in CSS pixels for the default `12px` monospace
 /// map-label font when the caller does not supply an explicit measured width.
-const DEFAULT_MAP_LABEL_CHAR_PX: f64 = 7.2;
+pub const DEFAULT_MAP_LABEL_CHAR_PX: f64 = 7.2;
 
 /// Idle and focused sRGB colours (`0xRRGGBB`) for a bar's strip fill and title text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -148,9 +148,18 @@ pub fn bar_world_height(zoom: f64, max_world_height: f64) -> f64 {
 /// Estimate a map label's box width in CSS pixels when no measured glyph width
 /// is supplied (`ceil(text_px) + 2 * PAD_X + 2` in `MapLabels._width`).
 pub fn estimate_map_label_width(name: &str) -> f64 {
-    ((name.chars().count() as f64) * DEFAULT_MAP_LABEL_CHAR_PX).ceil()
-        + 2.0 * MAP_LABEL_PAD_X_PX
-        + 2.0
+    estimate_map_label_width_with(name, DEFAULT_MAP_LABEL_CHAR_PX)
+}
+
+/// Estimate a map label's box width in CSS pixels using a measured per-character
+/// advance `char_px` at the map-label font size (`ceil(chars * char_px) + 2 * PAD_X + 2`).
+pub fn estimate_map_label_width_with(name: &str, char_px: f64) -> f64 {
+    let advance = if char_px.is_finite() && char_px > 0.0 {
+        char_px
+    } else {
+        DEFAULT_MAP_LABEL_CHAR_PX
+    };
+    ((name.chars().count() as f64) * advance).ceil() + 2.0 * MAP_LABEL_PAD_X_PX + 2.0
 }
 
 /// Geometry and text-fit outcome produced by [`TitleBarModel::layout`].
@@ -394,6 +403,7 @@ pub struct MapLabelDecision {
     pub id: String,
     pub name: String,
     pub focused: bool,
+    pub hovered: bool,
     pub target: ScreenBox,
     pub placement: Option<Placement>,
 }
@@ -669,6 +679,7 @@ impl WallNames {
                 id: term.id.clone(),
                 name: term.name.clone(),
                 focused: frame.focused_id.as_deref() == Some(term.id.as_str()),
+                hovered: frame.hovered_id.as_deref() == Some(term.id.as_str()),
                 target,
                 placement,
             });

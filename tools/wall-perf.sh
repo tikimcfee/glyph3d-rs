@@ -66,7 +66,7 @@ done
 
 if [[ "$NO_BUILD" != "1" ]]; then
   echo "Building release glyph3d-native, wallctl, and termd_bench_ctl..." >&2
-  cargo build --release -p glyph3d-native --bin glyph3d-native $CARGO_BUILD_EXTRA >&2
+  cargo build --release -p glyph3d-native $CARGO_BUILD_EXTRA >&2
   cargo build --release -p termd-client --example termd_bench_ctl >&2
 fi
 

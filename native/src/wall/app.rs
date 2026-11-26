@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::Vec2;
 use term_cells::Screen;
@@ -32,7 +32,7 @@ use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
 use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
-use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
+use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -212,6 +212,56 @@ fn cursor_of(c: CursorIcon) -> winit::window::CursorIcon {
     }
 }
 
+#[cfg(feature = "egui-ui")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerTarget {
+    Ui,
+    Wall,
+}
+
+/// Decide whether a pointer event at logical window point `pos` belongs to an
+/// open `egui` panel (`PointerTarget::Ui`) or to the canvas underneath
+/// (`PointerTarget::Wall`).
+///
+/// - While a wall button press/drag is in flight (`wall_buttons != 0`), moves,
+///   wheels, and releases stay with the wall so no gesture is stranded.
+/// - While `egui` is actively dragging a widget (`ctx.is_using_pointer()`),
+///   events stay with `egui` even if the cursor leads the panel box.
+/// - Otherwise, any event over an active `egui` `Area` (`ctx.layer_id_at(pos)`
+///   above `Order::Background`, or `egui_wants_pointer_input` / `is_pointer_over_area`
+///   when `pos` matches `ctx.pointer_latest_pos()`) goes to `egui`, and
+///   everything else goes to the wall.
+#[cfg(feature = "egui-ui")]
+fn pointer_target(
+    ui_active: bool,
+    ctx: &egui::Context,
+    pos: Point,
+    wall_buttons: u8,
+) -> PointerTarget {
+    if wall_buttons != 0 || !ui_active {
+        return PointerTarget::Wall;
+    }
+    let p = egui::pos2(pos.x as f32, pos.y as f32);
+    let over_area = ctx
+        .layer_id_at(p)
+        .is_some_and(|layer| layer.order != egui::Order::Background);
+    let over_settled = ctx.pointer_latest_pos().is_some_and(|lp| {
+        (lp - p).length_sq() <= 1.0
+            && (ctx.egui_wants_pointer_input() || ctx.is_pointer_over_egui())
+    });
+    if ctx.egui_is_using_pointer() || over_area || over_settled {
+        PointerTarget::Ui
+    } else {
+        PointerTarget::Wall
+    }
+}
+
+fn epoch_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// A screen as text, a line a row, trailing blanks and blank rows dropped.
 fn screen_text(s: &Screen) -> String {
     let mut out = String::new();
@@ -270,6 +320,54 @@ impl App {
     fn render_id(&mut self, id: &str) -> u64 {
         let next = self.render_ids.len() as u64 + 1;
         *self.render_ids.entry(id.to_string()).or_insert(next)
+    }
+
+    #[cfg(feature = "egui-ui")]
+    fn pointer_goes_to_ui(&self, ui_outcome: &UiEventOutcome) -> bool {
+        if self.buttons != 0 {
+            return false;
+        }
+        if ui_outcome.consumed {
+            return true;
+        }
+        self.gfx.as_ref().is_some_and(|g| {
+            pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+                == PointerTarget::Ui
+        })
+    }
+
+    /// Pull the connected daemon's live `status` document (or `WELCOME` metadata
+    /// if `status` is unavailable) into [`Wall::on_termd_status`].
+    fn refresh_termd_status(&mut self) {
+        let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &self.terms) else {
+            return;
+        };
+        let now_ms = epoch_now_ms();
+        let doc = match sessions.hub().status() {
+            Ok(val) => val,
+            Err(_) => {
+                let welcome = sessions.hub().welcome();
+                let terms: Vec<serde_json::Value> = sessions
+                    .ids()
+                    .map(|id| {
+                        let (cols, rows) = sessions
+                            .screen(id)
+                            .map_or((0, 0), |s| (s.cols, s.rows));
+                        serde_json::json!({ "id": id, "cols": cols, "rows": rows })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "daemon": {
+                        "version": welcome.daemon,
+                        "engine": welcome.engine,
+                        "ns": welcome.ns,
+                        "pid": welcome.pid,
+                    },
+                    "terminals": terms,
+                })
+            }
+        };
+        let _ = wall.on_termd_status(doc, now_ms);
     }
 
     fn open(&mut self, event_loop: &ActiveEventLoop) {
@@ -402,12 +500,29 @@ impl App {
         self.wall = Some(wall);
         self.terms = Some(terms);
         self.apply_effects();
+        self.refresh_termd_status();
         if let Some(wall) = &mut self.wall {
             wall.run("wall.fit");
         }
         self.apply_effects();
         self.serve_control();
         self.pump(false);
+        if let Ok(hover_id) = std::env::var("GLYPH_WALL_HOVER") {
+            let hover_pt = self.wall.as_mut().and_then(|wall| {
+                let f = wall.frame();
+                let bar = f.title_bars.iter().find(|b| b.terminal_id == hover_id)?;
+                let sb = f.camera.to_screen_box(bar.rect, f.viewport.w, f.viewport.h);
+                Some(Point::new(0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom)))
+            });
+            if let Some(pt) = hover_pt {
+                self.cursor = pt;
+                let ev = self.pointer(None);
+                if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                    wall.pointer_move(&ev, &screen_lookup(|id| terms.screen(id)));
+                }
+                self.apply_effects();
+            }
+        }
         self.perf.mark_opened(&self.proxy);
         self.redraw();
     }
@@ -494,19 +609,26 @@ impl App {
             other => {
                 let Terminals::Live(sessions) = terms else { return };
                 match other {
-                    WallEffect::SpawnTerminal { argv, cols, rows, .. } => match sessions.spawn(argv, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16) {
-                        Ok((id, cols, rows)) => {
-                            wall.terminal_appeared(TerminalAppeared::new(id, u32::from(cols), u32::from(rows)));
+                    WallEffect::SpawnTerminal { argv, cols, rows, .. } => {
+                        match sessions.spawn(argv, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16) {
+                            Ok((id, cols, rows)) => {
+                                wall.terminal_appeared(TerminalAppeared::new(id, u32::from(cols), u32::from(rows)));
+                            }
+                            Err(e) => log::error!("the wall could not start a terminal: {e}"),
                         }
-                        Err(e) => log::error!("the wall could not start a terminal: {e}"),
-                    },
-                    WallEffect::KillTerminal { id } => sessions.kill(&id),
+                        self.refresh_termd_status();
+                    }
+                    WallEffect::KillTerminal { id } => {
+                        sessions.kill(&id);
+                        self.refresh_termd_status();
+                    }
                     WallEffect::ResizeTerminal { id, cols, rows } => sessions.resize(&id, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16),
                     WallEffect::SendKey { id, key } => sessions.key(&id, &key),
                     WallEffect::PasteTerminal { id, text } => sessions.paste(&id, &text),
                     WallEffect::SendMouse { id, event } => sessions.mouse(&id, &event),
                     // wall-core emits +lines for up-into-history; Sessions::scroll takes negative for up.
                     WallEffect::ScrollTerminal { id, lines, cell } => sessions.scroll(&id, lines.saturating_neg(), cell.x, cell.y),
+                    WallEffect::ScrollTerminalLive { id } => sessions.scroll_live(&id),
                     WallEffect::RefreshTerminal { id } => sessions.repaint(&id),
                     _ => {}
                 }
@@ -643,13 +765,36 @@ impl App {
         let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
         let (changed, news) = sessions.pump();
-        let mut heard = !news.is_empty();
+        let mut heard = false;
+        let mut ended_any = false;
         for n in news {
             match n {
-                News::Resized { id, cols, rows } => wall.terminal_resized(&id, u32::from(cols), u32::from(rows)),
-                News::Title { id, title } => wall.terminal_title(&id, title),
-                News::Modes { id, modes } => wall.terminal_modes(&id, modes),
-                News::Ended { id } => wall.terminal_ended(&id),
+                News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                    if let Some(screen) = sessions.screen(&id) {
+                        heard |= wall.terminal_screen_filled(
+                            &id,
+                            screen,
+                            ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
+                        );
+                    }
+                }
+                News::Resized { id, cols, rows } => {
+                    wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
+                    heard = true;
+                }
+                News::Title { id, title } => {
+                    wall.terminal_title(&id, title);
+                    heard = true;
+                }
+                News::Modes { id, modes } => {
+                    wall.terminal_modes(&id, modes);
+                    heard = true;
+                }
+                News::Ended { id } => {
+                    wall.terminal_ended(&id);
+                    heard = true;
+                    ended_any = true;
+                }
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
@@ -657,6 +802,7 @@ impl App {
                         "termd ({}) disconnected — waiting for daemon",
                         wall.termd().namespace()
                     ));
+                    heard = true;
                 }
             }
         }
@@ -676,6 +822,7 @@ impl App {
             }
             wall.set_connected(true);
             heard = true;
+            ended_any = true;
         }
         for id in sessions.take_external_appeared() {
             match sessions.adopt(&id) {
@@ -685,6 +832,9 @@ impl App {
                 }
                 Err(e) => log::error!("{e}"),
             }
+        }
+        if ended_any {
+            self.refresh_termd_status();
         }
         if heard {
             self.apply_effects();
@@ -828,6 +978,8 @@ impl App {
         };
 
         #[cfg(feature = "egui-ui")]
+        self.panels.set_wall_dragging(self.buttons != 0);
+        #[cfg(feature = "egui-ui")]
         let mut panel_verbs: Vec<String> = Vec::new();
         #[cfg(feature = "egui-ui")]
         let mut panel_egui_keys = false;
@@ -909,16 +1061,23 @@ impl App {
         #[cfg(feature = "egui-ui")]
         {
             let mut changed = false;
+            let mut status_opened = false;
             if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
                 changed |= self.panels.sync_after_pass(wall, panel_egui_keys);
                 if !panel_verbs.is_empty() {
                     let lookup = screen_lookup(|id| terms.screen(id));
                     for verb in &panel_verbs {
+                        if verb.starts_with("wall.status") {
+                            status_opened = true;
+                        }
                         let reply = wall.run_with_screens(verb.as_str(), &lookup);
                         self.panels.record_verb_reply(verb, &reply.text);
                     }
                     changed = true;
                 }
+            }
+            if status_opened {
+                self.refresh_termd_status();
             }
             if changed {
                 self.apply_effects();
@@ -1156,12 +1315,17 @@ impl App {
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
         let lookup = screen_lookup(|id| terms.screen(id));
         if pressed {
-            // A secondary press (right-click, or Ctrl+left-click on macOS) may be
-            // the wall's menu, or the focused program's.
-            if secondary && wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
-                self.apply_effects();
-                self.redraw();
-                return;
+            // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
+            // mouse-reporting program claims it; no browser-menu passthrough.
+            if secondary {
+                if wall.menu().is_some() {
+                    let _ = wall.run("wall.menu close");
+                }
+                if wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+                    self.apply_effects();
+                    self.redraw();
+                    return;
+                }
             }
             wall.pointer_down(&ev, &lookup);
         } else {
@@ -1201,6 +1365,10 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            let sf = self.scale_factor();
+            self.cursor = Point::new(position.x / sf, position.y / sf);
+        }
         #[cfg(feature = "egui-ui")]
         let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
         #[cfg(feature = "egui-ui")]
@@ -1218,7 +1386,7 @@ impl ApplicationHandler<Wake> for App {
         }
         #[cfg(feature = "egui-ui")]
         let (ui_pointer, ui_keys) = (
-            ui_outcome.consumed || ui_outcome.wants_pointer,
+            self.pointer_goes_to_ui(&ui_outcome),
             ui_outcome.consumed || ui_outcome.wants_keyboard || panels_want_keys,
         );
         #[cfg(not(feature = "egui-ui"))]
@@ -1246,18 +1414,22 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.scale_factor();
                 let (x, y) = (position.x / sf, position.y / sf);
-                if ui_pointer && self.buttons == 0 {
-                    self.cursor = Point::new(x, y);
+                if ui_pointer {
                     return;
                 }
                 self.move_cursor(x, y);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                // A release always reaches the wall, so no gesture is left hanging.
-                if ui_pointer && state == ElementState::Pressed {
-                    return;
+                if state == ElementState::Pressed {
+                    if ui_pointer {
+                        return;
+                    }
+                    self.mouse(state, button);
+                } else if button_of(button).is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0) {
+                    // Only releases matching an active wall press reach the wall,
+                    // keeping wall drags whole without leaking UI button clicks.
+                    self.mouse(state, button);
                 }
-                self.mouse(state, button);
             }
             WindowEvent::MouseWheel { delta, .. } if !ui_pointer => self.wheel(delta),
             WindowEvent::PinchGesture { delta, .. } if !ui_pointer => self.pinch(delta),
@@ -1432,5 +1604,120 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
                 print!("{}", screen_text(s));
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "egui-ui"))]
+mod tests {
+    use super::*;
+
+    fn draw_right_sidebar_area(ctx: &egui::Context, events: Vec<egui::Event>) -> bool {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let full = ctx.run_ui(raw, |root_ui| {
+            egui::Area::new(egui::Id::new("test_panel"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(952.0, 0.0))
+                .default_size(egui::vec2(248.0, 800.0))
+                .interactable(true)
+                .show(root_ui.ctx(), |ui| {
+                    if ui.is_sizing_pass() {
+                        ui.ctx().request_discard("test_panel initial sizing");
+                    }
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(248.0, 800.0), egui::Sense::click_and_drag());
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+                });
+        });
+        !full.shapes.is_empty()
+    }
+
+    #[test]
+    fn pointer_target_blocks_clicks_wheels_and_drags_over_open_panels_and_passes_canvas() {
+        let ctx = egui::Context::default();
+
+        // Inactive UI: every point goes to the wall.
+        assert_eq!(
+            pointer_target(false, &ctx, Point::new(1050.0, 200.0), 0),
+            PointerTarget::Wall
+        );
+
+        // Open docked right panel covering x in [952..1200], y in [0..800].
+        let active = draw_right_sidebar_area(&ctx, Vec::new());
+        assert!(active);
+
+        // Points inside the open panel route to `Ui` (even before any `PointerMoved` ran in `ctx`);
+        // points on the uncovered canvas route to `Wall`.
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(1050.0, 200.0), 0),
+            PointerTarget::Ui
+        );
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(400.0, 300.0), 0),
+            PointerTarget::Wall
+        );
+
+        // Settled hover over the panel sets `is_pointer_over_egui()` / `egui_wants_pointer_input()`;
+        // moving off onto the canvas between frames still routes the live canvas point to `Wall`.
+        let _ = draw_right_sidebar_area(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(1050.0, 200.0))],
+        );
+        assert!(ctx.is_pointer_over_egui());
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(1050.0, 200.0), 0),
+            PointerTarget::Ui
+        );
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(300.0, 300.0), 0),
+            PointerTarget::Wall
+        );
+
+        // An active egui drag (`egui_is_using_pointer()`) keeps the pointer even if the cursor moves
+        // outside the panel's bounds mid-drag.
+        let _ = draw_right_sidebar_area(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(1050.0, 200.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(1050.0, 200.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = draw_right_sidebar_area(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(900.0, 200.0))],
+        );
+        assert!(ctx.egui_is_using_pointer());
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(900.0, 200.0), 0),
+            PointerTarget::Ui
+        );
+
+        // Release egui drag; a drag started on the wall (`wall_buttons != 0`) stays with `Wall`
+        // even when passing across an open panel.
+        let _ = draw_right_sidebar_area(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(900.0, 200.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!ctx.egui_is_using_pointer());
+        assert_eq!(
+            pointer_target(true, &ctx, Point::new(1050.0, 200.0), Buttons::LEFT.0),
+            PointerTarget::Wall
+        );
     }
 }
