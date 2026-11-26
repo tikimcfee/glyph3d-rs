@@ -3813,4 +3813,136 @@ mod tests {
         assert_eq!(count_ul_band(&px_clear, 16, 1, is_amber), 0, "cleared hover link must leave zero underline");
         assert_eq!(count_ul_band(&px_clear, 4, 2, is_amber), 0, "cleared hover link row 2 must leave zero underline");
     }
+
+    /// Scrolled-back terminal state:
+    /// - Replaying a `g3d-termd` scrollback `REPAINT` (`\x1b[?25l` cursor hidden) draws ZERO
+    ///   focused cursor pixels on the cell grid.
+    /// - `push_scrollback_indicator` draws the right-edge thumb and top-right `↑42` pill in the
+    ///   JS `AgentViewOverlay` `liveChip` palette (`#1a3026` / `#356b4f` / `#8ef0b8`).
+    #[test]
+    fn gpu_scrolled_back_hides_cursor_and_draws_chrome_indicator() {
+        use super::super::metrics::WorldRect;
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Simulate g3d-termd's `repaint::view` payload: historical lines + `\x1b[0m\x1b[?25l`.
+        let mut vt_stream = String::from("\x1b[?1049l\x1b[!p\x1b[H\x1b[2J");
+        for i in 1..=10 {
+            vt_stream.push_str(&format!("HISTLINE_{i:02}  scrolled history output from earlier build"));
+            if i < 10 {
+                vt_stream.push_str("\r\n");
+            }
+        }
+        vt_stream.push_str("\x1b[5;12H\x1b[0m\x1b[?25l");
+        let screen = super::super::replay::replay_screen(vt_stream.as_bytes(), 60, 10);
+        assert!(!screen.cursor.visible, "termd scrollback view must hide the cursor via DECTCEM");
+
+        let m = renderer.metrics();
+        let pad = renderer.style().panel_padding;
+        let body_rect = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, pad);
+        let w = 960u32;
+        let h = 360u32;
+        let cam = WallCamera::frame_rect(body_rect, (w, h), 1.10);
+
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        let family = renderer.font_family();
+        let pill_rect = {
+            let mut fonts = super::super::chrome::ChromeFonts::new(
+                m,
+                renderer.glyphs_mut().atlas_mut(),
+                family,
+            );
+            super::super::chrome::push_scrollback_indicator(
+                &mut shapes,
+                &mut labels,
+                &mut fonts,
+                super::super::chrome::ChromeView::new(cam.zoom, 1.0),
+                &super::super::chrome::ScrollbackIndicatorDesc {
+                    body_rect,
+                    z: 2.0,
+                    offset: 42,
+                    max: 200,
+                    visible_rows: screen.rows,
+                    viewing: true,
+                    focused: true,
+                },
+            )
+        }
+        .expect("scrolled-back terminal must emit scrollback badge");
+
+        let draw = TerminalDraw {
+            id: 606,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+        let frame = WallFrame {
+            paper: None,
+            terminals: &[draw],
+            shapes: &shapes,
+            labels: &labels,
+        };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_SCROLL_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &frame, (w, h), 1, Path::new(&path));
+            }
+        }
+
+        let count_rect = |r: WorldRect, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(r.min.x, r.max.y), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(r.max.x, r.min.y), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Cursor at (col 11, row 4) must be completely hidden (0 bright #6ee7a0 cursor pixels).
+        let cur_rect = WorldRect::new(
+            Vec2::new(11.0 * m.cell_width, -5.0 * m.cell_height),
+            Vec2::new(12.0 * m.cell_width, -4.0 * m.cell_height),
+        );
+        let is_cursor = |c: [u8; 3]| c[0].abs_diff(0x6e) <= 6 && c[1].abs_diff(0xe7) <= 6 && c[2].abs_diff(0xa0) <= 6;
+        assert_eq!(count_rect(cur_rect, is_cursor), 0, "hidden scrollback cursor must draw 0 cursor pixels");
+
+        // 2. Top-right pill shows #1a3026 fill and #8ef0b8 text (strictly brighter than #356b4f border g=107).
+        let is_pill_bg = |c: [u8; 3]| c[0].abs_diff(0x1a) <= 4 && c[1].abs_diff(0x30) <= 4 && c[2].abs_diff(0x26) <= 4;
+        let is_pill_fg = |c: [u8; 3]| c[1] >= 135 && c[2] >= 95 && c[1] > c[0] + 35;
+        let bg_px = count_rect(pill_rect, is_pill_bg);
+        let fg_px = count_rect(pill_rect, is_pill_fg);
+        assert!(bg_px > 100, "scrollback pill must draw #1a3026 fill (got {bg_px} px)");
+        assert!(fg_px >= 25, "scrollback pill must draw #8ef0b8 text (got {fg_px} px)");
+
+        // 3. Right-edge thumb appears along the right inside edge of body_rect.
+        let right_strip = WorldRect::new(
+            Vec2::new(body_rect.max.x - 8.0 / cam.zoom, body_rect.min.y + 4.0 / cam.zoom),
+            Vec2::new(body_rect.max.x - 2.0 / cam.zoom, body_rect.max.y - 4.0 / cam.zoom),
+        );
+        let is_thumb = |c: [u8; 3]| c[1] > 120 && c[1] > c[0] + 30;
+        assert!(count_rect(right_strip, is_thumb) > 30, "scrollback right-edge thumb must be visible");
+    }
 }
