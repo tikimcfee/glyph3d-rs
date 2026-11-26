@@ -1,0 +1,16 @@
+[package]
+name = "term-session"
+version = "0.1.0"
+edition = "2021"
+description = "Live terminal sessions over g3d-termd: one emulator thread per terminal with frame-coalesced screen publishing (the wall)."
+
+[dependencies]
+glyph-vt = { path = "../glyph-vt" }
+log = "0.4"
+serde_json = "1"
+term-cells = { path = "../term-cells" }
+termd-client = { path = "../termd-client" }
+wall-core = { path = "../wall-core" }
+
+[lints]
+workspace = true

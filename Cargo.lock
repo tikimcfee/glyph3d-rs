@@ -1830,6 +1830,7 @@ dependencies = [
  "serde_json",
  "simdutf8",
  "term-cells",
+ "term-session",
  "termd-client",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
@@ -4049,6 +4050,18 @@ dependencies = [
 [[package]]
 name = "term-cells"
 version = "0.1.0"
+
+[[package]]
+name = "term-session"
+version = "0.1.0"
+dependencies = [
+ "glyph-vt",
+ "log",
+ "serde_json",
+ "term-cells",
+ "termd-client",
+ "wall-core",
+]
 
 [[package]]
 name = "termcolor"
