@@ -195,6 +195,9 @@ pub struct Screen {
     /// panel behind every cell with no fill.
     pub default_fg: u32,
     pub default_bg: u32,
+    /// The colour the program asked its cursor to be (OSC 12), or the
+    /// theme's. Alpha 0 means it named none: the host draws its own.
+    pub cursor_color: u32,
 }
 
 impl Screen {
