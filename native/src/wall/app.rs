@@ -32,7 +32,7 @@ use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
 use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
-use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
+use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -659,6 +659,7 @@ impl App {
                     WallEffect::SendMouse { id, event } => sessions.mouse(&id, &event),
                     // wall-core emits +lines for up-into-history; Sessions::scroll takes negative for up.
                     WallEffect::ScrollTerminal { id, lines, cell } => sessions.scroll(&id, lines.saturating_neg(), cell.x, cell.y),
+                    WallEffect::ScrollTerminalLive { id } => sessions.scroll_live(&id),
                     WallEffect::RefreshTerminal { id } => sessions.repaint(&id),
                     _ => {}
                 }
@@ -788,15 +789,34 @@ impl App {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
         let t_pump = Instant::now();
         let (changed, news) = sessions.pump();
-        let mut heard = !news.is_empty();
+        let mut heard = false;
         let mut ended_any = false;
         for n in news {
             match n {
-                News::Resized { id, cols, rows } => wall.terminal_resized(&id, u32::from(cols), u32::from(rows)),
-                News::Title { id, title } => wall.terminal_title(&id, title),
-                News::Modes { id, modes } => wall.terminal_modes(&id, modes),
+                News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                    if let Some(screen) = sessions.screen(&id) {
+                        heard |= wall.terminal_screen_filled(
+                            &id,
+                            screen,
+                            ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
+                        );
+                    }
+                }
+                News::Resized { id, cols, rows } => {
+                    wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
+                    heard = true;
+                }
+                News::Title { id, title } => {
+                    wall.terminal_title(&id, title);
+                    heard = true;
+                }
+                News::Modes { id, modes } => {
+                    wall.terminal_modes(&id, modes);
+                    heard = true;
+                }
                 News::Ended { id } => {
                     wall.terminal_ended(&id);
+                    heard = true;
                     ended_any = true;
                 }
                 News::Disconnected { message } => {
@@ -806,6 +826,7 @@ impl App {
                         "termd ({}) disconnected — waiting for daemon",
                         wall.termd().namespace()
                     ));
+                    heard = true;
                 }
             }
         }

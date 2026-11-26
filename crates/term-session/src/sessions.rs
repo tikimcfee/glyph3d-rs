@@ -49,6 +49,17 @@ const PASSIVE_RECONNECT_POLL: Duration = Duration::from_millis(300);
 /// state machine (`wall_core::wall::Wall`) to hear.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum News {
+    /// Its screen was refilled by its emulator thread since the last [`Sessions::pump`].
+    /// `rewritten_cols` holds per-row `(lo, hi)` in-place rewritten spans aligned to the
+    /// published screen's row indices and trimmed of trailing `(0, 0)` rows (empty when no
+    /// cells were rewritten in place).
+    Filled {
+        id: String,
+        resized: bool,
+        scrolled_top: u32,
+        within_margins: bool,
+        rewritten_cols: Vec<(u16, u16)>,
+    },
     /// The terminal is now this size (its owner resized it).
     Resized { id: String, cols: u16, rows: u16 },
     /// The program updated its `OSC 0`/`2` window title.
@@ -410,6 +421,16 @@ impl Sessions {
                 });
             }
 
+            if let Some(delta) = tracked.session.take_fill_delta() {
+                news.push(News::Filled {
+                    id: id.clone(),
+                    resized: delta.resized,
+                    scrolled_top: delta.scrolled_top,
+                    within_margins: delta.within_margins,
+                    rewritten_cols: delta.rewritten_cols,
+                });
+            }
+
             if tracked.session.osc_title() != tracked.reported_osc_title {
                 tracked
                     .reported_osc_title
@@ -584,6 +605,18 @@ impl Sessions {
         } else {
             tracked.session.send_view(View::Delta(-i64::from(lines)));
         }
+    }
+
+    /// Returns terminal `id`'s scrollback view immediately to live (`View::Live`, offset 0).
+    /// No-op while the terminal is ended or showing the alternate screen.
+    pub fn scroll_live(&mut self, id: &str) {
+        let Some(tracked) = self.live.get(id) else {
+            return;
+        };
+        if tracked.session.is_ended() || tracked.session.modes().alt_screen {
+            return;
+        }
+        tracked.session.send_view(View::Live);
     }
 
     /// Requests `g3d-termd` to send a fresh `REPAINT` for terminal `id`.
