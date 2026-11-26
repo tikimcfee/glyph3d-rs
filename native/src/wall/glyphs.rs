@@ -823,7 +823,10 @@ impl GlyphSource {
         fonts_dir: &Path,
         emoji_sheet: &Path,
     ) -> Result<Self, FontError> {
-        let archive = Arc::new(EmojiSheetArchive::load(emoji_sheet));
+        let archive = {
+            let _s = super::startup::span("emoji_archive_parse");
+            Arc::new(EmojiSheetArchive::load(emoji_sheet))
+        };
         Self::load_with_capacities(
             device,
             queue,
@@ -853,6 +856,7 @@ impl GlyphSource {
         emoji_init_rows: u32,
         emoji_max_rows: u32,
     ) -> Result<Self, FontError> {
+        let _s_fonts = super::startup::span("font_parse_atlas");
         let specs = default_font_chain(fonts_dir);
         let mut atlas = FontAtlas::load_with_initial_rows(&specs, curve_rows, map_rows)?;
         let sparse_source = Arc::new(SparseEmojiSource::new(archive));

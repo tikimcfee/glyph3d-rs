@@ -438,6 +438,7 @@ impl App {
         // window, opening a second `WallStore` writer, or stealing `Role::Own`
         // size ownership from the running wall window.
         if let Some(ns) = &opts.namespace {
+            let _s = super::startup::span("control_socket_bind");
             match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
                 Ok(server) => self.control = Some(server),
                 Err(wall_control::Error::AlreadyRunning { path, .. }) => {
@@ -451,35 +452,45 @@ impl App {
             }
         }
 
-        let window = Arc::new(
-            event_loop
-                .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
-                .expect("window creation failed"),
-        );
-        let surface = self.ctx.instance.create_surface(window.clone()).expect("surface creation failed");
-        let caps = surface.get_capabilities(&self.ctx.adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
+        let window = {
+            let _s = super::startup::span("window_create");
+            Arc::new(
+                event_loop
+                    .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
+                    .expect("window creation failed"),
+            )
         };
-        surface.configure(&self.ctx.device, &config);
-        let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
+        let (surface, format, config, depth) = {
+            let _s = super::startup::span("surface_configure");
+            let surface = self.ctx.instance.create_surface(window.clone()).expect("surface creation failed");
+            let caps = surface.get_capabilities(&self.ctx.adapter);
+            let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+            let size = window.inner_size();
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
+                width: size.width.max(1),
+                height: size.height.max(1),
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+            };
+            surface.configure(&self.ctx.device, &config);
+            let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
+            (surface, format, config, depth)
+        };
 
         let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
         renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
         #[cfg(feature = "egui-ui")]
-        let ui = WallUi::new(&self.ctx.device, &window, format);
+        let ui = {
+            let _s = super::startup::span("egui_init");
+            WallUi::new(&self.ctx.device, &window, format)
+        };
         let sf = window.scale_factor();
 
         // The rules, at the renderer's cell size and the window's viewport.
@@ -492,34 +503,46 @@ impl App {
             namespace: namespace.clone(),
             ..RulesOptions::default()
         };
-        let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
+        let mut wall = {
+            let _s = super::startup::span("wall_store_load");
+            if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) }
+        };
 
         // The terminals.
         let terms = match &opts.namespace {
             Some(ns) => {
-                let mut sessions = match Sessions::open(ns, wake) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error: the wall could not reach its terminals: {e}");
-                        std::process::exit(1);
+                let mut sessions = {
+                    let _s = super::startup::span("termd_connect_spawn");
+                    match Sessions::open(ns, wake) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("error: the wall could not reach its terminals: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 };
-                let ids = sessions.list().unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                });
+                let ids = {
+                    let _s = super::startup::span("termd_list");
+                    sessions.list().unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    })
+                };
                 wall.set_live_terminals(&ids);
-                for id in &ids {
-                    match sessions.adopt(id) {
-                        Ok((cols, rows)) => {
-                            wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                {
+                    let _s = super::startup::span("termd_adopt");
+                    for id in &ids {
+                        match sessions.adopt(id) {
+                            Ok((cols, rows)) => {
+                                wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                            }
+                            Err(e) => log::error!("{e}"),
                         }
-                        Err(e) => log::error!("{e}"),
                     }
-                }
-                wall.set_connected(true);
-                if ids.is_empty() {
-                    wall.run("wall.spawn");
+                    wall.set_connected(true);
+                    if ids.is_empty() {
+                        wall.run("wall.spawn");
+                    }
                 }
                 Terminals::Live(sessions)
             }
@@ -850,6 +873,7 @@ impl App {
         for n in news {
             match n {
                 News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                    super::startup::mark_once("first_repaint_applied");
                     if let Some(screen) = sessions.screen(&id) {
                         heard |= wall.terminal_screen_filled(
                             &id,
@@ -1103,6 +1127,10 @@ impl App {
         if let (Some(enc), Some(frame)) = (encoder, frame) {
             self.ctx.queue.submit([enc.finish()]);
             self.ctx.queue.present(frame);
+            super::startup::mark_once("first_frame_presented");
+            if !draws.is_empty() {
+                super::startup::mark_once("first_terminal_frame_presented");
+            }
             self.perf.draw_us.push(now.elapsed().as_micros() as u64);
             if self.perf.log_enabled {
                 let due = self.perf.last_log.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0);

@@ -893,19 +893,24 @@ impl WallRenderer {
                 resource: paper_buf.as_entire_binding(),
             }],
         });
-        let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_paper.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_paper.wgsl",
-                include_str!("../shaders/wall_paper.wgsl"),
-            )),
-        });
-        let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wall paper pl"),
-            bind_group_layouts: &[Some(&paper_bgl)],
-            immediate_size: 0,
-        });
-        let paper_pipeline = build_paper_pipeline(device, &paper_pl, &paper_shader, color_format);
+        let (paper_shader, paper_pl, paper_pipeline) = {
+            let _s = super::startup::span("pipeline_paper");
+            let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wall_paper.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                    "wall_paper.wgsl",
+                    include_str!("../shaders/wall_paper.wgsl"),
+                )),
+            });
+            let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wall paper pl"),
+                bind_group_layouts: &[Some(&paper_bgl)],
+                immediate_size: 0,
+            });
+            let paper_pipeline = build_paper_pipeline(device, &paper_pl, &paper_shader, color_format);
+            (paper_shader, paper_pl, paper_pipeline)
+        };
+        let _ = paper_shader;
 
         let shape_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall shape frame uniform"),
@@ -959,20 +964,24 @@ impl WallRenderer {
                 },
             ],
         });
-        let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_shapes.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_shapes.wgsl",
-                include_str!("../shaders/wall_shapes.wgsl"),
-            )),
-        });
-        let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wall shapes pl"),
-            bind_group_layouts: &[Some(&shapes_bgl)],
-            immediate_size: 0,
-        });
-        let (shape_opaque_pipeline, shape_blend_pipeline) =
-            build_shape_pipelines(device, &shape_pl, &shape_shader, color_format);
+        let (shape_pl, shape_opaque_pipeline, shape_blend_pipeline) = {
+            let _s = super::startup::span("pipeline_shapes");
+            let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wall_shapes.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                    "wall_shapes.wgsl",
+                    include_str!("../shaders/wall_shapes.wgsl"),
+                )),
+            });
+            let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wall shapes pl"),
+                bind_group_layouts: &[Some(&shapes_bgl)],
+                immediate_size: 0,
+            });
+            let (shape_opaque_pipeline, shape_blend_pipeline) =
+                build_shape_pipelines(device, &shape_pl, &shape_shader, color_format);
+            (shape_pl, shape_opaque_pipeline, shape_blend_pipeline)
+        };
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -1082,55 +1091,83 @@ impl WallRenderer {
             ],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_cells.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_cells.wgsl",
-                include_str!("../shaders/wall_cells.wgsl"),
-            )),
-        });
+        let (
+            cell_pl,
+            labels_cap,
+            labels_buf,
+            labels_bgl,
+            labels_bg,
+            label_pl,
+            panel_pipeline,
+            fill_pipeline,
+            ink_pipeline,
+            cursor_pipeline,
+            label_pipeline,
+        ) = {
+            let _s = super::startup::span("pipeline_cells");
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wall_cells.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                    "wall_cells.wgsl",
+                    include_str!("../shaders/wall_cells.wgsl"),
+                )),
+            });
 
-        let cell_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wall cells pl"),
-            bind_group_layouts: &[Some(&shared_bgl), Some(&term_bgl)],
-            immediate_size: 0,
-        });
+            let cell_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wall cells pl"),
+                bind_group_layouts: &[Some(&shared_bgl), Some(&term_bgl)],
+                immediate_size: 0,
+            });
 
-        let labels_cap = 256usize;
-        let labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wall label glyphs"),
-            size: (labels_cap * std::mem::size_of::<LabelGlyphGpu>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let labels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("wall labels bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let labels_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wall labels bg"),
-            layout: &labels_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 2,
-                resource: labels_buf.as_entire_binding(),
-            }],
-        });
-        let label_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wall labels pl"),
-            bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
-            immediate_size: 0,
-        });
-        let (panel_pipeline, fill_pipeline, ink_pipeline, cursor_pipeline, label_pipeline) =
-            build_cell_pipelines(device, &cell_pl, &label_pl, &shader, color_format);
+            let labels_cap = 256usize;
+            let labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wall label glyphs"),
+                size: (labels_cap * std::mem::size_of::<LabelGlyphGpu>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let labels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("wall labels bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let labels_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wall labels bg"),
+                layout: &labels_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: labels_buf.as_entire_binding(),
+                }],
+            });
+            let label_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wall labels pl"),
+                bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
+                immediate_size: 0,
+            });
+            let (panel_pipeline, fill_pipeline, ink_pipeline, cursor_pipeline, label_pipeline) =
+                build_cell_pipelines(device, &cell_pl, &label_pl, &shader, color_format);
+            (
+                cell_pl,
+                labels_cap,
+                labels_buf,
+                labels_bgl,
+                labels_bg,
+                label_pl,
+                panel_pipeline,
+                fill_pipeline,
+                ink_pipeline,
+                cursor_pipeline,
+                label_pipeline,
+            )
+        };
 
         let shader_watcher = ShaderWatcher::from_env(Instant::now());
 
