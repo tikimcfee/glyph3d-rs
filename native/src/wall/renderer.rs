@@ -1787,11 +1787,10 @@ pub fn render_chrome_pattern_offscreen(
     frames: u32,
     zoom_multiplier: f32,
 ) {
-    let atlas = Arc::new(Atlas::load(emoji_sheet));
     let mut renderer = WallRenderer::new(
         &ctx.device,
         &ctx.queue,
-        atlas,
+        emoji_sheet,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         WallStyle::default(),
     );
