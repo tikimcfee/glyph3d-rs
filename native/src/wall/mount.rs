@@ -11,8 +11,7 @@
 //!
 //! [`Wall`] owns the open and placement state of all panels; [`Panels`] owns
 //! only each widget's transient UI view state (queries, active row, drafts,
-//! drag offsets, hold-to-close progress, and cached help sections) and
-//! intercepts `wall.palette` verbs (not registered in `wall_core::commands`).
+//! drag offsets, hold-to-close progress, and cached help sections).
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,9 +26,9 @@ use wall_core::menu::{
 use wall_core::model::WallSnapshot;
 use wall_core::palette::{PaletteGroup, PaletteSnapshot, PaletteTerminal};
 use wall_core::sidebar::{
-    BusSnapshot, SidebarGroup, SidebarInput as CoreSidebarInput, SidebarTerminal, build_sidebar,
+    SidebarGroup, SidebarInput as CoreSidebarInput, SidebarTerminal, build_sidebar,
 };
-use wall_core::status::{TermdStatus, chip_look, notice_for};
+use wall_core::status::{TermdStatus, chip_look};
 use wall_core::wall::{Wall, WallFrame, help_sections};
 
 use super::panels::{
@@ -79,13 +78,11 @@ impl Panels {
 
     /// Whether any mounted chrome strip, panel, title-bar hold, or `termd` notice
     /// needs an `egui` pass on this frame.
-    pub fn any_open(&self, wall: &Wall, described: &WallFrame) -> bool {
+    pub fn any_open(&self, _wall: &Wall, described: &WallFrame) -> bool {
         if described.fullscreen_backdrop.is_none() {
             // The topbar and `termd` chip are always visible on the canvas outside fullscreen.
             return true;
         }
-        let now_ms = epoch_now_ms();
-        let restart_ms = wall.config().restart_notice_ms.max(0.0).round() as u64;
         self.bar_buttons.is_holding()
             || (!self.wall_dragging && described.title_bars.iter().any(|b| b.hovered))
             || described.palette_open
@@ -96,7 +93,7 @@ impl Panels {
             || described.panels.settings_panel.open
             || self.settings_was_open
             || described.panels.status_window.open
-            || status_has_notice(wall.termd(), now_ms, restart_ms)
+            || described.status_notice.is_some()
             || self.status_was_active
             || described.panels.help_panel.open
             || self.help_was_open
@@ -113,8 +110,8 @@ impl Panels {
     }
 
     /// Draw the topbar, hovered title-bar buttons, and every open panel into
-    /// `ctx`, intercepting `wall.palette` locally and returning the remaining
-    /// `wall.*` / `terminal.*` verb lines to run after the pass.
+    /// `ctx`, returning every emitted `wall.*` / `terminal.*` verb line (including
+    /// `wall.palette`) to run through `wall.run` after the pass.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -122,7 +119,7 @@ impl Panels {
         described: &WallFrame,
     ) -> Vec<String> {
         let mut out = Vec::new();
-        let platform = Platform::host();
+        let platform = wall.platform();
         let viewport = panels::safe_viewport_rect(ctx);
         let fullscreen = described.fullscreen_backdrop.is_some();
 
@@ -332,8 +329,8 @@ impl Panels {
 
         let now_ms = epoch_now_ms();
         let restart_ms = wall.config().restart_notice_ms.max(0.0).round() as u64;
-        let status_window_or_notice = described.panels.status_window.open
-            || status_has_notice(wall.termd(), now_ms, restart_ms);
+        let status_window_or_notice =
+            described.panels.status_window.open || described.status_notice.is_some();
 
         let needs_snapshot = self.palette.open
             || described.menu.is_some()
@@ -482,7 +479,7 @@ impl Panels {
 
             if let Some(snap) = &snapshot {
                 let input = palette::PaletteInput {
-                    snapshot: build_palette_snapshot(snap, described, platform),
+                    snapshot: build_palette_snapshot(wall, snap, described, platform),
                 };
                 palette::show(ctx, &mut self.palette, &input, &mut out);
             }
@@ -528,31 +525,6 @@ impl Panels {
             );
         }
 
-        // Intercept `wall.palette [toggle|open|close]` locally (not in `wall_core::commands`).
-        out.retain(|line| {
-            let mut words = line.split_whitespace();
-            if words.next() != Some("wall.palette") {
-                return true;
-            }
-            let cur = self
-                .pending_palette_open
-                .unwrap_or(described.palette_open || self.palette.open);
-            let next = match words.next() {
-                Some("open") => true,
-                Some("close") => false,
-                Some("toggle") | None => !cur,
-                Some(_) => return false,
-            };
-            if next {
-                self.palette.open_find();
-            } else {
-                self.palette.close();
-            }
-            self.was_palette_open = next;
-            self.pending_palette_open = Some(next);
-            false
-        });
-
         self.palette_search_had_focus =
             self.palette.open && ctx.memory(|m| m.has_focus(egui::Id::new(PALETTE_INPUT_ID)));
         self.settings_search_had_focus =
@@ -562,8 +534,8 @@ impl Panels {
     }
 
     /// Synchronize [`Wall`] state after the `egui` pass (`palette_open` from
-    /// intercepted `wall.palette` or self-close, plus `field_focus`). Returns
-    /// `true` if [`Wall`] mutated and effects should be applied.
+    /// widget self-close plus `field_focus`). Returns `true` if [`Wall`]
+    /// mutated and effects should be applied.
     pub fn sync_after_pass(&mut self, wall: &mut Wall, egui_wants_keyboard: bool) -> bool {
         let mut mutated = false;
         if let Some(next) = self.pending_palette_open.take() {
@@ -669,15 +641,6 @@ fn measure_termd_chip_width(ctx: &egui::Context, status: &TermdStatus) -> f32 {
     })
 }
 
-fn status_has_notice(status: &TermdStatus, now_ms: u64, restart_notice_ms: u64) -> bool {
-    let since_ms = if status.since_ms() > 0 {
-        status.since_ms()
-    } else {
-        now_ms
-    };
-    notice_for(status, since_ms, now_ms, restart_notice_ms).is_some()
-}
-
 fn is_palette_chord(platform: Platform, modifiers: egui::Modifiers) -> bool {
     match platform {
         Platform::Mac => {
@@ -715,6 +678,7 @@ fn dock_rect(
 }
 
 fn build_palette_snapshot(
+    wall: &Wall,
     snap: &WallSnapshot,
     described: &WallFrame,
     platform: Platform,
@@ -753,7 +717,7 @@ fn build_palette_snapshot(
         grid_show: snap.config.grid_show,
         platform,
         relay_port: None,
-        bus: BusSnapshot::default(),
+        bus: wall.sidebar_bus_snapshot(),
     }
 }
 
@@ -789,7 +753,7 @@ fn build_core_sidebar_input(
             .collect(),
         focused_id: snap.focused_id.clone(),
         collapsed_groups: collapsed.iter().cloned().collect(),
-        bus: BusSnapshot::default(),
+        bus: wall.sidebar_bus_snapshot(),
     }
 }
 
@@ -1030,5 +994,36 @@ mod tests {
         let (verbs_help, _) = run_pass_at(&ctx, 2.9, esc, &mut panels, &mut wall);
         assert_eq!(verbs_help, vec!["wall.help close".to_string()]);
         assert!(!wall.store().help_panel().open);
+
+        // 7. `wall.palette` passes through `wall.run`, and `sidebar_bus_snapshot` + `platform`
+        //    feed the sidebar and palette directly from `Wall`.
+        use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+        wall.set_bus_snapshot(
+            Some(GomuxSnapshot {
+                gen: 1,
+                host: Some("workstation".to_owned()),
+                agents: vec![GomuxAgent {
+                    name: "coder".to_owned(),
+                    host: Some("workstation".to_owned()),
+                    live: true,
+                    status: Some("idle".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            "",
+        );
+        assert!(wall.run("wall.palette open").text.starts_with("OK"));
+        assert!(wall.palette_open());
+        let snap = wall.snapshot();
+        let described = wall.frame();
+        let pal_snap = build_palette_snapshot(&wall, &snap, &described, wall.platform());
+        assert_eq!(pal_snap.bus.agents.len(), 1);
+        assert_eq!(pal_snap.bus.agents[0].name, "coder");
+        let sb_in = build_core_sidebar_input(&wall, &snap, &[]);
+        assert_eq!(sb_in.bus.agents.len(), 1);
+        assert_eq!(sb_in.bus.agents[0].name, "coder");
+        assert!(wall.run("wall.palette close").text.starts_with("OK"));
+        assert!(!wall.palette_open());
     }
 }

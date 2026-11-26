@@ -32,7 +32,8 @@ use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
 use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
-use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
+use wall_core::status::TermdState;
+use wall_core::wall::{screen_lookup, CharWidths, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -149,8 +150,9 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
-    /// Persistent banner shown while `g3d-termd` is stopped/offline.
-    offline_notice: Option<String>,
+    /// Next wake deadline while `termd` is in a restarting/unreachable trouble state
+    /// so the rules' notice grace timers advance even while the window is idle.
+    termd_tick_at: Option<Instant>,
     perf: WallPerf,
 }
 
@@ -475,6 +477,7 @@ impl App {
         let namespace = opts.namespace.clone().unwrap_or_else(|| "pattern".to_string());
         let rules = RulesOptions {
             geometry: CellGeometry::with_padding(f64::from(metrics.cell_width * cell_scale), f64::from(metrics.cell_height * cell_scale), f64::from(PANEL_PAD), f64::from(PANEL_PAD)),
+            char_widths: CharWidths::from_unit_width(f64::from(metrics.cell_width / metrics.cell_height)),
             platform: Platform::host(),
             viewport: Size::new(f64::from(config.width) / sf, f64::from(config.height) / sf),
             scale_factor: sf,
@@ -493,6 +496,12 @@ impl App {
                         std::process::exit(1);
                     }
                 };
+                let welcome = sessions.hub().welcome();
+                wall.on_termd_welcome(
+                    welcome.instance.as_deref().unwrap_or(""),
+                    &welcome.features,
+                    epoch_now_ms(),
+                );
                 let ids = sessions.list().unwrap_or_else(|e| {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -709,7 +718,7 @@ impl App {
                     let reply = match &self.wall {
                         Some(wall) => {
                             let snap = wall.model().snapshot();
-                            let notice = snap.notice.or_else(|| self.offline_notice.clone());
+                            let notice = snap.notice.or_else(|| wall.status_notice().map(|n| n.text));
                             let terms_desc: Vec<_> = snap
                                 .terminals
                                 .iter()
@@ -822,17 +831,20 @@ impl App {
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
-                    self.offline_notice = Some(format!(
-                        "termd ({}) disconnected — waiting for daemon",
-                        wall.termd().namespace()
-                    ));
+                    wall.on_termd_disconnected(false, epoch_now_ms());
                     heard = true;
                 }
             }
         }
         if let Some(live_ids) = sessions.take_reconnected() {
             log::info!("termd came back ({} terminal(s))", live_ids.len());
-            self.offline_notice = None;
+            let welcome = sessions.hub().welcome();
+            wall.on_termd_welcome(
+                welcome.instance.as_deref().unwrap_or(""),
+                &welcome.features,
+                epoch_now_ms(),
+            );
+            wall.dismiss_termd_lost();
             if !live_ids.is_empty() {
                 wall.set_live_terminals(&live_ids);
             }
@@ -895,13 +907,20 @@ impl App {
         let now_ms = self.now_ms();
         let Some(wall) = &mut self.wall else { return };
         let moving = wall.tick(dt, now_ms);
-        let mut described: Described = wall.frame();
-        self.animating = moving || described.animating;
-        self.apply_effects();
-        // A daemon that went away says so on the notice line until it is back.
-        if described.notice.is_none() {
-            described.notice.clone_from(&self.offline_notice);
+        if wall.termd().state() == TermdState::Unreachable
+            && matches!(&self.terms, Some(Terminals::Live(s)) if s.is_reconnect_socket_absent())
+        {
+            wall.on_termd_socket_absent(epoch_now_ms());
         }
+        let described: Described = wall.frame();
+        let termd_state = wall.termd().state();
+        self.animating = moving || described.animating;
+        self.termd_tick_at = match termd_state {
+            TermdState::Restarting => Some(Instant::now() + std::time::Duration::from_millis(200)),
+            TermdState::Unreachable => Some(Instant::now() + std::time::Duration::from_secs(1)),
+            _ => None,
+        };
+        self.apply_effects();
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
 
@@ -1512,6 +1531,17 @@ impl ApplicationHandler<Wake> for App {
                 next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
+        if let Some(deadline) = self.termd_tick_at {
+            if now >= deadline {
+                self.termd_tick_at = None;
+                self.redraw();
+                if self.last_tick.elapsed() >= std::time::Duration::from_millis(180) {
+                    self.draw(false);
+                }
+            } else {
+                next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
+            }
+        }
         if let Some(deadline) = next_repaint {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             return;
@@ -1551,7 +1581,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
-        offline_notice: None,
+        termd_tick_at: None,
         perf: WallPerf {
             log_enabled: std::env::var("GLYPH_WALL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"),
             ..WallPerf::default()
