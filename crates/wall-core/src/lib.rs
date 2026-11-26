@@ -17,6 +17,7 @@ pub mod camera;
 pub mod chord;
 pub mod config;
 pub mod dock;
+pub mod groups;
 pub mod keymap;
 pub mod labels;
 pub mod layout;
