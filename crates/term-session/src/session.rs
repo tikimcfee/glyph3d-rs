@@ -688,11 +688,10 @@ fn session_worker_loop(
                             // onto the active grid, so cancel any pending post-resize repaint.
                             grow_repaint_due = None;
                         }
-                        if view {
-                            coalescer.mark_immediate();
-                        } else {
-                            coalescer.mark_dirty();
-                        }
+                        // Every `REPAINT` is a single authoritative snapshot from `termd`
+                        // (initial attach, scrollback view, reconnect, lag resync, or settled
+                        // primary-grow pull-back), never a byte flood: publish immediately.
+                        coalescer.mark_immediate();
                     }
                     Event::Size { cols, rows, .. } => {
                         let (grew_primary, on_alt) = {

@@ -1150,9 +1150,10 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(10), || {
             session.pump();
+            let lines = screen_lines(&session);
             (session.screen().cols, session.screen().rows) == (132, 40)
-                && session.row_text(0) == "1"
-                && session.row_text(29) == "30"
+                && lines.first().map(String::as_str) == Some("1")
+                && lines.get(29).map(String::as_str) == Some("30")
         }),
         "grow1 at 132x40 did not pull scrollback history lines 1..=7 via coalesced repaint: rows={:?} stats={:?}",
         screen_lines(&session),
