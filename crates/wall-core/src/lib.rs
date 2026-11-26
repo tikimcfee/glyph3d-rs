@@ -24,8 +24,12 @@ pub mod layout;
 pub mod menu;
 pub mod model;
 pub mod mouse;
+<<<<<<< HEAD
 pub mod names;
 pub mod palette;
+=======
+pub mod pointer;
+>>>>>>> wall-core-snap-scroll
 pub mod scroll;
 pub mod selection;
 pub mod settings;
