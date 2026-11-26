@@ -99,23 +99,30 @@ impl Terminals {
 }
 
 /// What exists once there is a window.
+///
+/// Field order is drop order, and it matters on Wayland: the egui layer
+/// (whose clipboard worker borrows the display) and the surface must go
+/// before the window (found on workstation, 2026-11-26: a segfault in
+/// `wl_proxy_destroy` at every exit).
 struct Gfx {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    depth: wgpu::TextureView,
-    renderer: WallRenderer,
-    /// Renderer scale that makes a cell [`WORLD_CELL_HEIGHT`] tall.
-    cell_scale: f32,
     #[cfg(feature = "egui-ui")]
     ui: WallUi,
+    renderer: WallRenderer,
+    depth: wgpu::TextureView,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    window: Arc<Window>,
+    /// Renderer scale that makes a cell [`WORLD_CELL_HEIGHT`] tall.
+    cell_scale: f32,
 }
 
 struct App {
+    /// Before `ctx`: dropped first, and cleared in `exiting` while the event
+    /// loop's display connection is still open.
+    gfx: Option<Gfx>,
     ctx: GpuContext,
     opts: Option<WallOptions>,
     proxy: EventLoopProxy<Wake>,
-    gfx: Option<Gfx>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
     /// The socket `wallctl` reaches this wall by; None if it could not bind
@@ -349,14 +356,14 @@ impl App {
         };
 
         self.gfx = Some(Gfx {
-            window,
-            surface,
-            config,
-            depth,
-            renderer,
-            cell_scale,
             #[cfg(feature = "egui-ui")]
             ui,
+            renderer,
+            depth,
+            surface,
+            config,
+            window,
+            cell_scale,
         });
         self.wall = Some(wall);
         self.terms = Some(terms);
@@ -385,7 +392,48 @@ impl App {
         log::warn!("the wall kept asking for more after eight rounds of effects; leaving the rest for the next event");
     }
 
+    /// The clipboard's text. On Linux it is read through the window's own
+    /// clipboard, which speaks Wayland; a fresh `arboard` there speaks X11
+    /// alone.
+    fn read_clipboard(&mut self) -> Option<String> {
+        #[cfg(all(target_os = "linux", feature = "egui-ui"))]
+        if let Some(g) = &mut self.gfx {
+            return g.ui.clipboard_text();
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                log::warn!("paste: the clipboard gave no text: {e}");
+                None
+            }
+        }
+    }
+
+    fn write_clipboard(&mut self, text: String) {
+        #[cfg(all(target_os = "linux", feature = "egui-ui"))]
+        if let Some(g) = &mut self.gfx {
+            g.ui.set_clipboard_text(text);
+            return;
+        }
+        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            log::warn!("copy: the clipboard refused the text: {e}");
+        }
+    }
+
     fn apply(&mut self, effect: WallEffect) {
+        let effect = match effect {
+            WallEffect::WriteClipboard { text } => {
+                self.write_clipboard(text);
+                return;
+            }
+            WallEffect::ReadClipboard { target } => {
+                if let (Some(text), Some(wall)) = (self.read_clipboard(), &mut self.wall) {
+                    wall.deliver_clipboard(&target, &text);
+                }
+                return;
+            }
+            other => other,
+        };
         let (Some(wall), Some(terms)) = (&mut self.wall, &mut self.terms) else { return };
         match effect {
             WallEffect::Redraw => {
@@ -398,15 +446,6 @@ impl App {
                     g.window.set_cursor(cursor_of(cursor));
                 }
             }
-            WallEffect::WriteClipboard { text } => {
-                if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-                    log::warn!("copy: the clipboard refused the text: {e}");
-                }
-            }
-            WallEffect::ReadClipboard { target } => match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                Ok(text) => wall.deliver_clipboard(&target, &text),
-                Err(e) => log::warn!("paste: the clipboard gave no text: {e}"),
-            },
             WallEffect::ConfigKnobChanged { key, value } => {
                 // The renderer's own knobs follow here as they are wired; the
                 // rules have already taken the value.
@@ -824,7 +863,8 @@ impl App {
     fn key(&mut self, ev: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
         let key = super::keys::key_event(ev, self.modifiers);
         // Quitting is the window's, not the wall's.
-        if key.pressed && key.mods.meta && !key.mods.ctrl && !key.mods.alt && key.code == "KeyQ" {
+        // Command+Q on macOS, Ctrl+Alt+Q elsewhere: the wall's chord modifier.
+        if key.pressed && key.code == "KeyQ" && key.mods == wall_core::chord::chord_mods(Platform::host()) {
             event_loop.exit();
             return;
         }
@@ -954,6 +994,13 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The egui layer, the surface and the window go while the event
+        // loop's display connection is still alive (see `Gfx`).
+        self.control = None;
+        self.gfx = None;
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.quit {
             event_loop.exit();
@@ -988,10 +1035,10 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("event loop creation failed");
     let now = Instant::now();
     let mut app = App {
+        gfx: None,
         ctx,
         opts: Some(opts),
         proxy: event_loop.create_proxy(),
-        gfx: None,
         wall: None,
         terms: None,
         control: None,
