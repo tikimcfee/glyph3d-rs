@@ -14,6 +14,7 @@ pub mod camera;
 pub mod cell;
 #[cfg(feature = "windowed")]
 pub mod keys;
+pub mod labels;
 pub mod metrics;
 pub mod paper;
 #[cfg(feature = "wgpu")]
@@ -22,7 +23,8 @@ pub mod shapes;
 pub mod test_pattern;
 
 pub use camera::WallCamera;
-pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph};
+pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph, resolve_str_glyphs};
+pub use labels::{Label, LabelGlyphGpu, LabelHeight, measure_label_width, pack_label_glyphs};
 pub use metrics::{CellMetrics, WorldRect, snap_cell_dimension};
 pub use paper::PaperStyle;
 #[cfg(feature = "wgpu")]

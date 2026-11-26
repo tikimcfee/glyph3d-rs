@@ -21,6 +21,7 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::cell::{CellGpu, dirty_row_ranges, pack_cell};
+use super::labels::{Label, LabelGlyphGpu, LabelHeight, measure_label_width, pack_label_glyphs};
 use super::metrics::CellMetrics;
 use super::paper::{PaperStyle, WallPaperUniform, build_paper_uniform};
 use super::shapes::{Shape, ShapeFrameUniform, ShapeGpu, expand_shape};
@@ -115,6 +116,9 @@ pub struct WallFrame<'a> {
     /// World-space 2D chrome shapes (group frames, title bar strips, selection outlines,
     /// lassos, drop outlines, map label pills and leaders), interleaved by `z`.
     pub shapes: &'a [Shape],
+    /// World-space or screen-pixel text labels (title bar names, group headers, map labels),
+    /// rendered with the cell pass's Slug shader and interleaved by `z`.
+    pub labels: &'a [Label<'a>],
 }
 
 /// Shared per-frame uniform block (`WallFrameUniform` in `wall_cells.wgsl`, 224 B).
@@ -190,6 +194,7 @@ enum DrawRun {
     ShapesOpaque(Range<u32>),
     ShapesBlend(Range<u32>),
     Terminal(usize),
+    Labels(Range<u32>),
 }
 
 /// Shared wgpu cell renderer for any number of live terminals.
@@ -214,13 +219,19 @@ pub struct WallRenderer {
     quad_index_buf: wgpu::Buffer,
     shared_bg: wgpu::BindGroup,
     term_bgl: wgpu::BindGroupLayout,
+    labels_bgl: wgpu::BindGroupLayout,
+    labels_buf: wgpu::Buffer,
+    labels_cap: usize,
+    labels_bg: wgpu::BindGroup,
     panel_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
     ink_pipeline: wgpu::RenderPipeline,
     cursor_pipeline: wgpu::RenderPipeline,
+    label_pipeline: wgpu::RenderPipeline,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
     shape_scratch: Vec<ShapeGpu>,
+    label_scratch: Vec<LabelGlyphGpu>,
     draw_runs: Vec<DrawRun>,
 }
 
@@ -664,6 +675,75 @@ impl WallRenderer {
         let ink_pipeline = make_pipeline("wall ink pipeline", "vs_ink", "fs_ink", false);
         let cursor_pipeline = make_pipeline("wall cursor pipeline", "vs_cursor", "fs_cursor", false);
 
+        let labels_cap = 256usize;
+        let labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wall label glyphs"),
+            size: (labels_cap * std::mem::size_of::<LabelGlyphGpu>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let labels_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("wall labels bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let labels_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wall labels bg"),
+            layout: &labels_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 2,
+                resource: labels_buf.as_entire_binding(),
+            }],
+        });
+        let label_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("wall labels pl"),
+            bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
+            immediate_size: 0,
+        });
+        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wall label pipeline"),
+            layout: Some(&label_pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_label"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_ink"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             atlas,
             _atlas_gpu: atlas_gpu,
@@ -685,19 +765,30 @@ impl WallRenderer {
             quad_index_buf,
             shared_bg,
             term_bgl,
+            labels_bgl,
+            labels_buf,
+            labels_cap,
+            labels_bg,
             panel_pipeline,
             fill_pipeline,
             ink_pipeline,
             cursor_pipeline,
+            label_pipeline,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
             shape_scratch: Vec::new(),
+            label_scratch: Vec::new(),
             draw_runs: Vec::new(),
         }
     }
 
     pub fn metrics(&self) -> CellMetrics {
         self.metrics
+    }
+
+    /// Measure the unclipped world width of `text` drawn at `height` under `zoom`.
+    pub fn measure_label_width(&self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
+        measure_label_width(self.metrics, &self.atlas.trie, text, height.resolve_world(zoom))
     }
 
     pub fn style(&self) -> &WallStyle {
@@ -937,16 +1028,18 @@ impl WallRenderer {
             self.sync_terminal(device, queue, draw, &mut stats);
         }
 
-        // Expand shapes and interleave with terminals back-to-front by world z.
-        // Equal-z tier tie-break: opaque shape (0) -> terminal (1) -> blend shape (2).
+        // Expand shapes and labels and interleave with terminals back-to-front by world z.
+        // Equal-z tier tie-break: opaque shape (0) -> terminal (1) -> blend shape (2) -> label (3).
         #[derive(Clone, Copy)]
         enum Pending {
             Shape { opaque: bool, raw_idx: usize },
             Terminal(usize),
+            Label(usize),
         }
         let mut raw_shapes: Vec<ShapeGpu> = Vec::new();
+        let mut raw_labels: Vec<LabelGlyphGpu> = Vec::new();
         let mut pending: Vec<(f32, u8, Pending)> =
-            Vec::with_capacity(terminals.len() + frame.shapes.len());
+            Vec::with_capacity(terminals.len() + frame.shapes.len() + frame.labels.len());
         for shape in frame.shapes {
             expand_shape(shape, camera.zoom, |opaque, gpu| {
                 let raw_idx = raw_shapes.len();
@@ -958,10 +1051,20 @@ impl WallRenderer {
         for (i, draw) in terminals.iter().enumerate() {
             pending.push((draw.z, 1, Pending::Terminal(i)));
         }
+        for label in frame.labels {
+            pack_label_glyphs(self.metrics, &self.atlas.trie, label, camera.zoom, |gpu| {
+                let raw_idx = raw_labels.len();
+                let z = gpu.z;
+                raw_labels.push(gpu);
+                pending.push((z, 3, Pending::Label(raw_idx)));
+            });
+        }
         pending.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         self.shape_scratch.clear();
         self.shape_scratch.reserve(raw_shapes.len());
+        self.label_scratch.clear();
+        self.label_scratch.reserve(raw_labels.len());
         self.draw_runs.clear();
         for (_, _, item) in pending {
             match item {
@@ -988,6 +1091,17 @@ impl WallRenderer {
                 }
                 Pending::Terminal(idx) => {
                     self.draw_runs.push(DrawRun::Terminal(idx));
+                }
+                Pending::Label(raw_idx) => {
+                    let gpu_idx = self.label_scratch.len() as u32;
+                    self.label_scratch.push(raw_labels[raw_idx]);
+                    if let Some(DrawRun::Labels(r)) = self.draw_runs.last_mut() {
+                        if r.end == gpu_idx {
+                            r.end = gpu_idx + 1;
+                            continue;
+                        }
+                    }
+                    self.draw_runs.push(DrawRun::Labels(gpu_idx..gpu_idx + 1));
                 }
             }
         }
@@ -1028,6 +1142,32 @@ impl WallRenderer {
                 &self.shapes_buf,
                 0,
                 bytemuck::cast_slice(&self.shape_scratch),
+            );
+        }
+
+        if !self.label_scratch.is_empty() {
+            if self.label_scratch.len() > self.labels_cap {
+                let new_cap = self.label_scratch.len().next_power_of_two().max(256);
+                self.labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wall label glyphs"),
+                    size: (new_cap * std::mem::size_of::<LabelGlyphGpu>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.labels_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("wall labels bg"),
+                    layout: &self.labels_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.labels_buf.as_entire_binding(),
+                    }],
+                });
+                self.labels_cap = new_cap;
+            }
+            queue.write_buffer(
+                &self.labels_buf,
+                0,
+                bytemuck::cast_slice(&self.label_scratch),
             );
         }
         stats
@@ -1094,6 +1234,12 @@ impl WallRenderer {
                         pass.set_pipeline(&self.cursor_pipeline);
                         pass.draw_indexed(0..6, 0, 0..1);
                     }
+                }
+                DrawRun::Labels(range) => {
+                    pass.set_pipeline(&self.label_pipeline);
+                    pass.set_bind_group(0, &self.shared_bg, &[]);
+                    pass.set_bind_group(1, &self.labels_bg, &[]);
+                    pass.draw_indexed(0..6, 0, range.clone());
                 }
             }
         }
@@ -1819,6 +1965,7 @@ mod tests {
                 paper: None,
                 terminals: &[draw],
                 shapes: &shapes,
+                labels: &[],
             },
             w,
             h,
@@ -1865,5 +2012,96 @@ mod tests {
         // Polygon interior is blue.
         let poly_mid = sample(Vec2::new(-7.5, 0.0));
         assert!(poly_mid[2] > 180, "polygon fill should be blue, got {poly_mid:?}");
+    }
+
+    /// Verifies non-terminal Slug labels render at world height, stay constant
+    /// pixel height under ScreenPx across zoom changes, and clip cleanly to a world rect.
+    #[test]
+    fn gpu_labels_world_screen_px_and_clip_rect() {
+        use super::super::metrics::WorldRect;
+
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut style = WallStyle::default();
+        style.clear_color = [0.0, 0.0, 0.0, 1.0];
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            style,
+        );
+
+        let w = 256u32;
+        let h = 128u32;
+        let count_green_px = |px: &[u8], x_range: Range<u32>| -> usize {
+            let mut n = 0usize;
+            for y in 0..h {
+                for x in x_range.clone() {
+                    let i = ((y * w + x) * 4) as usize;
+                    if px[i + 1] > 80 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Clipped world label: "MMMMMM" starting at x = 0 clipped to x <= 2.0 (right half stays dark).
+        let cam = WallCamera::new(Vec2::new(2.0, -1.0), 32.0);
+        let clip_x_px = cam.world_to_screen(Vec2::new(2.0, 0.0), (w, h)).x.round() as u32;
+        let clipped = Label::new(
+            "MMMMMM",
+            Vec2::new(0.0, 0.0),
+            LabelHeight::World(2.0),
+            [0.2, 1.0, 0.4, 1.0],
+            1.0,
+        )
+        .with_clip(WorldRect::new(Vec2::new(0.0, -2.0), Vec2::new(2.0, 0.0)));
+        let px_clip = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { labels: &[clipped], ..Default::default() },
+            w,
+            h,
+        );
+        let left_lit = count_green_px(&px_clip, 0..clip_x_px);
+        let right_lit = count_green_px(&px_clip, (clip_x_px + 1)..w);
+        assert!(left_lit > 100, "clipped label should draw inside clip rect ({left_lit} px)");
+        assert_eq!(right_lit, 0, "clipped label must draw zero pixels past clip.max.x");
+
+        // 2. ScreenPx label: same pixel count at zoom 12.0 and zoom 48.0 (constant pixel size).
+        let px_label = Label::new(
+            "HELLO",
+            Vec2::new(0.0, 0.0),
+            LabelHeight::ScreenPx(24.0),
+            [0.2, 1.0, 0.4, 1.0],
+            1.0,
+        );
+        let px_z12 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &WallCamera::new(Vec2::new(3.0, -1.0), 12.0),
+            &WallFrame { labels: std::slice::from_ref(&px_label), ..Default::default() },
+            w,
+            h,
+        );
+        let px_z48 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &WallCamera::new(Vec2::new(0.75, -0.25), 48.0),
+            &WallFrame { labels: &[px_label], ..Default::default() },
+            w,
+            h,
+        );
+        let n12 = count_green_px(&px_z12, 0..w);
+        let n48 = count_green_px(&px_z48, 0..w);
+        assert!(n12 > 100 && n48 > 100, "ScreenPx label should draw at both zooms ({n12}, {n48})");
+        let ratio = n12 as f32 / n48 as f32;
+        assert!(
+            (ratio - 1.0).abs() < 0.08,
+            "ScreenPx label size should stay constant across 4x zoom change (n12={n12}, n48={n48})"
+        );
     }
 }

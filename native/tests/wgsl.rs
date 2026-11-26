@@ -79,6 +79,9 @@ fn all_wgsl_shaders_parse_and_validate() {
                     if name == "CellGpu" {
                         assert_eq!(span, 16, "CellGpu WGSL struct size must match wall::cell CellGpu (16 B)");
                     }
+                    if name == "LabelGlyphGpu" {
+                        assert_eq!(span, 48, "LabelGlyphGpu WGSL struct size must match wall::labels LabelGlyphGpu (48 B)");
+                    }
                     if name == "WallPaperUniform" {
                         assert_eq!(span, 80, "WallPaperUniform WGSL struct size must match wall::paper WallPaperUniform (80 B)");
                     }

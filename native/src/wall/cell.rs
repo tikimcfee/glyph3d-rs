@@ -127,6 +127,80 @@ pub fn resolve_cell_glyph(trie: &TrieTable, screen: &Screen, cell: &Cell) -> u32
     0
 }
 
+/// Resolve a UTF-8 label string into `(glyph_id, span_cols)` pairs using the same
+/// atlas lookup seam as [`resolve_cell_glyph`].
+///
+/// Spaces emit `(0, 1)`; multi-codepoint emoji sequences in the atlas sequence
+/// table coalesce into a single `(slot, 2)` glyph. When `crates/glyph-font` lands,
+/// replacing [`resolve_cell_glyph`] and this helper moves both cells and labels over.
+pub fn resolve_str_glyphs(trie: &TrieTable, text: &str, mut emit: impl FnMut(u32, u8)) {
+    let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
+    let wide_threshold = (trie.metrics.advance_fu as i32) * 3 / 2;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let cp = chars[i];
+        if cp == 0x20 {
+            emit(0, 1);
+            i += 1;
+            continue;
+        }
+        if cp == 0xFE0F || cp == 0xFE0E || cp == 0x200D {
+            i += 1;
+            continue;
+        }
+
+        // Probe longest matching emoji sequence starting at `chars[i]` (ignoring VS16).
+        if trie.starts_a_sequence(cp) {
+            let mut key = [0u32; 16];
+            let mut raw_end = [0usize; 16];
+            let mut klen = 0usize;
+            let mut j = i;
+            while j < chars.len() && klen < key.len() {
+                let c = chars[j];
+                j += 1;
+                if c == 0xFE0F {
+                    if klen > 0 {
+                        raw_end[klen - 1] = j;
+                    }
+                    continue;
+                }
+                key[klen] = c;
+                raw_end[klen] = j;
+                klen += 1;
+            }
+            let mut matched = None;
+            for len in (2..=klen).rev() {
+                if let Some(slot) = trie.sequence_lookup(&key[..len]) {
+                    matched = Some((slot, raw_end[len - 1]));
+                    break;
+                }
+            }
+            if let Some((slot, next_i)) = matched {
+                emit(slot, 2);
+                i = next_i;
+                continue;
+            }
+        }
+
+        let entry = trie.lookup(cp);
+        let is_wide = entry.advance_fu > wide_threshold
+            || trie
+                .emoji_cell
+                .get(entry.glyph_id as usize)
+                .copied()
+                .flatten()
+                .is_some();
+        let span = if is_wide { 2 } else { 1 };
+        let gid = if entry.flags & FLAG_MISSING != 0 {
+            0
+        } else {
+            entry.glyph_id
+        };
+        emit(gid, span);
+        i += 1;
+    }
+}
+
 /// Pack one `term_cells::Cell` into its 16-byte [`CellGpu`] record.
 pub fn pack_cell(trie: &TrieTable, screen: &Screen, cell: &Cell) -> CellGpu {
     let span_cols = u32::from(cell.width.min(2));
