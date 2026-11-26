@@ -96,6 +96,10 @@ pub struct Cli {
     /// Stage A quad-field demo instead of the text field
     #[arg(long)]
     pub demo: bool,
+    /// Open the wall: the infinite canvas of terminals (with
+    /// --wall-test-pattern, the fixed test screen instead of live ones)
+    #[arg(long)]
+    pub wall: bool,
     /// Render the terminal wall test pattern (with --screenshot PATH)
     #[arg(long)]
     pub wall_test_pattern: bool,
@@ -443,7 +447,7 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(field_mode);
     under!(present_mode);
     under!(Some frames);
-    let scene_typed = ["demo", "wall_test_pattern", "agent_session", "load_repo", "render_file"]
+    let scene_typed = ["demo", "wall", "wall_test_pattern", "agent_session", "load_repo", "render_file"]
         .into_iter()
         .any(typed);
     if !scene_typed {

@@ -26,6 +26,9 @@ glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
 # The wall's plain terminal screen data seam (2026-11-26): the cell renderer
 # in native/src/wall/ reads Screen/Cell here without depending on any emulator.
 term-cells = { path = "../crates/term-cells" }
+# The wall's rules and its input types (keys named as the web names them),
+# with no window in them (2026-11-26).
+wall-core = { path = "../crates/wall-core" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
 # host that brings its own window links the library without it.
 winit = { version = "0.30", optional = true }

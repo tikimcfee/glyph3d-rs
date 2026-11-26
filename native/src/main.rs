@@ -86,7 +86,7 @@ fn main() {
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
         #[cfg(not(feature = "wgpu"))]
-        CliCommand::GpuInfo(_) | CliCommand::Render(_) | CliCommand::WallTestPattern { .. } => {
+        CliCommand::GpuInfo(_) | CliCommand::Render(_) | CliCommand::Wall { .. } | CliCommand::WallTestPattern { .. } => {
             eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
             std::process::exit(1);
         }
@@ -111,6 +111,22 @@ fn main() {
         } => {
             let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
+        }
+        #[cfg(feature = "windowed")]
+        CliCommand::Wall { emoji_sheet, pattern, frames } => {
+            let ctx = pollster::block_on(gpu::init(None));
+            let open: Box<dyn FnOnce(std::sync::Arc<dyn Fn() + Send + Sync>) -> Vec<Box<dyn wall::app::Terminal>>> = if pattern {
+                Box::new(|_wake| vec![Box::new(wall::app::StaticTerminal(wall::test_pattern::build_primary_screen())) as Box<dyn wall::app::Terminal>])
+            } else {
+                eprintln!("error: --wall has no live terminals yet; run it with --wall-test-pattern");
+                std::process::exit(1);
+            };
+            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, exit_after: frames.map(u64::from), open });
+        }
+        #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
+        CliCommand::Wall { .. } => {
+            eprintln!("error: --wall: this build has no window (the `windowed` feature is off)");
+            std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::WallTestPattern {

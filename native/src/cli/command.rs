@@ -26,6 +26,14 @@ pub enum CliCommand {
     },
     /// Render execution plan (windowed or offscreen).
     Render(RenderPlan),
+    /// Open the wall's window. `pattern`: show the fixed test screen
+    /// instead of live terminals.
+    Wall {
+        emoji_sheet: PathBuf,
+        pattern: bool,
+        /// Exit after this many frames (`--frames`).
+        frames: Option<u32>,
+    },
     /// Render the wall cell renderer test pattern offscreen.
     WallTestPattern {
         emoji_sheet: PathBuf,
@@ -145,6 +153,13 @@ impl Cli {
         }
 
         let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
+        if self.wall {
+            return CliCommand::Wall {
+                emoji_sheet,
+                pattern: self.wall_test_pattern,
+                frames: self.frames,
+            };
+        }
         if self.wall_test_pattern {
             return CliCommand::WallTestPattern {
                 emoji_sheet,
