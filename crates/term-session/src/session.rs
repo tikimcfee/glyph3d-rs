@@ -5,8 +5,9 @@ use crate::coalesce::{CoalescePolicy, Coalescer, PublishDecision};
 use crate::hub::HubInner;
 use crate::inbox::SessionInbox;
 use glyph_vt::{Theme, Vt};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use term_cells::{Modes, Screen};
@@ -38,6 +39,142 @@ pub struct SessionStats {
     pub bytes_parsed: u64,
     /// Total coalesced snapshots published from the session thread to the window slot.
     pub publishes: u64,
+    /// Total `resize` RPCs actually sent over the wire for this session.
+    pub resizes_sent: u64,
+    /// Total explicit `repaint` RPCs actually sent over the wire for this session.
+    pub repaints_sent: u64,
+}
+
+/// Accumulated per-fill delta across all [`Vt::fill`] runs between two window
+/// [`TerminalSession::pump`] drains.
+///
+/// Mirrors `glyph_vt::FillDelta` with plain owned types so `Sessions::pump`
+/// can hand it to `wall_core::wall::Wall::terminal_screen_filled` without
+/// coupling `wall-core` to `glyph-vt`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenFillDelta {
+    /// Whether the grid resized in any fill since the previous drain.
+    pub resized: bool,
+    /// Cumulative rows scrolled off row `0` since the previous drain.
+    pub scrolled_top: u32,
+    /// Whether any scroll since the previous drain was confined to margins
+    /// (`DECSTBM` / `DECSLRM`), downward, or line-delete rather than a
+    /// whole-screen upward scroll.
+    pub within_margins: bool,
+    /// Per-row half-open `(lo, hi)` column spans rewritten in place, aligned to
+    /// the post-scroll row indices of the published [`Screen`] and trimmed of
+    /// trailing `(0, 0)` rows (empty when no cells were rewritten in place).
+    pub rewritten_cols: Vec<(u16, u16)>,
+}
+
+/// Worker-to-window accumulator for [`ScreenFillDelta`] stored inside [`PublishedSlot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingFillDelta {
+    has_fill: bool,
+    delta: ScreenFillDelta,
+}
+
+impl PendingFillDelta {
+    fn capture_from_vt(&mut self, d: &glyph_vt::FillDelta) {
+        self.has_fill = true;
+        self.delta.resized = d.resized;
+        self.delta.scrolled_top = d.scrolled_top;
+        self.delta.within_margins = d.within_margins();
+        self.delta.rewritten_cols.clear();
+        if !d.resized {
+            let rw = d.rewritten_cols();
+            let rw_len = rw.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+            if rw_len > 0 {
+                self.delta.rewritten_cols.extend_from_slice(&rw[..rw_len]);
+            }
+        }
+    }
+
+    fn merge(&mut self, next: &ScreenFillDelta, cols: u16, rows: u16) {
+        if !self.has_fill {
+            self.has_fill = true;
+            self.delta.resized = next.resized;
+            self.delta.scrolled_top = next.scrolled_top;
+            self.delta.within_margins = next.within_margins;
+            self.delta.rewritten_cols.clear();
+            if !next.resized && !next.rewritten_cols.is_empty() {
+                self.delta
+                    .rewritten_cols
+                    .extend_from_slice(&next.rewritten_cols);
+            }
+            return;
+        }
+        if self.delta.resized || next.resized {
+            self.delta.resized = true;
+            self.delta.scrolled_top = 0;
+            self.delta.within_margins = false;
+            self.delta.rewritten_cols.clear();
+            return;
+        }
+
+        let prev_whole_scroll = !self.delta.within_margins && self.delta.scrolled_top > 0;
+        let next_whole_scroll = !next.within_margins && next.scrolled_top > 0;
+
+        if (prev_whole_scroll && next.within_margins)
+            || (self.delta.within_margins && next_whole_scroll)
+        {
+            // A margin scroll dominates a whole-screen scroll; because rows
+            // outside the margin also shifted, mark all rows rewritten so no
+            // selection is left pointing at stale rows.
+            self.delta.within_margins = true;
+            self.delta.scrolled_top = self.delta.scrolled_top.saturating_add(next.scrolled_top);
+            self.delta.rewritten_cols.clear();
+            if cols > 0 && rows > 0 {
+                self.delta
+                    .rewritten_cols
+                    .resize(usize::from(rows), (0, cols));
+            }
+            return;
+        }
+
+        if next_whole_scroll {
+            let shift = next.scrolled_top as usize;
+            if shift >= self.delta.rewritten_cols.len() {
+                self.delta.rewritten_cols.clear();
+            } else if shift > 0 {
+                self.delta.rewritten_cols.drain(..shift);
+            }
+        }
+        if next.within_margins {
+            self.delta.within_margins = true;
+        }
+        self.delta.scrolled_top = self.delta.scrolled_top.saturating_add(next.scrolled_top);
+        union_rewritten_cols(&mut self.delta.rewritten_cols, &next.rewritten_cols);
+    }
+
+    fn take(&mut self) -> Option<ScreenFillDelta> {
+        if !self.has_fill {
+            return None;
+        }
+        self.has_fill = false;
+        Some(std::mem::take(&mut self.delta))
+    }
+}
+
+fn union_rewritten_cols(dst: &mut Vec<(u16, u16)>, src: &[(u16, u16)]) {
+    let src_len = src.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+    if src_len == 0 {
+        return;
+    }
+    if dst.len() < src_len {
+        dst.resize(src_len, (0, 0));
+    }
+    for (y, &(slo, shi)) in src[..src_len].iter().enumerate() {
+        if slo >= shi {
+            continue;
+        }
+        let (dlo, dhi) = dst[y];
+        dst[y] = if dlo < dhi {
+            (dlo.min(slo), dhi.max(shi))
+        } else {
+            (slo, shi)
+        };
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +196,7 @@ struct PublishedMeta {
 struct PublishedSlot {
     screen: Screen,
     meta: PublishedMeta,
+    pending_delta: PendingFillDelta,
 }
 
 pub(crate) struct SessionShared {
@@ -66,6 +204,8 @@ pub(crate) struct SessionShared {
     has_news: AtomicBool,
     bytes_parsed: AtomicU64,
     publishes: AtomicU64,
+    resizes_sent: AtomicU64,
+    repaints_sent: AtomicU64,
 }
 
 /// Non-blocking fire-and-forget commands dispatched from UI callbacks so the window thread
@@ -73,7 +213,13 @@ pub(crate) struct SessionShared {
 pub(crate) enum AsyncCmd {
     Key { handle: u32, id: String, key: Key },
     Mouse { handle: u32, id: String, mouse: Mouse },
-    Resize { handle: u32, id: String, cols: u16, rows: u16 },
+    Resize {
+        handle: u32,
+        id: String,
+        cols: u16,
+        rows: u16,
+        shared: Arc<SessionShared>,
+    },
     Input { handle: u32, id: String, bytes: Vec<u8> },
     View {
         handle: u32,
@@ -82,9 +228,91 @@ pub(crate) enum AsyncCmd {
         shared: Arc<SessionShared>,
         wake: Arc<dyn Fn() + Send + Sync>,
     },
-    Repaint { handle: u32, id: String },
+    Repaint {
+        handle: u32,
+        id: String,
+        shared: Arc<SessionShared>,
+    },
     Kill { id: String },
     Unsubscribe { handle: u32 },
+}
+
+struct AsyncQueueState {
+    cmds: VecDeque<AsyncCmd>,
+    closed: bool,
+}
+
+/// Outbound async command queue that preserves FIFO ordering for input/lifecycle requests while
+/// coalescing queued `Resize` (keeping only the latest `(cols, rows)` per handle) and
+/// deduplicating queued `Repaint` per handle so a multi-step drag never queues a backlog of stale
+/// synchronous RPCs.
+pub(crate) struct AsyncCmdQueue {
+    state: Mutex<AsyncQueueState>,
+    cv: Condvar,
+}
+
+impl AsyncCmdQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(AsyncQueueState {
+                cmds: VecDeque::with_capacity(32),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn push(&self, cmd: AsyncCmd) {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        if guard.closed {
+            return;
+        }
+        match &cmd {
+            AsyncCmd::Resize { handle, cols, rows, .. } => {
+                for existing in &mut guard.cmds {
+                    if let AsyncCmd::Resize {
+                        handle: h,
+                        cols: existing_cols,
+                        rows: existing_rows,
+                        ..
+                    } = existing
+                    {
+                        if h == handle {
+                            *existing_cols = *cols;
+                            *existing_rows = *rows;
+                            return;
+                        }
+                    }
+                }
+            }
+            AsyncCmd::Repaint { handle, .. } => {
+                let already_queued = guard
+                    .cmds
+                    .iter()
+                    .any(|c| matches!(c, AsyncCmd::Repaint { handle: h, .. } if h == handle));
+                if already_queued {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        guard.cmds.push_back(cmd);
+        self.cv.notify_one();
+    }
+
+    pub(crate) fn pop(&self) -> Option<AsyncCmd> {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        while guard.cmds.is_empty() && !guard.closed {
+            guard = self.cv.wait(guard).expect("async cmd queue mutex poisoned");
+        }
+        guard.cmds.pop_front()
+    }
+
+    pub(crate) fn close(&self) {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        guard.closed = true;
+        self.cv.notify_all();
+    }
 }
 
 /// Window-side handle to one live terminal running its emulator on its own background thread.
@@ -99,6 +327,7 @@ pub struct TerminalSession {
     inbox: Arc<SessionInbox>,
     shared: Arc<SessionShared>,
     front_screen: Screen,
+    last_fill_delta: Option<ScreenFillDelta>,
     meta: PublishedMeta,
     display_title: String,
     seen_bells: u64,
@@ -162,10 +391,13 @@ impl TerminalSession {
             published: Mutex::new(PublishedSlot {
                 screen: initial_screen,
                 meta: initial_meta.clone(),
+                pending_delta: PendingFillDelta::default(),
             }),
             has_news: AtomicBool::new(false),
             bytes_parsed: AtomicU64::new(0),
             publishes: AtomicU64::new(0),
+            resizes_sent: AtomicU64::new(0),
+            repaints_sent: AtomicU64::new(0),
         });
 
         let vt = Arc::new(Mutex::new(initial_vt));
@@ -173,6 +405,7 @@ impl TerminalSession {
         let worker_inbox = Arc::clone(&inbox);
         let worker_shared = Arc::clone(&shared);
         let worker_hub = Arc::downgrade(&hub);
+        let worker_id = id.clone();
         let thread_name = format!("term-vt:{id}");
 
         let worker = thread::Builder::new()
@@ -180,6 +413,7 @@ impl TerminalSession {
             .spawn(move || {
                 session_worker_loop(
                     handle,
+                    worker_id,
                     cols,
                     rows,
                     theme,
@@ -202,6 +436,7 @@ impl TerminalSession {
             inbox,
             shared,
             front_screen,
+            last_fill_delta: None,
             meta: initial_meta,
             seen_bells: 0,
             seen_meta_gen: 0,
@@ -296,11 +531,13 @@ impl TerminalSession {
         self.meta.last_error.as_ref().map(|(c, m)| (c.as_str(), m.as_str()))
     }
 
-    /// Live byte-parse and screen-publish counters.
+    /// Live byte-parse, screen-publish, and outbound resize/repaint RPC counters.
     pub fn stats(&self) -> SessionStats {
         SessionStats {
             bytes_parsed: self.shared.bytes_parsed.load(Ordering::Relaxed),
             publishes: self.shared.publishes.load(Ordering::Relaxed),
+            resizes_sent: self.shared.resizes_sent.load(Ordering::Relaxed),
+            repaints_sent: self.shared.repaints_sent.load(Ordering::Relaxed),
         }
     }
 
@@ -310,8 +547,9 @@ impl TerminalSession {
         if !self.shared.has_news.swap(false, Ordering::Acquire) {
             return false;
         }
-        let guard = self.shared.published.lock().expect("published mutex poisoned");
+        let mut guard = self.shared.published.lock().expect("published mutex poisoned");
         let screen_changed = sync_screen_into(&guard.screen, &guard.screen.title, &mut self.front_screen);
+        let fill_delta = guard.pending_delta.take();
         let meta_changed = guard.meta.meta_gen != self.seen_meta_gen;
         if meta_changed {
             self.meta = guard.meta.clone();
@@ -324,7 +562,27 @@ impl TerminalSession {
                 self.display_title.clone_from(&self.meta.osc_title);
             }
         }
+        drop(guard);
+        if let Some(next) = fill_delta {
+            match &mut self.last_fill_delta {
+                Some(existing) => {
+                    let mut acc = PendingFillDelta {
+                        has_fill: true,
+                        delta: std::mem::take(existing),
+                    };
+                    acc.merge(&next, self.front_screen.cols, self.front_screen.rows);
+                    *existing = acc.delta;
+                }
+                None => self.last_fill_delta = Some(next),
+            }
+        }
         screen_changed || meta_changed
+    }
+
+    /// Takes the accumulated [`ScreenFillDelta`] from every worker fill drained by [`Self::pump`]
+    /// since the previous take (`None` when no screen fill occurred).
+    pub fn take_fill_delta(&mut self) -> Option<ScreenFillDelta> {
+        self.last_fill_delta.take()
     }
 
     /// Extracts stream selection text between `(col0, row0)` and `(col1, row1)` (`col` in
@@ -350,6 +608,7 @@ impl TerminalSession {
 
     /// Resizes the terminal in `g3d-termd` (requires [`Role::Own`]).
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Error> {
+        self.shared.resizes_sent.fetch_add(1, Ordering::Relaxed);
         self.hub.termd_handle().resize(self.handle, cols, rows)
     }
 
@@ -398,6 +657,7 @@ impl TerminalSession {
 
     /// Requests an explicit `REPAINT` from `g3d-termd`.
     pub fn repaint(&self) -> Result<(), Error> {
+        self.shared.repaints_sent.fetch_add(1, Ordering::Relaxed);
         self.hub.termd_handle().repaint(self.handle)
     }
 
@@ -448,7 +708,8 @@ impl TerminalSession {
         });
     }
 
-    /// Queues a terminal resize in FIFO order without blocking the window thread.
+    /// Queues a terminal resize without blocking the window thread, coalescing in place so only
+    /// the latest `(cols, rows)` for this terminal is sent over the wire during a multi-step drag.
     pub fn send_resize(&self, cols: u16, rows: u16) {
         if self.is_ended() {
             return;
@@ -458,6 +719,7 @@ impl TerminalSession {
             id: self.id.clone(),
             cols,
             rows,
+            shared: Arc::clone(&self.shared),
         });
     }
 
@@ -476,7 +738,7 @@ impl TerminalSession {
         });
     }
 
-    /// Queues an explicit `repaint` request without blocking the window thread.
+    /// Queues an explicit `repaint` request without blocking the window thread (deduplicated per handle).
     pub fn send_repaint(&self) {
         if self.is_ended() {
             return;
@@ -484,6 +746,7 @@ impl TerminalSession {
         self.hub.send_async(AsyncCmd::Repaint {
             handle: self.handle,
             id: self.id.clone(),
+            shared: Arc::clone(&self.shared),
         });
     }
 
@@ -507,7 +770,8 @@ impl TerminalSession {
     reason = "worker entrypoint owns all per-session handles moved onto its dedicated OS thread"
 )]
 fn session_worker_loop(
-    _handle: u32,
+    handle: u32,
+    session_id: String,
     initial_cols: u16,
     initial_rows: u16,
     theme: Theme,
@@ -526,6 +790,7 @@ fn session_worker_loop(
 
     let mut coalescer = Coalescer::new(policy);
     let mut batch: Vec<Event> = Vec::with_capacity(32);
+    let mut fill_scratch = PendingFillDelta::default();
 
     let mut osc_title = String::new();
     let mut prev_vt_title = String::new();
@@ -539,6 +804,7 @@ fn session_worker_loop(
     let mut closed = false;
     let mut last_error: Option<(String, String)> = None;
     let mut meta_dirty = false;
+    let mut grow_repaint_due: Option<Instant> = None;
 
     loop {
         batch.clear();
@@ -576,30 +842,48 @@ fn session_worker_loop(
                         if !view {
                             view_offset_zeroed = true;
                             meta_dirty = true;
+                            // A live repaint already carries any scrollback rows `termd` pulled
+                            // onto the active grid, so cancel any pending post-resize repaint.
+                            grow_repaint_due = None;
                         }
-                        if view {
-                            coalescer.mark_immediate();
-                        } else {
-                            coalescer.mark_dirty();
-                        }
+                        // Every `REPAINT` is a single authoritative snapshot from `termd`
+                        // (initial attach, scrollback view, reconnect, lag resync, or settled
+                        // primary-grow pull-back), never a byte flood: publish immediately.
+                        coalescer.mark_immediate();
                     }
-                    Event::Size { cols, rows, handle: h, .. } => {
-                        {
+                    Event::Size { cols, rows, .. } => {
+                        let (grew_primary, on_alt) = {
                             let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
+                            let prev_cols = vt.cols();
+                            let prev_rows = vt.rows();
+                            let alt = vt.modes().alt_screen;
                             vt.resize(cols, rows);
-                        }
+                            (!alt && (cols > prev_cols || rows > prev_rows), alt)
+                        };
                         viewing_scrollback = false;
                         view_offset_zeroed = true;
                         meta_dirty = true;
                         coalescer.mark_dirty();
-                        // Ask `termd` for a reflowed repaint on the shared IO worker so lines
-                        // pulled back out of daemon scrollback on a height increase reach our
-                        // zero-scrollback viewer without spawning a thread per resize step.
-                        if let Some(hub) = hub_weak.upgrade() {
-                            hub.send_async(AsyncCmd::Repaint {
-                                handle: h,
-                                id: String::new(),
-                            });
+                        // `g3d-termd` sends raw subscribers `EVENT size` without `REPAINT`, so
+                        // when a primary-screen terminal grows `cols` or `rows` (pulling history
+                        // rows out of daemon scrollback), debounce and ask once after the drag
+                        // settles (`grow_repaint_settle`) rather than on every intermediate step,
+                        // and never on the alternate screen where the program redraws itself.
+                        if on_alt {
+                            grow_repaint_due = None;
+                        } else if grew_primary || grow_repaint_due.is_some() {
+                            if policy.grow_repaint_settle.is_zero() {
+                                grow_repaint_due = None;
+                                if let Some(hub) = hub_weak.upgrade() {
+                                    hub.send_async(AsyncCmd::Repaint {
+                                        handle,
+                                        id: session_id.clone(),
+                                        shared: Arc::clone(&shared),
+                                    });
+                                }
+                            } else {
+                                grow_repaint_due = Some(Instant::now() + policy.grow_repaint_settle);
+                            }
                         }
                     }
                     Event::Title { title, .. } => {
@@ -660,6 +944,21 @@ fn session_worker_loop(
             }
         }
 
+        if let Some(due) = grow_repaint_due {
+            if Instant::now() >= due {
+                grow_repaint_due = None;
+                if alive && !closed && exit_info.is_none() {
+                    if let Some(hub) = hub_weak.upgrade() {
+                        hub.send_async(AsyncCmd::Repaint {
+                            handle,
+                            id: session_id.clone(),
+                            shared: Arc::clone(&shared),
+                        });
+                    }
+                }
+            }
+        }
+
         let sync_active = {
             let vt = vt_mutex.lock().expect("vt mutex poisoned");
             vt.synchronized_output()
@@ -671,6 +970,7 @@ fn session_worker_loop(
                 publish_snapshot(
                     &vt_mutex,
                     &mut working_screen,
+                    &mut fill_scratch,
                     &shared,
                     &mut osc_title,
                     &mut prev_vt_title,
@@ -694,6 +994,7 @@ fn session_worker_loop(
                     publish_snapshot(
                         &vt_mutex,
                         &mut working_screen,
+                        &mut fill_scratch,
                         &shared,
                         &mut osc_title,
                         &mut prev_vt_title,
@@ -711,14 +1012,15 @@ fn session_worker_loop(
                     );
                     return;
                 }
-                let _ = inbox.wait_for_activity(Some(deadline));
+                let wake_at = grow_repaint_due.map_or(deadline, |g| deadline.min(g));
+                let _ = inbox.wait_for_activity(Some(wake_at));
                 continue;
             }
             PublishDecision::Idle => {
                 if !alive || closed {
                     return;
                 }
-                if !inbox.wait_for_activity(None) {
+                if !inbox.wait_for_activity(grow_repaint_due) {
                     return;
                 }
             }
@@ -733,6 +1035,7 @@ fn session_worker_loop(
 fn publish_snapshot(
     vt_mutex: &Arc<Mutex<Vt>>,
     working_screen: &mut Screen,
+    fill_scratch: &mut PendingFillDelta,
     shared: &Arc<SessionShared>,
     osc_title: &mut String,
     prev_vt_title: &mut String,
@@ -748,9 +1051,13 @@ fn publish_snapshot(
     meta_dirty: &mut bool,
     wake: &(dyn Fn() + Send + Sync),
 ) {
+    fill_scratch.has_fill = false;
     let (mut screen_changed, cursor_color) = {
         let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
         let changed = vt.fill(working_screen);
+        if changed {
+            fill_scratch.capture_from_vt(vt.last_fill_delta());
+        }
         (changed, vt.cursor_color())
     };
 
@@ -770,6 +1077,10 @@ fn publish_snapshot(
 
     let mut slot = shared.published.lock().expect("published mutex poisoned");
     let copied = sync_screen_into(working_screen, osc_title, &mut slot.screen);
+    if fill_scratch.has_fill {
+        slot.pending_delta
+            .merge(&fill_scratch.delta, working_screen.cols, working_screen.rows);
+    }
 
     let mut metadata_updated = *meta_dirty;
     if slot.meta.modes != slot.screen.modes {
@@ -895,8 +1206,8 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
     true
 }
 
-pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncCmd>) {
-    while let Ok(cmd) = rx.recv() {
+pub(crate) fn run_async_cmd_worker(termd: TermdHandle, queue: Arc<AsyncCmdQueue>) {
+    while let Some(cmd) = queue.pop() {
         match cmd {
             AsyncCmd::Key { handle, id, key } => {
                 if let Err(e) = termd.key(handle, &key) {
@@ -908,7 +1219,14 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                     log::warn!("terminal {id}: mouse event was not sent: {e}");
                 }
             }
-            AsyncCmd::Resize { handle, id, cols, rows } => {
+            AsyncCmd::Resize {
+                handle,
+                id,
+                cols,
+                rows,
+                shared,
+            } => {
+                shared.resizes_sent.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = termd.resize(handle, cols, rows) {
                     log::warn!("terminal {id}: resize to {cols}x{rows} was refused: {e}");
                 }
@@ -933,7 +1251,8 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                 }
                 Err(e) => log::debug!("terminal {id}: view did not move: {e}"),
             },
-            AsyncCmd::Repaint { handle, id } => {
+            AsyncCmd::Repaint { handle, id, shared } => {
+                shared.repaints_sent.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = termd.repaint(handle) {
                     if !id.is_empty() {
                         log::warn!("terminal {id}: repaint was refused: {e}");
@@ -949,5 +1268,164 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                 let _ = termd.unsubscribe(handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_shared() -> Arc<SessionShared> {
+        Arc::new(SessionShared {
+            published: Mutex::new(PublishedSlot {
+                screen: Screen::new(80, 24),
+                meta: PublishedMeta {
+                    osc_title: String::new(),
+                    pwd: None,
+                    modes: Modes::default(),
+                    mouse_sgr: false,
+                    cursor_color: 0,
+                    scrollback: ScrollbackState::default(),
+                    bell_total: 0,
+                    role: Role::Own,
+                    exit: None,
+                    closed: false,
+                    last_error: None,
+                    meta_gen: 0,
+                },
+                pending_delta: PendingFillDelta::default(),
+            }),
+            has_news: AtomicBool::new(false),
+            bytes_parsed: AtomicU64::new(0),
+            publishes: AtomicU64::new(0),
+            resizes_sent: AtomicU64::new(0),
+            repaints_sent: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn async_cmd_queue_coalesces_resize_in_place_and_dedups_repaint_per_handle() {
+        let q = AsyncCmdQueue::new();
+        let s1 = dummy_shared();
+        let s2 = dummy_shared();
+
+        for step in 1..=14u16 {
+            q.push(AsyncCmd::Resize {
+                handle: 1,
+                id: "t1".into(),
+                cols: 80 + step,
+                rows: 24 + step,
+                shared: Arc::clone(&s1),
+            });
+            q.push(AsyncCmd::Repaint {
+                handle: 1,
+                id: "t1".into(),
+                shared: Arc::clone(&s1),
+            });
+        }
+        q.push(AsyncCmd::Resize {
+            handle: 2,
+            id: "t2".into(),
+            cols: 100,
+            rows: 30,
+            shared: Arc::clone(&s2),
+        });
+        q.close();
+
+        let mut popped = Vec::new();
+        while let Some(cmd) = q.pop() {
+            popped.push(cmd);
+        }
+        assert_eq!(popped.len(), 3, "14 resizes + 14 repaints on h1 + 1 resize on h2 -> 3 cmds");
+        assert!(matches!(
+            popped[0],
+            AsyncCmd::Resize { handle: 1, cols: 94, rows: 38, .. }
+        ));
+        assert!(matches!(popped[1], AsyncCmd::Repaint { handle: 1, .. }));
+        assert!(matches!(
+            popped[2],
+            AsyncCmd::Resize { handle: 2, cols: 100, rows: 30, .. }
+        ));
+    }
+
+    fn delta(
+        resized: bool,
+        scrolled_top: u32,
+        within_margins: bool,
+        rewritten_cols: Vec<(u16, u16)>,
+    ) -> ScreenFillDelta {
+        ScreenFillDelta {
+            resized,
+            scrolled_top,
+            within_margins,
+            rewritten_cols,
+        }
+    }
+
+    #[test]
+    fn fill_delta_accumulates_scrolls_shifts_prior_rewrites_and_unions_spans() {
+        let mut acc = PendingFillDelta::default();
+        assert_eq!(acc.take(), None);
+
+        // First fill: in-place rewrite on row 4 cols 2..6.
+        acc.merge(&delta(false, 0, false, vec![(0, 0), (0, 0), (0, 0), (0, 0), (2, 6)]), 20, 6);
+        // Second fill: whole-screen scroll up by 2 rows, plus rewrite on new row 2 cols 8..12
+        // (same original row 4!) and new row 5 cols 0..4.
+        acc.merge(
+            &delta(false, 2, false, vec![(0, 0), (0, 0), (8, 12), (0, 0), (0, 0), (0, 4)]),
+            20,
+            6,
+        );
+        // Third fill: whole-screen scroll up by 1 row with no in-place rewrites.
+        acc.merge(&delta(false, 1, false, Vec::new()), 20, 6);
+
+        let merged = acc.take().expect("accumulated delta");
+        assert!(!merged.resized);
+        assert_eq!(merged.scrolled_top, 3);
+        assert!(!merged.within_margins);
+        // Row 4 shifted up 2 -> row 2 unioned (2,6)U(8,12) = (2,12), then shifted up 1 -> row 1.
+        // Row 5 shifted up 1 -> row 4.
+        assert_eq!(
+            merged.rewritten_cols,
+            vec![(0, 0), (2, 12), (0, 0), (0, 0), (0, 4)]
+        );
+        assert_eq!(acc.take(), None);
+    }
+
+    #[test]
+    fn fill_delta_preserves_margin_scroll_and_ors_resize_and_avoids_empty_alloc() {
+        // Pure scroll without in-place rewrites keeps rewritten_cols unallocated.
+        let mut pure = PendingFillDelta::default();
+        pure.merge(&delta(false, 2, false, Vec::new()), 20, 6);
+        pure.merge(&delta(false, 3, false, Vec::new()), 20, 6);
+        let d = pure.take().expect("pure scroll");
+        assert_eq!(d.scrolled_top, 5);
+        assert!(!d.within_margins);
+        assert_eq!(d.rewritten_cols.capacity(), 0);
+
+        // Margin scroll followed by non-scrolling edit stays a margin scroll with spans unioned.
+        let mut margin = PendingFillDelta::default();
+        margin.merge(&delta(false, 0, true, vec![(0, 0), (0, 20)]), 20, 6);
+        margin.merge(&delta(false, 0, false, vec![(3, 7)]), 20, 6);
+        let d = margin.take().expect("margin scroll");
+        assert!(d.within_margins);
+        assert_eq!(d.rewritten_cols, vec![(3, 7), (0, 20)]);
+
+        // Whole-screen scroll mixed with margin scroll stays a margin scroll and marks all rows.
+        let mut mixed = PendingFillDelta::default();
+        mixed.merge(&delta(false, 2, false, Vec::new()), 20, 4);
+        mixed.merge(&delta(false, 0, true, vec![(0, 0), (0, 20)]), 20, 4);
+        let d = mixed.take().expect("mixed");
+        assert!(d.within_margins);
+        assert_eq!(d.rewritten_cols, vec![(0, 20); 4]);
+
+        // Resize ORs in either order and clears rewritten_cols.
+        let mut resized = PendingFillDelta::default();
+        resized.merge(&delta(false, 1, false, vec![(1, 5)]), 20, 4);
+        resized.merge(&delta(true, 0, false, Vec::new()), 30, 8);
+        resized.merge(&delta(false, 0, false, vec![(0, 10)]), 30, 8);
+        let d = resized.take().expect("resized");
+        assert!(d.resized);
+        assert!(d.rewritten_cols.is_empty());
     }
 }

@@ -5,7 +5,7 @@
 #     cp launch_config.example.toml launch_config.toml
 #
 # Startup defaults for interactive windowed runs, and the launcher's starting
-# point (`cargo glyph run` with no arguments, or `--launcher`). The renderer
+# point (`glyph3d-native --launcher` or `cargo glyph tui`). The renderer
 # reads it from the working directory or its parent, or from --launch-config
 # <path>. Any CLI flag overrides a setting here (a scene flag such as
 # --render-file overrides all of the scene keys), and a `--screenshot` run
@@ -77,7 +77,7 @@ no_ui = false
 
 # Repos the launcher cycles through with ◄/► (optional). Without this the
 # launcher offers "." and "native/fixtures/g-pick-repo". Add your own corpora.
-# Other scene keys: render_file = "<path>", demo = true, focus_file = "<substr>".
+# Other scene keys: wall = true, wall_ns = "rs-wall", render_file = "<path>", demo = true, focus_file = "<substr>".
 # Other modes: layout_mode = "shelf" | "carrel" | "library", debug_tint = "off" | "lod" |
 # "cull", present_mode = "fifo" | "mailbox" | "immediate".
 # repo_presets = [".", "native/fixtures/g-pick-repo", "~/src/some-large-repo"]

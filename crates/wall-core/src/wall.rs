@@ -38,7 +38,7 @@ use term_cells::{Modes, Screen};
 
 use crate::agent_view::{self, AgentViewDims};
 use crate::bus::{
-    attach_argv, bus_attachable, bus_hosts, bus_status, find_bus_agent, gomux_screen_id,
+    attach_argv, bus_attachable, bus_hosts, find_bus_agent, gomux_screen_id,
     is_bus_target, local_bus_name, GomuxSnapshot,
 };
 use crate::camera::{CameraPose, ScreenBox, WallCamera};
@@ -54,7 +54,7 @@ use crate::config::{AgentSide, GroupLayout, WallConfig, WALL_CONFIG_KEYS};
 use crate::dock::{dock_layout, DockLayout, DockSide, DockState};
 use crate::fullscreen::{
     dock_state_from_store, EnterOptions, FullscreenArea, FullscreenConfig, FullscreenHost,
-    FullscreenTerminal, TextStep, WallFullscreen,
+    FullscreenTerminal, TextStep, WallFullscreen, BACKDROP_OPACITY,
 };
 use crate::geom::{Point, Rect};
 use crate::groups::{
@@ -89,9 +89,10 @@ use crate::pointer::{
 use crate::router::{CommandInput, CommandMeta, CommandReply, CommandRouter, RegisterMeta};
 use crate::selection::TerminalSelection;
 use crate::settings::{KnobInput, KnobValue};
+use crate::sidebar::AgentStatus;
 use crate::snap::{grid_levels, snap_step, snap_to, GridLevels, GridSpec};
 use crate::split::{self, BranchSide, Direction, PaneMap};
-use crate::status::TermdStatus;
+use crate::status::{self, StatusNotice, TermdStatus, DEFAULT_RESTART_GRACE_MS};
 use crate::store::{
     AgentViewState, FullscreenMode, FullscreenState, HelpPanelPatch, HelpPanelState,
     SettingsPanelPatch, SettingsPanelState, SidebarPatch, SidebarState, StatusWindowPatch,
@@ -106,8 +107,9 @@ pub const DEFAULT_SPAWN_ROWS: u32 = 30;
 pub const DEFAULT_VIEWPORT_W: f64 = 1400.0;
 /// Default logical viewport height when none has been reported yet.
 pub const DEFAULT_VIEWPORT_H: f64 = 900.0;
-/// Fallback unit width per character used to size title bars when no font shaper is queried.
-const FALLBACK_CHAR_UNIT_WIDTH: f64 = 0.6;
+/// Fallback unit width per character used to size title bars and group headers
+/// when the window does not supply a measured font advance (`advance / line_height`).
+pub const DEFAULT_TITLE_CHAR_UNIT_WIDTH: f64 = 0.6;
 /// World Z offset for the fullscreen backdrop, just beneath `FULLSCREEN_Z`.
 const FULLSCREEN_BACKDROP_Z: f64 = FULLSCREEN_Z - 1.0;
 
@@ -177,6 +179,65 @@ impl ScreenLookup for BTreeMap<String, Screen> {
 
 // ── Construction options & terminal news ─────────────────────────────────────
 
+/// Measured monospace character advances supplied by the host renderer for
+/// sizing title bars, group headers, and map-label pills without coupling
+/// `wall-core` to a font rasterizer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharWidths {
+    /// Character advance divided by line height (`advance / line_height`), used
+    /// to size terminal title bars and group headers (default `0.6`).
+    pub title_unit_width: f64,
+    /// Character advance in logical CSS pixels at the `12 px` map-label font
+    /// size, used to size map-label pills (default `7.2`, matching `MapLabels.js`).
+    pub map_label_char_px: f64,
+}
+
+impl Default for CharWidths {
+    fn default() -> Self {
+        Self {
+            title_unit_width: DEFAULT_TITLE_CHAR_UNIT_WIDTH,
+            map_label_char_px: names::DEFAULT_MAP_LABEL_CHAR_PX,
+        }
+    }
+}
+
+impl CharWidths {
+    /// Construct from explicit `(title_unit_width, map_label_char_px)` measurements.
+    pub const fn new(title_unit_width: f64, map_label_char_px: f64) -> Self {
+        Self {
+            title_unit_width,
+            map_label_char_px,
+        }
+    }
+
+    /// Construct from a monospace font's `advance / line_height` ratio, deriving
+    /// `map_label_char_px = unit_width * 12.0` (the default `12 px` map-label font).
+    pub const fn from_unit_width(unit_width: f64) -> Self {
+        Self {
+            title_unit_width: unit_width,
+            map_label_char_px: unit_width * 12.0,
+        }
+    }
+
+    fn sanitized(self) -> Self {
+        let defaults = Self::default();
+        Self {
+            title_unit_width: if self.title_unit_width.is_finite() && self.title_unit_width > 0.0 {
+                self.title_unit_width
+            } else {
+                defaults.title_unit_width
+            },
+            map_label_char_px: if self.map_label_char_px.is_finite()
+                && self.map_label_char_px > 0.0
+            {
+                self.map_label_char_px
+            } else {
+                defaults.map_label_char_px
+            },
+        }
+    }
+}
+
 /// Construction parameters for [`Wall`].
 #[derive(Clone, Debug)]
 pub struct WallOptions {
@@ -184,6 +245,8 @@ pub struct WallOptions {
     pub born_config: WallConfig,
     /// Cell advance stride, panel padding, and depth scale in world units.
     pub geometry: CellGeometry,
+    /// Measured monospace character advances for title bars, group headers, and map labels.
+    pub char_widths: CharWidths,
     /// Host platform conventions (chord key, block-select modifier, copy/paste chords).
     pub platform: Platform,
     /// Initial column count requested on [`WallEffect::SpawnTerminal`].
@@ -205,6 +268,7 @@ impl Default for WallOptions {
         Self {
             born_config: WallConfig::default(),
             geometry: CellGeometry::default(),
+            char_widths: CharWidths::default(),
             platform: Platform::host(),
             default_cols: DEFAULT_SPAWN_COLS,
             default_rows: DEFAULT_SPAWN_ROWS,
@@ -260,6 +324,77 @@ impl TerminalAppeared {
         self.modes = modes;
         self
     }
+}
+
+/// Plain-data summary of how one terminal's [`Screen`] changed on an emulator
+/// fill (mirrors `glyph_vt::FillDelta` without coupling `wall-core` to
+/// `glyph-vt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenFillDelta<'a> {
+    /// Whether the terminal grid resized since the previous fill.
+    pub resized: bool,
+    /// Number of rows scrolled off row `0` since the previous fill.
+    pub scrolled_top: u32,
+    /// Whether scrolling was confined to margins (`DECSTBM` / `DECSLRM`) rather
+    /// than shifting the whole screen upward.
+    pub within_margins: bool,
+    /// Per-row half-open column ranges `(lo, hi)` rewritten in place (`lo >= hi`
+    /// or omitted trailing rows mean unchanged).
+    pub rewritten_cols: &'a [(u16, u16)],
+}
+
+/// Extract the last non-blank line from `screen`, trimmed at both ends, into
+/// `buf` (reusing `buf`'s capacity so unchanged screens do zero allocation).
+fn extract_preview_into(screen: &Screen, buf: &mut String) {
+    buf.clear();
+    for r in (0..screen.rows).rev() {
+        let row = screen.row(r);
+        let mut has_non_space = false;
+        for cell in row {
+            if cell.width == 0 || cell.content == 0 {
+                continue;
+            }
+            if cell.content < term_cells::CLUSTER_BASE {
+                if let Some(ch) = char::from_u32(cell.content) {
+                    if !ch.is_whitespace() {
+                        has_non_space = true;
+                        break;
+                    }
+                }
+            } else if !screen.content_str(cell).trim().is_empty() {
+                has_non_space = true;
+                break;
+            }
+        }
+        if !has_non_space {
+            continue;
+        }
+        for cell in row {
+            if cell.width == 0 {
+                continue;
+            }
+            if cell.content == 0 {
+                buf.push(' ');
+            } else {
+                buf.push_str(&screen.content_str(cell));
+            }
+        }
+        let trimmed = buf.trim();
+        let start = trimmed.as_ptr() as usize - buf.as_ptr() as usize;
+        let len = trimmed.len();
+        if start > 0 {
+            buf.drain(..start);
+        }
+        buf.truncate(len);
+        return;
+    }
+}
+
+/// Extract the last non-blank line from `screen` for sidebar/palette previews.
+pub fn preview_from_screen(screen: &Screen) -> String {
+    let mut buf = String::new();
+    extract_preview_into(screen, &mut buf);
+    buf
 }
 
 // ── Plain-data frame description (`WallFrame`) ───────────────────────────────
@@ -323,7 +458,14 @@ pub struct TerminalFrame {
 pub struct TitleBarFrame {
     pub terminal_id: String,
     pub rect: Rect,
+    /// Resolved display name without any `" · <status>"` agent suffix.
+    pub name: String,
+    /// Full display text (`name`, or `"<name> · <status>"` when `agent_status` is `Some`).
     pub text: String,
+    /// Attached gomuxai agent target (`name` or `name@host`) from the store, if any.
+    pub attached_agent: Option<String>,
+    /// Live gomuxai agent status when attached and present in the bus snapshot.
+    pub agent_status: Option<AgentStatus>,
     /// `false` when the terminal's name has been handed off to its map label.
     pub text_visible: bool,
     pub text_left: f64,
@@ -351,6 +493,7 @@ pub struct GroupFrame {
     pub text_color: u32,
     pub z: f64,
     pub focused: bool,
+    pub hovered: bool,
 }
 
 /// World-space selection outline around a selected terminal.
@@ -365,8 +508,16 @@ pub struct SelectionOutline {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapLabelFrame {
     pub terminal_id: String,
+    /// Resolved display name without any `" · <status>"` agent suffix.
+    pub name: String,
+    /// Full display text (`name`, or `"<name> · <status>"` when `agent_status` is `Some`).
     pub text: String,
+    /// Attached gomuxai agent target (`name` or `name@host`) from the store, if any.
+    pub attached_agent: Option<String>,
+    /// Live gomuxai agent status when attached and present in the bus snapshot.
+    pub agent_status: Option<AgentStatus>,
     pub focused: bool,
+    pub hovered: bool,
     pub label_box: ScreenBox,
     pub target: ScreenBox,
     pub leader: Option<Leader>,
@@ -379,6 +530,11 @@ pub struct FullscreenBackdrop {
     pub target: String,
     pub area: FullscreenArea,
     pub background: String,
+    /// Veil alpha (`BACKDROP_OPACITY = 0.9` in `WallFullscreen.js`).
+    pub opacity: f64,
+    /// World-space cutout rectangles left uncovered around the active fullscreen
+    /// pane(s), mirroring `WallFullscreen._cutoutBoxes`.
+    pub cutouts: Vec<Rect>,
     pub z: f64,
 }
 
@@ -410,7 +566,12 @@ pub struct WallFrame {
     pub drop_preview: Option<DropPreview>,
     pub map_labels: Vec<MapLabelFrame>,
     pub fullscreen_backdrop: Option<FullscreenBackdrop>,
+    /// Transient amber wall notice (e.g. fullscreen reload reminder or clipboard hint).
     pub notice: Option<String>,
+    /// Daemon outage / compatibility banner computed via [`crate::status::notice_for`]
+    /// (`tone` is `Amber` for `Restarting` after `restartNoticeMs` or `Red` for `Lost` /
+    /// `Lacks` / `Unreachable` / `Failed`; `dismiss` is `true` for the sticky `Lost` latch).
+    pub status_notice: Option<StatusNotice>,
     pub menu: Option<OpenMenu>,
     pub palette_open: bool,
     pub panels: PanelsFrame,
@@ -441,16 +602,29 @@ struct WallCore {
     names: WallNames,
     selections: HashMap<String, TerminalSelection>,
     selection_text_cache: HashMap<String, String>,
+    /// Last `Screen::title` observed per terminal so unchanged fills never allocate
+    /// and an empty `Screen::title` never clobbers a title delivered by `Event::Title`.
+    last_screen_titles: HashMap<String, String>,
+    /// Per-terminal Agent View stick-to-bottom pin state (`wall.agent.follow`, defaults to `true`).
+    agent_stick_bottom: HashMap<String, bool>,
+    preview_scratch: String,
     pressed_keys: PressedKeys,
     termd: TermdStatus,
+    /// Latest clock timestamp (ms) observed on `termd` status transitions or ticks,
+    /// supporting callers that pass either monotonic or Unix epoch ms into `on_termd_*`.
+    termd_now_ms: Option<u64>,
     bus: Option<GomuxSnapshot>,
     bus_reason: String,
     platform: Platform,
+    char_widths: CharWidths,
     default_cols: u32,
     default_rows: u32,
     scale_factor: f64,
     now_ms: f64,
     cursor: CursorIcon,
+    hovered_group_id: Option<String>,
+    hovered_label_id: Option<String>,
+    last_map_labels: Vec<(String, ScreenBox)>,
     lasso_screen: Option<Vec<Point>>,
     active_group_drag: Option<GroupDrag>,
     pending_spawns: VecDeque<PendingSpawn>,
@@ -1068,16 +1242,24 @@ impl WallCore {
             names: WallNames::new(None),
             selections: HashMap::new(),
             selection_text_cache: HashMap::new(),
+            last_screen_titles: HashMap::new(),
+            agent_stick_bottom: HashMap::new(),
+            preview_scratch: String::new(),
             pressed_keys: PressedKeys::new(),
             termd: TermdStatus::new(opts.namespace),
+            termd_now_ms: None,
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
             platform: opts.platform,
+            char_widths: opts.char_widths.sanitized(),
             default_cols: opts.default_cols,
             default_rows: opts.default_rows,
             scale_factor: opts.scale_factor.max(0.1),
             now_ms: 0.0,
             cursor: CursorIcon::Default,
+            hovered_group_id: None,
+            hovered_label_id: None,
+            last_map_labels: Vec::new(),
             lasso_screen: None,
             active_group_drag: None,
             pending_spawns: VecDeque::new(),
@@ -1197,6 +1379,11 @@ impl WallCore {
         for gid in stale_gids {
             self.model.store_mut().delete_group(&gid);
         }
+        if let Some(ref gid) = self.hovered_group_id {
+            if !live_gids.contains(gid) {
+                self.hovered_group_id = None;
+            }
+        }
         let updates: Vec<(String, WallGroup)> = self
             .groups
             .as_map()
@@ -1287,15 +1474,96 @@ impl WallCore {
         }
     }
 
-    fn title_of(&self, id: &str) -> String {
+    fn title_parts(&self, id: &str) -> (String, Option<String>, Option<AgentStatus>, String) {
         let name = self.model.name_of(id);
-        let agent_word = self
-            .model
-            .store()
-            .attached(id)
+        let attached_agent = self.model.store().attached(id).map(str::to_owned);
+        let agent_status = attached_agent
+            .as_deref()
             .and_then(|target| find_bus_agent(self.bus.as_ref(), target))
-            .map(|a| bus_status(a.status.as_deref()).word);
-        names::bar_title(&name, agent_word)
+            .map(|a| AgentStatus::parse(a.status.as_deref().unwrap_or("")));
+        let text = names::bar_title(&name, agent_status.map(AgentStatus::word));
+        (name, attached_agent, agent_status, text)
+    }
+
+    fn title_of(&self, id: &str) -> String {
+        self.title_parts(id).3
+    }
+
+    fn set_hovered_group(&mut self, group_id: Option<&str>) {
+        if self.hovered_group_id.as_deref() != group_id {
+            self.hovered_group_id = group_id.map(str::to_owned);
+            self.model.notify_changed();
+        }
+    }
+
+    fn set_hovered_label(&mut self, label_id: Option<&str>) {
+        if self.hovered_label_id.as_deref() != label_id {
+            self.hovered_label_id = label_id.map(str::to_owned);
+            self.model.notify_changed();
+        }
+    }
+
+    fn hit_map_label(&self, screen_x: f64, screen_y: f64) -> Option<String> {
+        if self.fullscreen.active() {
+            return None;
+        }
+        self.last_map_labels
+            .iter()
+            .rev()
+            .find(|(_, b)| {
+                screen_x >= b.left
+                    && screen_x <= b.right
+                    && screen_y >= b.top
+                    && screen_y <= b.bottom
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    fn record_termd_now_ms(&mut self, now_ms: u64) {
+        self.termd_now_ms = Some(self.termd_now_ms.map_or(now_ms, |prev| prev.max(now_ms)));
+    }
+
+    fn effective_termd_now_ms(&self) -> u64 {
+        let wall_ms = self.now_ms.max(0.0) as u64;
+        let since_ms = self.termd.since_ms();
+        match self.termd_now_ms {
+            Some(t) => t.max(since_ms).max(if t > wall_ms.saturating_add(60_000) {
+                t
+            } else {
+                wall_ms
+            }),
+            None => wall_ms.max(since_ms),
+        }
+    }
+
+    fn status_notice(&self) -> Option<StatusNotice> {
+        let restart_notice_ms = self.model.config().restart_notice_ms.max(0.0).round() as u64;
+        let now_ms = self.effective_termd_now_ms();
+        status::notice_for(
+            &self.termd,
+            self.termd.since_ms(),
+            now_ms,
+            restart_notice_ms,
+        )
+    }
+
+    fn advance_termd_clock(&mut self, dt_secs: f64, now_ms: f64) {
+        let prev_notice = self.status_notice();
+        let wall_ms = now_ms.max(0.0) as u64;
+        if let Some(t) = self.termd_now_ms {
+            if t > wall_ms.saturating_add(60_000) {
+                let delta = (dt_secs.max(0.0) * 1000.0).round() as u64;
+                self.termd_now_ms = Some(t.saturating_add(delta));
+            } else {
+                self.termd_now_ms = Some(wall_ms.max(t));
+            }
+        }
+        let effective = self.effective_termd_now_ms();
+        let escalated = self.termd.tick_grace(effective, DEFAULT_RESTART_GRACE_MS);
+        let next_notice = self.status_notice();
+        if escalated || next_notice != prev_notice {
+            self.model.notify_changed();
+        }
     }
 
     fn cell_at(&self, id: &str, screen_x: f64, screen_y: f64) -> Option<CellPoint> {
@@ -1613,6 +1881,9 @@ impl WallCore {
         if self.model.hovered_id() == Some(id) {
             self.model.set_hovered(None);
         }
+        if self.hovered_label_id.as_deref() == Some(id) {
+            self.hovered_label_id = None;
+        }
         self.model.deselect_one_raw(id);
         let owned = id.to_owned();
         let _ = self.with_groups(|g, host| g.relayout_of(host, &owned));
@@ -1654,6 +1925,11 @@ impl WallCore {
         self.sync_groups_to_store();
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
+        self.last_screen_titles.remove(id);
+        self.agent_stick_bottom.remove(id);
+        if self.hovered_label_id.as_deref() == Some(id) {
+            self.hovered_label_id = None;
+        }
         self.model.deselect_one_raw(id);
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -1784,8 +2060,12 @@ impl WallCore {
     }
 
     fn terminal_resized(&mut self, id: &str, cols: u32, rows: u32) {
+        let prev = self.model.terminal(id).map(|t| (t.cols, t.rows));
         if !self.model.set_terminal_size_raw(id, cols, rows) {
             return;
+        }
+        if prev != Some((cols, rows)) {
+            self.clear_text_selection(id);
         }
         let in_fs = self.fullscreen.active() && self.fullscreen.has(&self.read_fs_view(), id);
         if in_fs {
@@ -1800,6 +2080,82 @@ impl WallCore {
         self.model.notify_changed();
     }
 
+    fn terminal_screen_filled(
+        &mut self,
+        id: &str,
+        screen: &Screen,
+        delta: ScreenFillDelta<'_>,
+    ) -> bool {
+        if self.model.terminal(id).is_none() {
+            return false;
+        }
+        let mut changed = false;
+
+        // 1. Maintain active text selection lifetime across scroll, rewrite, or resize.
+        if let Some(sel) = self.selections.get_mut(id) {
+            if sel.sync_after_fill(
+                screen,
+                delta.resized,
+                delta.scrolled_top,
+                delta.within_margins,
+                delta.rewritten_cols,
+            ) {
+                if sel.is_empty() {
+                    self.selection_text_cache.remove(id);
+                    self.model.set_terminal_has_selection(id, false);
+                } else {
+                    let text = sel.text(screen);
+                    self.selection_text_cache.insert(id.to_owned(), text);
+                    self.model.set_terminal_has_selection(id, true);
+                }
+                changed = true;
+            }
+        }
+
+        // 2. Refresh the last non-blank preview line when cells changed (or preview is still empty).
+        let cells_changed = delta.resized
+            || delta.scrolled_top > 0
+            || delta.within_margins
+            || delta.rewritten_cols.iter().any(|&(lo, hi)| lo < hi);
+        let cur_preview_empty = self
+            .model
+            .terminal(id)
+            .is_some_and(|t| t.preview.is_empty());
+        if cells_changed || cur_preview_empty {
+            extract_preview_into(screen, &mut self.preview_scratch);
+            let unchanged = self
+                .model
+                .terminal(id)
+                .is_some_and(|t| t.preview == self.preview_scratch);
+            if !unchanged {
+                let next = self.preview_scratch.clone();
+                changed |= self.model.set_terminal_preview(id, next);
+            }
+        }
+
+        // 3. Propagate `Screen::title` when the emulator's title changed (including an
+        //    adopted terminal's initial `Repaint` OSC title), without clobbering a title
+        //    delivered out-of-band by `Event::Title` when `screen.title` stays empty.
+        let prev_screen_title = self
+            .last_screen_titles
+            .get(id)
+            .map_or("", String::as_str);
+        if screen.title != prev_screen_title {
+            let next_title = screen.title.clone();
+            if let Some(slot) = self.last_screen_titles.get_mut(id) {
+                slot.clone_from(&next_title);
+            } else {
+                self.last_screen_titles.insert(id.to_owned(), next_title.clone());
+            }
+            changed |= self.model.set_terminal_title(id, next_title);
+        }
+
+        if changed {
+            self.model.notify_changed();
+        }
+        changed
+    }
+
     fn terminal_ended(&mut self, id: &str) {
         let prev_group = self.groups.group_of(id);
         let (existed, was_focused) = self.model.unmount_terminal_raw(id);
@@ -1808,6 +2164,11 @@ impl WallCore {
         }
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
+        self.last_screen_titles.remove(id);
+        self.agent_stick_bottom.remove(id);
+        if self.hovered_label_id.as_deref() == Some(id) {
+            self.hovered_label_id = None;
+        }
         self.names.prune(|tid| self.model.terminal(tid).is_some());
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -2149,19 +2510,26 @@ impl WallCore {
 
         // Update title bars and map labels for all shown terminals.
         let shown = self.model.shown_order();
+        let mut title_meta: HashMap<String, (String, Option<String>, Option<AgentStatus>, String)> =
+            HashMap::with_capacity(shown.len());
         let named_terminals: Vec<NamedTerminal> = shown
             .iter()
             .filter_map(|id| {
                 let body_rect = self.model.terminal_rect(id)?;
-                let title = self.title_of(id);
+                let (name, attached_agent, agent_status, title) = self.title_parts(id);
                 let unit_text_width =
-                    (title.chars().count() as f64) * FALLBACK_CHAR_UNIT_WIDTH;
+                    (title.chars().count() as f64) * self.char_widths.title_unit_width;
+                let map_label_width_px = Some(names::estimate_map_label_width_with(
+                    &title,
+                    self.char_widths.map_label_char_px,
+                ));
+                title_meta.insert(id.clone(), (name, attached_agent, agent_status, title.clone()));
                 Some(NamedTerminal {
                     id: id.clone(),
                     name: title,
                     body_rect,
                     unit_text_width,
-                    map_label_width_px: None,
+                    map_label_width_px,
                 })
             })
             .collect();
@@ -2251,10 +2619,17 @@ impl WallCore {
                     ),
                     TitleBarModel::active_colors,
                 );
+            let (name, attached_agent, agent_status) = match title_meta.get(&bar.id) {
+                Some((name, attached, status, _)) => (name.clone(), attached.clone(), *status),
+                None => (bar.name.clone(), None, None),
+            };
             title_bars.push(TitleBarFrame {
                 terminal_id: bar.id.clone(),
                 rect: layout.strip_rect,
+                name,
                 text: bar.name.clone(),
+                attached_agent,
+                agent_status,
                 text_visible: bar.name_visible,
                 text_left: layout.text_left,
                 text_height: layout.line_height,
@@ -2286,10 +2661,12 @@ impl WallCore {
             let focused = focused_id
                 .as_deref()
                 .is_some_and(|f| group.members.iter().any(|m| m == f));
+            let hovered =
+                !self.fullscreen.active() && self.hovered_group_id.as_deref() == Some(gid.as_str());
             let mut header_model = TitleBarModel::group_header();
             header_model.set_name(name.clone());
             header_model.set_focused(focused);
-            let unit_w = (name.chars().count() as f64) * FALLBACK_CHAR_UNIT_WIDTH;
+            let unit_w = (name.chars().count() as f64) * self.char_widths.title_unit_width;
             let header_layout = header_model.layout(
                 frame_rect.min_x,
                 frame_rect.max_x,
@@ -2316,6 +2693,7 @@ impl WallCore {
                 text_color,
                 z: self.groups.depth_of(&gid),
                 focused,
+                hovered,
             });
         }
         group_frames.sort_by(|a, b| a.z.total_cmp(&b.z));
@@ -2345,20 +2723,36 @@ impl WallCore {
         });
 
         // Map labels placed in screen space.
+        let hovered_label = (!self.fullscreen.active())
+            .then_some(self.hovered_label_id.as_deref())
+            .flatten();
         let map_labels: Vec<MapLabelFrame> = names_plan
             .map_labels
             .into_iter()
             .filter_map(|m| {
                 let placement = m.placement?;
+                let (name, attached_agent, agent_status) = match title_meta.get(&m.id) {
+                    Some((name, attached, status, _)) => (name.clone(), attached.clone(), *status),
+                    None => (m.name.clone(), None, None),
+                };
+                let hovered = m.hovered || hovered_label == Some(m.id.as_str());
                 Some(MapLabelFrame {
                     terminal_id: m.id,
+                    name,
                     text: m.name,
+                    attached_agent,
+                    agent_status,
                     focused: m.focused,
+                    hovered,
                     label_box: placement.label_box,
                     target: m.target,
                     leader: placement.leader,
                 })
             })
+            .collect();
+        self.last_map_labels = map_labels
+            .iter()
+            .map(|ml| (ml.terminal_id.clone(), ml.label_box))
             .collect();
 
         // Fullscreen backdrop.
@@ -2367,11 +2761,52 @@ impl WallCore {
             let area = self.fullscreen.area(&fs_view);
             let mode = self.fullscreen.mode().unwrap_or(FullscreenMode::Single);
             let target = self.fullscreen.target().unwrap_or_default().to_owned();
+            let cutouts = match mode {
+                FullscreenMode::Single => self
+                    .fullscreen
+                    .id()
+                    .and_then(|id| self.model.terminal_rect(id))
+                    .into_iter()
+                    .collect(),
+                FullscreenMode::Group => {
+                    let group = self
+                        .fullscreen
+                        .group_id()
+                        .and_then(|gid| self.groups.group(gid));
+                    let is_split = group.is_some_and(|g| g.layout == GroupLayout::Split);
+                    if is_split {
+                        let has_bars = group
+                            .and_then(|g| g.split.as_ref())
+                            .is_some_and(|s| s.bars);
+                        let rects: Vec<Rect> = fs_view_elevated
+                            .iter()
+                            .filter_map(|id| {
+                                if has_bars {
+                                    self.window_rect_at_zoom(id, zoom)
+                                } else {
+                                    self.model.terminal_rect(id)
+                                }
+                            })
+                            .collect();
+                        union_rect(&rects).into_iter().collect()
+                    } else {
+                        fs_view_elevated
+                            .iter()
+                            .filter_map(|id| {
+                                self.window_rect_at_zoom(id, zoom)
+                                    .or_else(|| self.model.terminal_rect(id))
+                            })
+                            .collect()
+                    }
+                }
+            };
             Some(FullscreenBackdrop {
                 mode,
                 target,
                 area,
                 background: cfg.background.clone(),
+                opacity: BACKDROP_OPACITY,
+                cutouts,
                 z: FULLSCREEN_BACKDROP_Z,
             })
         } else {
@@ -2420,6 +2855,7 @@ impl WallCore {
             map_labels,
             fullscreen_backdrop,
             notice: self.model.notice().map(str::to_owned),
+            status_notice: self.status_notice(),
             menu: self.model.menu().cloned(),
             palette_open: self.palette_open,
             panels,
@@ -2527,6 +2963,13 @@ impl WallApi for WallCore {
 
     fn show(&mut self, id: &str) -> Result<(), String> {
         self.show_terminal(id);
+        Ok(())
+    }
+
+    fn focus(&mut self, id: &str) -> Result<(), String> {
+        if !self.focus(Some(id), false) {
+            return Err(format!("no terminal '{id}'"));
+        }
         Ok(())
     }
 
@@ -3265,12 +3708,19 @@ impl WallApi for WallCore {
     }
 
     fn agent_jump(&mut self, id: &str, target: &str) -> Result<AgentJumpResult, String> {
+        if self.model.terminal(id).is_some_and(|t| t.modes.alt_screen) {
+            let msg = format!(
+                "{} is on the alternate screen — primary scrollback jump is unavailable while a full-screen TUI is active",
+                self.model.name_of(id)
+            );
+            self.model.notify(msg.clone(), self.now_ms);
+            return Err(msg);
+        }
         if target == "live" {
-            self.model.push_effect(WallEffect::ScrollTerminal {
+            self.model.push_effect(WallEffect::ScrollTerminalLive {
                 id: id.to_owned(),
-                lines: 0,
-                cell: Point::new(0.0, 0.0),
             });
+            self.model.notify_changed();
             return Ok(AgentJumpResult {
                 live: true,
                 event_id: String::new(),
@@ -3282,6 +3732,37 @@ impl WallApi for WallCore {
 
     fn agent_load_earlier(&mut self, _id: &str) -> Result<AgentEarlierResult, String> {
         Ok(AgentEarlierResult { loaded: 0 })
+    }
+
+    fn palette_open(&self) -> bool {
+        self.palette_open
+    }
+
+    fn set_palette_open(&mut self, open: bool) {
+        if self.palette_open != open {
+            self.palette_open = open;
+            self.model.notify_changed();
+        }
+    }
+
+    fn agent_set_stick_bottom(&mut self, id: &str, mode: &str) -> Result<bool, String> {
+        if self.model.terminal(id).is_none() {
+            return Err(format!("no terminal '{id}'"));
+        }
+        let cur = self.agent_stick_bottom.get(id).copied().unwrap_or(true);
+        let next = match mode {
+            "off" => false,
+            "toggle" => !cur,
+            "on" | "tail" => true,
+            other => {
+                return Err(format!(
+                    "agent follow takes tail|on|off|toggle, not '{other}'"
+                ));
+            }
+        };
+        self.agent_stick_bottom.insert(id.to_owned(), next);
+        self.model.notify_changed();
+        Ok(next)
     }
 
     fn relay_endpoint(&self) -> Option<(String, u16)> {
@@ -3334,8 +3815,8 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
     router.register(
         "terminal.scroll",
         RegisterMeta {
-            description: "Scroll a terminal's scrollback view by N lines at cell (x, y)",
-            usage: "<id> <lines> [cell_x cell_y]",
+            description: "Scroll a terminal's scrollback view (+ = up into history, - = down toward live, or `live`)",
+            usage: "<id> <lines | live> [cell_x cell_y]",
             returns: "",
         },
         |args, core, _meta| {
@@ -3345,9 +3826,18 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
             if core.model.terminal(id).is_none() {
                 return Ok(CommandReply::err(format!("no terminal '{id}'")));
             }
+            if args.get(1).map(String::as_str) == Some("live") {
+                core.model
+                    .push_effect(WallEffect::ScrollTerminalLive { id: id.clone() });
+                core.model.notify_changed();
+                return Ok(CommandReply::ok(
+                    format!("terminal '{id}' scroll live"),
+                    Some(json!({ "id": id, "live": true, "offset": 0 })),
+                ));
+            }
             let lines: i32 = match args.get(1).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
-                None => return Ok(CommandReply::err("lines must be an integer")),
+                None => return Ok(CommandReply::err("lines must be an integer or 'live'")),
             };
             let cx: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let cy: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -3713,6 +4203,10 @@ impl PointerHost for PointerBridge<'_, '_> {
         self.router.context.model.set_hovered(id);
     }
 
+    fn set_hovered_group(&mut self, group_id: Option<&str>) {
+        self.router.context.set_hovered_group(group_id);
+    }
+
     fn set_cursor(&mut self, cursor: CursorIcon) {
         self.router.context.set_cursor(cursor);
     }
@@ -4000,10 +4494,11 @@ impl Wall {
     }
 
     /// Advance camera easing, wheel scroll glides, fullscreen refit settlement,
-    /// hold-to-close timers, and timed notices. Returns `true` if another frame
-    /// should be scheduled.
+    /// hold-to-close timers, daemon restart grace timers, and timed notices.
+    /// Returns `true` if another animation frame should be scheduled.
     pub fn tick(&mut self, dt_secs: f64, now_ms: f64) -> bool {
         self.router.context.now_ms = now_ms;
+        self.router.context.advance_termd_clock(dt_secs, now_ms);
         let cam_moving = self.router.context.model.step_camera_and_notice(dt_secs, now_ms);
         {
             let mut bridge = PointerBridge {
@@ -4018,6 +4513,21 @@ impl Wall {
         let holding = self.router.context.tick_close_hold();
         self.sync_pointer_flags();
         cam_moving || self.pointer.gliding() || self.router.context.fullscreen.settling() || holding
+    }
+
+    /// Update the measured monospace character advances used to size title bars,
+    /// group headers, and map-label pills (e.g. after loading or switching fonts).
+    pub fn set_char_widths(&mut self, widths: CharWidths) {
+        let next = widths.sanitized();
+        if self.router.context.char_widths != next {
+            self.router.context.char_widths = next;
+            self.router.context.model.notify_changed();
+        }
+    }
+
+    /// Measured monospace character advances currently configured on this wall.
+    pub fn char_widths(&self) -> CharWidths {
+        self.router.context.char_widths
     }
 
     // ── Pointer, wheel, pinch & context menu ─────────────────────────────────
@@ -4047,6 +4557,10 @@ impl Wall {
             };
             self.pointer.on_move(&mut bridge, event);
         }
+        if !self.pointer.busy() {
+            let hit_label = self.router.context.hit_map_label(event.x, event.y);
+            self.router.context.set_hovered_label(hit_label.as_deref());
+        }
         self.sync_pointer_flags();
     }
 
@@ -4074,6 +4588,8 @@ impl Wall {
             };
             self.pointer.on_cancel(&mut bridge, event);
         }
+        self.router.context.set_hovered_group(None);
+        self.router.context.set_hovered_label(None);
         self.sync_pointer_flags();
         self.router.context.model.notify_changed();
     }
@@ -4430,6 +4946,26 @@ impl Wall {
         self.router.context.model.set_terminal_preview(id, preview);
     }
 
+    /// Notify the wall that terminal `id`'s [`Screen`] was refilled by its emulator.
+    ///
+    /// Maintains text-selection lifetime ([`TerminalSelection::sync_after_fill`]),
+    /// refreshes the terminal's last non-blank preview line when cells changed, and
+    /// propagates `screen.title` when the emulator's title changed (covering adopted
+    /// terminals whose initial `Repaint` sets `Screen::title`).
+    ///
+    /// Returns `true` when any wall state changed (selection shifted/cleared,
+    /// preview changed, or title changed).
+    pub fn terminal_screen_filled(
+        &mut self,
+        id: &str,
+        screen: &Screen,
+        delta: ScreenFillDelta<'_>,
+    ) -> bool {
+        self.router
+            .context
+            .terminal_screen_filled(id, screen, delta)
+    }
+
     /// Notify the wall that terminal `id` ended or closed on the daemon.
     pub fn terminal_ended(&mut self, id: &str) {
         self.router.context.terminal_ended(id);
@@ -4437,23 +4973,89 @@ impl Wall {
     }
 
     /// Reconcile durable store entries against the daemon's live terminal list on connect.
-    /// Returns the forgotten terminal ids.
+    /// Call before adopting existing terminals with [`Self::terminal_appeared`] so dead
+    /// group members are pruned before surviving groups lay out. Returns the forgotten ids.
     pub fn set_live_terminals<S: AsRef<str>>(&mut self, live_ids: &[S]) -> Vec<String> {
         let gone = self.router.context.set_live_terminals(live_ids);
         self.sync_pointer_flags();
         gone
     }
 
-    /// Record whether the daemon connection is up.
+    /// Record whether the daemon connection is up. Independent of [`Self::set_live_terminals`]
+    /// and [`Self::terminal_appeared`]; calling `set_connected(true)` after adopting existing
+    /// terminals keeps `WallSnapshot::connected` false until adoption finishes.
     pub fn set_connected(&mut self, connected: bool) {
         self.router.context.model.set_connected(connected);
     }
 
+    /// Record a `WELCOME` handshake from `g3d-termd` (`instance` and advertised `features`).
+    pub fn on_termd_welcome<S: AsRef<str>>(
+        &mut self,
+        instance: &str,
+        features: &[S],
+        now_ms: u64,
+    ) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router
+            .context
+            .termd
+            .on_welcome(instance, features, now_ms);
+        self.router.context.model.notify_changed();
+    }
+
     /// Ingest a `termd` status document pushed by the daemon.
     pub fn on_termd_status(&mut self, value: Value, now_ms: u64) -> Result<(), String> {
+        self.router.context.record_termd_now_ms(now_ms);
         self.router.context.termd.on_status_json(value, now_ms)?;
         self.router.context.model.notify_changed();
         Ok(())
+    }
+
+    /// Notify that the `termd` status connection dropped (`Restarting` or clean `Absent`).
+    pub fn on_termd_disconnected(&mut self, planned_restart: bool, now_ms: u64) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router
+            .context
+            .termd
+            .on_disconnected(planned_restart, now_ms);
+        self.router.context.model.notify_changed();
+    }
+
+    /// Notify that nothing listens on the namespace socket (`Absent`, or `Lost` if live shells vanished).
+    pub fn on_termd_socket_absent(&mut self, now_ms: u64) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router.context.termd.on_socket_absent(now_ms);
+        self.router.context.model.notify_changed();
+    }
+
+    /// Notify that the holder accepted the socket while waiting for a brain (`Restarting`).
+    pub fn on_termd_holder_waiting(&mut self, now_ms: u64) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router.context.termd.on_holder_waiting(now_ms);
+        self.router.context.model.notify_changed();
+    }
+
+    /// Notify that the holder reported `brain_failed` (`Failed`).
+    pub fn on_termd_brain_failed(&mut self, now_ms: u64) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router.context.termd.on_brain_failed(now_ms);
+        self.router.context.model.notify_changed();
+    }
+
+    /// Notify that the daemon socket path is unreachable or inaccessible (`Unreachable`).
+    pub fn on_termd_socket_unreachable(&mut self, now_ms: u64) {
+        self.router.context.record_termd_now_ms(now_ms);
+        self.router.context.termd.on_socket_unreachable(now_ms);
+        self.router.context.model.notify_changed();
+    }
+
+    /// Dismiss any sticky `termd lost` notice banner. Returns `true` if one was active.
+    pub fn dismiss_termd_lost(&mut self) -> bool {
+        let dismissed = self.router.context.termd.dismiss_lost();
+        if dismissed {
+            self.router.context.model.notify_changed();
+        }
+        dismissed
     }
 
     /// Update the gomuxai agent bus snapshot.
@@ -4541,6 +5143,61 @@ impl Wall {
         &self.router.context.termd
     }
 
+    /// Host platform conventions configured on this wall (`Platform::Mac` or `Platform::Other`).
+    pub fn platform(&self) -> Platform {
+        self.router.context.platform
+    }
+
+    /// Latest gomuxai agent bus snapshot set via [`Self::set_bus_snapshot`], if any.
+    pub fn bus_snapshot(&self) -> Option<&GomuxSnapshot> {
+        self.router.context.bus.as_ref()
+    }
+
+    /// Diagnostic reason paired with [`Self::bus_snapshot`] when gomuxai is unavailable.
+    pub fn bus_reason(&self) -> &str {
+        &self.router.context.bus_reason
+    }
+
+    /// Projected [`crate::sidebar::BusSnapshot`] ready for the sidebar and command palette panels.
+    pub fn sidebar_bus_snapshot(&self) -> crate::sidebar::BusSnapshot {
+        let Some(snap) = self.router.context.bus.as_ref() else {
+            return crate::sidebar::BusSnapshot {
+                host: String::new(),
+                reason: self.router.context.bus_reason.clone(),
+                agents: Vec::new(),
+            };
+        };
+        crate::sidebar::BusSnapshot {
+            host: snap.host.clone().unwrap_or_default(),
+            reason: self.router.context.bus_reason.clone(),
+            agents: snap
+                .agents
+                .iter()
+                .map(|a| crate::sidebar::BusAgentInput {
+                    name: a.name.clone(),
+                    host: a.host.clone().unwrap_or_default(),
+                    live: a.live,
+                    status: a.status.clone().unwrap_or_default(),
+                    end_reason: a.end_reason.clone().unwrap_or_default(),
+                    attached: a.attached,
+                    detail: a.detail.clone().unwrap_or_default(),
+                    cwd: a.cwd.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether terminal `id`'s Agent View scroll list is currently pinned to its live tail
+    /// (`wall.agent.follow`; defaults to `true`).
+    pub fn agent_stick_bottom(&self, id: &str) -> bool {
+        self.router
+            .context
+            .agent_stick_bottom
+            .get(id)
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub fn cursor(&self) -> CursorIcon {
         self.router.context.cursor
     }
@@ -4551,6 +5208,11 @@ impl Wall {
 
     pub fn hovered_id(&self) -> Option<&str> {
         self.router.context.model.hovered_id()
+    }
+
+    /// Currently hovered group header ID, if any.
+    pub fn hovered_group_id(&self) -> Option<&str> {
+        self.router.context.hovered_group_id.as_deref()
     }
 
     pub fn selection(&self) -> &[String] {
@@ -4608,6 +5270,11 @@ impl Wall {
 
     pub fn notice(&self) -> Option<&str> {
         self.router.context.model.notice()
+    }
+
+    /// Current daemon outage / compatibility notice computed via [`crate::status::notice_for`].
+    pub fn status_notice(&self) -> Option<StatusNotice> {
+        self.router.context.status_notice()
     }
 
     pub fn palette_open(&self) -> bool {

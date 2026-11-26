@@ -283,8 +283,12 @@ pub enum WallEffect {
     PasteTerminal { id: String, text: String },
     /// Ask `termd` to deliver a DECSET mouse event to terminal `id`.
     SendMouse { id: String, event: TerminalMouseEvent },
-    /// Ask `termd` to scroll terminal `id`'s view by `lines` (negative = up into history) at `cell`.
+    /// Ask `termd` to scroll terminal `id`'s view by `lines` (positive = up into scrollback
+    /// history, negative = down toward live output, matching `terminalScroll.js` and
+    /// `terminal.scroll`) at `cell`.
     ScrollTerminal { id: String, lines: i32, cell: Point },
+    /// Ask `termd` to return terminal `id`'s scrollback view immediately to live (`View::Live`, offset 0).
+    ScrollTerminalLive { id: String },
     /// Ask `termd` to send a full repaint for terminal `id`.
     RefreshTerminal { id: String },
     /// Copy `text` onto the OS system clipboard (`wall.copy` or `copyOnSelect == "clipboard"`).
