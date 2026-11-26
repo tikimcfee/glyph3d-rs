@@ -13,12 +13,18 @@
 #      pump stall time, draw time, process CPU, and upload stats.
 #   2. Untouched idle behavior over 5 idle seconds (after a 1.2 s startup settle so the
 #      opening `wall.fit` camera ease has snapped home), verifying 0 frames drawn and
-#      ~0 ms process CPU between input/output events.
+#      minimal process CPU between input/output events.
 #
-# Safety:
+# Safety & process-hygiene invariants:
 #   - Never touches live namespaces `wall`, `agents`, or `default`.
 #   - Always sets `G3D_TERMD_DIR` to a private 0700 directory under `/tmp/g3d-wp-<pid>/...`.
-#   - Stops every scratch daemon and removes `/tmp/g3d-wp-<pid>` on normal exit and on error.
+#   - Every spawned terminal runs under a hard wall-clock + `RLIMIT_CPU` supervisor
+#     (`--ttl-secs`, default 12s for floods / 10s for idle) and `g3d-termd` starts with
+#     `--idle-exit 5`, so floods and daemons self-terminate even if this script is `kill -9`'d.
+#   - On EXIT/INT/TERM/HUP, stops each scratch daemon via `g3d`/`termd_bench_ctl stop` AND
+#     kills recorded `holder`, `brain`, and `term` PIDs + child process groups from `pids.txt`.
+#   - Never removes a scratch directory before confirming via `kill -0` that its daemon and
+#     all recorded child PIDs are dead.
 
 set -euo pipefail
 
@@ -35,6 +41,8 @@ esac
 
 FRAMES="${GLYPH_WALL_PERF_FRAMES:-120}"
 MAX_WALL_MS="${GLYPH_WALL_PERF_MAX_MS:-4000}"
+FLOOD_TTL_SECS="${GLYPH_WALL_PERF_FLOOD_TTL_SECS:-15}"
+IDLE_TTL_SECS="${GLYPH_WALL_PERF_IDLE_TTL_SECS:-15}"
 COLS="${GLYPH_WALL_PERF_COLS:-80}"
 ROWS="${GLYPH_WALL_PERF_ROWS:-24}"
 COUNTS="${GLYPH_WALL_PERF_COUNTS:-1 4 14}"
@@ -61,47 +69,116 @@ fi
 
 RENDERER="${GLYPH_RENDERER:-$REPO_ROOT/target/release/glyph3d-native}"
 CTL_BIN="$REPO_ROOT/target/release/examples/termd_bench_ctl"
-
-# Prevent macOS display sleep / App Nap from turning CAMetalLayer drawables into Cst::Occluded.
-if [[ -x /usr/bin/caffeinate ]]; then
-  /usr/bin/caffeinate -disu -w "$$" >/dev/null 2>&1 &
-  sleep 0.5
+G3D_BIN=""
+if [[ -x /Users/lugo/.local/bin/g3d ]]; then
+  G3D_BIN="/Users/lugo/.local/bin/g3d"
+elif command -v g3d >/dev/null 2>&1; then
+  G3D_BIN="$(command -v g3d)"
 fi
 
 SCRATCH_ROOT="/tmp/g3d-wp-$$"
 mkdir -m 0700 -p "$SCRATCH_ROOT"
 ACTIVE_DIR=""
+CAFFEINATE_PID=""
+
+if [[ -x /usr/bin/caffeinate ]]; then
+  /usr/bin/caffeinate -disu -w "$$" >/dev/null 2>&1 &
+  CAFFEINATE_PID="$!"
+fi
+
+kill_recorded_pids() {
+  local pids_file="$1"
+  local sig="$2"
+  [[ -f "$pids_file" ]] || return 0
+  while read -r role pid _rest; do
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      pkill "-$sig" -P "$pid" >/dev/null 2>&1 || true
+      if [[ "$role" == "term" ]]; then
+        kill "-$sig" -- "-$pid" >/dev/null 2>&1 || true
+      fi
+      kill "-$sig" "$pid" >/dev/null 2>&1 || true
+    fi
+  done < "$pids_file"
+}
+
+any_recorded_pid_alive() {
+  local pids_file="$1"
+  [[ -f "$pids_file" ]] || return 1
+  while read -r _role pid _rest; do
+    [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done < "$pids_file"
+  return 1
+}
 
 stop_scratch_dir() {
   local d="$1"
-  if [[ -n "$d" && -d "$d" ]]; then
-    "$CTL_BIN" stop --dir "$d" --ns "$NS" >/dev/null 2>&1 || true
-    for lock in "$d"/*.lock; do
-      if [[ -f "$lock" ]]; then
-        local pid
-        pid="$(tr -d '[:space:]' < "$lock" || true)"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); then
-          kill -KILL "$pid" >/dev/null 2>&1 || true
-        fi
-      fi
-    done
-    rm -rf "$d" || true
+  [[ -n "$d" && -d "$d" ]] || return 0
+  local pids_file="$d/pids.txt"
+  local sock="$d/termd-$NS.sock"
+
+  # 1. Request clean shutdown via g3d stop (if available) and termd_bench_ctl stop.
+  if [[ -n "$G3D_BIN" && -S "$sock" ]]; then
+    G3D_TERMD_DIR="$d" "$G3D_BIN" --ns "$NS" stop >/dev/null 2>&1 || true
   fi
+  if [[ -x "$CTL_BIN" ]]; then
+    "$CTL_BIN" stop --dir "$d" --ns "$NS" >/dev/null 2>&1 || true
+  fi
+  [[ -d "$d" ]] || return 0
+
+  # 2. Belt-and-suspenders: signal any surviving recorded holder/brain/term PIDs + children.
+  if any_recorded_pid_alive "$pids_file"; then
+    kill_recorded_pids "$pids_file" TERM
+    local i
+    for (( i = 0; i < 10; i++ )); do
+      any_recorded_pid_alive "$pids_file" || break
+      sleep 0.05
+    done
+  fi
+  if any_recorded_pid_alive "$pids_file"; then
+    kill_recorded_pids "$pids_file" KILL
+    local i
+    for (( i = 0; i < 40; i++ )); do
+      any_recorded_pid_alive "$pids_file" || break
+      sleep 0.05
+    done
+  fi
+
+  # 3. Never remove the scratch directory if any recorded daemon/child is still alive.
+  if any_recorded_pid_alive "$pids_file"; then
+    echo "wall-perf.sh: ERROR: daemon/children still alive in $d; keeping directory for inspection:" >&2
+    cat "$pids_file" >&2 || true
+    return 1
+  fi
+
+  rm -rf "$d"
 }
 
 cleanup() {
-  if [[ -n "$ACTIVE_DIR" ]]; then
-    stop_scratch_dir "$ACTIVE_DIR"
+  local status=$?
+  trap - EXIT INT TERM HUP
+  if [[ -n "$CAFFEINATE_PID" ]]; then
+    kill "$CAFFEINATE_PID" >/dev/null 2>&1 || true
+  fi
+  local clean_ok=1
+  if [[ -n "$ACTIVE_DIR" && -d "$ACTIVE_DIR" ]]; then
+    stop_scratch_dir "$ACTIVE_DIR" || clean_ok=0
     ACTIVE_DIR=""
   fi
   if [[ -d "$SCRATCH_ROOT" ]]; then
     for sub in "$SCRATCH_ROOT"/*; do
       if [[ -d "$sub" ]]; then
-        stop_scratch_dir "$sub"
+        stop_scratch_dir "$sub" || clean_ok=0
       fi
     done
-    rm -rf "$SCRATCH_ROOT" || true
+    if (( clean_ok == 1 )); then
+      rm -rf "$SCRATCH_ROOT"
+    fi
   fi
+  exit "$status"
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -118,7 +195,7 @@ run_flood_case() {
   ACTIVE_DIR="$SCRATCH_ROOT/${label}-n${n}"
   mkdir -m 0700 -p "$ACTIVE_DIR"
 
-  echo "Running flood: workload=$label terminals=$n (${COLS}x${ROWS}) target_frames=$FRAMES max_ms=$MAX_WALL_MS ..." >&2
+  echo "Running flood: workload=$label terminals=$n (${COLS}x${ROWS}) target_frames=$FRAMES max_ms=$MAX_WALL_MS ttl=${FLOOD_TTL_SECS}s ..." >&2
   "$CTL_BIN" start \
     --dir "$ACTIVE_DIR" \
     --ns "$NS" \
@@ -126,6 +203,7 @@ run_flood_case() {
     --cols "$COLS" \
     --rows "$ROWS" \
     --warmup-ms 150 \
+    --ttl-secs "$FLOOD_TTL_SECS" \
     -- /bin/sh -c "$shell_cmd"
 
   local out_file="$SCRATCH_ROOT/out-${label}-n${n}.log"
@@ -153,7 +231,7 @@ run_idle_case() {
   ACTIVE_DIR="$SCRATCH_ROOT/idle-n${n}"
   mkdir -m 0700 -p "$ACTIVE_DIR"
 
-  echo "Running idle: terminals=$n (${COLS}x${ROWS}) settle=${SETTLE_MS}ms idle=${IDLE_MS}ms ..." >&2
+  echo "Running idle: terminals=$n (${COLS}x${ROWS}) settle=${SETTLE_MS}ms idle=${IDLE_MS}ms ttl=${IDLE_TTL_SECS}s ..." >&2
   "$CTL_BIN" start \
     --dir "$ACTIVE_DIR" \
     --ns "$NS" \
@@ -161,7 +239,8 @@ run_idle_case() {
     --cols "$COLS" \
     --rows "$ROWS" \
     --warmup-ms 200 \
-    -- /bin/sh -c 'printf "idle-ready\n"; exec sleep 300'
+    --ttl-secs "$IDLE_TTL_SECS" \
+    -- /bin/sh -c 'printf "idle-ready\n"; exec sleep 30'
 
   local out_file="$SCRATCH_ROOT/out-idle-n${n}.log"
   GLYPH_WALL_PERF=1 \
@@ -227,7 +306,7 @@ headers = [
     "Workload", "N", "Frames", "Wall (s)", "FPS",
     "Pump p50/p95/max (ms)", "Pump sum (ms) / Wakes",
     "Draw p50/p95/max (ms)", "Wait p50 (ms)",
-    "Proc CPU (ms)", "Uploads (drawn/up/rows/writes)", "Stalled"
+    "Proc CPU (ms)", "Uploads (drawn/up/rows/writes)", "Status"
 ]
 print("| " + " | ".join(headers) + " |")
 print("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -244,9 +323,9 @@ with open(results_path, "r", encoding="utf-8") as f:
         wait = parse_sub(kv["wait_ms"])
         up = parse_sub(kv["uploads"])
         wall_s = float(kv["wall_ms"]) / 1000.0
-        stalled = "yes (in pump)" if kv.get("stalled") == "1" else "no"
+        status = "stalled in pump" if kv.get("stalled") == "1" else "ok"
         if kv.get("occluded", "0") != "0":
-            stalled += f" (occl:{kv['occluded']})"
+            status += f" (occl:{kv['occluded']})"
         row = [
             workload,
             n,
@@ -259,7 +338,7 @@ with open(results_path, "r", encoding="utf-8") as f:
             wait["p50"],
             kv["proc_cpu_ms"],
             f"{up['drawn']}/{up['uploaded']}/{up['rows']}/{up['writes']}",
-            stalled,
+            status,
         ]
         print("| " + " | ".join(row) + " |")
 
