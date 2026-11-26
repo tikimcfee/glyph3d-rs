@@ -39,9 +39,13 @@ const UNDERLINE_CURLY: u32 = 3u;
 const UNDERLINE_DOTTED: u32 = 4u;
 const UNDERLINE_DASHED: u32 = 5u;
 
+const CURSOR_VISIBLE: u32 = 1u << 0u;
+const CURSOR_SOLID_BLOCK: u32 = 1u << 3u;
+
 // Sub-layer Z offsets within one terminal (larger z = nearer in reverse-Z).
 const Z_OFFSET_PANEL: f32 = -0.002;
 const Z_OFFSET_FILL: f32 = -0.001;
+const Z_OFFSET_CURSOR_BACK: f32 = -0.0005;
 const Z_OFFSET_INK: f32 = 0.0;
 const Z_OFFSET_CURSOR: f32 = 0.001;
 
@@ -83,9 +87,9 @@ struct TerminalUniform {
     cursor_flags: u32,
     border_override: u32,
     scale: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    cursor_color: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 struct CellGpu {
@@ -131,6 +135,11 @@ fn unpack_rgba8(packed: u32) -> vec4<f32> {
         f32((packed >> 16u) & 0xFFu),
         f32((packed >> 24u) & 0xFFu),
     ) / 255.0;
+}
+
+fn resolved_cursor_color() -> vec4<f32> {
+    let ov = unpack_rgba8(term.cursor_color);
+    return select(frame.cursor_color, ov, ov.a > 0.0);
 }
 
 fn srgb_channel_to_linear(c: f32) -> f32 {
@@ -471,8 +480,28 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
             * vec2<f32>(frame.emoji_cell);
     }
 
-    let fg_srgb = vec4<f32>(unpack_rgba8(cell.fg).rgb, 1.0);
-    let decor_srgb = select(fg_srgb.rgb, unpack_rgba8(cell.ul).rgb, (style & STYLE_UNDERLINE_COLOR) != 0u);
+    let solid_block = (term.cursor_flags & CURSOR_SOLID_BLOCK) != 0u;
+    let under_cursor = solid_block
+        && row == term.cursor_row
+        && col <= term.cursor_col
+        && term.cursor_col < col + span_cols;
+
+    let raw_fg = unpack_rgba8(cell.fg).rgb;
+    var fg_rgb = raw_fg;
+    var cell_style = style;
+    if under_cursor {
+        let cell_bg_rgba = unpack_rgba8(cell.bg);
+        let cell_bg = select(unpack_rgba8(term.default_bg).rgb, cell_bg_rgba.rgb, cell_bg_rgba.a > 0.0);
+        let cursor_rgb = resolved_cursor_color().rgb;
+        let diff = abs(cell_bg - cursor_rgb);
+        // Ghostty cursor-text default: draw the glyph over a solid block cursor in the
+        // cell's background colour, falling back to cell fg only on colour collision so
+        // inverse cells stay readable.
+        fg_rgb = select(cell_bg, raw_fg, max(diff.x, max(diff.y, diff.z)) < 0.05);
+        cell_style = cell_style & (~STYLE_DIM);
+    }
+    let fg_srgb = vec4<f32>(fg_rgb, 1.0);
+    let decor_srgb = select(fg_srgb.rgb, unpack_rgba8(cell.ul).rgb, (cell_style & STYLE_UNDERLINE_COLOR) != 0u);
 
     out.clip = clip;
     out.glyph_uv = c;
@@ -482,7 +511,7 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     out.curve_count = curve_count;
     out.mode = mode;
     out.glyph_arg = glyph_arg;
-    out.style = style;
+    out.style = cell_style;
     out.cell_info = vec4<f32>(
         quad_w / max(cell_size.x, 1e-6),
         cell_size.x / max(cell_size.y, 1e-6),
@@ -687,7 +716,7 @@ fn fs_ink(in: InkVsOut) -> @location(0) vec4<f32> {
             ul_cov = band_coverage(c0 - h, c0 + h, lo, inv)
                 + band_coverage(c1 - h, c1 + h, lo, inv);
         } else if ul == UNDERLINE_CURLY {
-            let amp = max(frame.line_b.w, 0.5 * fw.y);
+            let amp = select(0.0, max(frame.line_b.w, 0.5 * fw.y), frame.line_b.w > 0.0);
             let w = TAU * x;
             let cy = max(frame.line_b.z, amp + h) + amp * sin(w);
             let slope = amp * TAU * cos(w) * dx / fw.y;
@@ -734,10 +763,11 @@ struct CursorVsOut {
 @vertex
 fn vs_cursor(@builtin(vertex_index) vi: u32) -> CursorVsOut {
     var out: CursorVsOut;
-    if (term.cursor_flags & 1u) == 0u || term.cursor_col >= term.cols || term.cursor_row >= term.rows {
+    if (term.cursor_flags & CURSOR_VISIBLE) == 0u || term.cursor_col >= term.cols || term.cursor_row >= term.rows {
         out.clip = OFFSCREEN;
         return out;
     }
+    let solid_block = (term.cursor_flags & CURSOR_SOLID_BLOCK) != 0u;
     let span_cols = max((term.cursor_flags >> 4u) & 3u, 1u);
     let c = quad_corner(vi);
     let cell_size = frame.cell_size * term.scale;
@@ -747,7 +777,7 @@ fn vs_cursor(@builtin(vertex_index) vi: u32) -> CursorVsOut {
     let y1 = term.origin.y - f32(term.cursor_row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
     let y = select(y0, y1, c.y > 0.5);
-    let z = term.z + Z_OFFSET_CURSOR;
+    let z = term.z + select(Z_OFFSET_CURSOR, Z_OFFSET_CURSOR_BACK, solid_block);
 
     let clip = frame.view_proj * vec4<f32>(x, y, z, 1.0);
     let foot_cu = frame.view_proj * vec4<f32>(x1 - x0, 0.0, 0.0, 0.0);
@@ -772,30 +802,32 @@ fn fs_cursor(in: CursorVsOut) -> @location(0) vec4<f32> {
 
     let focused = term.focused != 0u;
     let shape = (term.cursor_flags >> 1u) & 3u;
-    var alpha = 0.0;
+    var cov = 0.0;
 
     if !focused {
-        // Hollow crisp screen-pixel outline when unfocused (cursorMaterial.js).
+        // Hollow crisp screen-pixel outline when unfocused (leaves glyph untouched).
         let edge_px = min(px_pos, cell_px - px_pos);
         let dist_px = min(edge_px.x, edge_px.y);
         let bw = frame.cursor_border_px;
-        alpha = 1.0 - smoothstep(bw - 0.5, bw + 0.5, dist_px);
+        cov = 1.0 - smoothstep(bw - 0.5, bw + 0.5, dist_px);
     } else if shape == 1u {
-        // Bar cursor on the left edge of the cell.
+        // Bar cursor on the left edge of the cell (leaves glyph untouched).
         let bar_w = max(2.0, cell_px.x * 0.14);
-        alpha = (1.0 - smoothstep(bar_w - 0.5, bar_w + 0.5, px_pos.x)) * 0.92;
+        cov = 1.0 - smoothstep(bar_w - 0.5, bar_w + 0.5, px_pos.x);
     } else if shape == 2u {
-        // Underline cursor along the bottom edge of the cell.
+        // Underline cursor along the bottom edge of the cell (leaves glyph untouched).
         let ul_h = max(2.0, cell_px.y * 0.12);
-        alpha = (1.0 - smoothstep(ul_h - 0.5, ul_h + 0.5, px_pos.y)) * 0.92;
+        cov = 1.0 - smoothstep(ul_h - 0.5, ul_h + 0.5, px_pos.y);
     } else {
-        // Focused block cursor: translucent solid fill so the glyph reads through it.
-        alpha = frame.cursor_fill_alpha;
+        // Focused block cursor: solid fill drawn behind ink (vs_ink draws glyph in cell bg).
+        cov = frame.cursor_fill_alpha;
     }
 
+    let cursor_col = resolved_cursor_color();
+    let alpha = cov * cursor_col.a;
     if alpha <= 0.0 {
         discard;
     }
-    let rgb = srgb_to_output(frame.cursor_color.rgb);
+    let rgb = srgb_to_output(cursor_col.rgb);
     return vec4<f32>(rgb * alpha, alpha);
 }

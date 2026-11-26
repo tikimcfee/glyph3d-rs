@@ -460,18 +460,24 @@ pub struct WallSettings {
     pub border_unfocused_color: [f32; 4],
     /// Terminal cursor colour (sRGB 0..1 RGBA).
     pub cursor_color: [f32; 4],
-    /// Solid focused block cursor fill opacity (0..1).
+    /// Solid focused block cursor fill opacity (0..1; 1.0 = solid block with background-coloured text).
     pub cursor_fill_opacity: f32,
     /// Hollow unfocused cursor outline width in screen pixels.
     pub cursor_border_px: f32,
+    /// Blinking cursor half-period in milliseconds (`0` disables blinking).
+    pub cursor_blink_ms: u32,
     /// Cell height in screen pixels below which text greeks into a bar (0 = never).
     pub greek_px: f32,
-    /// Underline centre height from cell bottom (fraction of cell height).
+    /// Fallback underline centre height from cell bottom (overridden by the active font's `post` table).
     pub underline_y: f32,
-    /// Strikethrough centre height from cell bottom (fraction of cell height).
+    /// Fallback strikethrough centre height from cell bottom (overridden by the active font's `OS/2` table).
     pub strike_y: f32,
-    /// Line decoration thickness (fraction of cell height).
+    /// Fallback line decoration thickness in cell heights (overridden by the active font's `post` table).
     pub line_thickness: f32,
+    /// User thickness multiplier applied to the font's `line_thickness` (`GLYPH_LINE_DEFAULTS.lineThickness`).
+    pub line_thickness_scale: f32,
+    /// Vertical offset in cell heights added to the font's `underline_y` (`GLYPH_LINE_DEFAULTS.underlineRaise`).
+    pub underline_raise: f32,
     /// Curly underline wave amplitude as a multiple of line thickness.
     pub curly_amplitude: f32,
     /// SGR 2 dim ink/line opacity multiplier (0..1).

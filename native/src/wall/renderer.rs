@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
@@ -52,10 +53,13 @@ pub struct WallStyle {
     pub cursor_color: [f32; 4],
     pub cursor_fill_opacity: f32,
     pub cursor_border_px: f32,
+    pub cursor_blink_ms: u32,
     pub greek_px: f32,
     pub underline_y: f32,
     pub strike_y: f32,
     pub line_thickness: f32,
+    pub line_thickness_scale: f32,
+    pub underline_raise: f32,
     pub curly_amplitude: f32,
     pub dim_alpha: f32,
 }
@@ -73,10 +77,13 @@ impl From<&WallSettings> for WallStyle {
             cursor_color: s.cursor_color,
             cursor_fill_opacity: s.cursor_fill_opacity,
             cursor_border_px: s.cursor_border_px,
+            cursor_blink_ms: s.cursor_blink_ms,
             greek_px: s.greek_px,
             underline_y: s.underline_y,
             strike_y: s.strike_y,
             line_thickness: s.line_thickness,
+            line_thickness_scale: s.line_thickness_scale,
+            underline_raise: s.underline_raise,
             curly_amplitude: s.curly_amplitude,
             dim_alpha: s.dim_alpha,
         }
@@ -170,9 +177,9 @@ struct TerminalUniform {
     cursor_flags: u32,
     border_override: u32,
     scale: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    cursor_color: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 struct TerminalGpu {
@@ -247,6 +254,91 @@ pub struct WallRenderer {
     shape_scratch: Vec<ShapeGpu>,
     label_scratch: Vec<LabelGlyphGpu>,
     draw_runs: Vec<DrawRun>,
+    cursor_blink: CursorBlinkState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlinkTarget {
+    terminal_id: u64,
+    col: u16,
+    row: u16,
+    shape: CursorShape,
+}
+
+#[derive(Clone, Debug)]
+struct CursorBlinkState {
+    anchor: Option<Instant>,
+    target: Option<BlinkTarget>,
+    visible: bool,
+}
+
+impl Default for CursorBlinkState {
+    fn default() -> Self {
+        Self {
+            anchor: None,
+            target: None,
+            visible: true,
+        }
+    }
+}
+
+impl CursorBlinkState {
+    fn update(
+        &mut self,
+        terminals: &[TerminalDraw<'_>],
+        half_period_ms: u32,
+        now: Instant,
+    ) -> Option<Instant> {
+        if half_period_ms == 0 {
+            self.anchor = None;
+            self.target = None;
+            self.visible = true;
+            return None;
+        }
+
+        let target = terminals.iter().find_map(|d| {
+            let cur = d.screen.cursor;
+            if d.focused
+                && cur.visible
+                && cur.blink
+                && cur.col < d.screen.cols
+                && cur.row < d.screen.rows
+            {
+                Some(BlinkTarget {
+                    terminal_id: d.id,
+                    col: cur.col,
+                    row: cur.row,
+                    shape: cur.shape,
+                })
+            } else {
+                None
+            }
+        });
+
+        let Some(target) = target else {
+            self.anchor = None;
+            self.target = None;
+            self.visible = true;
+            return None;
+        };
+
+        if self.target != Some(target) {
+            self.target = Some(target);
+            self.anchor = Some(now);
+        }
+
+        let anchor = *self.anchor.get_or_insert(now);
+        let period_ns = u128::from(half_period_ms) * 1_000_000u128;
+        let elapsed_ns = now.saturating_duration_since(anchor).as_nanos();
+        let phase = elapsed_ns / period_ns;
+        self.visible = (phase & 1) == 0;
+        let next_offset_ns = (phase + 1).saturating_mul(period_ns);
+        let next_offset = Duration::new(
+            (next_offset_ns / 1_000_000_000u128).min(u128::from(u64::MAX)) as u64,
+            (next_offset_ns % 1_000_000_000u128) as u32,
+        );
+        anchor.checked_add(next_offset)
+    }
 }
 
 const PREMUL_BLEND: wgpu::BlendState = wgpu::BlendState {
@@ -289,31 +381,63 @@ fn srgb_to_wgpu_clear_color(rgba: [f32; 4], target_is_srgb: bool) -> wgpu::Color
     }
 }
 
+const CURSOR_VISIBLE_FLAG: u32 = 1 << 0;
+const CURSOR_SOLID_BLOCK_FLAG: u32 = 1 << 3;
+
 fn fold_line_uniforms(style: &WallStyle) -> ([f32; 4], [f32; 4]) {
-    let t = style.line_thickness.max(1e-4);
-    let ul_y = style.underline_y.clamp(t * 0.5, 1.0 - t * 0.5);
-    let amp = t * style.curly_amplitude;
-    let lower = (ul_y - t).max(t * 0.5);
-    let line_a = [ul_y, t, style.strike_y, 0.0];
-    let line_b = [lower, lower + 2.0 * t, ul_y.max(amp + t * 0.5), amp];
+    // Matches `glyphMaterial.js::foldLines`: font line thickness × user scale,
+    // underline shifted by `underline_raise` and clamped inside `[t/2, 1 - t/2]`.
+    let t = (style.line_thickness * style.line_thickness_scale).clamp(1e-4, 1.0);
+    let half_t = t * 0.5;
+    let ul_y = (style.underline_y + style.underline_raise)
+        .max(half_t)
+        .min(1.0 - half_t);
+    let amp = (t * style.curly_amplitude).max(0.0);
+    let lower = (ul_y - t).max(half_t);
+    let strike_y = style.strike_y.max(half_t).min(1.0 - half_t);
+    let line_a = [ul_y, t, strike_y, 0.0];
+    let line_b = [lower, lower + 2.0 * t, ul_y.max(amp + half_t), amp];
     (line_a, line_b)
 }
 
-fn pack_cursor_flags(screen: &Screen) -> u32 {
+fn cursor_drawn_now(draw: &TerminalDraw<'_>, blink_on: bool) -> bool {
+    let cur = draw.screen.cursor;
+    cur.visible
+        && cur.col < draw.screen.cols
+        && cur.row < draw.screen.rows
+        && (!draw.focused || !cur.blink || blink_on)
+}
+
+fn cursor_is_solid_block(draw: &TerminalDraw<'_>, blink_on: bool) -> bool {
+    cursor_drawn_now(draw, blink_on)
+        && draw.focused
+        && draw.screen.cursor.shape == CursorShape::Block
+}
+
+fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
+    let screen = draw.screen;
     let cur = screen.cursor;
-    let visible = u32::from(cur.visible);
+    let drawn = cursor_drawn_now(draw, blink_on);
+    let solid_block = cursor_is_solid_block(draw, blink_on);
     let shape = match cur.shape {
         CursorShape::Block => 0u32,
         CursorShape::Bar => 1u32,
         CursorShape::Underline => 2u32,
     };
-    let span_cols = if cur.visible && cur.col < screen.cols && cur.row < screen.rows {
+    let span_cols = if drawn {
         let w = screen.row(cur.row)[cur.col as usize].width;
         if w == 2 { 2u32 } else { 1u32 }
     } else {
         1u32
     };
-    visible | (shape << 1) | (span_cols << 4)
+    let mut flags = (shape << 1) | (span_cols << 4);
+    if drawn {
+        flags |= CURSOR_VISIBLE_FLAG;
+    }
+    if solid_block {
+        flags |= CURSOR_SOLID_BLOCK_FLAG;
+    }
+    flags
 }
 
 fn make_shared_bg(
@@ -815,6 +939,7 @@ impl WallRenderer {
             shape_scratch: Vec::new(),
             label_scratch: Vec::new(),
             draw_runs: Vec::new(),
+            cursor_blink: CursorBlinkState::default(),
         }
     }
 
@@ -878,6 +1003,28 @@ impl WallRenderer {
 
     pub fn style_mut(&mut self) -> &mut WallStyle {
         &mut self.style
+    }
+
+    /// Advance the renderer's cursor-blink phase to `now` for `terminals` and return
+    /// the instant of the next phase change, or `None` if no focused visible terminal
+    /// has a blinking cursor (or `style.cursor_blink_ms == 0`).
+    ///
+    /// Call before [`Self::render`] / [`Self::prepare`] in an on-demand event loop and
+    /// schedule a redraw at the returned deadline. Unfocused cursors stay hollow and
+    /// never blink; moving the cursor, changing its shape, or switching focus resets
+    /// the phase solid-on so typing never hides the cursor mid-stroke.
+    pub fn next_cursor_blink(
+        &mut self,
+        terminals: &[TerminalDraw<'_>],
+        now: Instant,
+    ) -> Option<Instant> {
+        self.cursor_blink
+            .update(terminals, self.style.cursor_blink_ms, now)
+    }
+
+    /// Whether a blinking focused cursor is currently in its visible (lit) phase.
+    pub fn cursor_blink_visible(&self) -> bool {
+        self.cursor_blink.visible
     }
 
     /// Release cached GPU buffers for a closed terminal.
@@ -985,12 +1132,12 @@ impl WallRenderer {
             panel_opacity: draw.panel_opacity.unwrap_or(self.style.panel_opacity),
             cursor_col: u32::from(screen.cursor.col),
             cursor_row: u32::from(screen.cursor.row),
-            cursor_flags: pack_cursor_flags(screen),
+            cursor_flags: pack_cursor_flags(draw, self.cursor_blink.visible),
             border_override: draw.border_color.unwrap_or(0),
             scale: sanitize_scale(draw.scale),
-            _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
+            cursor_color: screen.cursor_color,
+            _pad1: 0,
+            _pad2: 0,
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
@@ -1316,22 +1463,32 @@ impl WallRenderer {
                     pass.set_bind_group(0, &self.shared_bg, &[]);
                     pass.set_bind_group(1, &gpu.bind_group, &[]);
 
+                    let cursor_drawn = cursor_drawn_now(draw, self.cursor_blink.visible);
+                    let cursor_solid = cursor_is_solid_block(draw, self.cursor_blink.visible);
+
                     pass.set_pipeline(&self.panel_pipeline);
                     pass.draw_indexed(0..6, 0, 0..1);
 
+                    if cell_count > 0 && gpu.has_any_bg {
+                        pass.set_pipeline(&self.fill_pipeline);
+                        pass.draw_indexed(0..6, 0, 0..cell_count);
+                    }
+
+                    // Focused block cursor draws solid behind ink so the glyph renders
+                    // over it in the cell's background colour without washout.
+                    if cursor_solid {
+                        pass.set_pipeline(&self.cursor_pipeline);
+                        pass.draw_indexed(0..6, 0, 0..1);
+                    }
+
                     if cell_count > 0 {
-                        if gpu.has_any_bg {
-                            pass.set_pipeline(&self.fill_pipeline);
-                            pass.draw_indexed(0..6, 0, 0..cell_count);
-                        }
                         pass.set_pipeline(&self.ink_pipeline);
                         pass.draw_indexed(0..6, 0, 0..cell_count);
                     }
 
-                    if draw.screen.cursor.visible
-                        && draw.screen.cursor.col < draw.screen.cols
-                        && draw.screen.cursor.row < draw.screen.rows
-                    {
+                    // Hollow unfocused, bar, and underline cursors draw above ink
+                    // without modifying the glyph underneath.
+                    if cursor_drawn && !cursor_solid {
                         pass.set_pipeline(&self.cursor_pipeline);
                         pass.draw_indexed(0..6, 0, 0..1);
                     }
@@ -2459,5 +2616,307 @@ mod tests {
         assert_eq!(s_after.rows_uploaded, 1, "family switch must repack cached terminals");
         assert!(renderer.set_font_family(MONASPACE_ARGON_FAMILY));
         assert!(!renderer.set_font_family("nonexistent-family"));
+    }
+
+    #[test]
+    fn fold_line_uniforms_matches_js_rules() {
+        let mut style = WallStyle {
+            underline_y: 0.1127,
+            strike_y: 0.38,
+            line_thickness: 0.0314,
+            line_thickness_scale: 1.0,
+            underline_raise: 0.0,
+            curly_amplitude: 1.5,
+            ..WallStyle::default()
+        };
+        let (a, b) = fold_line_uniforms(&style);
+        assert!((a[0] - 0.1127).abs() < 1e-6);
+        assert!((a[1] - 0.0314).abs() < 1e-6);
+        assert!((a[2] - 0.38).abs() < 1e-6);
+        let expected_amp = 0.0314 * 1.5;
+        let expected_lower = 0.1127 - 0.0314;
+        assert!((b[0] - expected_lower).abs() < 1e-6);
+        assert!((b[1] - (expected_lower + 2.0 * 0.0314)).abs() < 1e-6);
+        assert!((b[2] - 0.1127_f32.max(expected_amp + 0.0314 * 0.5)).abs() < 1e-6);
+        assert!((b[3] - expected_amp).abs() < 1e-6);
+
+        // User knobs scale font thickness and raise underline cleanly.
+        style.line_thickness_scale = 2.0;
+        style.underline_raise = 0.05;
+        let (a2, b2) = fold_line_uniforms(&style);
+        assert!((a2[1] - 0.0628).abs() < 1e-6);
+        assert!((a2[0] - 0.1627).abs() < 1e-6);
+        assert!((b2[3] - 0.0628 * 1.5).abs() < 1e-6);
+
+        // Zero curly_amplitude flattens wave amplitude to 0.
+        style.curly_amplitude = 0.0;
+        let (a3, b3) = fold_line_uniforms(&style);
+        assert_eq!(b3[3], 0.0);
+        assert!((b3[2] - a3[0]).abs() < 1e-6);
+
+        // Extreme scale and raises clamp safely without panicking.
+        style.line_thickness_scale = 100.0;
+        style.underline_raise = -10.0;
+        let (a_lo, _) = fold_line_uniforms(&style);
+        assert_eq!(a_lo[1], 1.0);
+        assert!((a_lo[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cursor_blink_state_phases_reset_and_idle() {
+        let mut screen = Screen::new(10, 4);
+        screen.cursor = term_cells::Cursor {
+            col: 2,
+            row: 1,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+        fn make(id: u64, s: &Screen, focused: bool) -> TerminalDraw<'_> {
+            TerminalDraw {
+                id,
+                screen: s,
+                position: Vec2::ZERO,
+                z: 0.0,
+                scale: 1.0,
+                focused,
+                panel_opacity: None,
+                border_color: None,
+            }
+        }
+
+        let mut blink = CursorBlinkState::default();
+        let t0 = Instant::now();
+
+        // Non-blinking focused cursor needs no timer and stays visible.
+        assert_eq!(blink.update(&[make(1, &screen, true)], 530, t0), None);
+        assert!(blink.visible);
+
+        // Unfocused blinking cursor stays hollow and never schedules a timer.
+        screen.cursor.blink = true;
+        assert_eq!(blink.update(&[make(1, &screen, false)], 530, t0), None);
+        assert!(blink.visible);
+
+        // Disabled blink (half_period_ms = 0) never schedules a timer.
+        assert_eq!(blink.update(&[make(1, &screen, true)], 0, t0), None);
+        assert!(blink.visible);
+
+        // Focused blinking cursor alternates ON / OFF every 530 ms.
+        let d0 = blink.update(&[make(1, &screen, true)], 530, t0);
+        assert_eq!(d0, Some(t0 + Duration::from_millis(530)));
+        assert!(blink.visible);
+
+        let d1 = blink.update(&[make(1, &screen, true)], 530, t0 + Duration::from_millis(529));
+        assert_eq!(d1, Some(t0 + Duration::from_millis(530)));
+        assert!(blink.visible);
+
+        let d2 = blink.update(&[make(1, &screen, true)], 530, t0 + Duration::from_millis(530));
+        assert_eq!(d2, Some(t0 + Duration::from_millis(1060)));
+        assert!(!blink.visible);
+
+        let d3 = blink.update(&[make(1, &screen, true)], 530, t0 + Duration::from_millis(1060));
+        assert_eq!(d3, Some(t0 + Duration::from_millis(1590)));
+        assert!(blink.visible);
+
+        // Moving the cursor during an OFF phase resets it immediately solid-on.
+        let t_off = t0 + Duration::from_millis(600);
+        let _ = blink.update(&[make(1, &screen, true)], 530, t_off);
+        assert!(!blink.visible);
+        screen.cursor.col = 3;
+        let d_moved = blink.update(&[make(1, &screen, true)], 530, t_off);
+        assert!(blink.visible);
+        assert_eq!(d_moved, Some(t_off + Duration::from_millis(530)));
+
+        // Hiding the cursor stops timers immediately.
+        screen.cursor.visible = false;
+        assert_eq!(blink.update(&[make(1, &screen, true)], 530, t_off), None);
+        assert!(blink.visible);
+    }
+
+    /// Verifies solid focused block cursor fills opaque, draws glyph text over it in
+    /// the cell's background colour, honours `Screen::cursor_color` (alpha 0 fallback),
+    /// leaves bar/underline/hollow glyphs untouched, and suppresses cursor on blink-off.
+    #[test]
+    fn gpu_block_cursor_solid_text_inversion_color_and_blink() {
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let style = WallStyle {
+            cursor_color: [0.431, 0.906, 0.627, 1.0], // #6ee7a0 -> ~(110, 231, 160)
+            cursor_blink_ms: 500,
+            ..WallStyle::default()
+        };
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            style,
+        );
+
+        let m = renderer.metrics();
+        let w = 96u32;
+        let h = 144u32;
+        let cam = WallCamera::new(Vec2::new(m.cell_width * 0.5, -m.cell_height * 0.5), 96.0);
+
+        let mut screen = Screen::new(4, 2);
+        screen.default_bg = rgb(0x0d, 0x10, 0x17);
+        screen.row_mut(0)[0] = term_cells::Cell {
+            content: 'M' as u32,
+            fg: rgb(0xe0, 0x20, 0xe0),
+            bg: 0,
+            ul: 0,
+            attrs: 0,
+            width: 1,
+            _pad: 0,
+        };
+        screen.touch_row(0);
+        screen.cursor = term_cells::Cursor {
+            col: 0,
+            row: 0,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+
+        fn make(s: &Screen, focused: bool) -> TerminalDraw<'_> {
+            TerminalDraw {
+                id: 1,
+                screen: s,
+                position: Vec2::ZERO,
+                z: 1.0,
+                scale: 1.0,
+                focused,
+                panel_opacity: Some(1.0),
+                border_color: None,
+            }
+        }
+
+        let tl = cam.world_to_screen(Vec2::ZERO, (w, h));
+        let br = cam.world_to_screen(Vec2::new(m.cell_width, -m.cell_height), (w, h));
+        let x0 = (tl.x.ceil() as u32 + 2).min(w - 1);
+        let x1 = (br.x.floor() as u32).saturating_sub(2).min(w);
+        let y0 = (tl.y.ceil() as u32 + 2).min(h - 1);
+        let y1 = (br.y.floor() as u32).saturating_sub(2).min(h);
+        let count_matching = |px: &[u8], pred: fn([u8; 3]) -> bool| -> usize {
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = ((y * w + x) * 4) as usize;
+                    if pred([px[i], px[i + 1], px[i + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Focused Block on default bg: solid green cursor fill + dark #0d1017 'M' ink, zero magenta.
+        let px_solid = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, true)], ..Default::default() },
+            w,
+            h,
+        );
+        let solid_green = count_matching(&px_solid, |c| {
+            c[0].abs_diff(110) <= 3 && c[1].abs_diff(231) <= 3 && c[2].abs_diff(160) <= 3
+        });
+        let dark_ink = count_matching(&px_solid, |c| {
+            c[0].abs_diff(0x0d) <= 3 && c[1].abs_diff(0x10) <= 3 && c[2].abs_diff(0x17) <= 3
+        });
+        let magenta_ink = count_matching(&px_solid, |c| c[0] > 180 && c[2] > 180 && c[1] < 80);
+        assert!(solid_green > 500, "focused block cursor must fill solid #6ee7a0 ({solid_green} px)");
+        assert!(dark_ink > 100, "glyph over solid block cursor must draw in default_bg #0d1017 ({dark_ink} px)");
+        assert_eq!(magenta_ink, 0, "glyph over solid block cursor must not draw in cell fg");
+
+        // 2. Explicit cell bg (#1830b0): glyph draws in cell's own bg over solid green cursor.
+        screen.row_mut(0)[0].bg = rgb(0x18, 0x30, 0xb0);
+        screen.touch_row(0);
+        let px_cell_bg = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, true)], ..Default::default() },
+            w,
+            h,
+        );
+        let blue_ink = count_matching(&px_cell_bg, |c| {
+            c[0].abs_diff(0x18) <= 3 && c[1].abs_diff(0x30) <= 3 && c[2].abs_diff(0xb0) <= 3
+        });
+        assert!(blue_ink > 100, "glyph over solid block cursor must draw in explicit cell.bg ({blue_ink} px)");
+        screen.row_mut(0)[0].bg = 0;
+        screen.touch_row(0);
+
+        // 3. Screen::cursor_color overrides style cursor_color when alpha > 0, falls back when 0.
+        screen.cursor_color = rgb(0xff, 0x55, 0x00);
+        let px_orange = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, true)], ..Default::default() },
+            w,
+            h,
+        );
+        let orange_cursor = count_matching(&px_orange, |c| {
+            c[0].abs_diff(0xff) <= 3 && c[1].abs_diff(0x55) <= 3 && c[2] <= 3
+        });
+        assert!(orange_cursor > 500, "Screen::cursor_color must override style cursor colour ({orange_cursor} px)");
+        screen.cursor_color = 0;
+
+        // 4. Bar, Underline, and Unfocused Hollow leave glyph fg magenta untouched.
+        for (focused, shape) in [
+            (false, CursorShape::Block),
+            (true, CursorShape::Bar),
+            (true, CursorShape::Underline),
+        ] {
+            screen.cursor.shape = shape;
+            let px = render_rgba_bytes(
+                &ctx,
+                &mut renderer,
+                &cam,
+                &WallFrame { terminals: &[make(&screen, focused)], ..Default::default() },
+                w,
+                h,
+            );
+            let mag = count_matching(&px, |c| {
+                c[0].abs_diff(0xe0) <= 3 && c[1].abs_diff(0x20) <= 3 && c[2].abs_diff(0xe0) <= 3
+            });
+            assert!(
+                mag > 100,
+                "cursor (focused={focused}, shape={shape:?}) must leave glyph fg untouched ({mag} px)"
+            );
+        }
+
+        // 5. Blink OFF phase suppresses focused block cursor and restores magenta glyph ink.
+        screen.cursor.shape = CursorShape::Block;
+        screen.cursor.blink = true;
+        let t0 = Instant::now();
+        let draw = make(&screen, true);
+        let deadline = renderer.next_cursor_blink(std::slice::from_ref(&draw), t0);
+        assert_eq!(deadline, Some(t0 + Duration::from_millis(500)));
+        assert!(renderer.cursor_blink_visible());
+
+        let _ = renderer.next_cursor_blink(
+            std::slice::from_ref(&draw),
+            t0 + Duration::from_millis(500),
+        );
+        assert!(!renderer.cursor_blink_visible());
+        let px_off = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[draw], ..Default::default() },
+            w,
+            h,
+        );
+        let green_when_off = count_matching(&px_off, |c| {
+            c[0].abs_diff(110) <= 5 && c[1].abs_diff(231) <= 5 && c[2].abs_diff(160) <= 5
+        });
+        let magenta_when_off = count_matching(&px_off, |c| {
+            c[0].abs_diff(0xe0) <= 3 && c[1].abs_diff(0x20) <= 3 && c[2].abs_diff(0xe0) <= 3
+        });
+        assert_eq!(green_when_off, 0, "blink-off must hide the block cursor");
+        assert!(magenta_when_off > 100, "blink-off must restore normal glyph fg ({magenta_when_off} px)");
     }
 }
