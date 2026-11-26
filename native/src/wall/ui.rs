@@ -322,12 +322,10 @@ pub fn color32_from_srgb(rgba: [f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(ch(rgba[0]), ch(rgba[1]), ch(rgba[2]), ch(rgba[3]))
 }
 
-/// Path to the bundled monospace UI font under `assets/fonts/`.
+/// Path to the bundled monospace UI font (`fonts/Cousine-Regular.ttf`), resolved
+/// through the same bundle -> repo lookup order as [`super::glyphs::default_fonts_dir`].
 pub fn wall_ui_font_path() -> PathBuf {
-    crate::atlas_dir()
-        .parent()
-        .map(|assets| assets.join("fonts/Cousine-Regular.ttf"))
-        .unwrap_or_else(|| PathBuf::from("assets/fonts/Cousine-Regular.ttf"))
+    super::glyphs::default_fonts_dir().join("Cousine-Regular.ttf")
 }
 
 /// Apply the wall's dark visual theme (sourced from `config/defaults.toml [wall]`)
