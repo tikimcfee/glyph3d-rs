@@ -36,12 +36,20 @@ G3D_TERMD_DIR=/tmp/g3d-font-<pid> ./target/release/wallctl --ns probe wall.snap
 G3D_TERMD_DIR=/tmp/g3d-font-<pid> ./target/release/wallctl --ns probe app.quit
 ```
 
-### Fast WGSL iteration without Rust rebuilds
+### Fast WGSL iteration (live hot-reload — no restart!)
 
-Because `native/src/wall/renderer.rs` now honours `GLYPH_WALL_SHADER_DIR`, editing `wall_cells.wgsl` / `wall_shapes.wgsl` / `wall_paper.wgsl` only needs a **1.8 s restart of the release binary** with zero `cargo build`:
+Because `native/src/wall/renderer.rs` honours `GLYPH_WALL_SHADER_DIR` and watches the three wall shaders (`wall_paper.wgsl`, `wall_shapes.wgsl`, `wall_cells.wgsl`) via a 150 ms mtime+size poll on the window's existing `WaitUntil` timer (zero polling when `GLYPH_WALL_SHADER_DIR` is unset), saving an edit to any wall WGSL file now reloads **live with zero restart**:
+
+1. Validates syntax, types, and required entry points with `wgpu::naga` first.
+2. Rebuilds **only the affected pipeline(s)** inside a `wgpu::ErrorFilter::Validation` error scope (`wall_paper.wgsl`: 1 pipeline; `wall_shapes.wgsl`: 2 pipelines; `wall_cells.wgsl`: 5 pipelines) and swaps atomically.
+3. On any validation or pipeline error, keeps the old pipeline(s) untouched, logs the error **once** (`log::error!`), and shows a one-line amber notice (`shader <file>: ...`) in the wall's notice bar until fixed.
 
 ```sh
+# Release binary with live WGSL hot-reload:
 GLYPH_WALL_SHADER_DIR=native/src/shaders ./target/release/glyph3d-native --wall --wall-ns probe
+
+# Or under relax (tools/wall-relax.sh exports GLYPH_WALL_SHADER_DIR automatically):
+tools/wall-relax.sh
 ```
 
 ---
@@ -59,7 +67,7 @@ Crate graph under `glyph3d-native`: 343 crates, 5,001 files, 2.60M lines, 38 bui
 | **`native/src/wall/ui.rs`** (mounted HUD `show_debug_hud`) | **5.18–8.72 s** | **Yes (live)** | **Yes** (no restart) | `rung: "patch"`, `work 5.18–6.61 s`, 2 fns installed & borrow-checked in `45 ms` when HUD active. |
 | **`crates/wall-core/src/wall.rs`** (`build_frame` & `run_with_screens`) | **0.89–4.85 s** | **Yes (live, cross-crate)** | **Yes** (no restart) | `build_frame` title-bar `fill_color`: `4.85 s` 1st / **`0.89 s`** repeat (`work 177 ms`). `run_with_screens`: `2.44 s` patch / `2.53 s` confirmed via `wallctl wall.snap` changing live (`OK: snap off` → `LIVE-CORE OK: snap on`). |
 | **`crates/wall-core/src/commands.rs`** (startup-boxed closures) | **0.74–4.32 s** (patch) / **restart** (effect) | **Partial** (needs restart for boxed closures) | **Yes** on restart | `register_wall_commands` patches live (`0.74 s` warm), but closures boxed into `self.router` once during `Wall::open` keep their startup closure pointer until restart. Named helpers called from handlers patch live. |
-| **`native/src/shaders/wall_cells.wgsl`** | **49.0 s** (`relax` restart) / **1.83 s** (release binary restart) | **No — needs restart** | **Yes** (`app.text t1`) | `relax` *does* watch `include_str!` files (`detect 4.0 ms`) and live-patches `WallRenderer::new` in `0.82 s`, but `WallRenderer::new` only runs once at startup so live `wgpu::RenderPipeline`s are not recreated. Under `relax`, editing a `include_str!`-fallback shader also invalidates `glyph3d-native`'s startup image (`~49 s` restart); restarting the release binary with `GLYPH_WALL_SHADER_DIR` reloads from disk in **`1.83 s`** with zero Rust rebuild. |
+| **`native/src/shaders/wall_cells.wgsl`** (live hot-reload via `GLYPH_WALL_SHADER_DIR`) | **0.31 s** release (`0.94 s` 1st) / **0.65 s** `relax` (`3.22 s` 1st) | **Yes (live)** | **Yes** (no restart) | 150 ms mtime poll + `wgpu::naga` validation + affected-pipeline rebuild (`86.9 ms` release / `191.6 ms` `relax` warm rebuild; `776 ms` / `2.70 s` first). Broken WGSL keeps the old pipeline intact, logs once (`216 ms` release / `1.42 s` `relax`), and shows a notice at top of the wall; fixing clears it and swaps live. (Previously required a 49 s `relax` restart or 1.83 s release restart.) |
 
 ### Terminal persistence across restarts
 
@@ -92,4 +100,4 @@ Under `PresentMode::Fifo`, an occasional JIT/GC frame crossing 16.7 ms quantizes
 2. **Non-fatal third-party Relax compile notices:** When background typeck is enabled, `bevy_transform 0.20.0-rc.2` (`E0477`), `lock_api 0.4.14`, `typewit 1.15.2`, and `serde 1.0.229` emit background gap notices; none affect wall execution.
 3. **macOS window occlusion:** When a maximized/fullscreen app completely covers the `1600×1000` background wall window, macOS suppresses `drawRect:` and `Surface::get_current_texture()` returns `Occluded`, so `App::draw()` returns before `pending_shot` and `self.frames` stays `0`. `wallctl` non-render verbs (`app.text`, `wall.snap`, `app.quit`) still work while occluded, but `app.shot` and `--frames` runs need the window unoccluded.
 4. **Exit flush time:** After `app.quit` prints `the wall drew N frames`, `relax` takes ~4–30 s to spill updated `.rcs` stores and rewrite the ~29 MB startup image before the process exits.
-5. **Possible future speed-up for live WGSL reload:** Right now `wall_cells.wgsl` needs a restart because `WallRenderer::new` builds pipelines once at startup. Adding a `renderer.reload_shaders` verb (calling `load_wall_wgsl` + rebuilding the 3 pipelines) would turn WGSL iteration into <100 ms live reload in both `relax` and the release binary.
+5. **Live WGSL reload vs `include_str!` under `relax`:** When editing shaders inside the repo's `native/src/shaders/` directory under `relax`, `WallRenderer`'s mtime watcher hot-reloads the live pipeline in ~0.65 s while `relax` also re-patches `WallRenderer::new` in the background (harmless); when `GLYPH_WALL_SHADER_DIR` is unset, zero filesystem polling or timer wakeups occur.
