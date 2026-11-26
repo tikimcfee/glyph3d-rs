@@ -1359,3 +1359,287 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         burst_stats.resizes_sent
     );
 }
+
+#[test]
+fn part1_scroll_state_pipelined_bell_and_osc8_links() {
+    use term_session::Sessions;
+
+    let scratch = ScratchDaemon::new("part1");
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions =
+        Sessions::open_target(&scratch.target(), wake.waker()).expect("open Sessions");
+
+    // 1. Scroll state (`offset`, `max` / `history_len()`, `at_bottom`) + `scroll_to_live` +
+    //    `scroll(id, 0, ..)` zero-delta jump (`wall.agent.jump live`).
+    let sb_ready = scratch.dir.join("sb-ready");
+    let sb_script = "\
+        i=1; while [ $i -le 35 ]; do printf 'HIST-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; \
+        printf 'LIVE-PROMPT>'; \
+        printf r > \"$1\"; \
+        exec sleep 60";
+    let (t1, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                sb_script.into(),
+                "sh".into(),
+                sb_ready.to_string_lossy().into_owned(),
+            ]),
+            60,
+            10,
+        )
+        .expect("spawn t1");
+
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            let Some(sb) = sessions.scrollback(&t1) else {
+                return false;
+            };
+            // `status_follow(Some(500))` populates `max` (`scrollback_rows`) even before any scroll!
+            sb_ready.exists()
+                && sb.offset == 0
+                && sb.at_bottom
+                && sb.is_at_bottom()
+                && !sb.viewing
+                && sb.history_len() >= 25
+                && sessions
+                    .text(&t1, 0, 0, 60, 9)
+                    .unwrap_or_default()
+                    .contains("LIVE-PROMPT>")
+        }),
+        "initial scrollback state did not report at_bottom=true and history_len >= 25: {:?}",
+        sessions.scrollback(&t1)
+    );
+
+    // Scroll up 12 lines into history.
+    seen = wake.current();
+    sessions.scroll(&t1, -12, 0.0, 0.0);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            let Some(sb) = sessions.scrollback(&t1) else {
+                return false;
+            };
+            sb.offset == 12
+                && !sb.at_bottom
+                && sb.viewing
+                && sb.history_len() >= 25
+                && !sessions.screen(&t1).expect("screen").cursor.visible
+        }),
+        "scroll(-12) did not update scrollback state to offset=12, at_bottom=false: {:?}",
+        sessions.scrollback(&t1)
+    );
+
+    // Jump directly back to live via `Sessions::scroll_to_live`.
+    seen = wake.current();
+    sessions.scroll_to_live(&t1);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            let Some(sb) = sessions.scrollback(&t1) else {
+                return false;
+            };
+            sb.offset == 0
+                && sb.at_bottom
+                && !sb.viewing
+                && sessions.screen(&t1).expect("screen").cursor.visible
+                && sessions
+                    .text(&t1, 0, 0, 60, 9)
+                    .unwrap_or_default()
+                    .contains("LIVE-PROMPT>")
+        }),
+        "scroll_to_live did not return t1 to offset=0, at_bottom=true: {:?}",
+        sessions.scrollback(&t1)
+    );
+
+    // Scroll back 8 lines, then exercise `wall.agent.jump live`'s zero-delta `scroll(id, 0, ..)`.
+    seen = wake.current();
+    sessions.scroll(&t1, -8, 0.0, 0.0);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions.scrollback(&t1).is_some_and(|sb| sb.offset == 8 && !sb.at_bottom)
+        }),
+        "scroll(-8) did not move to offset=8"
+    );
+    seen = wake.current();
+    sessions.scroll(&t1, 0, 0.0, 0.0);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions
+                .scrollback(&t1)
+                .is_some_and(|sb| sb.offset == 0 && sb.at_bottom && !sb.viewing)
+        }),
+        "zero-delta scroll(0) did not jump t1 back to live: {:?}",
+        sessions.scrollback(&t1)
+    );
+
+    // 2. Counted, drainable bell (`bell_count`, `unread_bells`, `take_bell`, `take_bells`) +
+    //    pipelined `create_and_subscribe` startup bell test.
+    let bell_ready = scratch.dir.join("bell-ready");
+    let bell_script = "\
+        printf r > \"$1\"; \
+        while IFS= read -r line; do printf '\\007RING:%s\\r\\n' \"$line\"; done";
+    let (t2, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                bell_script.into(),
+                "sh".into(),
+                bell_ready.to_string_lossy().into_owned(),
+            ]),
+            60,
+            10,
+        )
+        .expect("spawn t2");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            bell_ready.exists()
+        }),
+        "bell loop terminal t2 did not start"
+    );
+
+    for step in 1..=3 {
+        sessions.paste(&t2, &format!("b{step}\n"));
+        assert!(
+            wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+                let _ = sessions.pump();
+                sessions.bell_count(&t2) >= step
+            }),
+            "bell #{step} did not arrive on t2"
+        );
+    }
+    assert_eq!(sessions.bell_count(&t2), 3);
+    assert_eq!(sessions.unread_bells(&t2), 3);
+    assert_eq!(sessions.take_bells(), vec![(t2.clone(), 3)]);
+    assert_eq!(sessions.unread_bells(&t2), 0);
+    assert_eq!(sessions.take_bell(&t2), 0);
+    assert_eq!(sessions.bell_count(&t2), 3, "cumulative bell_count stays monotonic after drain");
+
+    // Immediate startup bell (no sleep gate before `printf '\007'`), exercising `create_and_subscribe`.
+    let mut caught_startup_bells = 0usize;
+    let mut startup_ids = Vec::new();
+    for i in 0..8 {
+        let marker = scratch.dir.join(format!("imm-{i}"));
+        let (bid, _, _) = sessions
+            .spawn(
+                Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '\\007IMM_BELL'; printf x > \"$1\"; exec sleep 60".into(),
+                    "sh".into(),
+                    marker.to_string_lossy().into_owned(),
+                ]),
+                40,
+                6,
+            )
+            .expect("spawn immediate bell terminal");
+        assert!(
+            wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+                let _ = sessions.pump();
+                marker.exists()
+                    && sessions
+                        .text(&bid, 0, 0, 40, 5)
+                        .unwrap_or_default()
+                        .contains("IMM_BELL")
+            }),
+            "immediate bell terminal {bid} did not render IMM_BELL"
+        );
+        // Give any trailing Event::Bell frame a brief moment to land if emitted.
+        let _ = wait_for(&wake, &mut seen, Duration::from_millis(50), || {
+            let _ = sessions.pump();
+            sessions.unread_bells(&bid) >= 1
+        });
+        if sessions.take_bell(&bid) >= 1 {
+            caught_startup_bells += 1;
+        }
+        startup_ids.push(bid);
+    }
+    println!(
+        "[pipelined create_and_subscribe startup bell] caught {caught_startup_bells}/{} un-gated t=0 bells",
+        startup_ids.len()
+    );
+    for bid in startup_ids {
+        sessions.kill(&bid);
+    }
+
+    // 3. `OSC 8` hyperlinks (`Sessions::link_at`, wide-character tail resolution, and `REPAINT`).
+    let link_ready = scratch.dir.join("link-ready");
+    let link_script = "\
+        printf '\\033[H\\033[2J'; \
+        printf '\\033]8;;https://glyph3d.dev/docs\\033\\\\DOCS\\033]8;;\\033\\\\ plain '; \
+        printf '\\033]8;id=repo;https://github.com/lugotools/glyph3d\\007漢字\\033]8;;\\007!'; \
+        printf k > \"$1\"; \
+        exec sleep 60";
+    let (t3, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                link_script.into(),
+                "sh".into(),
+                link_ready.to_string_lossy().into_owned(),
+            ]),
+            60,
+            8,
+        )
+        .expect("spawn t3");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            link_ready.exists()
+                && sessions
+                    .row_text(&t3, 0)
+                    .unwrap_or_default()
+                    .contains("DOCS plain 漢字!")
+        }),
+        "t3 did not render OSC 8 row: {:?}",
+        sessions.row_text(&t3, 0)
+    );
+
+    // Columns 0..=3: "DOCS" -> https://glyph3d.dev/docs
+    for c in 0..=3 {
+        assert_eq!(
+            sessions.link_at(&t3, c, 0).as_deref(),
+            Some("https://glyph3d.dev/docs"),
+            "col {c} should carry first OSC 8 URI"
+        );
+    }
+    // Columns 4..=10: " plain " -> None
+    for c in 4..=10 {
+        assert_eq!(sessions.link_at(&t3, c, 0), None, "col {c} must be unlinked");
+    }
+    // Columns 11..=14: "漢字" (two wide CJK chars, 2 cells each; both head and tail cells resolve)
+    for c in 11..=14 {
+        assert_eq!(
+            sessions.link_at(&t3, c, 0).as_deref(),
+            Some("https://github.com/lugotools/glyph3d"),
+            "wide CJK cell col {c} should resolve second OSC 8 URI"
+        );
+    }
+    // Column 15 ("!") and out-of-bounds -> None
+    assert_eq!(sessions.link_at(&t3, 15, 0), None);
+    assert_eq!(sessions.link_at(&t3, 999, 999), None);
+    assert_eq!(sessions.link_at("nonexistent", 0, 0), None);
+
+    // Re-adopt `t3` on a fresh `Sessions` (fed solely by `g3d-termd`'s `REPAINT`, `Extras::ALL`)
+    // and verify `OSC 8` links survive `REPAINT` as well!
+    let mut reader2 =
+        Sessions::open_target(&scratch.target(), wake.waker()).expect("open second Sessions");
+    reader2.adopt(&t3).expect("re-adopt t3");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = reader2.pump();
+            reader2.link_at(&t3, 0, 0).as_deref() == Some("https://glyph3d.dev/docs")
+                && reader2.link_at(&t3, 12, 0).as_deref()
+                    == Some("https://github.com/lugotools/glyph3d")
+        }),
+        "OSC 8 hyperlinks should survive g3d-termd REPAINT on re-adopt"
+    );
+}

@@ -28,7 +28,7 @@ pub use session::{ExitInfo, ScrollbackState, SessionStats, TerminalSession};
 pub use sessions::{NAMESPACE, News, Sessions};
 pub use term_cells::{Modes, MouseTracking, Screen};
 pub use termd_client::{
-    code, Capture, CaptureFormat, CaptureReply, Colors, ConnectOptions, Error, IfExists, Key,
-    KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Target, TermInfo, View,
-    ViewReply, Welcome, WireError,
+    code, Capture, CaptureFormat, CaptureReply, Colors, ConnectOptions, Error, Flow, IfExists, Key,
+    KeyAction, Mode, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Subscribe, Target,
+    TermInfo, View, ViewReply, Welcome, WireError,
 };

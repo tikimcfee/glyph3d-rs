@@ -23,8 +23,7 @@ use std::time::Duration;
 
 use term_cells::{Modes, Screen};
 use termd_client::{
-    ConnectOptions, Create, Key, KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Target,
-    View,
+    ConnectOptions, Key, KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Target, View,
 };
 use wall_core::keymap::{self, TerminalKey, TerminalKeyAction};
 use wall_core::mouse::MouseAction as WallMouseAction;
@@ -253,7 +252,8 @@ impl Sessions {
     }
 
     /// Starts a terminal (the account's login shell when `argv` is `None`) under the first free
-    /// `tN` id, and adopts it as size owner. Returns `(id, cols, rows)`.
+    /// `tN` id, pipelining `create` and `subscribe` in one socket write, and adopts it as size
+    /// owner. Returns `(id, cols, rows)`.
     pub fn spawn(
         &mut self,
         argv: Option<Vec<String>>,
@@ -265,19 +265,10 @@ impl Sessions {
             .map(|n| format!("t{n}"))
             .find(|cand| !taken.contains(cand) && !self.live.contains_key(cand))
             .expect("some tN is free");
-        let made = self
-            .hub
-            .client()
-            .create(&Create {
-                id,
-                argv,
-                cols,
-                rows,
-                ..Create::default()
-            })
-            .map_err(|e| format!("termd create: {e}"))?;
-        let (cols, rows) = self.adopt(&made.id)?;
-        Ok((made.id, cols, rows))
+        self.spawn_with(&SpawnOptions {
+            argv,
+            ..SpawnOptions::shell(id, cols, rows)
+        })
     }
 
     /// Starts a terminal with full [`SpawnOptions`] (cwd, env, scrollback, colours) and adopts it.
@@ -325,6 +316,11 @@ impl Sessions {
         self.live.get(id).map(|t| t.session.row_text(row))
     }
 
+    /// `OSC 8` hyperlink URI at `(col, row)` (`0`-based) on terminal `id`, if the cell carries one.
+    pub fn link_at(&self, id: &str, col: u16, row: u16) -> Option<String> {
+        self.live.get(id).and_then(|t| t.session.link_at(col, row))
+    }
+
     /// Working directory last reported via `OSC 7` for terminal `id`.
     pub fn pwd(&self, id: &str) -> Option<&str> {
         self.live.get(id).and_then(|t| t.session.pwd())
@@ -335,14 +331,37 @@ impl Sessions {
         self.live.get(id).map(|t| t.session.modes())
     }
 
-    /// Current scrollback view state (`offset`, `max`, `viewing`) of `id`.
+    /// Current scrollback view state (`offset`, `max`, `at_bottom`, `viewing`) of `id`.
     pub fn scrollback(&self, id: &str) -> Option<ScrollbackState> {
         self.live.get(id).map(|t| t.session.scrollback())
+    }
+
+    /// Cumulative bell count observed on terminal `id`.
+    pub fn bell_count(&self, id: &str) -> u64 {
+        self.live.get(id).map_or(0, |t| t.session.bell_count())
+    }
+
+    /// Unread bell count waiting to be drained on terminal `id`.
+    pub fn unread_bells(&self, id: &str) -> u64 {
+        self.live.get(id).map_or(0, |t| t.session.unread_bells())
     }
 
     /// Drains any unread bells rung on `id` since the previous call.
     pub fn take_bell(&mut self, id: &str) -> u64 {
         self.live.get_mut(id).map_or(0, |t| t.session.take_bell())
+    }
+
+    /// Drains unread bell counts across every live terminal, returning `(id, count)` for each
+    /// terminal that rang at least once since the last drain.
+    pub fn take_bells(&mut self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for (id, tracked) in &mut self.live {
+            let n = tracked.session.take_bell();
+            if n > 0 {
+                out.push((id.clone(), n));
+            }
+        }
+        out
     }
 
     /// Exit status of `id`, if its process has exited.
@@ -378,7 +397,13 @@ impl Sessions {
                                 continue;
                             }
                             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if !self.live.contains_key(id) {
+                                if let Some(tracked) = self.live.get_mut(id) {
+                                    if let Some(sb_rows) =
+                                        item.get("scrollback_rows").and_then(|v| v.as_u64())
+                                    {
+                                        tracked.session.note_status_scrollback(sb_rows);
+                                    }
+                                } else {
                                     self.external_appeared.insert(id.to_owned());
                                 }
                             }
@@ -553,11 +578,13 @@ impl Sessions {
     }
 
     /// Scrolls terminal `id` by `lines` at cell `(col, row)` (`lines < 0` scrolls up into history).
-    /// On the primary screen this moves this subscriber's scrollback `view` in `g3d-termd`; on the
+    /// On the primary screen this moves this subscriber's scrollback `view` in `g3d-termd` (and a
+    /// zero delta jumps back to live output, bridging `wall.agent.jump <id> live`); on the
     /// alternate screen there is no scrollback, so wheel notches at `(col, row)` are sent to the
     /// program instead.
     pub fn scroll(&mut self, id: &str, lines: i32, col: f64, row: f64) {
         if lines == 0 {
+            self.scroll_to_live(id);
             return;
         }
         let Some(tracked) = self.live.get(id) else {
@@ -584,6 +611,18 @@ impl Sessions {
         } else {
             tracked.session.send_view(View::Delta(-i64::from(lines)));
         }
+    }
+
+    /// Returns a scrolled-back primary-screen terminal `id` immediately to the live bottom
+    /// (`offset = 0`, `at_bottom = true`). No-op on the alternate screen or an ended terminal.
+    pub fn scroll_to_live(&mut self, id: &str) {
+        let Some(tracked) = self.live.get(id) else {
+            return;
+        };
+        if tracked.session.is_ended() || tracked.session.modes().alt_screen {
+            return;
+        }
+        tracked.session.send_view(View::Live);
     }
 
     /// Requests `g3d-termd` to send a fresh `REPAINT` for terminal `id`.
