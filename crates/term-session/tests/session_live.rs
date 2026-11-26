@@ -631,12 +631,16 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
     let sub_gate = scratch.dir.join("sub-ready");
     let setup_done = scratch.dir.join("setup-done");
     let start_2026 = scratch.dir.join("start-2026");
+    let mid_2026 = scratch.dir.join("mid-2026");
     let phase1_done = scratch.dir.join("p1");
     let go_exit = scratch.dir.join("go-exit");
 
     // Wait for `sub_gate` first so transient events (`BEL`) cannot fire in the window between
-    // `create` and `subscribe` when 8 tests + CPU load share the host.
+    // `create` and `subscribe` when 8 tests + CPU load share the host. Inside `?2026h`..`?2026l`,
+    // synchronize via builtin `IFS= read -r _` on stdin rather than forking `/bin/sleep` so heavy
+    // scheduler contention cannot stall `/bin/sh` past `DEFAULT_SYNC_TIMEOUT`.
     let script = "\
+        stty -echo; \
         while [ ! -f \"$1\" ]; do sleep 0.005; done; \
         printf '\\033]2;wall-craft-title\\007'; \
         printf '\\033]7;file://localhost/tmp/craft-cwd\\007'; \
@@ -647,10 +651,11 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
         printf s > \"$2\"; \
         while [ ! -f \"$3\" ]; do sleep 0.01; done; \
         printf '\\033[?2026h\\033[5;1HTORN_MID_FRAME    '; \
-        sleep 0.06; \
+        printf m > \"$4\"; \
+        IFS= read -r _; \
         printf '\\033[5;1HATOMIC_2026_FRAME!\\033[?2026l'; \
-        printf p > \"$4\"; \
-        while [ ! -f \"$5\" ]; do sleep 0.01; done; \
+        printf p > \"$5\"; \
+        while [ ! -f \"$6\" ]; do sleep 0.01; done; \
         printf '\\033[?1049l'; \
         exit 42";
 
@@ -665,6 +670,7 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
                 sub_gate.to_string_lossy().into_owned(),
                 setup_done.to_string_lossy().into_owned(),
                 start_2026.to_string_lossy().into_owned(),
+                mid_2026.to_string_lossy().into_owned(),
                 phase1_done.to_string_lossy().into_owned(),
                 go_exit.to_string_lossy().into_owned(),
             ]),
@@ -716,9 +722,38 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
     // Rest > 16ms so the upcoming ?2026h frame arrives after a genuine quiet spell.
     std::thread::sleep(Duration::from_millis(35));
     session.pump();
+    let bytes_before_2026 = session.stats().bytes_parsed;
     fs::write(&start_2026, b"1").expect("trigger ?2026h frame");
 
     let mut ever_saw_torn = false;
+    let mid_fed = wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+        if session.pump()
+            && screen_lines(&session)
+                .iter()
+                .any(|l| l.contains("TORN_MID_FRAME"))
+        {
+            ever_saw_torn = true;
+        }
+        mid_2026.exists() && session.stats().bytes_parsed >= bytes_before_2026 + 24
+    });
+    assert!(mid_fed, "?2026h mid-frame bytes were never fed into Vt");
+
+    // Hold > 16ms coalescing interval while ?2026h remains open and verify no publish leaked.
+    std::thread::sleep(Duration::from_millis(25));
+    if session.pump()
+        && screen_lines(&session)
+            .iter()
+            .any(|l| l.contains("TORN_MID_FRAME"))
+    {
+        ever_saw_torn = true;
+    }
+    assert!(
+        !ever_saw_torn,
+        "DEC ?2026h mid-frame text TORN_MID_FRAME leaked before ?2026l!"
+    );
+
+    // Unblock the shell builtin `read` so it emits `ATOMIC_2026_FRAME!\033[?2026l` immediately.
+    session.send_input(b"\n".to_vec());
     let sync_ok = wait_for(&wake, &mut seen, Duration::from_secs(10), || {
         if session.pump()
             && screen_lines(&session)
