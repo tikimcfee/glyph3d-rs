@@ -686,23 +686,26 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
     let phase1_done = scratch.dir.join("p1");
     let go_exit = scratch.dir.join("go-exit");
 
-    // 1) Set OSC 2 title, OSC 7 pwd, ?1000h + ?1006h + ?2004h + ?1049h, ring BEL twice, draw 3
-    //    rows for selection text/block_text/row_text, and wait for a quiet spell (`start_2026`).
+    // 1) Set OSC 2 title, OSC 7 pwd, ?1000h + ?1006h + ?2004h + ?1049h, draw 3 rows for
+    //    selection text/block_text/row_text, and wait for a quiet spell (`start_2026`).
     // 2) Enter DEC ?2026h synchronized output from a quiet state, write TORN_MID_FRAME, sleep
-    //    60ms (> 16ms coalescer interval!), overwrite with ATOMIC_2026_FRAME!, and close ?2026l.
+    //    60ms (> 16ms coalescer interval!), overwrite with ATOMIC_2026_FRAME!, close ?2026l, and
+    //    ring BEL twice once the subscriber is known to be attached (ringing BEL before subscribe
+    //    races `create` -> `subscribe` under parallel CPU load because `REPAINT` replays screen
+    //    state, not past transient bells).
     // 3) Wait for `go_exit`, leave alt screen, exit 42.
     let script = "\
         printf '\\033]2;wall-craft-title\\007'; \
         printf '\\033]7;file://localhost/tmp/craft-cwd\\007'; \
         printf '\\033[?1049h\\033[H\\033[2J'; \
         printf '\\033[?1000h\\033[?1006h\\033[?2004h'; \
-        printf '\\007\\007'; \
         printf 'ALPHA_0123\\r\\nBRAVO_4567\\r\\nCHARLIE_89\\r\\n'; \
         printf s > \"$1\"; \
         while [ ! -f \"$2\" ]; do sleep 0.01; done; \
         printf '\\033[?2026h\\033[5;1HTORN_MID_FRAME    '; \
         sleep 0.06; \
         printf '\\033[5;1HATOMIC_2026_FRAME!\\033[?2026l'; \
+        printf '\\007\\007'; \
         printf p > \"$3\"; \
         while [ ! -f \"$4\" ]; do sleep 0.01; done; \
         printf '\\033[?1049l'; \
@@ -746,7 +749,8 @@ fn surface_title_pwd_modes_bell_sync2026_selection_and_exit() {
     while (!phase1_done.exists()
         || !screen_lines(&session)
             .iter()
-            .any(|l| l.contains("ATOMIC_2026_FRAME!")))
+            .any(|l| l.contains("ATOMIC_2026_FRAME!"))
+        || session.bell_count() < 1)
         && Instant::now() < deadline
     {
         wake.wait_since(&mut seen, Duration::from_millis(5));
