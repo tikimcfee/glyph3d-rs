@@ -56,7 +56,7 @@ impl WorldRect {
 /// = 24 bits of IEEE 754 float32 mantissa), matching `snapCellDimension` in
 /// `glyph3d-js/packages/glyph3d-core/src/core/cellMetrics.js`.
 pub fn snap_cell_dimension(value: f32) -> f32 {
-    if !(value > 0.0) || !value.is_finite() {
+    if !value.is_finite() || value <= 0.0 {
         return value;
     }
     let value_f64 = f64::from(value);

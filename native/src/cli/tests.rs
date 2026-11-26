@@ -806,3 +806,43 @@ fn launch_config_scene_yields_to_a_typed_scene() {
     assert_eq!(typed.present_mode, PresentMode::Mailbox);
 }
 
+#[test]
+fn wall_test_pattern_and_replay_flags_parse_and_validate() {
+    let cli = parse(&["--wall-test-pattern", "--screenshot", "wall.png", "--zoom", "2"]);
+    match cli.action() {
+        CliCommand::WallTestPattern { screenshot, frames, zoom, .. } => {
+            assert_eq!(screenshot, Some(PathBuf::from("wall.png")));
+            assert_eq!(frames, 1);
+            assert_eq!(zoom, 2.0);
+        }
+        other => panic!("expected WallTestPattern, got {other:?}"),
+    }
+
+    let cli = parse(&["--wall-replay", "session.vt"]);
+    match cli.action() {
+        CliCommand::WallReplay { file, cols, rows, .. } => {
+            assert_eq!(file, PathBuf::from("session.vt"));
+            assert_eq!((cols, rows), (80, 24));
+        }
+        other => panic!("expected WallReplay, got {other:?}"),
+    }
+
+    let cli = parse(&["--wall-replay", "session.vt", "--wall-size", "132x43", "--screenshot", "out.png"]);
+    match cli.action() {
+        CliCommand::WallReplay { file, cols, rows, screenshot, .. } => {
+            assert_eq!(file, PathBuf::from("session.vt"));
+            assert_eq!((cols, rows), (132, 43));
+            assert_eq!(screenshot, Some(PathBuf::from("out.png")));
+        }
+        other => panic!("expected WallReplay, got {other:?}"),
+    }
+
+    for bad in ["0x24", "80x0", "80", "abcx24", "80x99999"] {
+        let text = match try_parse(&["--wall-replay", "a.vt", "--wall-size", bad]) {
+            Ok(_) => panic!("clap must refuse --wall-size {bad}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("--wall-size"), "error must name the flag: {text}");
+    }
+}
+

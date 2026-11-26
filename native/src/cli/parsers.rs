@@ -62,6 +62,25 @@ pub fn parse_rgba(s: &str) -> Result<[f32; 4], String> {
     Ok(out)
 }
 
+/// Parse `COLSxROWS` (e.g. `80x24`) for `--wall-size`.
+pub fn parse_wall_size(s: &str) -> Result<(u16, u16), String> {
+    let Some((c, r)) = s.split_once(['x', 'X']) else {
+        return Err(format!("--wall-size: expected COLSxROWS (e.g. 80x24), got {s:?}"));
+    };
+    let cols: u16 = c
+        .trim()
+        .parse()
+        .map_err(|_| format!("--wall-size: invalid column count in {s:?}"))?;
+    let rows: u16 = r
+        .trim()
+        .parse()
+        .map_err(|_| format!("--wall-size: invalid row count in {s:?}"))?;
+    if cols == 0 || rows == 0 {
+        return Err(format!("--wall-size: cols and rows must both be >= 1, got {cols}x{rows}"));
+    }
+    Ok((cols, rows))
+}
+
 #[cfg(feature = "wgpu")]
 /// Parse windowed present mode string.
 pub fn parse_present_mode(s: &str) -> wgpu::PresentMode {

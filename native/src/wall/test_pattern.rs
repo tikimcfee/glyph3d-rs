@@ -3,19 +3,38 @@
 
 use term_cells::{CLUSTER_BASE, Cell, Cursor, CursorShape, Screen, attrs, rgb};
 
-/// Write an ASCII/UTF-8 string into `screen` starting at `(col, row)` with
-/// the given foreground, background (`0` = panel shows through), underline
-/// colour, and attribute flags.
-pub fn write_run(
-    screen: &mut Screen,
-    row: u16,
-    mut col: u16,
-    text: &str,
-    fg: u32,
-    bg: u32,
-    ul: u32,
-    cell_attrs: u16,
-) -> u16 {
+/// Colours and attribute flags for a styled run written into a test-pattern [`Screen`].
+#[derive(Clone, Copy, Debug)]
+pub struct RunStyle {
+    pub fg: u32,
+    pub bg: u32,
+    pub ul: u32,
+    pub attrs: u16,
+}
+
+impl RunStyle {
+    pub const fn fg(fg: u32) -> Self {
+        Self { fg, bg: 0, ul: 0, attrs: 0 }
+    }
+
+    pub const fn with_bg(mut self, bg: u32) -> Self {
+        self.bg = bg;
+        self
+    }
+
+    pub const fn with_ul(mut self, ul: u32) -> Self {
+        self.ul = ul;
+        self
+    }
+
+    pub const fn with_attrs(mut self, cell_attrs: u16) -> Self {
+        self.attrs = cell_attrs;
+        self
+    }
+}
+
+/// Write an ASCII/UTF-8 string into `screen` starting at `(col, row)` with `style`.
+pub fn write_run(screen: &mut Screen, row: u16, mut col: u16, text: &str, style: RunStyle) -> u16 {
     let cols = screen.cols;
     for ch in text.chars() {
         if col >= cols {
@@ -28,10 +47,10 @@ pub fn write_run(
         }
         screen.row_mut(row)[col as usize] = Cell {
             content: ch as u32,
-            fg,
-            bg,
-            ul,
-            attrs: cell_attrs,
+            fg: style.fg,
+            bg: style.bg,
+            ul: style.ul,
+            attrs: style.attrs,
             width,
             _pad: 0,
         };
@@ -39,7 +58,7 @@ pub fn write_run(
             screen.row_mut(row)[(col + 1) as usize] = Cell {
                 content: 0,
                 fg: 0,
-                bg,
+                bg: style.bg,
                 ul: 0,
                 attrs: 0,
                 width: 0,
@@ -53,16 +72,7 @@ pub fn write_run(
 }
 
 /// Write a multi-codepoint cluster (e.g. ZWJ emoji sequence) as a 2-column cell.
-pub fn write_cluster(
-    screen: &mut Screen,
-    row: u16,
-    col: u16,
-    cluster: &str,
-    fg: u32,
-    bg: u32,
-    ul: u32,
-    cell_attrs: u16,
-) -> u16 {
+pub fn write_cluster(screen: &mut Screen, row: u16, col: u16, cluster: &str, style: RunStyle) -> u16 {
     if col + 1 >= screen.cols {
         return col;
     }
@@ -70,17 +80,17 @@ pub fn write_cluster(
     screen.clusters.push(cluster.to_string());
     screen.row_mut(row)[col as usize] = Cell {
         content: CLUSTER_BASE + idx,
-        fg,
-        bg,
-        ul,
-        attrs: cell_attrs,
+        fg: style.fg,
+        bg: style.bg,
+        ul: style.ul,
+        attrs: style.attrs,
         width: 2,
         _pad: 0,
     };
     screen.row_mut(row)[(col + 1) as usize] = Cell {
         content: 0,
         fg: 0,
-        bg,
+        bg: style.bg,
         ul: 0,
         attrs: 0,
         width: 0,
@@ -114,139 +124,125 @@ pub fn build_primary_screen() -> Screen {
     let dark = rgb(0x12, 0x14, 0x1e);
 
     // Row 0: title banner
-    write_run(&mut s, 0, 1, "glyph3d wall cell renderer ", cyan, 0, 0, attrs::BOLD);
-    write_run(&mut s, 0, 28, "--wall-test-pattern", green, 0, 0, 0);
+    write_run(&mut s, 0, 1, "glyph3d wall cell renderer ", RunStyle::fg(cyan).with_attrs(attrs::BOLD));
+    write_run(&mut s, 0, 28, "--wall-test-pattern", RunStyle::fg(green));
 
     // Row 2: palette text colours
     let mut c = 1;
-    c = write_run(&mut s, 2, c, "Palette: ", fg, 0, 0, 0);
-    c = write_run(&mut s, 2, c, "red ", red, 0, 0, 0);
-    c = write_run(&mut s, 2, c, "green ", green, 0, 0, 0);
-    c = write_run(&mut s, 2, c, "yellow ", yellow, 0, 0, 0);
-    c = write_run(&mut s, 2, c, "cyan ", cyan, 0, 0, 0);
-    c = write_run(&mut s, 2, c, "magenta ", magenta, 0, 0, 0);
-    write_run(&mut s, 2, c, "orange", orange, 0, 0, 0);
+    c = write_run(&mut s, 2, c, "Palette: ", RunStyle::fg(fg));
+    c = write_run(&mut s, 2, c, "red ", RunStyle::fg(red));
+    c = write_run(&mut s, 2, c, "green ", RunStyle::fg(green));
+    c = write_run(&mut s, 2, c, "yellow ", RunStyle::fg(yellow));
+    c = write_run(&mut s, 2, c, "cyan ", RunStyle::fg(cyan));
+    c = write_run(&mut s, 2, c, "magenta ", RunStyle::fg(magenta));
+    write_run(&mut s, 2, c, "orange", RunStyle::fg(orange));
 
     // Row 4: background fills (including dark #1a1b26 vs bright fills)
     c = 1;
-    c = write_run(&mut s, 4, c, "Fills: ", fg, 0, 0, 0);
-    c = write_run(&mut s, 4, c, " ADDED ", dark, green, 0, 0);
-    c = write_run(&mut s, 4, c, " ", fg, 0, 0, 0);
-    c = write_run(&mut s, 4, c, " REMOVED ", rgb(0xff, 0xff, 0xff), rgb(0xb8, 0x2d, 0x45), 0, 0);
-    c = write_run(&mut s, 4, c, " ", fg, 0, 0, 0);
-    c = write_run(&mut s, 4, c, " INFO ", dark, cyan, 0, 0);
-    c = write_run(&mut s, 4, c, " ", fg, 0, 0, 0);
-    write_run(&mut s, 4, c, " #24283b ", fg, rgb(0x24, 0x28, 0x3b), 0, 0);
+    c = write_run(&mut s, 4, c, "Fills: ", RunStyle::fg(fg));
+    c = write_run(&mut s, 4, c, " ADDED ", RunStyle::fg(dark).with_bg(green));
+    c = write_run(&mut s, 4, c, " ", RunStyle::fg(fg));
+    c = write_run(&mut s, 4, c, " REMOVED ", RunStyle::fg(rgb(0xff, 0xff, 0xff)).with_bg(rgb(0xb8, 0x2d, 0x45)));
+    c = write_run(&mut s, 4, c, " ", RunStyle::fg(fg));
+    c = write_run(&mut s, 4, c, " INFO ", RunStyle::fg(dark).with_bg(cyan));
+    c = write_run(&mut s, 4, c, " ", RunStyle::fg(fg));
+    write_run(&mut s, 4, c, " #24283b ", RunStyle::fg(fg).with_bg(rgb(0x24, 0x28, 0x3b)));
 
     // Row 6: underline styles (single, double, curly)
     c = 1;
-    c = write_run(&mut s, 6, c, "Underlines: ", fg, 0, 0, 0);
+    c = write_run(&mut s, 6, c, "Underlines: ", RunStyle::fg(fg));
     c = write_run(
         &mut s,
         6,
         c,
         "single line",
-        fg,
-        0,
-        0,
-        attrs::UNDERLINE_SINGLE << attrs::UNDERLINE_SHIFT,
+        RunStyle::fg(fg).with_attrs(attrs::UNDERLINE_SINGLE << attrs::UNDERLINE_SHIFT),
     );
-    c = write_run(&mut s, 6, c, "  ", fg, 0, 0, 0);
+    c = write_run(&mut s, 6, c, "  ", RunStyle::fg(fg));
     c = write_run(
         &mut s,
         6,
         c,
         "double line",
-        yellow,
-        0,
-        0,
-        attrs::UNDERLINE_DOUBLE << attrs::UNDERLINE_SHIFT,
+        RunStyle::fg(yellow).with_attrs(attrs::UNDERLINE_DOUBLE << attrs::UNDERLINE_SHIFT),
     );
-    c = write_run(&mut s, 6, c, "  ", fg, 0, 0, 0);
+    c = write_run(&mut s, 6, c, "  ", RunStyle::fg(fg));
     write_run(
         &mut s,
         6,
         c,
         "curly spell",
-        fg,
-        0,
-        red,
-        (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR,
+        RunStyle::fg(fg)
+            .with_ul(red)
+            .with_attrs((attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR),
     );
 
     // Row 8: dotted, dashed, coloured underline
     c = 1;
-    c = write_run(&mut s, 8, c, "More UL:    ", fg, 0, 0, 0);
+    c = write_run(&mut s, 8, c, "More UL:    ", RunStyle::fg(fg));
     c = write_run(
         &mut s,
         8,
         c,
         "dotted run",
-        cyan,
-        0,
-        0,
-        attrs::UNDERLINE_DOTTED << attrs::UNDERLINE_SHIFT,
+        RunStyle::fg(cyan).with_attrs(attrs::UNDERLINE_DOTTED << attrs::UNDERLINE_SHIFT),
     );
-    c = write_run(&mut s, 8, c, "   ", fg, 0, 0, 0);
+    c = write_run(&mut s, 8, c, "   ", RunStyle::fg(fg));
     c = write_run(
         &mut s,
         8,
         c,
         "dashed run",
-        magenta,
-        0,
-        0,
-        attrs::UNDERLINE_DASHED << attrs::UNDERLINE_SHIFT,
+        RunStyle::fg(magenta).with_attrs(attrs::UNDERLINE_DASHED << attrs::UNDERLINE_SHIFT),
     );
-    c = write_run(&mut s, 8, c, "   ", fg, 0, 0, 0);
+    c = write_run(&mut s, 8, c, "   ", RunStyle::fg(fg));
     write_run(
         &mut s,
         8,
         c,
         "sgr58 cyan",
-        fg,
-        0,
-        cyan,
-        (attrs::UNDERLINE_SINGLE << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR,
+        RunStyle::fg(fg)
+            .with_ul(cyan)
+            .with_attrs((attrs::UNDERLINE_SINGLE << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR),
     );
 
     // Row 10: strikethrough, overline, dim
     c = 1;
-    c = write_run(&mut s, 10, c, "Styles: ", fg, 0, 0, 0);
-    c = write_run(&mut s, 10, c, "strikethrough", red, 0, 0, attrs::STRIKE);
-    c = write_run(&mut s, 10, c, "  ", fg, 0, 0, 0);
-    c = write_run(&mut s, 10, c, "overline run", green, 0, 0, attrs::OVERLINE);
-    c = write_run(&mut s, 10, c, "  ", fg, 0, 0, 0);
-    write_run(&mut s, 10, c, "dim faint text", fg, 0, 0, attrs::DIM);
+    c = write_run(&mut s, 10, c, "Styles: ", RunStyle::fg(fg));
+    c = write_run(&mut s, 10, c, "strikethrough", RunStyle::fg(red).with_attrs(attrs::STRIKE));
+    c = write_run(&mut s, 10, c, "  ", RunStyle::fg(fg));
+    c = write_run(&mut s, 10, c, "overline run", RunStyle::fg(green).with_attrs(attrs::OVERLINE));
+    c = write_run(&mut s, 10, c, "  ", RunStyle::fg(fg));
+    write_run(&mut s, 10, c, "dim faint text", RunStyle::fg(fg).with_attrs(attrs::DIM));
 
     // Row 12: wide emoji + cluster emoji + adjacent cell fill (proves fill never covers ink)
     c = 1;
-    c = write_run(&mut s, 12, c, "Emoji: ", fg, 0, 0, 0);
-    c = write_run(&mut s, 12, c, "🚀", fg, rgb(0x28, 0x34, 0x57), 0, 0);
-    c = write_run(&mut s, 12, c, "X", dark, green, 0, 0);
-    c = write_run(&mut s, 12, c, " rocket  ", fg, 0, 0, 0);
-    c = write_run(&mut s, 12, c, "🐀", fg, rgb(0x3b, 0x2a, 0x45), 0, 0);
-    c = write_run(&mut s, 12, c, " rat  ", fg, 0, 0, 0);
+    c = write_run(&mut s, 12, c, "Emoji: ", RunStyle::fg(fg));
+    c = write_run(&mut s, 12, c, "🚀", RunStyle::fg(fg).with_bg(rgb(0x28, 0x34, 0x57)));
+    c = write_run(&mut s, 12, c, "X", RunStyle::fg(dark).with_bg(green));
+    c = write_run(&mut s, 12, c, " rocket  ", RunStyle::fg(fg));
+    c = write_run(&mut s, 12, c, "🐀", RunStyle::fg(fg).with_bg(rgb(0x3b, 0x2a, 0x45)));
+    c = write_run(&mut s, 12, c, " rat  ", RunStyle::fg(fg));
     c = write_cluster(
         &mut s,
         12,
         c,
         "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
-        fg,
-        rgb(0x1f, 0x3b, 0x32),
-        yellow,
-        (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR,
+        RunStyle::fg(fg)
+            .with_bg(rgb(0x1f, 0x3b, 0x32))
+            .with_ul(yellow)
+            .with_attrs((attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR),
     );
-    write_run(&mut s, 12, c, " zwj+curly", fg, 0, 0, 0);
+    write_run(&mut s, 12, c, " zwj+curly", RunStyle::fg(fg));
 
     // Row 14: prompt + cursor on 'w'
     c = 1;
-    c = write_run(&mut s, 14, c, "lugo@wall", green, 0, 0, 0);
-    c = write_run(&mut s, 14, c, ":", fg, 0, 0, 0);
-    c = write_run(&mut s, 14, c, "~/glyph3d-rs", cyan, 0, 0, 0);
-    c = write_run(&mut s, 14, c, "$ ", yellow, 0, 0, 0);
+    c = write_run(&mut s, 14, c, "lugo@wall", RunStyle::fg(green));
+    c = write_run(&mut s, 14, c, ":", RunStyle::fg(fg));
+    c = write_run(&mut s, 14, c, "~/glyph3d-rs", RunStyle::fg(cyan));
+    c = write_run(&mut s, 14, c, "$ ", RunStyle::fg(yellow));
     let cursor_col = c;
-    write_run(&mut s, 14, c, "well hello there!", fg, 0, 0, 0);
+    write_run(&mut s, 14, c, "well hello there!", RunStyle::fg(fg));
 
     // Row 16: contiguous fill gradient bar (verifies snapped zero-seam cell edges)
     for col in 1..61u16 {
@@ -308,10 +304,10 @@ pub fn build_overlapping_test_pattern(metrics: super::metrics::CellMetrics) -> V
     let blue = rgb(0x82, 0xaa, 0xff);
     let teal = rgb(0x4f, 0xd6, 0xbe);
     let coral = rgb(0xff, 0x75, 0x7f);
-    write_run(&mut back, 0, 1, "Terminal 1 (z = 0.0, unfocused)", blue, 0, 0, 0);
-    write_run(&mut back, 2, 1, "Hollow cursor -> ", fg1, 0, 0, 0);
-    write_run(&mut back, 2, 18, "unfocused cell", teal, 0, 0, 0);
-    write_run(&mut back, 4, 1, "Overlapped below-right by z=1 and z=2:", fg1, 0, 0, attrs::DIM);
+    write_run(&mut back, 0, 1, "Terminal 1 (z = 0.0, unfocused)", RunStyle::fg(blue));
+    write_run(&mut back, 2, 1, "Hollow cursor -> ", RunStyle::fg(fg1));
+    write_run(&mut back, 2, 18, "unfocused cell", RunStyle::fg(teal));
+    write_run(&mut back, 4, 1, "Overlapped below-right by z=1 and z=2:", RunStyle::fg(fg1).with_attrs(attrs::DIM));
     for r in 6..12u16 {
         let bg = if r % 2 == 0 { rgb(0x22, 0x2c, 0x45) } else { rgb(0x2c, 0x1f, 0x38) };
         write_run(
@@ -319,10 +315,7 @@ pub fn build_overlapping_test_pattern(metrics: super::metrics::CellMetrics) -> V
             r,
             1,
             "BACKGROUND-TEXT-SHOULD-BE-OCCLUDED-BY-NEARER",
-            coral,
-            bg,
-            0,
-            0,
+            RunStyle::fg(coral).with_bg(bg),
         );
     }
     back.cursor = Cursor {
@@ -341,32 +334,24 @@ pub fn build_overlapping_test_pattern(metrics: super::metrics::CellMetrics) -> V
     let fg2 = mid.default_fg;
     let amber = rgb(0xf0, 0xb4, 0x5a);
     let mint = rgb(0x6e, 0xe7, 0xa0);
-    write_run(&mut mid, 0, 1, "Terminal 2 (z = 1.0, bar cursor)", amber, 0, 0, 0);
-    write_run(&mut mid, 2, 1, "Covers z=0; covered by z=2 front", fg2, 0, 0, 0);
-    write_run(&mut mid, 4, 1, "Bar cursor: ", fg2, 0, 0, 0);
-    write_run(&mut mid, 4, 13, "insert mode here", mint, 0, 0, 0);
-    write_run(
-        &mut mid,
-        6,
-        1,
-        "Mixed: ",
-        fg2,
-        0,
-        0,
-        0,
-    );
+    write_run(&mut mid, 0, 1, "Terminal 2 (z = 1.0, bar cursor)", RunStyle::fg(amber));
+    write_run(&mut mid, 2, 1, "Covers z=0; covered by z=2 front", RunStyle::fg(fg2));
+    write_run(&mut mid, 4, 1, "Bar cursor: ", RunStyle::fg(fg2));
+    write_run(&mut mid, 4, 13, "insert mode here", RunStyle::fg(mint));
+    write_run(&mut mid, 6, 1, "Mixed: ", RunStyle::fg(fg2));
     write_run(
         &mut mid,
         6,
         8,
         "dim+strike+curly",
-        rgb(0xf7, 0x76, 0x8e),
-        0,
-        amber,
-        attrs::DIM
-            | attrs::STRIKE
-            | (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT)
-            | attrs::UNDERLINE_COLOR,
+        RunStyle::fg(rgb(0xf7, 0x76, 0x8e))
+            .with_ul(amber)
+            .with_attrs(
+                attrs::DIM
+                    | attrs::STRIKE
+                    | (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT)
+                    | attrs::UNDERLINE_COLOR,
+            ),
     );
     for r in 8..12u16 {
         write_run(
@@ -374,10 +359,7 @@ pub fn build_overlapping_test_pattern(metrics: super::metrics::CellMetrics) -> V
             r,
             1,
             "MIDDLE-LAYER-TEXT-OCCLUDED-BY-FRONT-TERM",
-            amber,
-            rgb(0x28, 0x24, 0x1c),
-            0,
-            0,
+            RunStyle::fg(amber).with_bg(rgb(0x28, 0x24, 0x1c)),
         );
     }
     mid.cursor = Cursor {

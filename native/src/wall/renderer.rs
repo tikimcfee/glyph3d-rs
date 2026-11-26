@@ -832,11 +832,11 @@ pub fn render_wall_to_png(
     renderer: &mut WallRenderer,
     camera: &WallCamera,
     terminals: &[TerminalDraw<'_>],
-    width: u32,
-    height: u32,
+    viewport: (u32, u32),
     frames: u32,
     path: &Path,
 ) {
+    let (width, height) = viewport;
     let device = &ctx.device;
     let format = renderer.color_format;
     let size = wgpu::Extent3d {
@@ -988,8 +988,7 @@ pub fn render_test_pattern_offscreen(
         &mut renderer,
         &camera,
         &draws,
-        crate::OFFSCREEN_WIDTH,
-        crate::OFFSCREEN_HEIGHT,
+        (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT),
         frames,
         path,
     );

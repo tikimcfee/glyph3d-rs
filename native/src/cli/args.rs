@@ -99,6 +99,12 @@ pub struct Cli {
     /// Render the terminal wall test pattern (with --screenshot PATH)
     #[arg(long)]
     pub wall_test_pattern: bool,
+    /// Replay a recorded terminal byte stream through crates/glyph-vt (with --screenshot PATH)
+    #[arg(long, value_name = "PATH")]
+    pub wall_replay: Option<PathBuf>,
+    /// Terminal grid dimensions for --wall-replay as COLSxROWS (default 80x24)
+    #[arg(long, value_name = "COLSxROWS", value_parser = parse_wall_size)]
+    pub wall_size: Option<(u16, u16)>,
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
@@ -443,7 +449,7 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(field_mode);
     under!(present_mode);
     under!(Some frames);
-    let scene_typed = ["demo", "wall_test_pattern", "agent_session", "load_repo", "render_file"]
+    let scene_typed = ["demo", "wall_test_pattern", "wall_replay", "agent_session", "load_repo", "render_file"]
         .into_iter()
         .any(typed);
     if !scene_typed {

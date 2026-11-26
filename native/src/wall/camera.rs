@@ -113,7 +113,7 @@ impl WallCamera {
     /// Multiply `zoom` by `factor` while keeping the world point under `screen`
     /// fixed at the same pixel.
     pub fn zoom_about_screen_point(&mut self, screen: Vec2, factor: f32, viewport: (u32, u32)) {
-        if !(factor > 0.0) || !factor.is_finite() {
+        if !factor.is_finite() || factor <= 0.0 {
             return;
         }
         let anchor = self.screen_to_world(screen, viewport);
