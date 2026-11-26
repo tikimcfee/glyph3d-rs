@@ -162,6 +162,7 @@ cleanup() {
   trap - EXIT INT TERM HUP
   if [[ -n "$CAFFEINATE_PID" ]]; then
     kill "$CAFFEINATE_PID" >/dev/null 2>&1 || true
+    wait "$CAFFEINATE_PID" >/dev/null 2>&1 || true
   fi
   local clean_ok=1
   if [[ -n "$ACTIVE_DIR" && -d "$ACTIVE_DIR" ]]; then

@@ -895,16 +895,17 @@ impl ApplicationHandler<Wake> for App {
         if self.animating {
             self.redraw();
         }
-        let mut ui_wake_at = None;
         #[cfg(feature = "egui-ui")]
-        if let Some(at) = self.ui_repaint_at {
-            if Instant::now() >= at {
+        let ui_wake_at = match self.ui_repaint_at {
+            Some(at) if Instant::now() >= at => {
                 self.ui_repaint_at = None;
                 self.redraw();
-            } else {
-                ui_wake_at = Some(at);
+                None
             }
-        }
+            other => other,
+        };
+        #[cfg(not(feature = "egui-ui"))]
+        let ui_wake_at = None;
         let (exit_perf, flow) = self.perf.control_flow(self.frames, ui_wake_at);
         if exit_perf {
             event_loop.exit();
