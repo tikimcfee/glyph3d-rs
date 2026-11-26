@@ -864,7 +864,7 @@ mod tests {
         apply_hover_link_to_cell(&mut cell, &tinted);
         let st2 = (cell.glyph_and_flags >> STYLE_SHIFT) & 0x7F;
         assert_ne!(st2 & style_bits::UNDERLINE_COLOR, 0);
-        assert_eq!(cell.ul, 0xFF_ff_b0_60);
+        assert_eq!(cell.ul, 0xff_ff_b0_60);
 
         // Existing curly underline is preserved (not downgraded to single).
         let mut curly = CellGpu {
