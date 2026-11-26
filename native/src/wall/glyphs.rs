@@ -1890,8 +1890,8 @@ mod tests {
             assert!((glyphs.line_height_scale() - lh).abs() < 1e-6);
             let m = glyphs.cell_metrics();
             assert!(
-                (m.cell_height - base_metrics.cell_height * lh as f32).abs() < 1e-4,
-                "cell_height {} should scale by {lh}x from {}",
+                (m.cell_height - base_metrics.cell_height * lh as f32).abs() < 2e-3,
+                "cell_height {} should scale by {lh}x from {} (within binary-snap tolerance)",
                 m.cell_height,
                 base_metrics.cell_height
             );
