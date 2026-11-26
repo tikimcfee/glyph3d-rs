@@ -14,6 +14,7 @@ pub mod geom;
 pub mod input;
 
 pub mod chord;
+pub mod commands;
 pub mod config;
 pub mod dock;
 pub mod keymap;
@@ -21,6 +22,7 @@ pub mod labels;
 pub mod layout;
 pub mod menu;
 pub mod mouse;
+pub mod router;
 pub mod scroll;
 pub mod settings;
 pub mod snap;
