@@ -393,6 +393,7 @@ pub struct WallAgents {
     worker: Option<JoinHandle<()>>,
     synced_store_views: BTreeMap<String, AgentViewState>,
     synced_termd_rows: Vec<TermdTerminalStatus>,
+    synced_stick_bottom: HashMap<String, bool>,
     live_meta: HashMap<String, LiveTerminalMeta>,
     last_fleet: Option<FleetSnapshot>,
     last_bus_gen: u64,
@@ -443,6 +444,7 @@ impl WallAgents {
             worker: Some(worker),
             synced_store_views: BTreeMap::new(),
             synced_termd_rows: Vec::new(),
+            synced_stick_bottom: HashMap::new(),
             live_meta: HashMap::new(),
             last_fleet: None,
             last_bus_gen: 0,
@@ -548,6 +550,8 @@ impl WallAgents {
         // 1. Prune departed terminals from AgentViews & cached live metadata.
         self.live_meta
             .retain(|id, _| wall.terminal(id).is_some());
+        self.synced_stick_bottom
+            .retain(|id, _| wall.terminal(id).is_some());
         {
             let host = WallHostAdapter {
                 wall,
@@ -555,6 +559,13 @@ impl WallAgents {
                 live_meta: &self.live_meta,
             };
             self.views.prune(&host, |id| wall.terminal(id).is_some());
+            for id in wall.model().order() {
+                let want = wall.agent_stick_bottom(id);
+                if self.synced_stick_bottom.get(id).copied() != Some(want) {
+                    let _ = self.views.set_stick_bottom(&host, id, want);
+                    self.synced_stick_bottom.insert(id.clone(), want);
+                }
+            }
         }
 
         // 2. Sync termd status + live session metadata (`pwd`, `cwd`, `scrollback_rows`, `view`, `alt`).
@@ -747,31 +758,35 @@ impl WallAgents {
                 AgentViewsEffect::UnfollowSession { session_id } => {
                     outbound_cmds.push(WorkerCmd::UnfollowSession { session_id });
                 }
-                AgentViewsEffect::ScrollTerminal { id, target } => {
-                    let prev_view = self
-                        .live_meta
-                        .get(&id)
-                        .map(|m| m.view)
-                        .unwrap_or_else(|| self.views.view_offset_of(&id));
-                    let lines: i32 = match target {
-                        ScrollTarget::Live => i32::MAX / 2,
-                        ScrollTarget::Offset(target_off) => {
-                            let delta = i128::from(prev_view) - i128::from(target_off);
-                            delta.clamp(i128::from(i32::MIN / 2), i128::from(i32::MAX / 2)) as i32
-                        }
-                    };
-                    if lines != 0 {
-                        let lines_arg = lines.to_string();
-                        let _ = wall.run(["terminal.scroll", id.as_str(), lines_arg.as_str()]);
+                AgentViewsEffect::ScrollTerminal { id, target } => match target {
+                    ScrollTarget::Live => {
+                        let _ = wall.run(["terminal.scroll", id.as_str(), "live"]);
                         if let Some(meta) = self.live_meta.get_mut(&id) {
-                            meta.view = match target {
-                                ScrollTarget::Live => 0,
-                                ScrollTarget::Offset(off) => off,
-                            };
+                            meta.view = 0;
                         }
                         wall_mutated = true;
                     }
-                }
+                    ScrollTarget::Offset(target_off) => {
+                        let prev_view = self
+                            .live_meta
+                            .get(&id)
+                            .map(|m| m.view)
+                            .unwrap_or_else(|| self.views.view_offset_of(&id));
+                        // `terminal.scroll` takes `+` for up into history, `-` for down toward live.
+                        let delta = i128::from(target_off) - i128::from(prev_view);
+                        let lines =
+                            delta.clamp(i128::from(i32::MIN / 2), i128::from(i32::MAX / 2)) as i32;
+                        if lines != 0 {
+                            let lines_arg = lines.to_string();
+                            let _ =
+                                wall.run(["terminal.scroll", id.as_str(), lines_arg.as_str()]);
+                            if let Some(meta) = self.live_meta.get_mut(&id) {
+                                meta.view = target_off;
+                            }
+                            wall_mutated = true;
+                        }
+                    }
+                },
                 AgentViewsEffect::MoveGroup { group_id, dx, dy } => {
                     let dx_s = dx.to_string();
                     let dy_s = dy.to_string();
@@ -946,13 +961,22 @@ impl WallAgents {
         let stick_changes = panel_state.take_stick_bottom_changes();
         if !stick_changes.is_empty() {
             let gen_before = self.views.generation();
-            let host = WallHostAdapter {
-                wall,
-                fleet: self.last_fleet.as_ref(),
-                live_meta: &self.live_meta,
-            };
+            {
+                let host = WallHostAdapter {
+                    wall,
+                    fleet: self.last_fleet.as_ref(),
+                    live_meta: &self.live_meta,
+                };
+                for (id, at_bottom) in &stick_changes {
+                    let _ = self.views.set_stick_bottom(&host, id, *at_bottom);
+                }
+            }
             for (id, at_bottom) in stick_changes {
-                let _ = self.views.set_stick_bottom(&host, &id, at_bottom);
+                if wall.terminal(&id).is_some() {
+                    let mode = if at_bottom { "on" } else { "off" };
+                    let _ = wall.run(["wall.agent.follow", id.as_str(), mode]);
+                    self.synced_stick_bottom.insert(id, at_bottom);
+                }
             }
             if self.views.generation() != gen_before {
                 changed = true;
@@ -2067,9 +2091,19 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                WallEffect::ScrollTerminal { id, lines, .. } if id == "gx-coder" && *lines < 0
+                WallEffect::ScrollTerminal { id, lines, .. } if id == "gx-coder" && *lines > 0
             )),
-            "jumping to an older write-time anchor must emit a negative ScrollTerminal effect, got: {effects:?}"
+            "jumping to an older write-time anchor must emit a positive (+up into history) ScrollTerminal effect, got: {effects:?}"
+        );
+
+        let live_jump = agents.run_verb(&mut wall, "wall.agent.jump gx-coder live");
+        assert!(live_jump.text.contains("scrolled to live"));
+        let live_effects = wall.drain_effects();
+        assert!(
+            live_effects
+                .iter()
+                .any(|e| matches!(e, WallEffect::ScrollTerminalLive { id } if id == "gx-coder")),
+            "jumping to live must emit ScrollTerminalLive, got: {live_effects:?}"
         );
 
         // Test egui `panel_input` & `apply_panel_outputs` (`take_clicked_focus_id` +
