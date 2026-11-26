@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
@@ -16,7 +15,6 @@ use glyph_font::FamilyId;
 use term_cells::{CursorShape, Screen};
 use wgpu::util::DeviceExt;
 
-use crate::atlas::{Atlas, EmojiTexture};
 use crate::config::WallSettings;
 use crate::gpu::GpuContext;
 
@@ -209,9 +207,7 @@ enum DrawRun {
 
 /// Shared wgpu cell renderer for any number of live terminals.
 pub struct WallRenderer {
-    atlas: Arc<Atlas>,
     glyphs: GlyphSource,
-    _emoji_gpu: EmojiTexture,
     metrics: CellMetrics,
     style: WallStyle,
     color_format: wgpu::TextureFormat,
@@ -229,7 +225,6 @@ pub struct WallRenderer {
     frame_buf: wgpu::Buffer,
     quad_index_buf: wgpu::Buffer,
     shared_bgl: wgpu::BindGroupLayout,
-    emoji_view: wgpu::TextureView,
     emoji_sampler: wgpu::Sampler,
     shared_bg: wgpu::BindGroup,
     term_bgl: wgpu::BindGroupLayout,
@@ -321,7 +316,6 @@ fn make_shared_bg(
     shared_bgl: &wgpu::BindGroupLayout,
     frame_buf: &wgpu::Buffer,
     glyphs: &GlyphSource,
-    emoji_view: &wgpu::TextureView,
     emoji_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -342,7 +336,7 @@ fn make_shared_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::TextureView(emoji_view),
+                resource: wgpu::BindingResource::TextureView(glyphs.emoji_view()),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
@@ -353,16 +347,16 @@ fn make_shared_bg(
 }
 
 impl WallRenderer {
-    /// Build a `WallRenderer` on `device`/`queue` targeting `color_format` + [`WALL_DEPTH_FORMAT`].
+    /// Build a `WallRenderer` on `device`/`queue` targeting `color_format` + [`WALL_DEPTH_FORMAT`],
+    /// loading runtime fonts from `assets/fonts/` and lazy colour emoji from `emoji_sheet`.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        atlas: Arc<Atlas>,
+        emoji_sheet: &Path,
         color_format: wgpu::TextureFormat,
         mut style: WallStyle,
     ) -> Self {
-        let glyphs = GlyphSource::new(device, queue, Arc::clone(&atlas));
-        let emoji_gpu = EmojiTexture::upload(device, queue, &atlas.emoji);
+        let glyphs = GlyphSource::new(device, queue, emoji_sheet);
         let metrics = glyphs.cell_metrics();
         glyphs.apply_line_metrics(&mut style);
 
@@ -551,11 +545,6 @@ impl WallRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let emoji_view = emoji_gpu.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("wall emoji sheet view"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
         let emoji_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("wall emoji sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -623,7 +612,6 @@ impl WallRenderer {
             &shared_bgl,
             &frame_buf,
             &glyphs,
-            &emoji_view,
             &emoji_sampler,
         );
 
@@ -777,9 +765,7 @@ impl WallRenderer {
         });
 
         Self {
-            atlas,
             glyphs,
-            _emoji_gpu: emoji_gpu,
             metrics,
             style,
             color_format,
@@ -797,7 +783,6 @@ impl WallRenderer {
             frame_buf,
             quad_index_buf,
             shared_bgl,
-            emoji_view,
             emoji_sampler,
             shared_bg,
             term_bgl,
@@ -820,10 +805,6 @@ impl WallRenderer {
 
     pub fn metrics(&self) -> CellMetrics {
         self.metrics
-    }
-
-    pub fn atlas(&self) -> &Atlas {
-        &self.atlas
     }
 
     /// Underlying runtime [`GlyphSource`] (active font family, Slug atlas, GPU textures).
@@ -1076,35 +1057,8 @@ impl WallRenderer {
             self.draw_paper = false;
         }
 
-        let (line_a, line_b) = fold_line_uniforms(&self.style);
-        let sheet = &self.atlas.emoji.sheet;
         let view_proj = camera.view_proj(viewport).to_cols_array_2d();
         let viewport_f = [viewport.0.max(1) as f32, viewport.1.max(1) as f32];
-        let frame_uniform = WallFrameUniform {
-            view_proj,
-            viewport: viewport_f,
-            cell_size: [self.metrics.cell_width, self.metrics.cell_height],
-            line_a,
-            line_b,
-            border_focused_color: self.style.border_focused_color,
-            border_unfocused_color: self.style.border_unfocused_color,
-            cursor_color: self.style.cursor_color,
-            emoji_cell: [sheet.cell_w, sheet.cell_h],
-            emoji_cols: sheet.cols,
-            emoji_rows: sheet.rows_per_layer,
-            emoji_layer: [sheet.layer_w as f32, sheet.layer_h as f32],
-            greek_px: self.style.greek_px,
-            dim_alpha: self.style.dim_alpha,
-            panel_padding: self.style.panel_padding,
-            panel_border_px: self.style.border_width_px,
-            border_focused_scale: self.style.border_focused_scale,
-            cursor_fill_alpha: self.style.cursor_fill_opacity,
-            cursor_border_px: self.style.cursor_border_px,
-            target_is_srgb: u32::from(target_is_srgb),
-            _pad0: 0,
-            _pad1: 0,
-        };
-        queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame_uniform));
 
         let terminals = frame.terminals;
         let mut stats = UploadStats {
@@ -1147,8 +1101,8 @@ impl WallRenderer {
                 pending.push((z, 3, Pending::Label(raw_idx)));
             });
         }
-        // Flush any newly encoded cell or label glyphs to the GPU textures and rebuild
-        // the shared bind group if either backing texture grew.
+        // Flush any newly encoded cell, label, or sparse emoji glyphs to the GPU textures and
+        // rebuild the shared bind group if any backing texture grew.
         let glyph_sync = self.glyphs.sync(device, queue);
         if glyph_sync.rebound {
             self.shared_bg = make_shared_bg(
@@ -1156,10 +1110,39 @@ impl WallRenderer {
                 &self.shared_bgl,
                 &self.frame_buf,
                 &self.glyphs,
-                &self.emoji_view,
                 &self.emoji_sampler,
             );
         }
+
+        // Write frame uniforms AFTER `glyphs.sync` so `emoji_cols`/`emoji_rows`/`emoji_layer`
+        // match the live sparse emoji texture after any growth this frame.
+        let (line_a, line_b) = fold_line_uniforms(&self.style);
+        let emoji = self.glyphs.emoji_layout();
+        let frame_uniform = WallFrameUniform {
+            view_proj,
+            viewport: viewport_f,
+            cell_size: [self.metrics.cell_width, self.metrics.cell_height],
+            line_a,
+            line_b,
+            border_focused_color: self.style.border_focused_color,
+            border_unfocused_color: self.style.border_unfocused_color,
+            cursor_color: self.style.cursor_color,
+            emoji_cell: [emoji.cell_w, emoji.cell_h],
+            emoji_cols: emoji.cols,
+            emoji_rows: emoji.rows,
+            emoji_layer: [emoji.layer_w as f32, emoji.layer_h as f32],
+            greek_px: self.style.greek_px,
+            dim_alpha: self.style.dim_alpha,
+            panel_padding: self.style.panel_padding,
+            panel_border_px: self.style.border_width_px,
+            border_focused_scale: self.style.border_focused_scale,
+            cursor_fill_alpha: self.style.cursor_fill_opacity,
+            cursor_border_px: self.style.cursor_border_px,
+            target_is_srgb: u32::from(target_is_srgb),
+            _pad0: 0,
+            _pad1: 0,
+        };
+        queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame_uniform));
         pending.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         self.shape_scratch.clear();
@@ -1558,11 +1541,10 @@ pub fn render_test_pattern_offscreen(
     frames: u32,
     zoom_multiplier: f32,
 ) {
-    let atlas = Arc::new(Atlas::load(emoji_sheet));
     let mut renderer = WallRenderer::new(
         &ctx.device,
         &ctx.queue,
-        atlas,
+        emoji_sheet,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         WallStyle::default(),
     );
@@ -1740,11 +1722,10 @@ mod tests {
     #[test]
     fn gpu_dark_srgb_round_trip_and_depth_occlusion() {
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             WallStyle::default(),
         );
@@ -1800,11 +1781,10 @@ mod tests {
     #[test]
     fn gpu_dirty_row_uploads_and_cursor_shapes() {
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             WallStyle::default(),
         );
@@ -1947,11 +1927,10 @@ mod tests {
     #[test]
     fn gpu_paper_draws_exact_minor_and_major_lines_and_hard_switches() {
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             WallStyle::default(),
         );
@@ -2033,11 +2012,10 @@ mod tests {
         use super::super::shapes::{DashStyle, LeaderShape, PolygonShape, RectShape};
 
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             WallStyle::default(),
         );
@@ -2169,7 +2147,6 @@ mod tests {
         use super::super::metrics::WorldRect;
 
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let style = WallStyle {
             clear_color: [0.0, 0.0, 0.0, 1.0],
             ..WallStyle::default()
@@ -2177,7 +2154,7 @@ mod tests {
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             style,
         );
@@ -2259,7 +2236,6 @@ mod tests {
     #[test]
     fn gpu_terminal_scale_scales_panel_fills_ink_and_cursor() {
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let style = WallStyle {
             clear_color: [0.0, 0.0, 0.0, 1.0],
             ..WallStyle::default()
@@ -2267,7 +2243,7 @@ mod tests {
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            atlas,
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             style,
         );
@@ -2339,7 +2315,6 @@ mod tests {
         use term_cells::attrs;
 
         let ctx = crate::gpu::test_device::context();
-        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
         let style = WallStyle {
             clear_color: [0.0, 0.0, 0.0, 1.0],
             ..WallStyle::default()
@@ -2347,7 +2322,7 @@ mod tests {
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
-            Arc::clone(&atlas),
+            &crate::default_emoji_sheet(),
             wgpu::TextureFormat::Rgba8UnormSrgb,
             style,
         );
@@ -2435,7 +2410,10 @@ mod tests {
         assert_eq!(s_before.rows_uploaded, 1);
 
         assert!(renderer.set_font_family(DEFAULT_FONT_FAMILY));
-        assert_eq!(renderer.metrics(), CellMetrics::from_primary(atlas.metrics));
+        assert_eq!(
+            renderer.metrics(),
+            CellMetrics::from_primary(crate::atlas::default_trie().metrics)
+        );
         assert_ne!(renderer.metrics().cell_width, neon_metrics.cell_width);
 
         // Even with static_screen.generation == 0 unchanged, family switch forces re-pack.

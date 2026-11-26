@@ -245,14 +245,13 @@ mod tests {
     use term_cells::{CLUSTER_BASE, rgb};
 
     use super::*;
-    use crate::atlas::Atlas;
-    use crate::wall::glyphs::{AtlasEmojiSource, default_fonts_dir};
+    use crate::wall::glyphs::{EmojiSheetArchive, SparseEmojiSource, default_fonts_dir};
 
     fn test_font_atlas() -> (FontAtlas, FamilyId) {
         let specs = default_font_chain(&default_fonts_dir());
         let mut atlas = FontAtlas::load(&specs).expect("load default font chain");
-        let baked = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
-        atlas.set_emoji_source(Some(Arc::new(AtlasEmojiSource::new(baked))));
+        let archive = Arc::new(EmojiSheetArchive::load(&crate::default_emoji_sheet()));
+        atlas.set_emoji_source(Some(Arc::new(SparseEmojiSource::new(archive))));
         let family = atlas
             .family_id(MONASPACE_NEON_FAMILY)
             .unwrap_or_else(|| atlas.default_family());

@@ -33,9 +33,9 @@ pub use cell::{
     CellGpu, dirty_row_ranges, pack_cell, pack_cell_resolved, pack_cell_style, resolve_cell_glyph,
     resolve_str_glyphs,
 };
-pub use glyphs::AtlasEmojiSource;
+pub use glyphs::{EmojiSheetArchive, SparseEmojiSource};
 #[cfg(feature = "wgpu")]
-pub use glyphs::{GlyphSource, GlyphSyncStats};
+pub use glyphs::{GlyphSource, GlyphSyncStats, SparseEmojiLayout};
 pub use labels::{Label, LabelGlyphGpu, LabelHeight, measure_label_width, pack_label_glyphs};
 pub use metrics::{CellMetrics, WorldRect, snap_cell_dimension};
 pub use paper::PaperStyle;

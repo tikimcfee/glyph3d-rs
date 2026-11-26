@@ -464,10 +464,11 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     var emoji_cell_xy = vec2<f32>(0.0);
     var emoji_layer = 0u;
     if mode == 1u {
-        let per_layer = frame.emoji_cols * frame.emoji_rows;
+        let cols = max(frame.emoji_cols, 1u);
+        let per_layer = max(cols * frame.emoji_rows, 1u);
         emoji_layer = glyph_arg / per_layer;
         let rem = glyph_arg % per_layer;
-        emoji_cell_xy = vec2<f32>(f32(rem % frame.emoji_cols), f32(rem / frame.emoji_cols))
+        emoji_cell_xy = vec2<f32>(f32(rem % cols), f32(rem / cols))
             * vec2<f32>(frame.emoji_cell);
     }
 
@@ -547,10 +548,11 @@ fn vs_label(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     var emoji_cell_xy = vec2<f32>(0.0);
     var emoji_layer = 0u;
     if mode == 1u {
-        let per_layer = frame.emoji_cols * frame.emoji_rows;
+        let cols = max(frame.emoji_cols, 1u);
+        let per_layer = max(cols * frame.emoji_rows, 1u);
         emoji_layer = glyph_arg / per_layer;
         let rem = glyph_arg % per_layer;
-        emoji_cell_xy = vec2<f32>(f32(rem % frame.emoji_cols), f32(rem / frame.emoji_cols))
+        emoji_cell_xy = vec2<f32>(f32(rem % cols), f32(rem / cols))
             * vec2<f32>(frame.emoji_cell);
     }
 
@@ -597,9 +599,15 @@ fn fs_ink(in: InkVsOut) -> @location(0) vec4<f32> {
         // emoji stay aspect-true while lines still span both columns.
         let aspect_x = in.cell_info.w;
         let local_x = in.glyph_uv.x * aspect_x - 0.5 * (aspect_x - 1.0);
-        if local_x >= 0.0 && local_x <= 1.0 {
-            let inset = vec2<f32>(0.5);
-            let span = vec2<f32>(frame.emoji_cell) - vec2<f32>(1.0);
+        if local_x >= 0.0 && local_x <= 1.0 && frame.emoji_cols > 0u && frame.emoji_rows > 0u {
+            let cell_f = vec2<f32>(frame.emoji_cell);
+            let dx_tex = j[0] * cell_f * vec2<f32>(aspect_x, -1.0);
+            let dy_tex = j[1] * cell_f * vec2<f32>(aspect_x, -1.0);
+            // Half-texel inset scaled to the sampled mip level (capped at mip 3 = 8x)
+            // prevents bilinear/trilinear neighbor-cell bleed in the sparse emoji grid.
+            let mip_scale = clamp(max(length(dx_tex), length(dy_tex)), 1.0, 8.0);
+            let inset = vec2<f32>(0.5 * mip_scale);
+            let span = max(cell_f - 2.0 * inset, vec2<f32>(1.0));
             let emoji_uv = (in.emoji_cell_xy + inset + vec2<f32>(local_x, 1.0 - in.glyph_uv.y) * span)
                 / frame.emoji_layer;
             let grad_scale = (span / frame.emoji_layer) * vec2<f32>(aspect_x, -1.0);

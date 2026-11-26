@@ -26,7 +26,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
@@ -221,8 +220,7 @@ impl App {
 
         let opts = self.opts.take().expect("the window opens once");
         self.exit_after = opts.exit_after;
-        let atlas = Arc::new(Atlas::load(&opts.emoji_sheet));
-        let renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, atlas, format, WallStyle::default());
+        let renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         #[cfg(feature = "egui-ui")]
         let ui = WallUi::new(&self.ctx.device, &window, format);
         let metrics = renderer.metrics();
