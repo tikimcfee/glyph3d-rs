@@ -22,8 +22,8 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::cell::{
-    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges_with_selection,
-    pack_cell_resolved, snap_row_span_to_wide,
+    CellGpu, CellLinkHover, CellSelection, apply_hover_link_to_cell, apply_selection_to_cell,
+    dirty_row_ranges_with_overlays, pack_cell_resolved, snap_row_span_to_wide,
 };
 use super::glyphs::GlyphSource;
 use super::labels::{Label, LabelGlyphGpu, LabelHeight, pack_label_glyphs};
@@ -119,6 +119,8 @@ pub struct TerminalDraw<'a> {
     pub border_color: Option<u32>,
     /// Optional cell-coordinate text selection highlight (linear stream or column block).
     pub selection: Option<CellSelection>,
+    /// Optional cell-coordinate hovered hyperlink range drawn as a single underline.
+    pub hover_link: Option<CellLinkHover>,
 }
 
 /// Complete description of one wall frame submitted to [`WallRenderer::render`].
@@ -191,6 +193,7 @@ struct TerminalGpu {
     rows: u16,
     uploaded_gen: u64,
     uploaded_selection: Option<CellSelection>,
+    uploaded_hover_link: Option<CellLinkHover>,
     force_repack: bool,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
@@ -1147,6 +1150,7 @@ impl WallRenderer {
                     rows,
                     uploaded_gen: 0,
                     uploaded_selection: None,
+                    uploaded_hover_link: None,
                     force_repack: false,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
@@ -1183,10 +1187,12 @@ impl WallRenderer {
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
         let active_selection = draw.selection.filter(|s| !s.is_empty());
+        let active_hover_link = draw.hover_link.filter(|l| !l.is_empty());
 
         if cell_count == 0 {
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             return;
         }
 
@@ -1200,13 +1206,21 @@ impl WallRenderer {
                 let sel_span = active_selection.map_or(0..0, |s| {
                     snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
                 });
+                let link_span = active_hover_link.map_or(0..0, |l| {
+                    snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                });
                 for (c, cell) in row_cells.iter().enumerate() {
                     let mut packed =
                         pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                    let col_u16 = c as u16;
                     if let Some(sel) = active_selection {
-                        let col_u16 = c as u16;
                         if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                             apply_selection_to_cell(&mut packed, &sel);
+                        }
+                    }
+                    if let Some(link) = active_hover_link {
+                        if col_u16 >= link_span.start && col_u16 < link_span.end {
+                            apply_hover_link_to_cell(&mut packed, &link);
                         }
                     }
                     if (packed.bg >> 24) != 0 {
@@ -1220,19 +1234,24 @@ impl WallRenderer {
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             gpu.force_repack = false;
             stats.terminals_uploaded += 1;
             stats.rows_uploaded += usize::from(rows);
             stats.write_calls += 1;
-        } else if screen.generation != gpu.uploaded_gen || active_selection != gpu.uploaded_selection
+        } else if screen.generation != gpu.uploaded_gen
+            || active_selection != gpu.uploaded_selection
+            || active_hover_link != gpu.uploaded_hover_link
         {
-            let dirty = dirty_row_ranges_with_selection(
+            let dirty = dirty_row_ranges_with_overlays(
                 &screen.row_gen,
                 cols,
                 screen.generation,
                 gpu.uploaded_gen,
                 gpu.uploaded_selection,
                 active_selection,
+                gpu.uploaded_hover_link,
+                active_hover_link,
             );
             let cols_usize = usize::from(cols);
             if !dirty.is_empty() {
@@ -1247,16 +1266,24 @@ impl WallRenderer {
                     let sel_span = active_selection.map_or(0..0, |s| {
                         snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
                     });
+                    let link_span = active_hover_link.map_or(0..0, |l| {
+                        snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                    });
                     for (c, cell) in row_cells.iter().enumerate() {
                         let mut packed = pack_cell_resolved(
                             self.glyphs.resolve_cell(screen, cell),
                             screen,
                             cell,
                         );
+                        let col_u16 = c as u16;
                         if let Some(sel) = active_selection {
-                            let col_u16 = c as u16;
                             if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                                 apply_selection_to_cell(&mut packed, &sel);
+                            }
+                        }
+                        if let Some(link) = active_hover_link {
+                            if col_u16 >= link_span.start && col_u16 < link_span.end {
+                                apply_hover_link_to_cell(&mut packed, &link);
                             }
                         }
                         if (packed.bg >> 24) != 0 {
@@ -1278,6 +1305,7 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
         }
     }
 
@@ -1816,6 +1844,7 @@ pub fn render_test_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -1906,6 +1935,7 @@ pub fn render_chrome_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -2075,6 +2105,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let near = TerminalDraw {
                 id: 2,
@@ -2086,6 +2117,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
             let frame = WallFrame { terminals: &list, ..Default::default() };
@@ -2128,6 +2160,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
         let cam = WallCamera::new(Vec2::new(3.0, -4.0), 32.0);
@@ -2359,6 +2392,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let shapes = vec![
@@ -2600,6 +2634,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let w = 256u32;
@@ -2687,6 +2722,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             render_rgba_bytes(
                 &ctx,
@@ -2729,6 +2765,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let cam = WallCamera::new(Vec2::new(1.0, -0.5), 48.0);
         let s_before = renderer.prepare(
@@ -2758,6 +2795,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let s_after = renderer.prepare(
             &ctx.device,
@@ -2836,6 +2874,7 @@ mod tests {
                 panel_opacity: None,
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -2942,6 +2981,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -3117,6 +3157,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection,
+                hover_link: None,
             }
         }
 
@@ -3318,6 +3359,7 @@ mod tests {
             panel_opacity: None,
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let px = render_rgba_bytes(
             &ctx,
@@ -3488,6 +3530,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: Some(split_sel),
+            hover_link: None,
         };
         let frame = WallFrame { terminals: &[draw], ..Default::default() };
         let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
@@ -3607,5 +3650,167 @@ mod tests {
                 "wide glyph under trailing-half cursor must not leak un-inverted cyan (col {col})"
             );
         }
+    }
+
+    /// Hover-link underline (`TerminalDraw::hover_link` / `CellLinkHover`):
+    /// - Underlines single-row and soft-wrapped multi-row URLs in the cell's own fg or a custom colour
+    /// - Snaps split wide characters so both columns underline cleanly
+    /// - Uploads ONLY the row(s) whose hover-link span changed (0 rows steady, 1–2 rows on hover/clear)
+    #[test]
+    fn gpu_hover_link_underline_single_multi_row_wide_and_dirty_uploads() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Build a 32x4 screen with a plain URL on row 0, a wrapped OSC 8 link across rows 1..2,
+        // and a wide 'W' cell inside row 3.
+        let mut screen = Screen::new(32, 4);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        let cyan = rgb(0x7d, 0xcf, 0xff);
+        let green = rgb(0x6e, 0xe7, 0xa0);
+        let fg = screen.default_fg;
+
+        super::super::test_pattern::write_run(&mut screen, 0, 1, "see ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 0, 5, "https://glyph3d.dev/wall", super::super::test_pattern::RunStyle::fg(cyan));
+        super::super::test_pattern::write_run(&mut screen, 1, 1, "wrapped link: ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 1, 15, "https://example.o", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 2, 0, "rg/docs/rendering", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 3, 1, "plain text row (no link)", super::super::test_pattern::RunStyle::fg(fg));
+
+        let m = renderer.metrics();
+        let w = 960u32;
+        let h = 240u32;
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.08);
+
+        let make = |hover_link: Option<CellLinkHover>| TerminalDraw {
+            id: 505,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link,
+        };
+
+        // 1. Initial upload without hover link -> all 4 rows uploaded.
+        let s0 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s0.rows_uploaded, 4);
+
+        // 2. Hover row 0 URL `5..29` -> ONLY row 0 uploaded (1 row, 1 write_call)!
+        let link0 = CellLinkHover::single_row(0, 5, 29);
+        let s1 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 1, write_calls: 1 });
+
+        // Steady frame with same hover_link uploads 0 rows.
+        let s1_idle = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1_idle.rows_uploaded, 0);
+
+        // Count ink pixels in the underline band below the baseline (bottom 15% of cell height).
+        let count_ul_band = |px: &[u8], col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(f32::from(col) * m.cell_width, -(f32::from(row) + 0.85) * m.cell_height), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(f32::from(col + 1) * m.cell_width, -f32::from(row + 1) * m.cell_height), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let is_cyan = |c: [u8; 3]| c[0].abs_diff(0x7d) <= 15 && c[1].abs_diff(0xcf) <= 15 && c[2] > 220;
+        let is_amber = |c: [u8; 3]| c[0] > 210 && c[1] > 150 && c[2] < 130;
+
+        let px_row0 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+            w,
+            h,
+        );
+        // Col 5 ('h') and col 13 ('l') have cyan hover underline; col 2 ('e' in "see") has none.
+        assert!(count_ul_band(&px_row0, 5, 0, is_cyan) > 12, "hovered URL start cell should draw cyan underline");
+        assert!(count_ul_band(&px_row0, 13, 0, is_cyan) > 12, "hovered URL interior cell should draw cyan underline");
+        assert_eq!(count_ul_band(&px_row0, 2, 0, is_cyan), 0, "unhovered cell before URL must have no cyan underline");
+
+        // 3. Move hover to multi-row wrapped URL (1,15)..(2,17) with custom amber underline colour ->
+        //    ONLY rows 0..3 (3 rows: old row 0 + new rows 1..=2) uploaded; row 3 untouched!
+        let link_wrap = CellLinkHover::new(1, 15, 2, 17).with_color(rgb(0xf0, 0xb4, 0x5a));
+        let s2 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() },
+        );
+        assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 1 });
+
+        let wrap_frame = WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() };
+        let px_wrap = render_rgba_bytes(&ctx, &mut renderer, &cam, &wrap_frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_LINK_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &wrap_frame, (w, h), 1, Path::new(&path));
+            }
+        }
+        // Row 0 underline is gone; rows 1 (col 16) and 2 (col 4) show amber underline!
+        assert_eq!(count_ul_band(&px_wrap, 5, 0, is_cyan), 0, "clearing row 0 hover must remove its underline");
+        assert!(count_ul_band(&px_wrap, 16, 1, is_amber) > 12, "wrapped hover link row 1 must draw amber underline");
+        assert!(count_ul_band(&px_wrap, 4, 2, is_amber) > 12, "wrapped hover link row 2 must draw amber underline");
+        assert_eq!(count_ul_band(&px_wrap, 10, 1, is_amber), 0, "cells before wrapped link must not underline");
+
+        // 4. Clearing hover link uploads ONLY rows 1..3 (2 rows) and removes underline cleanly.
+        let s3 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 2, write_calls: 1 });
+        let px_clear = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+            w,
+            h,
+        );
+        assert_eq!(count_ul_band(&px_clear, 16, 1, is_amber), 0, "cleared hover link must leave zero underline");
+        assert_eq!(count_ul_band(&px_clear, 4, 2, is_amber), 0, "cleared hover link row 2 must leave zero underline");
     }
 }

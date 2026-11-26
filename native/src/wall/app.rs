@@ -671,6 +671,7 @@ impl App {
                         foreground: fg,
                     }
                 }),
+                hover_link: None,
             });
         }
 
