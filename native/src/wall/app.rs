@@ -508,7 +508,11 @@ impl App {
         }
         if ran {
             self.apply_effects();
-            self.redraw();
+            if self.pending_shot.is_some() {
+                self.draw();
+            } else {
+                self.redraw();
+            }
         }
     }
 
@@ -571,22 +575,33 @@ impl App {
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
+        let has_shot = self.pending_shot.is_some();
         let frame = match g.surface.get_current_texture() {
-            Cst::Success(f) | Cst::Suboptimal(f) => f,
+            Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
             Cst::Lost | Cst::Outdated => {
                 g.surface.configure(&self.ctx.device, &g.config);
-                g.window.request_redraw();
-                return;
+                if !has_shot {
+                    g.window.request_redraw();
+                    return;
+                }
+                None
             }
-            // Covered or asleep: the next event that matters asks again.
-            Cst::Occluded | Cst::Timeout => return,
+            // Covered or asleep: the next event that matters asks again, unless
+            // `app.shot` is waiting for an offscreen PNG.
+            Cst::Occluded | Cst::Timeout => {
+                if !has_shot {
+                    return;
+                }
+                None
+            }
             Cst::Validation => {
                 log::error!("the wall's surface failed validation; skipping the frame");
-                return;
+                if !has_shot {
+                    return;
+                }
+                None
             }
         };
-        let view = frame.texture.create_view(&Default::default());
-        let target = WallTarget { color_view: &view, depth_view: &g.depth, width: g.config.width, height: g.config.height };
         let sf = g.window.scale_factor() as f32;
         // The wall's camera is in logical pixels per world unit; the
         // renderer's is in physical ones.
@@ -713,8 +728,14 @@ impl App {
             min_px: described.paper.grid.grid_min_px as f32 * sf,
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
-        let stats = g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &camera, &wall_frame);
+        let mut surface_frame = frame.map(|f| {
+            let view = f.texture.create_view(&Default::default());
+            let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
+            let target = WallTarget { color_view: &view, depth_view: &g.depth, width: g.config.width, height: g.config.height };
+            let stats = g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &camera, &wall_frame);
+            (f, view, encoder, stats)
+        });
+        let stats = surface_frame.as_ref().map_or_else(super::renderer::UploadStats::default, |(_, _, _, s)| *s);
         let _ = stats;
 
         #[cfg(feature = "egui-ui")]
@@ -745,8 +766,8 @@ impl App {
                 }
             });
             panel_egui_keys = ui_frame.wants_keyboard;
-            if let Some(painted) = ui_frame.painted.as_mut() {
-                g.ui.paint(&self.ctx.device, &self.ctx.queue, &mut encoder, &view, painted);
+            if let (Some((_, view, encoder, _)), Some(painted)) = (surface_frame.as_mut(), ui_frame.painted.as_mut()) {
+                g.ui.paint(&self.ctx.device, &self.ctx.queue, encoder, view, painted);
             }
             match ui_frame.repaint_after {
                 Some(delay) if delay.is_zero() => {
@@ -761,8 +782,10 @@ impl App {
             self.ui_repaint_at = None;
             None
         };
-        self.ctx.queue.submit([encoder.finish()]);
-        self.ctx.queue.present(frame);
+        if let Some((frame, _, encoder, _)) = surface_frame {
+            self.ctx.queue.submit([encoder.finish()]);
+            self.ctx.queue.present(frame);
+        }
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
         // draws the same frame once more offscreen and saves it.
