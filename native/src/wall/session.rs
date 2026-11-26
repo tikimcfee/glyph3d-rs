@@ -22,7 +22,7 @@ use termd_client::{Create, Event, Key, KeyAction, Role, Target, Termd};
 use wall_core::input::{KeyEvent, Platform};
 use wall_core::keymap::{self, TerminalKeyAction};
 
-use super::app::Terminal;
+use super::app::{Opened, Terminal};
 
 /// The size a terminal the wall starts is born at.
 pub const NEW_COLS: u16 = 100;
@@ -172,10 +172,20 @@ impl Terminal for LiveTerminal {
     }
 }
 
+/// Start one more shell in the hub's namespace, under the first free
+/// `tN` id, and take it as its size's owner.
+fn spawn(hub: &Rc<RefCell<Hub>>) -> Result<Box<dyn Terminal>, String> {
+    let taken: Vec<String> = hub.borrow().termd.list().map_err(|e| format!("termd list: {e}"))?.into_iter().map(|t| t.id).collect();
+    let id = (1..).map(|n| format!("t{n}")).find(|id| !taken.contains(id)).expect("some tN is free");
+    let made = hub.borrow().termd.create(&Create { id, cols: NEW_COLS, rows: NEW_ROWS, ..Create::default() }).map_err(|e| format!("termd create: {e}"))?;
+    let sub = hub.borrow().termd.subscribe(&made.id, Role::Own, None, 0).map_err(|e| format!("termd subscribe {}: {e}", made.id))?;
+    Ok(Box::new(LiveTerminal::new(hub.clone(), made.id, sub.handle, sub.cols, sub.rows)))
+}
+
 /// Connect to `namespace` (starting its daemon if none runs), take every
 /// terminal it holds as their size's owner, and start a shell if it holds
 /// none. `wake` is called from the reader thread whenever something arrives.
-pub fn open(namespace: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Vec<Box<dyn Terminal>>, String> {
+pub fn open(namespace: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Opened, String> {
     let target = Target::namespace(namespace);
     let termd = Termd::connect_or_start(&target, "glyph3d-wall", Box::new(move || wake())).map_err(|e| format!("termd namespace `{namespace}`: {e}"))?;
     let mut ids: Vec<String> = termd.list().map_err(|e| format!("termd list: {e}"))?.into_iter().map(|t| t.id).collect();
@@ -187,10 +197,10 @@ pub fn open(namespace: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Vec<Bo
     }
     ids.sort();
     let hub = Rc::new(RefCell::new(Hub { termd, inbox: HashMap::new() }));
-    let mut out: Vec<Box<dyn Terminal>> = Vec::new();
+    let mut terminals: Vec<Box<dyn Terminal>> = Vec::new();
     for id in ids {
         let sub = hub.borrow().termd.subscribe(&id, Role::Own, None, 0).map_err(|e| format!("termd subscribe {id}: {e}"))?;
-        out.push(Box::new(LiveTerminal::new(hub.clone(), id, sub.handle, sub.cols, sub.rows)));
+        terminals.push(Box::new(LiveTerminal::new(hub.clone(), id, sub.handle, sub.cols, sub.rows)));
     }
-    Ok(out)
+    Ok(Opened { terminals, spawn: Some(Box::new(move || spawn(&hub))) })
 }

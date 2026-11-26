@@ -36,6 +36,9 @@ glyph-vt = { path = "../crates/glyph-vt" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
 # host that brings its own window links the library without it.
 winit = { version = "0.30", optional = true }
+# The system clipboard, for the wall's paste (and copy) chords. Already in
+# the graph through egui-winit; text only.
+arboard = { version = "3", optional = true, default-features = false }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
@@ -110,7 +113,7 @@ default = ["wgpu", "windowed", "egui-ui", "launcher"]
 wgpu = ["dep:wgpu", "dep:wgpu-profiler", "dep:pollster", "glyph-field/wgpu", "glyph-field-derived/wgpu"]
 # The window: `windowed/` and winit (2026-10-26). Off, there is no window
 # (the binary refuses a windowed run).
-windowed = ["wgpu", "dep:winit"]
+windowed = ["wgpu", "dep:winit", "dep:arboard"]
 # The terminal launcher. Off, `--launcher` is refused and a bare run opens
 # the default scene, as it did before C27. It starts this binary's window
 # as a child, so it needs one.

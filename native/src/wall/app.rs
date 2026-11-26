@@ -75,7 +75,17 @@ pub struct WallOptions {
     pub exit_after: Option<u64>,
     /// Builds the terminals once the window exists. It is handed a waker
     /// that reader threads call when a terminal has news.
-    pub open: Box<dyn FnOnce(Arc<dyn Fn() + Send + Sync>) -> Vec<Box<dyn Terminal>>>,
+    pub open: Box<dyn FnOnce(Arc<dyn Fn() + Send + Sync>) -> Opened>,
+}
+
+/// Starts one more terminal (the spawn chord).
+pub type Spawn = Box<dyn FnMut() -> Result<Box<dyn Terminal>, String>>;
+
+/// What opening the wall's terminals gives the window: the terminals that
+/// exist, and a way to start another, if this source can.
+pub struct Opened {
+    pub terminals: Vec<Box<dyn Terminal>>,
+    pub spawn: Option<Spawn>,
 }
 
 /// A terminal on the canvas.
@@ -111,6 +121,8 @@ struct App {
     panning: bool,
     frames: u64,
     exit_after: Option<u64>,
+    spawn: Option<Spawn>,
+    next_id: u64,
 }
 
 impl App {
@@ -195,18 +207,43 @@ impl App {
             // The loop may be gone at shutdown; nothing is left to wake.
             let _ = proxy.send_event(Wake);
         });
-        let mut x = 0.0_f32;
-        for (i, term) in (opts.open)(wake).into_iter().enumerate() {
-            let (cols, rows) = (term.screen().cols, term.screen().rows);
-            let position = Vec2::new(x, 0.0);
-            x += metrics.grid_rect(position, cols, rows).width() + 2.0 * padding + GAP;
-            self.terminals.push(Placed { id: i as u64 + 1, term, position, z: i as f32 + 1.0 });
+        let _ = (metrics, padding);
+        let opened = (opts.open)(wake);
+        self.spawn = opened.spawn;
+        for term in opened.terminals {
+            self.place(term);
         }
         if let Some(first) = self.terminals.first().map(|t| t.id) {
             self.focus(first);
         }
         self.frame_all();
         self.redraw();
+    }
+
+    /// Put a terminal on the canvas, to the right of everything there.
+    fn place(&mut self, term: Box<dyn Terminal>) -> u64 {
+        let right = self.terminals.iter().map(|t| self.rect_of(t).max.x).fold(f32::NEG_INFINITY, f32::max);
+        let padding = self.gfx.as_ref().map_or(0.0, |g| g.renderer.style().panel_padding);
+        let x = if right.is_finite() { right + GAP + padding } else { 0.0 };
+        let top = self.terminals.iter().map(|t| t.z).fold(0.0_f32, f32::max);
+        self.next_id += 1;
+        let id = self.next_id;
+        self.terminals.push(Placed { id, term, position: Vec2::new(x, 0.0), z: top + 1.0 });
+        id
+    }
+
+    /// The spawn chord: one more terminal, focused and brought into view.
+    fn spawn_terminal(&mut self) {
+        let Some(spawn) = &mut self.spawn else { return };
+        match spawn() {
+            Ok(term) => {
+                let id = self.place(term);
+                self.focus(id);
+                self.frame_all();
+                self.redraw();
+            }
+            Err(e) => log::error!("the wall could not start a terminal: {e}"),
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -260,6 +297,13 @@ impl App {
         self.frames += 1;
         // A counted run can type: GLYPH_WALL_PASTE is pasted into the
         // focused terminal a moment in, so a script sees a program answer.
+        // A counted run can also spawn: GLYPH_WALL_SPAWN=N starts N more terminals.
+        if self.exit_after.is_some() && self.frames == 10 {
+            let n = std::env::var("GLYPH_WALL_SPAWN").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+            for _ in 0..n {
+                self.spawn_terminal();
+            }
+        }
         if self.exit_after.is_some() && self.frames == 30 {
             if let Ok(text) = std::env::var("GLYPH_WALL_PASTE") {
                 if let Some(t) = self.focused.and_then(|id| self.terminals.iter_mut().find(|t| t.id == id)) {
@@ -309,8 +353,28 @@ impl App {
                     self.redraw();
                     return;
                 }
+                "Backslash" => {
+                    self.spawn_terminal();
+                    return;
+                }
                 _ => {}
             }
+        }
+        // The paste chord (Cmd+V on macOS, Ctrl+Shift+V elsewhere) pastes the
+        // system clipboard; the program never sees the key itself.
+        if wall_core::chord::is_paste_chord(wall_core::input::Platform::host(), &key) {
+            if key.pressed && !key.repeat {
+                match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                    Ok(text) if !text.is_empty() => {
+                        if let Some(t) = self.focused.and_then(|id| self.terminals.iter_mut().find(|t| t.id == id)) {
+                            t.term.paste(&text);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("paste: the clipboard gave no text: {e}"),
+                }
+            }
+            return;
         }
         if let Some(t) = self.focused.and_then(|id| self.terminals.iter_mut().find(|t| t.id == id)) {
             t.term.key(&key);
@@ -400,6 +464,8 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         panning: false,
         frames: 0,
         exit_after: None,
+        spawn: None,
+        next_id: 0,
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);

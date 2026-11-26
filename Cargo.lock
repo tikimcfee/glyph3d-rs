@@ -1792,6 +1792,7 @@ dependencies = [
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "ash",
  "bevy_ecs",
  "bevy_transform",
