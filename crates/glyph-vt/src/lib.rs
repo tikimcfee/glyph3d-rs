@@ -136,6 +136,13 @@ impl Vt {
         self.terminal.rows() as u16
     }
 
+    /// Whether DEC private mode 2026 (`CSI ? 2026 h`, synchronized output) is
+    /// currently active, indicating the program is mid-frame and screen
+    /// publication should wait for `CSI ? 2026 l` (or a safety timeout).
+    pub fn synchronized_output(&self) -> bool {
+        self.terminal.modes.get(Mode::SynchronizedOutput)
+    }
+
     /// Resolved cursor colour (`OSC 12` override if active, otherwise the
     /// theme's cursor colour). Exposed here because [`term_cells::Cursor`] does
     /// not carry a colour field.
