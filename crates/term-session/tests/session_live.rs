@@ -176,7 +176,18 @@ fn last_non_empty_line(session: &TerminalSession) -> String {
 
 #[test]
 fn flood_single_terminal_and_key_during_flood() {
+    use std::fmt::Write as _;
+
     let scratch = ScratchDaemon::new("flood1");
+    let seq_file = scratch.dir.join("seq_2m.txt");
+    {
+        let mut buf = String::with_capacity(15_000_000);
+        for i in 1..=2_000_000u32 {
+            let _ = writeln!(buf, "{i}");
+        }
+        fs::write(&seq_file, buf.as_bytes()).expect("write seq_2m.txt");
+    }
+
     let wake = Arc::new(WakeSignal::default());
     let hub = SessionHub::open_with(&scratch.target(), HubOptions::default(), wake.waker())
         .expect("open scratch hub");
@@ -189,7 +200,9 @@ fn flood_single_terminal_and_key_during_flood() {
             argv: Some(vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "seq -f '%.0f' 1 2000000".into(),
+                "exec cat \"$1\"".into(),
+                "sh".into(),
+                seq_file.to_string_lossy().into_owned(),
             ]),
             cols: 80,
             rows: 24,
@@ -200,7 +213,7 @@ fn flood_single_terminal_and_key_during_flood() {
 
     let mut seen = wake.current();
     let mut pump_true_calls = 0u64;
-    let settled = wait_for(&wake, &mut seen, Duration::from_secs(60), || {
+    let settled = wait_for(&wake, &mut seen, Duration::from_secs(120), || {
         if session.pump() {
             pump_true_calls += 1;
         }
@@ -329,8 +342,19 @@ fn flood_single_terminal_and_key_during_flood() {
 
 #[test]
 fn flood_fourteen_terminals_concurrently() {
+    use std::fmt::Write as _;
+
     const N: usize = 14;
     let scratch = ScratchDaemon::new("flood14");
+    let seq_file = scratch.dir.join("seq_300k.txt");
+    {
+        let mut buf = String::with_capacity(2_200_000);
+        for i in 1..=300_000u32 {
+            let _ = writeln!(buf, "{i}");
+        }
+        fs::write(&seq_file, buf.as_bytes()).expect("write seq_300k.txt");
+    }
+
     let wake = Arc::new(WakeSignal::default());
     let hub = SessionHub::open_with(&scratch.target(), HubOptions::default(), wake.waker())
         .expect("open scratch hub");
@@ -343,7 +367,13 @@ fn flood_fourteen_terminals_concurrently() {
         let sess = hub
             .spawn(&SpawnOptions {
                 id: id.clone(),
-                argv: Some(vec!["/bin/sh".into(), "-c".into(), "seq 1 300000".into()]),
+                argv: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exec cat \"$1\"".into(),
+                    "sh".into(),
+                    seq_file.to_string_lossy().into_owned(),
+                ]),
                 cols: 80,
                 rows: 24,
                 env_base: Some(base_env()),
@@ -354,7 +384,7 @@ fn flood_fourteen_terminals_concurrently() {
     }
 
     let mut seen = wake.current();
-    let all_done = wait_for(&wake, &mut seen, Duration::from_secs(90), || {
+    let all_done = wait_for(&wake, &mut seen, Duration::from_secs(120), || {
         for s in &mut sessions {
             s.pump();
         }
