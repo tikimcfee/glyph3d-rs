@@ -23,6 +23,8 @@ pub mod renderer;
 pub mod session;
 pub mod shapes;
 pub mod test_pattern;
+#[cfg(feature = "egui-ui")]
+pub mod ui;
 
 pub use camera::WallCamera;
 pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph, resolve_str_glyphs};
@@ -32,9 +34,14 @@ pub use paper::PaperStyle;
 #[cfg(feature = "wgpu")]
 pub use renderer::{
     TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallFrame, WallRenderer, WallStyle, WallTarget,
-    render_test_pattern_offscreen, render_wall_to_png,
+    render_test_pattern_offscreen, render_wall_to_png, render_wall_to_png_with_overlay,
 };
 pub use shapes::{DashStyle, DotShape, LeaderShape, LineShape, PolygonShape, RectShape, Shape};
+#[cfg(feature = "egui-ui")]
+pub use ui::{
+    DebugHudInput, HudTerminalInfo, PaintedUi, UiEventOutcome, UiFrame, WallUi,
+    configure_wall_context, show_debug_hud,
+};
 
 /// Convert a 24-bit `0xRRGGBB` sRGB hex colour and `alpha` into normalized sRGB RGBA (`0.0..=1.0`).
 pub const fn srgb_hex(hex: u32, alpha: f32) -> [f32; 4] {
