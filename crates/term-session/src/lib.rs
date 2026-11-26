@@ -19,15 +19,16 @@ mod session;
 pub mod sessions;
 
 pub use coalesce::{
-    CoalescePolicy, DEFAULT_COALESCE_INTERVAL, DEFAULT_FEED_QUANTUM_BYTES, DEFAULT_INBOX_MAX_BYTES,
-    DEFAULT_SYNC_TIMEOUT,
+    CoalescePolicy, DEFAULT_COALESCE_INTERVAL, DEFAULT_FEED_QUANTUM_BYTES,
+    DEFAULT_GROW_REPAINT_SETTLE, DEFAULT_INBOX_MAX_BYTES, DEFAULT_SYNC_TIMEOUT,
 };
 pub use glyph_vt::Theme;
 pub use hub::{DaemonEvent, DaemonState, HubOptions, SessionHub, SpawnOptions};
-pub use session::{ExitInfo, ScrollbackState, SessionStats, TerminalSession};
+pub use session::{ExitInfo, ScreenFillDelta, ScrollbackState, SessionStats, TerminalSession};
 pub use sessions::{NAMESPACE, News, Sessions};
 pub use term_cells::{Modes, MouseTracking, Screen};
 pub use termd_client::{
-    code, Colors, ConnectOptions, Error, IfExists, Key, KeyAction, Mouse, MouseAction,
-    MouseButton, OptionAsAlt, Role, Target, TermInfo, View, ViewReply, Welcome, WireError,
+    code, Capture, CaptureFormat, CaptureReply, Colors, ConnectOptions, Error, IfExists, Key,
+    KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Target, TermInfo, View,
+    ViewReply, Welcome, WireError,
 };

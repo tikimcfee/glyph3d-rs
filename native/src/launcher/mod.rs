@@ -1,9 +1,8 @@
 //! The launcher: a terminal front end of the renderer itself (C27,
 //! 2026-10-10; plan in `out/history/PLAN-LAUNCHER-INTO-RENDERER-2026-10-10.md`).
 //!
-//! `glyph3d-native --launcher`, or no arguments at all on a terminal, opens
-//! it. Its state is a `LaunchConfig` over the CLI's own defaults (`model`),
-//! its rows are drawn from the clap derives (`draw`), and Enter writes that
+//! `glyph3d-native --launcher` opens it. Its state is a `LaunchConfig` over
+//! the CLI's own defaults (`model`), its rows are drawn from the clap derives (`draw`), and Enter writes that
 //! config to a file and starts this same binary with `--launch-config
 //! <file>` as a child, returning to the menu when the window closes. A child
 //! and not the window in-process because winit allows one event loop per
@@ -24,7 +23,7 @@ mod save;
 
 pub use model::{Control, Launcher, Target, View};
 
-use std::io::{self, stdout, IsTerminal, Stdout};
+use std::io::{self, stdout, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,12 +34,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-/// Whether this invocation opens the launcher: `--launcher`, or no
-/// arguments at all with a terminal on both ends (a script that runs the
-/// bare binary still gets the default scene).
+/// Whether this invocation opens the launcher (`--launcher`; a bare run opens
+/// the wall since milestone 7, 2026-11-26).
 pub fn wanted(matches: &clap::ArgMatches) -> bool {
     matches.get_flag("launcher")
-        || (std::env::args_os().len() == 1 && io::stdin().is_terminal() && io::stdout().is_terminal())
 }
 
 /// Run the launcher until the user quits. `config` is `--launch-config`.
