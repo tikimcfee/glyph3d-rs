@@ -778,11 +778,11 @@ impl App {
             }
         }
 
-        // The notice: one line at the top of the wall.
-        if let Some(text) = &described.notice {
+        // The notice: one line at the top of the wall (or an active dev shader error).
+        if let Some(text) = described.notice.as_deref().or_else(|| g.renderer.shader_error_notice()) {
             let px = 14.0 * sf;
             let at = to_world(16.0, 14.0);
-            labels.push(Label::new(text.clone(), at, LabelHeight::ScreenPx(px), srgb_hex(0xffc857, 1.0), Z_OVERLAY));
+            labels.push(Label::new(text.to_string(), at, LabelHeight::ScreenPx(px), srgb_hex(0xffc857, 1.0), Z_OVERLAY));
         }
 
         let paper = PaperStyle {
@@ -1267,6 +1267,12 @@ impl ApplicationHandler<Wake> for App {
             Some(_) => self.redraw(),
             None => {}
         }
+        let now = Instant::now();
+        let shader_repaint_at = self.gfx.as_mut().and_then(|g| {
+            let (dirty, next) = g.renderer.poll_shaders(&self.ctx.device, now);
+            if dirty { g.window.request_redraw(); }
+            next
+        });
         // Something is still moving (an eased camera, a glide) or an offscreen
         // shot is pending: ask for a redraw, and fall back to a surface-free
         // tick/shot if macOS suppresses RedrawRequested while occluded.
@@ -1285,8 +1291,7 @@ impl ApplicationHandler<Wake> for App {
                 return;
             }
         }
-        let now = Instant::now();
-        let mut next_repaint: Option<Instant> = None;
+        let mut next_repaint: Option<Instant> = shader_repaint_at;
         #[cfg(feature = "egui-ui")]
         if let Some(deadline) = self.ui_repaint_at {
             if now >= deadline {

@@ -8,8 +8,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
@@ -227,6 +227,7 @@ pub struct WallRenderer {
     color_format: wgpu::TextureFormat,
     paper_buf: wgpu::Buffer,
     paper_bg: wgpu::BindGroup,
+    paper_pl: wgpu::PipelineLayout,
     paper_pipeline: wgpu::RenderPipeline,
     draw_paper: bool,
     shape_frame_buf: wgpu::Buffer,
@@ -234,6 +235,7 @@ pub struct WallRenderer {
     shapes_buf: wgpu::Buffer,
     shapes_cap: usize,
     shapes_bg: wgpu::BindGroup,
+    shape_pl: wgpu::PipelineLayout,
     shape_opaque_pipeline: wgpu::RenderPipeline,
     shape_blend_pipeline: wgpu::RenderPipeline,
     frame_buf: wgpu::Buffer,
@@ -246,17 +248,345 @@ pub struct WallRenderer {
     labels_buf: wgpu::Buffer,
     labels_cap: usize,
     labels_bg: wgpu::BindGroup,
+    cell_pl: wgpu::PipelineLayout,
+    label_pl: wgpu::PipelineLayout,
     panel_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
     ink_pipeline: wgpu::RenderPipeline,
     cursor_pipeline: wgpu::RenderPipeline,
     label_pipeline: wgpu::RenderPipeline,
+    shader_watcher: Option<ShaderWatcher>,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
     shape_scratch: Vec<ShapeGpu>,
     label_scratch: Vec<LabelGlyphGpu>,
     draw_runs: Vec<DrawRun>,
     cursor_blink: CursorBlinkState,
+}
+
+const SHADER_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+const PAPER_ENTRY_POINTS: &[&str] = &["vs_paper", "fs_paper"];
+const SHAPE_ENTRY_POINTS: &[&str] = &["vs_shape", "fs_shape"];
+const CELL_ENTRY_POINTS: &[&str] = &[
+    "vs_panel",
+    "fs_panel",
+    "vs_fill",
+    "fs_fill",
+    "vs_ink",
+    "fs_ink",
+    "vs_cursor",
+    "fs_cursor",
+    "vs_label",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchedShaderKind {
+    Paper,
+    Shapes,
+    Cells,
+}
+
+impl WatchedShaderKind {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Paper => "wall_paper.wgsl",
+            Self::Shapes => "wall_shapes.wgsl",
+            Self::Cells => "wall_cells.wgsl",
+        }
+    }
+
+    const fn entry_points(self) -> &'static [&'static str] {
+        match self {
+            Self::Paper => PAPER_ENTRY_POINTS,
+            Self::Shapes => SHAPE_ENTRY_POINTS,
+            Self::Cells => CELL_ENTRY_POINTS,
+        }
+    }
+}
+
+struct WatchedShader {
+    kind: WatchedShaderKind,
+    last_stamp: Option<(SystemTime, u64)>,
+    last_error: Option<String>,
+    notice: Option<String>,
+}
+
+struct ShaderWatcher {
+    dir: PathBuf,
+    poll_interval: Duration,
+    next_poll: Instant,
+    files: [WatchedShader; 3],
+    active_notice: Option<String>,
+}
+
+impl ShaderWatcher {
+    fn from_dir(dir: PathBuf, now: Instant) -> Self {
+        let make = |kind: WatchedShaderKind| {
+            let stamp = file_stamp(&dir.join(kind.file_name()));
+            WatchedShader {
+                kind,
+                last_stamp: stamp,
+                last_error: None,
+                notice: None,
+            }
+        };
+        Self {
+            files: [
+                make(WatchedShaderKind::Paper),
+                make(WatchedShaderKind::Shapes),
+                make(WatchedShaderKind::Cells),
+            ],
+            dir,
+            poll_interval: SHADER_POLL_INTERVAL,
+            next_poll: now + SHADER_POLL_INTERVAL,
+            active_notice: None,
+        }
+    }
+
+    fn from_env(now: Instant) -> Option<Self> {
+        let dir = std::env::var_os("GLYPH_WALL_SHADER_DIR")?;
+        if dir.is_empty() {
+            return None;
+        }
+        Some(Self::from_dir(PathBuf::from(dir), now))
+    }
+
+    fn refresh_notice(&mut self) -> bool {
+        let next = self.files.iter().find_map(|f| f.notice.clone());
+        let changed = next != self.active_notice;
+        self.active_notice = next;
+        changed
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
+/// Parse and validate WGSL source with `naga` and verify every required entry point exists.
+fn validate_wall_wgsl(name: &str, src: &str, required_entries: &[&str]) -> Result<(), String> {
+    let module = wgpu::naga::front::wgsl::parse_str(src)
+        .map_err(|e| format!("{name}: {}", e.emit_to_string(src)))?;
+    let mut validator = wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    );
+    validator
+        .validate(&module)
+        .map_err(|e| format!("{name}: {}", e.emit_to_string(src)))?;
+    for &entry in required_entries {
+        if !module.entry_points.iter().any(|ep| ep.name == entry) {
+            return Err(format!("{name}: missing entry point `{entry}`"));
+        }
+    }
+    Ok(())
+}
+
+/// First non-empty line of a multi-line error, truncated for the wall's one-line notice bar.
+fn compact_shader_error(name: &str, full: &str) -> String {
+    let line = full
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("invalid WGSL");
+    let stripped = line.strip_prefix(name).and_then(|s| s.strip_prefix(':')).map(str::trim).unwrap_or(line);
+    let mut out = format!("shader {name}: {stripped}");
+    if out.len() > 140 {
+        let mut end = 137;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("...");
+    }
+    out
+}
+
+fn build_paper_pipeline(
+    device: &wgpu::Device,
+    paper_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall paper pipeline"),
+        layout: Some(paper_pl),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_paper"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_paper"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(PREMUL_BLEND),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: WALL_DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn build_shape_pipelines(
+    device: &wgpu::Device,
+    shape_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let make = |label: &str, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(shape_pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_shape"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_shape"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    (
+        make("wall shape opaque pipeline", true),
+        make("wall shape blend pipeline", false),
+    )
+}
+
+fn build_cell_pipelines(
+    device: &wgpu::Device,
+    cell_pl: &wgpu::PipelineLayout,
+    label_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
+    let make = |label: &str, vs: &str, fs: &str, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(cell_pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(vs),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let panel = make("wall panel pipeline", "vs_panel", "fs_panel", true);
+    let fill = make("wall fill pipeline", "vs_fill", "fs_fill", true);
+    let ink = make("wall ink pipeline", "vs_ink", "fs_ink", false);
+    let cursor = make("wall cursor pipeline", "vs_cursor", "fs_cursor", false);
+    let label = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall label pipeline"),
+        layout: Some(label_pl),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_label"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_ink"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(PREMUL_BLEND),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: WALL_DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (panel, fill, ink, cursor, label)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,41 +883,7 @@ impl WallRenderer {
             bind_group_layouts: &[Some(&paper_bgl)],
             immediate_size: 0,
         });
-        let paper_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wall paper pipeline"),
-            layout: Some(&paper_pl),
-            vertex: wgpu::VertexState {
-                module: &paper_shader,
-                entry_point: Some("vs_paper"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &paper_shader,
-                entry_point: Some("fs_paper"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(PREMUL_BLEND),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: WALL_DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let paper_pipeline = build_paper_pipeline(device, &paper_pl, &paper_shader, color_format);
 
         let shape_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall shape frame uniform"),
@@ -653,45 +949,8 @@ impl WallRenderer {
             bind_group_layouts: &[Some(&shapes_bgl)],
             immediate_size: 0,
         });
-        let make_shape_pipeline = |label: &str, depth_write: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&shape_pl),
-                vertex: wgpu::VertexState {
-                    module: &shape_shader,
-                    entry_point: Some("vs_shape"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shape_shader,
-                    entry_point: Some("fs_shape"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: Some(PREMUL_BLEND),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: WALL_DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let shape_opaque_pipeline = make_shape_pipeline("wall shape opaque pipeline", true);
-        let shape_blend_pipeline = make_shape_pipeline("wall shape blend pipeline", false);
+        let (shape_opaque_pipeline, shape_blend_pipeline) =
+            build_shape_pipelines(device, &shape_pl, &shape_shader, color_format);
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -809,54 +1068,11 @@ impl WallRenderer {
             )),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let cell_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall cells pl"),
             bind_group_layouts: &[Some(&shared_bgl), Some(&term_bgl)],
             immediate_size: 0,
         });
-
-        let make_pipeline = |label: &str, vs: &str, fs: &str, depth_write: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: Some(PREMUL_BLEND),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: WALL_DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let panel_pipeline = make_pipeline("wall panel pipeline", "vs_panel", "fs_panel", true);
-        let fill_pipeline = make_pipeline("wall fill pipeline", "vs_fill", "fs_fill", true);
-        let ink_pipeline = make_pipeline("wall ink pipeline", "vs_ink", "fs_ink", false);
-        let cursor_pipeline = make_pipeline("wall cursor pipeline", "vs_cursor", "fs_cursor", false);
 
         let labels_cap = 256usize;
         let labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -891,41 +1107,10 @@ impl WallRenderer {
             bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
             immediate_size: 0,
         });
-        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wall label pipeline"),
-            layout: Some(&label_pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_label"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_ink"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(PREMUL_BLEND),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: WALL_DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let (panel_pipeline, fill_pipeline, ink_pipeline, cursor_pipeline, label_pipeline) =
+            build_cell_pipelines(device, &cell_pl, &label_pl, &shader, color_format);
+
+        let shader_watcher = ShaderWatcher::from_env(Instant::now());
 
         Self {
             glyphs,
@@ -934,6 +1119,7 @@ impl WallRenderer {
             color_format,
             paper_buf,
             paper_bg,
+            paper_pl,
             paper_pipeline,
             draw_paper: false,
             shape_frame_buf,
@@ -941,6 +1127,7 @@ impl WallRenderer {
             shapes_buf,
             shapes_cap,
             shapes_bg,
+            shape_pl,
             shape_opaque_pipeline,
             shape_blend_pipeline,
             frame_buf,
@@ -953,11 +1140,14 @@ impl WallRenderer {
             labels_buf,
             labels_cap,
             labels_bg,
+            cell_pl,
+            label_pl,
             panel_pipeline,
             fill_pipeline,
             ink_pipeline,
             cursor_pipeline,
             label_pipeline,
+            shader_watcher,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
             shape_scratch: Vec::new(),
@@ -1023,6 +1213,154 @@ impl WallRenderer {
 
     pub fn style_mut(&mut self) -> &mut WallStyle {
         &mut self.style
+    }
+
+    /// Active one-line shader reload error notice, if the latest disk reload failed validation.
+    pub fn shader_error_notice(&self) -> Option<&str> {
+        self.shader_watcher
+            .as_ref()
+            .and_then(|w| w.active_notice.as_deref())
+    }
+
+    /// Override the watched shader directory (for tests; production reads `GLYPH_WALL_SHADER_DIR`).
+    #[cfg(test)]
+    pub(crate) fn set_shader_watch_dir(&mut self, dir: Option<PathBuf>) {
+        self.shader_watcher = dir.map(|d| {
+            let mut w = ShaderWatcher::from_dir(d, Instant::now());
+            w.next_poll = Instant::now();
+            w
+        });
+    }
+
+    /// Poll `GLYPH_WALL_SHADER_DIR` for modified wall WGSL files, validate changed source with
+    /// `naga`, rebuild only the affected pipeline(s), and swap them in atomically.
+    ///
+    /// Returns `(needs_redraw, next_poll_deadline)`. When `GLYPH_WALL_SHADER_DIR` is unset,
+    /// returns `(false, None)` immediately without touching the filesystem or scheduling timers.
+    pub fn poll_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        now: Instant,
+    ) -> (bool, Option<Instant>) {
+        let Some(watcher) = self.shader_watcher.as_mut() else {
+            return (false, None);
+        };
+        if now < watcher.next_poll {
+            return (false, Some(watcher.next_poll));
+        }
+        watcher.next_poll = now + watcher.poll_interval;
+        let next_deadline = Some(watcher.next_poll);
+
+        let mut dirty = false;
+        let dir = watcher.dir.clone();
+        let mut to_reload: Vec<(usize, WatchedShaderKind, String)> = Vec::new();
+
+        for (idx, entry) in watcher.files.iter_mut().enumerate() {
+            let path = dir.join(entry.kind.file_name());
+            let stamp = file_stamp(&path);
+            if stamp.is_none() || stamp == entry.last_stamp {
+                continue;
+            }
+            entry.last_stamp = stamp;
+            match std::fs::read_to_string(&path) {
+                Ok(src) => to_reload.push((idx, entry.kind, src)),
+                Err(e) => {
+                    let msg = format!("{}: {e}", entry.kind.file_name());
+                    if entry.last_error.as_deref() != Some(msg.as_str()) {
+                        log::error!("wall shader reload failed: {msg}");
+                        entry.last_error = Some(msg.clone());
+                    }
+                    entry.notice = Some(compact_shader_error(entry.kind.file_name(), &msg));
+                }
+            }
+        }
+
+        for (idx, kind, src) in to_reload {
+            let name = kind.file_name();
+            let t0 = Instant::now();
+            match self.try_reload_shader(device, kind, &src) {
+                Ok(()) => {
+                    log::info!(
+                        "wall shader reloaded: {name} ({:.1} ms)",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    if let Some(w) = self.shader_watcher.as_mut() {
+                        w.files[idx].last_error = None;
+                        w.files[idx].notice = None;
+                    }
+                    dirty = true;
+                }
+                Err(err) => {
+                    if let Some(w) = self.shader_watcher.as_mut() {
+                        if w.files[idx].last_error.as_deref() != Some(err.as_str()) {
+                            log::error!("wall shader reload failed ({name}):\n{err}");
+                            w.files[idx].last_error = Some(err.clone());
+                        }
+                        w.files[idx].notice = Some(compact_shader_error(name, &err));
+                    }
+                }
+            }
+        }
+
+        if let Some(w) = self.shader_watcher.as_mut() {
+            if w.refresh_notice() {
+                dirty = true;
+            }
+        }
+        (dirty, next_deadline)
+    }
+
+    fn try_reload_shader(
+        &mut self,
+        device: &wgpu::Device,
+        kind: WatchedShaderKind,
+        src: &str,
+    ) -> Result<(), String> {
+        let name = kind.file_name();
+        validate_wall_wgsl(name, src, kind.entry_points())?;
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(name),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+        });
+
+        match kind {
+            WatchedShaderKind::Paper => {
+                let paper = build_paper_pipeline(device, &self.paper_pl, &module, self.color_format);
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.paper_pipeline = paper;
+            }
+            WatchedShaderKind::Shapes => {
+                let (opaque, blend) =
+                    build_shape_pipelines(device, &self.shape_pl, &module, self.color_format);
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.shape_opaque_pipeline = opaque;
+                self.shape_blend_pipeline = blend;
+            }
+            WatchedShaderKind::Cells => {
+                let (panel, fill, ink, cursor, label) = build_cell_pipelines(
+                    device,
+                    &self.cell_pl,
+                    &self.label_pl,
+                    &module,
+                    self.color_format,
+                );
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.panel_pipeline = panel;
+                self.fill_pipeline = fill;
+                self.ink_pipeline = ink;
+                self.cursor_pipeline = cursor;
+                self.label_pipeline = label;
+            }
+        }
+        Ok(())
     }
 
     /// Advance the renderer's cursor-blink phase to `now` for `terminals` and return
@@ -3246,5 +3584,139 @@ mod tests {
         );
         assert_eq!(count_cell(&px_clear, 3, 1, is_sel_bg), 0, "cleared selection must restore original background");
         assert!(count_cell(&px_clear, 3, 1, is_orig_fg) > 40, "cleared selection must restore original fg");
+    }
+
+    #[test]
+    fn gpu_shader_hot_reload_validates_swaps_and_keeps_old_on_error() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+        // With watcher disabled, poll_shaders is a zero-work no-op.
+        renderer.set_shader_watch_dir(None);
+        assert_eq!(renderer.poll_shaders(&ctx.device, Instant::now()), (false, None));
+        assert!(renderer.shader_error_notice().is_none());
+
+        // Stage all three shaders in a temporary watch directory.
+        let tmp = std::env::temp_dir().join(format!(
+            "glyph3d-shader-reload-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp shader dir");
+        let cells_src = include_str!("../shaders/wall_cells.wgsl");
+        std::fs::write(tmp.join("wall_paper.wgsl"), include_str!("../shaders/wall_paper.wgsl")).unwrap();
+        std::fs::write(tmp.join("wall_shapes.wgsl"), include_str!("../shaders/wall_shapes.wgsl")).unwrap();
+        std::fs::write(tmp.join("wall_cells.wgsl"), cells_src).unwrap();
+
+        renderer.set_shader_watch_dir(Some(tmp.clone()));
+        let mut screen = Screen::new(4, 2);
+        screen.default_bg = rgb(0x10, 0x10, 0x20);
+        let draws = [TerminalDraw {
+            id: 1,
+            screen: &screen,
+            position: Vec2::new(-2.0, 2.0),
+            z: 0.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+        }];
+        let cam = WallCamera::new(Vec2::ZERO, 32.0);
+        let (w, h) = (128, 128);
+
+        let center_rgb = |px: &[u8]| -> [u8; 3] {
+            let i = ((h / 2) * w + (w / 2)) as usize * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        // Baseline: dark blue panel (#101020).
+        let px0 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c0 = center_rgb(&px0);
+        assert!(c0[2] > c0[1], "baseline should be dark blue, got {c0:?}");
+
+        // 1. Valid edit: force panel fragment output to bright green (0.0, 0.8, 0.2).
+        let green_src = cells_src.replacen(
+            "let fill_rgb = srgb_to_output(in.fill_color.rgb);",
+            "let fill_rgb = srgb_to_output(vec3<f32>(0.0, 0.8, 0.2));",
+            1,
+        );
+        assert_ne!(green_src, cells_src, "expected fill_rgb line in wall_cells.wgsl");
+        std::fs::write(tmp.join("wall_cells.wgsl"), &green_src).unwrap();
+        let (dirty, next) = renderer.poll_shaders(&ctx.device, Instant::now() + SHADER_POLL_INTERVAL);
+        assert!(dirty, "valid edit must trigger reload");
+        assert!(next.is_some());
+        assert!(renderer.shader_error_notice().is_none());
+
+        let px1 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c1 = center_rgb(&px1);
+        assert!(c1[1] > 180 && c1[0] < 30, "reloaded shader should draw green panel, got {c1:?}");
+
+        // 2. Broken WGSL: keep green pipeline intact, expose error notice, and do not re-dirty on repeat poll.
+        std::fs::write(tmp.join("wall_cells.wgsl"), "fn broken( { !!!").unwrap();
+        let (dirty_err, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 3,
+        );
+        assert!(dirty_err, "new shader error should dirty notice");
+        let notice = renderer.shader_error_notice().expect("error notice should be set");
+        assert!(notice.contains("wall_cells.wgsl"), "notice should name shader: {notice}");
+
+        let (dirty_repeat, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 5,
+        );
+        assert!(!dirty_repeat, "unchanged broken file must not spam redraws/errors");
+
+        let px2 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c2 = center_rgb(&px2);
+        assert!(c2[1] > 180 && c2[0] < 30, "old green pipeline must stay active on error, got {c2:?}");
+
+        // 3. Fix back to original: clears notice and restores dark blue panel.
+        std::fs::write(tmp.join("wall_cells.wgsl"), cells_src).unwrap();
+        let (dirty_fix, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 7,
+        );
+        assert!(dirty_fix, "fixed shader must reload and clear notice");
+        assert!(renderer.shader_error_notice().is_none());
+        let px3 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c3 = center_rgb(&px3);
+        assert!(c3[2] > c3[1] && c3[1] < 40, "restored shader should draw dark blue again, got {c3:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
