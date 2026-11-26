@@ -39,6 +39,12 @@ impl Utf8Decoder {
         Self::default()
     }
 
+    /// True when no partial multi-byte UTF-8 sequence is buffered.
+    #[inline]
+    pub fn is_ground(&self) -> bool {
+        self.state == ACCEPT_STATE
+    }
+
     /// Feed the next byte. Returns `(codepoint, consumed)`. If `consumed`
     /// is false, an ill-formed sequence was rejected: a replacement char is
     /// returned and the SAME byte must be fed again before continuing.

@@ -157,14 +157,36 @@ pub enum MouseTracking {
     Any,
 }
 
-/// The modes a host needs to route input.
+/// How pointer coordinates and buttons are encoded when [`MouseTracking`] is
+/// active (DECSET 1005 / 1006 / 1015 / 1016, the last set winning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseFormat {
+    /// Classic X10/X11 byte encoding (default when 1005/1006/1015/1016 are off).
+    #[default]
+    X10,
+    /// DECSET 1005: UTF-8 multibyte cell coordinates.
+    Utf8,
+    /// DECSET 1006: SGR `CSI < Pb ; Px ; Py M/m` cell coordinates.
+    Sgr,
+    /// DECSET 1015: urxvt `CSI Pb ; Px ; Py M` decimal cell coordinates.
+    Urxvt,
+    /// DECSET 1016: SGR `CSI < Pb ; Px ; Py M/m` pixel coordinates.
+    SgrPixels,
+}
+
+/// The modes a host needs to route input and frame updates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Modes {
     pub alt_screen: bool,
     pub mouse: MouseTracking,
+    pub mouse_format: MouseFormat,
     pub bracketed_paste: bool,
     pub app_cursor: bool,
     pub focus_events: bool,
+    /// Active screen's Kitty keyboard protocol flags (`0..=31`, `CSI > / = / < u`).
+    pub kitty_keyboard: u8,
+    /// DECSET 2026: program is mid-frame and asked the viewer to hold presentation.
+    pub synchronized_output: bool,
 }
 
 /// A terminal's visible screen.

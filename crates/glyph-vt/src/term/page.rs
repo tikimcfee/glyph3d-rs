@@ -111,13 +111,27 @@ pub enum SemanticPrompt {
     Input,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Row {
     /// May be shorter than the grid width; cells beyond are default.
     pub cells: Vec<Cell>,
     /// This row soft-wraps into the next row.
     pub wrapped: bool,
     pub semantic: SemanticPrompt,
+    /// Set whenever cells or `wrapped` on this row may have changed since the
+    /// viewer last resolved it.
+    pub dirty: bool,
+}
+
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            cells: Vec::new(),
+            wrapped: false,
+            semantic: SemanticPrompt::Output,
+            dirty: true,
+        }
+    }
 }
 
 impl Row {
@@ -133,6 +147,7 @@ impl Row {
     /// Mutable access, growing storage (with default cells) as needed.
     #[inline]
     pub fn cell_mut(&mut self, col: usize) -> &mut Cell {
+        self.dirty = true;
         if col >= self.cells.len() {
             self.cells.resize(col + 1, Cell::default());
         }
@@ -148,10 +163,11 @@ impl Row {
     }
 
     /// Clear the whole row to blank-with-bg of `style`, at `cols` width.
-    /// A fully default clear stores nothing (empty vec).
+    /// A fully default clear stores nothing (retaining existing capacity).
     pub fn clear(&mut self, style: &Style, cols: usize) {
         self.wrapped = false;
         self.semantic = SemanticPrompt::Output;
+        self.dirty = true;
         let blank = Cell::blank_with_bg(style);
         if blank.is_default() {
             self.cells.clear();
@@ -183,15 +199,18 @@ impl Row {
                 CellContent::WideChar(_) => {
                     if col + 1 < len && self.cells[col + 1].content == CellContent::WideTail {
                         self.cells[col + 1] = Cell::blank_with_bg(style);
+                        self.dirty = true;
                     }
                 }
                 CellContent::Cluster(ref c) if c.width == 2 => {
                     if col + 1 < len && self.cells[col + 1].content == CellContent::WideTail {
                         self.cells[col + 1] = Cell::blank_with_bg(style);
+                        self.dirty = true;
                     }
                 }
                 CellContent::WideTail if col > 0 => {
                     self.cells[col - 1] = Cell::blank_with_bg(style);
+                    self.dirty = true;
                 }
                 _ => {}
             }
