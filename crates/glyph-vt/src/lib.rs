@@ -94,9 +94,12 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        // Panel foreground and background match `term_cells::Screen::new`;
-        // the 16 ANSI colours match `collections/terminalPalette.js`'s
-        // dark-panel readable palette.
+        // Matches the browser wall's terminal theme:
+        // - 16 ANSI colours: `packages/glyph3d-core/src/collections/terminalPalette.js` (`ANSI_16`)
+        // - Default foreground (`#cccccc`): `terminalPalette.js` (`RESET_FG = {0.8, 0.8, 0.8}`)
+        // - Default background (`#0a0a1e`): `collections/TerminalGrid.js` (`backgroundColor ?? 0x0a0a1e`)
+        // - Default cursor (`#6ee7a0`): `collections/TerminalGrid.js` (`TERMINAL_CURSOR_DEFAULTS.color`)
+        // - `bold_is_bright` (`false`): `collections/TerminalEmulator.js` (`BOLD_IS_BRIGHT_DEFAULT`)
         Self {
             palette: [
                 rgb(0x00, 0x00, 0x00), // 0: black
@@ -116,9 +119,9 @@ impl Default for Theme {
                 rgb(0x4d, 0xff, 0xff), // 14: bright cyan
                 rgb(0xff, 0xff, 0xff), // 15: bright white
             ],
-            fg: rgb(0xd8, 0xde, 0xe9),
-            bg: rgb(0x0d, 0x10, 0x17),
-            cursor: rgb(0xd8, 0xde, 0xe9),
+            fg: rgb(0xcc, 0xcc, 0xcc),
+            bg: rgb(0x0a, 0x0a, 0x1e),
+            cursor: rgb(0x6e, 0xe7, 0xa0),
             bold_is_bright: false,
         }
     }
