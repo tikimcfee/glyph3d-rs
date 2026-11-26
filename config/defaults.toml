@@ -391,3 +391,23 @@ region_picked_edge_opacity = 0.9
 # a whole test binary (build.toml [settings] process_timeout_secs).
 # 1..=86400. Moves no pixel: it bounds a wait, never what is drawn.
 wait_timeout_secs = 60
+
+[wall]
+# The wall canvas and terminal cell pass (2026-11-26, native/src/wall/).
+# Colours here are sRGB 0.0-1.0 (decoded with exact IEC sRGB in the shader).
+clear_color = [0.055, 0.063, 0.086, 1.0]          # #0e1016 canvas backdrop
+panel_opacity = 0.96
+panel_padding = 0.30                              # world units around the cell grid
+border_width_px = 1.5                             # hairline thickness in screen px
+border_focused_scale = 1.6                        # thickness multiplier when focused
+border_focused_color = [0.431, 0.906, 0.627, 1.0] # #6ee7a0 focus green
+border_unfocused_color = [0.24, 0.28, 0.36, 0.85] # muted slate hairline
+cursor_color = [0.431, 0.906, 0.627, 1.0]         # #6ee7a0 focus green
+cursor_fill_opacity = 0.50                        # solid focused block alpha
+cursor_border_px = 1.5                            # hollow unfocused outline in screen px
+greek_px = 8.0                                    # cell height px below which text greeks
+underline_y = 0.12                                # underline centre from cell bottom (0..1)
+strike_y = 0.42                                   # strikethrough centre from cell bottom (0..1)
+line_thickness = 0.05                             # decoration line thickness in cell heights
+curly_amplitude = 1.5                             # curly underline amplitude x thickness
+dim_alpha = 0.50                                  # SGR 2 faint ink/line opacity

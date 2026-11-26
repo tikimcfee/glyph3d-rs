@@ -39,6 +39,7 @@ pub struct Settings {
     pub quad_demo: QuadDemoSettings,
     pub library: LibrarySettings,
     pub gpu: GpuSettings,
+    pub wall: WallSettings,
 }
 
 /// The glyph field view (`--render-file`, `--load-repo`, windowed).
@@ -437,6 +438,44 @@ impl GpuSettings {
     pub fn wait_limit(&self) -> std::time::Duration {
         std::time::Duration::from_secs(u64::from(self.wait_timeout_secs))
     }
+}
+
+/// The terminal wall cell renderer (`native/src/wall/`, 2026-11-26).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WallSettings {
+    /// Canvas background clear colour (sRGB 0..1 RGBA).
+    pub clear_color: [f32; 4],
+    /// Default terminal panel background opacity (0..1).
+    pub panel_opacity: f32,
+    /// Padding around the terminal cell grid inside its panel, in world units.
+    pub panel_padding: f32,
+    /// Resting panel border hairline width in screen pixels.
+    pub border_width_px: f32,
+    /// Border thickness multiplier when a terminal is focused.
+    pub border_focused_scale: f32,
+    /// Focused terminal border colour (sRGB 0..1 RGBA).
+    pub border_focused_color: [f32; 4],
+    /// Unfocused terminal border colour (sRGB 0..1 RGBA).
+    pub border_unfocused_color: [f32; 4],
+    /// Terminal cursor colour (sRGB 0..1 RGBA).
+    pub cursor_color: [f32; 4],
+    /// Solid focused block cursor fill opacity (0..1).
+    pub cursor_fill_opacity: f32,
+    /// Hollow unfocused cursor outline width in screen pixels.
+    pub cursor_border_px: f32,
+    /// Cell height in screen pixels below which text greeks into a bar (0 = never).
+    pub greek_px: f32,
+    /// Underline centre height from cell bottom (fraction of cell height).
+    pub underline_y: f32,
+    /// Strikethrough centre height from cell bottom (fraction of cell height).
+    pub strike_y: f32,
+    /// Line decoration thickness (fraction of cell height).
+    pub line_thickness: f32,
+    /// Curly underline wave amplitude as a multiple of line thickness.
+    pub curly_amplitude: f32,
+    /// SGR 2 dim ink/line opacity multiplier (0..1).
+    pub dim_alpha: f32,
 }
 
 impl Settings {

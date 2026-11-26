@@ -96,6 +96,9 @@ pub struct Cli {
     /// Stage A quad-field demo instead of the text field
     #[arg(long)]
     pub demo: bool,
+    /// Render the terminal wall test pattern (with --screenshot PATH)
+    #[arg(long)]
+    pub wall_test_pattern: bool,
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
@@ -440,7 +443,7 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(field_mode);
     under!(present_mode);
     under!(Some frames);
-    let scene_typed = ["demo", "agent_session", "load_repo", "render_file"]
+    let scene_typed = ["demo", "wall_test_pattern", "agent_session", "load_repo", "render_file"]
         .into_iter()
         .any(typed);
     if !scene_typed {
