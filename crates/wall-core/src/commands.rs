@@ -672,7 +672,10 @@ pub trait WallApi {
     fn hide(&mut self, id: &str) -> Result<(), String>;
     fn show(&mut self, id: &str) -> Result<(), String>;
     /// Focus terminal `id` without moving or easing the camera (`wall.focus`).
-    fn focus(&mut self, id: &str) -> Result<(), String>;
+    /// Defaults to [`Self::focus_and_frame`] for minimal test doubles.
+    fn focus(&mut self, id: &str) -> Result<(), String> {
+        self.focus_and_frame(id)
+    }
     fn focus_and_frame(&mut self, id: &str) -> Result<(), String>;
     fn spawn(&mut self, at: Option<Point>) -> Result<String, String>;
     fn fit_all(&mut self) -> Result<(), String>;

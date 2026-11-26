@@ -10,23 +10,30 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use term_cells::{Modes, MouseTracking as TermMouseTracking, Screen};
+use wall_core::bus::{GomuxAgent, GomuxSnapshot};
 use wall_core::config::GroupLayout;
 use wall_core::dock::DockSide;
+use wall_core::fullscreen::BACKDROP_OPACITY;
 use wall_core::geom::{Point, Rect};
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::keymap::{KeyDecision, TerminalKey};
-use wall_core::layout::FULLSCREEN_Z;
+use wall_core::layout::{union_rect, FULLSCREEN_Z};
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
+use wall_core::names::MAP_LABEL_PAD_X_PX;
 use wall_core::pointer::{
     Buttons, CursorIcon, MouseAction, PointerEvent, ProgramMouseButton, TerminalMouseEvent,
     WheelEvent,
 };
 use wall_core::scroll::DeltaMode;
 use wall_core::selection::screen_from_lines;
+use wall_core::sidebar::AgentStatus;
 use wall_core::snap::{snap_step, snap_to, GridSpec};
+use wall_core::status::{NoticeKind, StatusTone};
 use wall_core::store::{FullscreenMode, Storage, WallStore};
-use wall_core::wall::{ScreenFillDelta, TerminalAppeared, Wall, WallFrame, WallOptions};
+use wall_core::wall::{
+    CharWidths, ScreenFillDelta, TerminalAppeared, Wall, WallFrame, WallOptions,
+};
 
 const MODS_NONE: Mods = Mods {
     shift: false,
@@ -2134,5 +2141,554 @@ fn agent_jump_live_and_terminal_scroll_live_emit_scroll_live_effect() {
     assert!(reply.text.contains("alternate screen"));
     h.pump();
     assert!(h.scroll_lives.is_empty());
+}
+
+// ── Round 3: WallFrame chrome enrichments (describe.rs) ──────────────────────
+
+#[test]
+fn frame_title_bar_and_map_label_expose_structured_agent_status() {
+    let mut h = Harness::new();
+    let plain = h.spawn();
+
+    // Unattached terminal has no attached_agent / agent_status and `name == text`.
+    let f0 = h.frame();
+    let plain_bar = f0
+        .title_bars
+        .iter()
+        .find(|b| b.terminal_id == plain)
+        .expect("plain title bar");
+    assert_eq!(plain_bar.name, plain);
+    assert_eq!(plain_bar.text, plain);
+    assert_eq!(plain_bar.attached_agent, None);
+    assert_eq!(plain_bar.agent_status, None);
+
+    // Populate a live gomuxai bus agent and attach a terminal to it.
+    let make_snap = |status: &str| GomuxSnapshot {
+        gen: 1,
+        host: Some("local".to_owned()),
+        agents: vec![GomuxAgent {
+            name: "build-bot".to_owned(),
+            host: Some("local".to_owned()),
+            live: true,
+            status: Some(status.to_owned()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    h.wall.set_bus_snapshot(Some(make_snap("waiting")), "");
+    h.run_ok("wall.attach build-bot");
+    let attached_id = h
+        .wall
+        .model()
+        .order()
+        .iter()
+        .find(|id| id.as_str() != plain.as_str())
+        .expect("attached terminal spawned")
+        .clone();
+
+    let f1 = h.frame();
+    let bar = f1
+        .title_bars
+        .iter()
+        .find(|b| b.terminal_id == attached_id)
+        .expect("attached title bar");
+    assert_eq!(bar.name, "build-bot@local");
+    assert_eq!(bar.text, "build-bot@local · waiting");
+    assert_eq!(bar.attached_agent.as_deref(), Some("build-bot@local"));
+    assert_eq!(bar.agent_status, Some(AgentStatus::Waiting));
+
+    // Even when a custom name itself contains ` · `, `name` stays distinct from `agent_status`.
+    h.run_ok(&format!("wall.rename {attached_id} \"job · waiting\""));
+    let f2 = h.frame();
+    let renamed_bar = f2
+        .title_bars
+        .iter()
+        .find(|b| b.terminal_id == attached_id)
+        .expect("renamed title bar");
+    assert_eq!(renamed_bar.name, "job · waiting");
+    assert_eq!(renamed_bar.text, "job · waiting · waiting");
+    assert_eq!(renamed_bar.agent_status, Some(AgentStatus::Waiting));
+
+    // Zoom far out so terminals hand off to map labels: MapLabelFrame carries the same structured fields.
+    h.wall.pinch(700.0, 450.0, 0.05);
+    let f_far = h.frame();
+    let ml = f_far
+        .map_labels
+        .iter()
+        .find(|m| m.terminal_id == attached_id)
+        .expect("attached map label");
+    assert_eq!(ml.name, "job · waiting");
+    assert_eq!(ml.text, "job · waiting · waiting");
+    assert_eq!(ml.attached_agent.as_deref(), Some("build-bot@local"));
+    assert_eq!(ml.agent_status, Some(AgentStatus::Waiting));
+
+    // Updating the bus status flips agent_status cleanly on both title bars and map labels.
+    h.wall.set_bus_snapshot(Some(make_snap("processing")), "");
+    let f_proc = h.frame();
+    let ml_proc = f_proc
+        .map_labels
+        .iter()
+        .find(|m| m.terminal_id == attached_id)
+        .expect("processing map label");
+    assert_eq!(ml_proc.name, "job · waiting");
+    assert_eq!(ml_proc.text, "job · waiting · processing");
+    assert_eq!(ml_proc.agent_status, Some(AgentStatus::Processing));
+}
+
+#[test]
+fn frame_group_hovered_tracks_pointer_over_group_header() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h
+        .wall
+        .groups()
+        .ids()
+        .into_iter()
+        .next()
+        .expect("created group");
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // Initially neither hovered.
+    let f0 = h.frame();
+    let g0 = f0.groups.iter().find(|g| g.id == gid).expect("group frame");
+    assert!(!g0.hovered);
+    assert_eq!(h.wall.hovered_group_id(), None);
+
+    // Move pointer over the group's header strip -> GroupFrame::hovered becomes true.
+    let header_screen = h.screen_pt(rect_center(g0.header_rect));
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: header_screen.x,
+            y: header_screen.y,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    let f1 = h.frame();
+    let g1 = f1.groups.iter().find(|g| g.id == gid).expect("group frame");
+    assert!(g1.hovered, "hovering group header must set GroupFrame::hovered");
+    assert_eq!(h.wall.hovered_group_id(), Some(gid.as_str()));
+    assert_eq!(h.wall.cursor(), CursorIcon::Move);
+
+    // Moving onto a member terminal body clears group hover and sets terminal hover.
+    let body_screen = h.screen_pt(rect_center(h.wall.terminal_rect(&t1).expect("t1 rect")));
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: body_screen.x,
+            y: body_screen.y,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    let f2 = h.frame();
+    let g2 = f2.groups.iter().find(|g| g.id == gid).expect("group frame");
+    assert!(!g2.hovered, "moving off header onto terminal must clear group hover");
+    assert_eq!(h.wall.hovered_group_id(), None);
+    assert_eq!(h.wall.hovered_id(), Some(t1.as_str()));
+
+    // Entering fullscreen also suppresses group hover.
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: header_screen.x,
+            y: header_screen.y,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    assert_eq!(h.wall.hovered_group_id(), Some(gid.as_str()));
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.settle();
+    let f_fs = h.frame();
+    assert!(
+        f_fs.groups.iter().all(|g| !g.hovered),
+        "fullscreen must not report any group header as hovered"
+    );
+}
+
+#[test]
+fn frame_fullscreen_backdrop_exposes_opacity_and_cutouts_for_single_split_and_tile() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h
+        .wall
+        .groups()
+        .ids()
+        .into_iter()
+        .next()
+        .expect("created group");
+
+    // 1. Single-pane fullscreen: opacity = BACKDROP_OPACITY (0.9), single cutout = body_rect.
+    h.run_ok(&format!("wall.fullscreen.pane on {t1}"));
+    h.settle();
+    let f_single = h.frame();
+    let veil_single = f_single
+        .fullscreen_backdrop
+        .as_ref()
+        .expect("single fullscreen backdrop");
+    assert_eq!(veil_single.mode, FullscreenMode::Single);
+    assert!((veil_single.opacity - BACKDROP_OPACITY).abs() < 1e-12);
+    let t1_body = f_single
+        .terminals
+        .iter()
+        .find(|t| t.id == t1)
+        .expect("t1")
+        .body_rect;
+    assert_eq!(veil_single.cutouts, vec![t1_body]);
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+
+    // 2. Group Tile fullscreen: one cutout per elevated member (body + visible title bar).
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.settle();
+    let f_tile = h.frame();
+    let veil_tile = f_tile
+        .fullscreen_backdrop
+        .as_ref()
+        .expect("tile fullscreen backdrop");
+    assert_eq!(veil_tile.mode, FullscreenMode::Group);
+    assert!((veil_tile.opacity - BACKDROP_OPACITY).abs() < 1e-12);
+    assert_eq!(
+        veil_tile.cutouts.len(),
+        2,
+        "tile group fullscreen must emit one cutout per elevated member"
+    );
+    for id in [&t1, &t2] {
+        let body = f_tile
+            .terminals
+            .iter()
+            .find(|t| t.id == *id)
+            .expect("term")
+            .body_rect;
+        let bar = f_tile
+            .title_bars
+            .iter()
+            .find(|b| b.terminal_id == *id)
+            .expect("bar")
+            .rect;
+        let expected = union_rect(&[body, bar]).expect("window rect");
+        assert!(
+            veil_tile.cutouts.contains(&expected),
+            "tile cutout for {id} should equal body+bar union {expected:?}, got {:?}",
+            veil_tile.cutouts
+        );
+    }
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+
+    // 3. Group Split fullscreen (bars ON): single union cutout spanning both panes + bars.
+    h.run_ok(&format!("wall.group.layout {gid} split"));
+    h.run_ok(&format!("wall.group.bars {gid} on"));
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.settle();
+    let f_split_bars = h.frame();
+    let veil_split_bars = f_split_bars
+        .fullscreen_backdrop
+        .as_ref()
+        .expect("split fullscreen backdrop");
+    assert_eq!(
+        veil_split_bars.cutouts.len(),
+        1,
+        "split group fullscreen must merge elevated panes into one cutout rect"
+    );
+    let split_win_rects: Vec<Rect> = [&t1, &t2]
+        .iter()
+        .map(|id| {
+            let body = f_split_bars
+                .terminals
+                .iter()
+                .find(|t| t.id == **id)
+                .expect("term")
+                .body_rect;
+            let bar = f_split_bars
+                .title_bars
+                .iter()
+                .find(|b| b.terminal_id == **id)
+                .expect("bar")
+                .rect;
+            union_rect(&[body, bar]).expect("win")
+        })
+        .collect();
+    let expected_union_bars = union_rect(&split_win_rects).expect("split union");
+    assert_eq!(veil_split_bars.cutouts, vec![expected_union_bars]);
+
+    // 4. Group Split fullscreen (bars OFF): single union cutout spanning body rects only.
+    h.run_ok(&format!("wall.group.bars {gid} off"));
+    h.settle();
+    let f_split_nobars = h.frame();
+    let veil_split_nobars = f_split_nobars
+        .fullscreen_backdrop
+        .as_ref()
+        .expect("split no-bars backdrop");
+    let body_union = union_rect(&[
+        f_split_nobars
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .body_rect,
+        f_split_nobars
+            .terminals
+            .iter()
+            .find(|t| t.id == t2)
+            .expect("t2")
+            .body_rect,
+    ])
+    .expect("body union");
+    assert_eq!(veil_split_nobars.cutouts, vec![body_union]);
+}
+
+#[test]
+fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+
+    // Initially no daemon notice.
+    assert_eq!(h.frame().status_notice, None);
+
+    let ok_doc = serde_json::json!({
+        "daemon": { "version": "g3d-termd/0.2.0", "engine": "glyph-vt/0.1", "ns": "test", "started_at": 100 },
+        "terminals": [{ "id": t1, "cols": 100, "rows": 30, "flow": "ok", "subscribers": [] }]
+    });
+
+    // Missing `paste` feature -> Red `Lacks` notice.
+    h.wall.on_termd_welcome("inst-1", &["key"], 100);
+    h.wall.on_termd_status(ok_doc.clone(), 100).expect("status ok");
+    let lacks = h
+        .frame()
+        .status_notice
+        .expect("missing paste op must produce Lacks notice");
+    assert_eq!(lacks.kind, NoticeKind::Lacks);
+    assert_eq!(lacks.tone, StatusTone::Red);
+    assert!(!lacks.dismiss);
+    assert!(lacks.text.contains("paste"));
+
+    // Full protocol 1.2 handshake clears Lacks.
+    h.wall.on_termd_welcome("inst-1", &["key", "paste"], 200);
+    h.wall.on_termd_status(ok_doc, 200).expect("status ok");
+    assert_eq!(h.frame().status_notice, None);
+
+    // Disconnect -> Restarting: hidden during restartNoticeMs (400 ms), then Amber, then escalates to Red Unreachable past 5 s grace.
+    h.wall.on_termd_disconnected(false, 1_000);
+    h.wall.tick(0.2, 1_200.0);
+    assert_eq!(
+        h.frame().status_notice,
+        None,
+        "restarting notice must wait until restartNoticeMs (400 ms)"
+    );
+
+    h.wall.tick(0.3, 1_500.0);
+    let restarting = h
+        .frame()
+        .status_notice
+        .expect("restarting notice should appear past 400 ms");
+    assert_eq!(restarting.kind, NoticeKind::Restarting);
+    assert_eq!(restarting.tone, StatusTone::Amber);
+    assert!(!restarting.dismiss);
+
+    h.wall.tick(5.0, 6_500.0);
+    let unreachable = h
+        .frame()
+        .status_notice
+        .expect("restarting past 5 s grace must escalate to Unreachable");
+    assert_eq!(unreachable.kind, NoticeKind::Unreachable);
+    assert_eq!(unreachable.tone, StatusTone::Red);
+    assert!(!unreachable.dismiss);
+
+    // Brain failed -> Red Failed notice.
+    h.wall.on_termd_brain_failed(7_000);
+    let failed = h.frame().status_notice.expect("Failed notice");
+    assert_eq!(failed.kind, NoticeKind::Failed);
+    assert_eq!(failed.tone, StatusTone::Red);
+    assert!(!failed.dismiss);
+
+    // Socket absent after live shells -> sticky dismissible Red Lost notice, coexisting with transient notice.
+    h.wall.on_termd_socket_absent(8_000);
+    h.wall.deliver_clipboard(&t1, "");
+    let f_both = h.frame();
+    assert!(
+        f_both.notice.as_deref().is_some_and(|s| s.contains("clipboard")),
+        "transient wall notice must remain intact alongside status_notice"
+    );
+    let lost = f_both.status_notice.expect("Lost status notice");
+    assert_eq!(lost.kind, NoticeKind::Lost);
+    assert_eq!(lost.tone, StatusTone::Red);
+    assert!(lost.dismiss, "Lost status notice must be dismissible");
+
+    // Dismissing clears status_notice without clearing the transient notice.
+    assert!(h.wall.dismiss_termd_lost());
+    assert_eq!(h.frame().status_notice, None);
+    assert!(h.frame().notice.is_some());
+}
+
+#[test]
+fn frame_measured_char_widths_shrink_map_label_pills_and_scale_title_bars() {
+    // 1. Default widths (`0.6` unit width, `7.2` map-label CSS px) vs setter (`0.53`, `6.36`).
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let label_20 = "measured-width-check";
+    assert_eq!(label_20.chars().count(), 20);
+    h.run_ok(&format!("wall.rename {t1} {label_20}"));
+
+    // Zoom far out so `t1` uses a map label.
+    h.wall.pinch(700.0, 450.0, 0.05);
+    let f_default = h.frame();
+    let ml_default = f_default
+        .map_labels
+        .iter()
+        .find(|m| m.terminal_id == t1)
+        .expect("default map label");
+    let default_w = ml_default.label_box.right - ml_default.label_box.left;
+    let expected_default_w = (20.0 * 7.2_f64).ceil() + 2.0 * MAP_LABEL_PAD_X_PX + 2.0;
+    assert!(
+        (default_w - expected_default_w).abs() < 1e-6,
+        "default pill width should be {expected_default_w}, got {default_w}"
+    );
+
+    // Supply the real font's measured advances (`0.53` unit width, `6.36` CSS px at 12 px).
+    let measured = CharWidths::new(0.53, 6.36);
+    h.wall.set_char_widths(measured);
+    assert_eq!(h.wall.char_widths(), measured);
+    let f_narrow = h.frame();
+    let ml_narrow = f_narrow
+        .map_labels
+        .iter()
+        .find(|m| m.terminal_id == t1)
+        .expect("measured map label");
+    let narrow_w = ml_narrow.label_box.right - ml_narrow.label_box.left;
+    let expected_narrow_w = (20.0 * 6.36_f64).ceil() + 2.0 * MAP_LABEL_PAD_X_PX + 2.0;
+    assert!(
+        (narrow_w - expected_narrow_w).abs() < 1e-6,
+        "measured pill width should be {expected_narrow_w}, got {narrow_w}"
+    );
+    assert!(
+        narrow_w < default_w,
+        "6.36 px/char pill ({narrow_w}) must be narrower than 7.2 px/char fallback ({default_w})"
+    );
+
+    // 2. Passing CharWidths via WallOptions applies immediately on construction and scales title bars.
+    let long_title = "a-very-long-terminal-title-that-must-shrink-to-fit-inside-its-bar";
+    let mut wall_default = Wall::in_memory(WallOptions::default());
+    wall_default.terminal_appeared(TerminalAppeared::new("t1", 30, 10).with_title(long_title));
+    let bar_default = wall_default.frame().title_bars.pop().expect("default bar");
+
+    let mut wall_measured = Wall::in_memory(WallOptions {
+        char_widths: CharWidths::from_unit_width(0.53),
+        ..WallOptions::default()
+    });
+    wall_measured.terminal_appeared(TerminalAppeared::new("t1", 30, 10).with_title(long_title));
+    let bar_measured = wall_measured.frame().title_bars.pop().expect("measured bar");
+
+    assert!(
+        bar_measured.text_height > bar_default.text_height,
+        "narrower char unit width (0.53) must fit the same long title taller ({}) than 0.6 ({})",
+        bar_measured.text_height,
+        bar_default.text_height
+    );
+}
+
+#[test]
+fn frame_map_label_hovered_tracks_terminal_and_label_pill_hover() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // Zoom far out so both terminals hand off to placed map labels.
+    h.wall.pinch(700.0, 450.0, 0.05);
+    let f0 = h.frame();
+    assert_eq!(
+        f0.map_labels.len(),
+        2,
+        "both zoomed-out terminals must have placed map labels"
+    );
+    assert!(f0.map_labels.iter().all(|m| !m.hovered));
+
+    // 1. Hovering terminal t1's body sets MapLabelFrame::hovered for t1 only.
+    let t1_screen = h.screen_pt(rect_center(h.wall.terminal_rect(&t1).expect("t1 rect")));
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: t1_screen.x,
+            y: t1_screen.y,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    let f1 = h.frame();
+    let ml1 = f1.map_labels.iter().find(|m| m.terminal_id == t1).expect("ml1");
+    let ml2 = f1.map_labels.iter().find(|m| m.terminal_id == t2).expect("ml2");
+    assert!(ml1.hovered, "hovering t1 must set its MapLabelFrame::hovered");
+    assert!(!ml2.hovered);
+
+    // 2. Hovering t2's placed map-label pill (outside t2's body) sets t2's MapLabelFrame::hovered.
+    let pill2 = ml2.label_box;
+    let pill2_x = 0.5 * (pill2.left + pill2.right);
+    let pill2_y = 0.5 * (pill2.top + pill2.bottom);
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: pill2_x,
+            y: pill2_y,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    let f2 = h.frame();
+    let ml1_after = f2.map_labels.iter().find(|m| m.terminal_id == t1).expect("ml1");
+    let ml2_after = f2.map_labels.iter().find(|m| m.terminal_id == t2).expect("ml2");
+    assert!(!ml1_after.hovered);
+    assert!(
+        ml2_after.hovered,
+        "hovering t2's map-label pill must set its MapLabelFrame::hovered"
+    );
+
+    // 3. Moving to empty canvas clears all map-label hover states.
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            x: 5.0,
+            y: 5.0,
+            button: None,
+            buttons: Buttons::NONE,
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    let f3 = h.frame();
+    assert!(
+        f3.map_labels.iter().all(|m| !m.hovered),
+        "moving to empty canvas must clear MapLabelFrame::hovered"
+    );
 }
 
