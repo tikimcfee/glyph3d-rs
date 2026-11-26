@@ -60,6 +60,68 @@ pub struct SavedCursor {
 /// (`resize_reflow`) and sends nothing; neither does `clear_all`.
 pub type ScrollbackSink = Arc<dyn Fn(&Row) + Send + Sync>;
 
+/// Scroll activity accumulated on a [`Screen`] since the last `Vt::fill`.
+#[derive(Clone, Debug, Default)]
+pub struct PendingScroll {
+    /// Rows scrolled off row `0` (`scroll_top == 0 && full_width_margins()`,
+    /// excluding `CSI M` line deletions).
+    pub scrolled_top: u32,
+    /// True if at least one full-screen upward scroll (`0..rows`, full width,
+    /// not `CSI M`) occurred since the last fill.
+    pub saw_full_screen_up: bool,
+    /// True if any margin-bounded scroll (`DECSTBM` / `DECSLRM`), downward
+    /// scroll (`RI` / `CSI T` / `CSI L`), or `CSI M` line deletion occurred.
+    pub saw_margin_scroll: bool,
+    /// Per-row half-open column span `(lo, hi)` (`lo < hi`) of cells moved by
+    /// margin/downward/delete-line scrolls since the last fill.
+    pub margin_moved_cols: Vec<(u16, u16)>,
+}
+
+impl PendingScroll {
+    pub fn reset(&mut self) {
+        self.scrolled_top = 0;
+        self.saw_full_screen_up = false;
+        self.saw_margin_scroll = false;
+        self.margin_moved_cols.fill((0, 0));
+    }
+
+    pub fn record_margin_move(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+    ) {
+        if self.margin_moved_cols.len() != rows {
+            self.margin_moved_cols.resize(rows, (0, 0));
+        }
+        let full_hi = cols.min(u16::MAX as usize) as u16;
+        if self.saw_full_screen_up {
+            // Earlier in the same batch the whole screen scrolled up and now a
+            // sub-region or downward scroll moved rows non-uniformly: mark all
+            // rows moved in place.
+            self.margin_moved_cols.fill((0, full_hi));
+            self.saw_full_screen_up = false;
+        }
+        self.saw_margin_scroll = true;
+        let lo = left.min(cols).min(u16::MAX as usize) as u16;
+        let hi = (right.saturating_add(1)).min(cols).min(u16::MAX as usize) as u16;
+        if lo < hi && rows > 0 {
+            let end = bottom.min(rows - 1);
+            for slot in &mut self.margin_moved_cols[top.min(end)..=end] {
+                if slot.0 >= slot.1 {
+                    *slot = (lo, hi);
+                } else {
+                    slot.0 = slot.0.min(lo);
+                    slot.1 = slot.1.max(hi);
+                }
+            }
+        }
+    }
+}
+
 pub struct Screen {
     pub cols: usize,
     pub rows: usize,
@@ -88,6 +150,9 @@ pub struct Screen {
     /// previously printed cell, to append combining input.
     pub previous_char: Option<(usize, usize)>,
 
+    /// Scroll tracking accumulated between `Vt::fill` calls.
+    pub pending_scroll: PendingScroll,
+
     /// See [`ScrollbackSink`]; none by default.
     pub scrollback_sink: Option<ScrollbackSink>,
 }
@@ -111,6 +176,7 @@ impl Screen {
             left_margin: 0,
             right_margin: cols - 1,
             previous_char: None,
+            pending_scroll: PendingScroll::default(),
             scrollback_sink: None,
         }
     }
@@ -155,9 +221,65 @@ impl Screen {
     /// a scrollback screen, evicted rows go to history. Blank rows appear
     /// at the bottom carrying the pen's bg (`style`).
     pub fn scroll_up(&mut self, count: usize, style: &Style) {
-        let count = count.min(self.scroll_bottom - self.scroll_top + 1);
+        self.scroll_up_inner(count, style, false);
+    }
+
+    /// Scroll up for `CSI M` (`DL`, delete lines): shifts `scroll_top..=scroll_bottom`
+    /// upward without counting as output scrolled off the top of the screen.
+    pub fn scroll_up_delete_lines(&mut self, count: usize, style: &Style) {
+        self.scroll_up_inner(count, style, true);
+    }
+
+    fn scroll_up_inner(&mut self, count: usize, style: &Style, is_delete_lines: bool) {
+        let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top) + 1);
         if count == 0 {
             return;
+        }
+
+        if is_delete_lines {
+            self.pending_scroll.record_margin_move(
+                self.rows,
+                self.cols,
+                self.scroll_top,
+                self.scroll_bottom,
+                self.left_margin,
+                self.right_margin,
+            );
+        } else if self.scroll_top == 0
+            && self.scroll_bottom + 1 == self.rows
+            && self.full_width_margins()
+        {
+            self.pending_scroll.scrolled_top = self
+                .pending_scroll
+                .scrolled_top
+                .saturating_add(count as u32);
+            if self.pending_scroll.saw_margin_scroll {
+                self.pending_scroll.record_margin_move(
+                    self.rows,
+                    self.cols,
+                    0,
+                    self.rows.saturating_sub(1),
+                    0,
+                    self.cols.saturating_sub(1),
+                );
+            } else {
+                self.pending_scroll.saw_full_screen_up = true;
+            }
+        } else {
+            if self.scroll_top == 0 && self.full_width_margins() {
+                self.pending_scroll.scrolled_top = self
+                    .pending_scroll
+                    .scrolled_top
+                    .saturating_add(count as u32);
+            }
+            self.pending_scroll.record_margin_move(
+                self.rows,
+                self.cols,
+                self.scroll_top,
+                self.scroll_bottom,
+                self.left_margin,
+                self.right_margin,
+            );
         }
 
         if self.full_width_margins() {
@@ -174,10 +296,15 @@ impl Screen {
                         sink(&row);
                     }
                     self.scrollback.push_back(row);
+                    self.active[self.scroll_bottom].clear(style, self.cols);
                 } else {
-                    // Dropped.
+                    // Recycle the evicted row's Vec<Cell> capacity into scroll_bottom.
+                    row.clear(style, self.cols);
+                    self.active[self.scroll_bottom] = row;
                 }
-                self.active[self.scroll_bottom].clear(style, self.cols);
+            }
+            for y in self.scroll_top..=self.scroll_bottom {
+                self.active[y].dirty = true;
             }
             if to_history && self.scrollback.len() > self.max_scrollback {
                 let overflow = self.scrollback.len() - self.max_scrollback;
@@ -192,19 +319,35 @@ impl Screen {
             for y in self.scroll_top..=self.scroll_bottom {
                 let src_y = y + count;
                 if src_y <= self.scroll_bottom {
-                    let src: Vec<Cell> = (l..=r)
+                    let mut src: Vec<Cell> = (l..=r)
                         .map(|x| self.active[src_y].cell(x).cloned().unwrap_or_default())
                         .collect();
+                    if let Some(first) = src.first_mut() {
+                        if first.content == crate::term::page::CellContent::WideTail {
+                            *first = Cell::blank_with_bg(&first.style);
+                        }
+                    }
+                    if let Some(last) = src.last_mut() {
+                        if last.content.is_wide_head() {
+                            *last = Cell::blank_with_bg(&last.style);
+                        }
+                    }
                     let dst = &mut self.active[y];
+                    dst.split_wide_at(l, style);
+                    dst.split_wide_at(r, style);
                     for (i, cell) in src.into_iter().enumerate() {
                         *dst.cell_mut(l + i) = cell;
                     }
+                    dst.dirty = true;
                 } else {
                     let blank = Cell::blank_with_bg(style);
                     let dst = &mut self.active[y];
+                    dst.split_wide_at(l, style);
+                    dst.split_wide_at(r, style);
                     for x in l..=r {
                         *dst.cell_mut(x) = blank.clone();
                     }
+                    dst.dirty = true;
                 }
             }
         }
@@ -213,35 +356,62 @@ impl Screen {
     /// Scroll the scroll region down by `count`: blank rows appear at the
     /// top. Never touches scrollback.
     pub fn scroll_down(&mut self, count: usize, style: &Style) {
-        let count = count.min(self.scroll_bottom - self.scroll_top + 1);
+        let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top) + 1);
         if count == 0 {
             return;
         }
+        self.pending_scroll.record_margin_move(
+            self.rows,
+            self.cols,
+            self.scroll_top,
+            self.scroll_bottom,
+            self.left_margin,
+            self.right_margin,
+        );
 
         if self.full_width_margins() {
             for _ in 0..count {
-                self.active.remove(self.scroll_bottom);
-                self.active.insert(self.scroll_top, Row::new());
-                self.active[self.scroll_top].clear(style, self.cols);
+                let mut recycled = self.active.remove(self.scroll_bottom);
+                recycled.clear(style, self.cols);
+                self.active.insert(self.scroll_top, recycled);
+            }
+            for y in self.scroll_top..=self.scroll_bottom {
+                self.active[y].dirty = true;
             }
         } else {
             let (l, r) = (self.left_margin, self.right_margin);
             for y in (self.scroll_top..=self.scroll_bottom).rev() {
                 if y >= self.scroll_top + count {
                     let src_y = y - count;
-                    let src: Vec<Cell> = (l..=r)
+                    let mut src: Vec<Cell> = (l..=r)
                         .map(|x| self.active[src_y].cell(x).cloned().unwrap_or_default())
                         .collect();
+                    if let Some(first) = src.first_mut() {
+                        if first.content == crate::term::page::CellContent::WideTail {
+                            *first = Cell::blank_with_bg(&first.style);
+                        }
+                    }
+                    if let Some(last) = src.last_mut() {
+                        if last.content.is_wide_head() {
+                            *last = Cell::blank_with_bg(&last.style);
+                        }
+                    }
                     let dst = &mut self.active[y];
+                    dst.split_wide_at(l, style);
+                    dst.split_wide_at(r, style);
                     for (i, cell) in src.into_iter().enumerate() {
                         *dst.cell_mut(l + i) = cell;
                     }
+                    dst.dirty = true;
                 } else {
                     let blank = Cell::blank_with_bg(style);
                     let dst = &mut self.active[y];
+                    dst.split_wide_at(l, style);
+                    dst.split_wide_at(r, style);
                     for x in l..=r {
                         *dst.cell_mut(x) = blank.clone();
                     }
+                    dst.dirty = true;
                 }
             }
         }
@@ -266,14 +436,17 @@ impl Screen {
         for row in &mut self.active {
             if row.cells.len() > cols {
                 row.cells.truncate(cols);
-                // Never leave half a wide char at the edge.
-                if let Some(last) = row.cells.last_mut() {
-                    if last.content.is_wide_head() {
-                        *last = Cell::default();
-                    }
-                }
                 row.wrapped = false;
             }
+            // Never leave half a wide char at the right edge (incl. cols == 1).
+            if row.cells.len() == cols {
+                if let Some(last) = row.cells.last_mut() {
+                    if last.content.is_wide_head() {
+                        *last = Cell::blank_with_bg(&last.style);
+                    }
+                }
+            }
+            row.dirty = true;
         }
         self.cols = cols;
         self.rows = rows;
@@ -364,7 +537,7 @@ impl Screen {
             let mut x = 0usize;
             let mut cell_index = 0usize;
             let total = cells.len();
-            let mut iter = cells.into_iter().peekable();
+            let mut iter = cells.into_iter();
             loop {
                 if let Some(off) = cursor_off {
                     if off == cell_index {
@@ -372,7 +545,26 @@ impl Screen {
                     }
                 }
                 let Some(cell) = iter.next() else { break };
+                if cell.content == crate::term::page::CellContent::WideTail {
+                    // WideTail cells are regenerated directly alongside their
+                    // wide head below; skip old tails instead of emitting a
+                    // third column or an orphan tail at column 0.
+                    cell_index += 1;
+                    continue;
+                }
                 let width = cell.content.width().max(1) as usize;
+                if width == 2 && cols == 1 {
+                    // A 1-column screen cannot fit a 2-column glyph.
+                    if x >= 1 {
+                        row.wrapped = true;
+                        new_rows.push(std::mem::take(&mut row));
+                        row.semantic = semantic;
+                    }
+                    *row.cell_mut(0) = Cell::blank_with_bg(&cell.style);
+                    x = 1;
+                    cell_index += 1;
+                    continue;
+                }
                 if x + width > cols {
                     // Wrap. A wide char that doesn't fit leaves a spacer.
                     if width == 2 && x < cols {
@@ -385,16 +577,17 @@ impl Screen {
                     row.semantic = semantic;
                     x = 0;
                 }
-                let is_tail =
-                    cell.content == crate::term::page::CellContent::WideTail;
-                if !is_tail {
-                    *row.cell_mut(x) = cell;
-                    x += width;
-                } else {
-                    // Tail cells re-emerge from their heads.
-                    *row.cell_mut(x) = cell;
-                    x += 1;
+                let head_style = cell.style;
+                let head_link = cell.hyperlink;
+                *row.cell_mut(x) = cell;
+                if width == 2 {
+                    *row.cell_mut(x + 1) = Cell {
+                        content: crate::term::page::CellContent::WideTail,
+                        style: head_style,
+                        hyperlink: head_link,
+                    };
                 }
+                x += width;
                 cell_index += 1;
                 let _ = total;
             }
@@ -533,6 +726,9 @@ impl Screen {
                     remove -= 1;
                 }
             }
+        }
+        for row in &mut self.active {
+            row.dirty = true;
         }
         self.rows = rows;
         self.cursor.y = self.cursor.y.min(rows - 1);

@@ -252,14 +252,19 @@ pub fn build_primary_screen() -> Screen {
     c = write_run(&mut s, 10, c, "  ", RunStyle::fg(fg));
     write_run(&mut s, 10, c, "dim faint text", RunStyle::fg(fg).with_attrs(attrs::DIM));
 
-    // Row 12: wide emoji + cluster emoji + adjacent cell fill (proves fill never covers ink)
+    // Row 12: varied sparse emoji (single, adjacent full-bleed squares, flag, skin tone,
+    // keycap, VS16 vs VS15 heart, ZWJ family + curly underline, adjacent cell fill)
     c = 1;
     c = write_run(&mut s, 12, c, "Emoji: ", RunStyle::fg(fg));
     c = write_run(&mut s, 12, c, "🚀", RunStyle::fg(fg).with_bg(rgb(0x28, 0x34, 0x57)));
     c = write_run(&mut s, 12, c, "X", RunStyle::fg(dark).with_bg(green));
-    c = write_run(&mut s, 12, c, " rocket  ", RunStyle::fg(fg));
-    c = write_run(&mut s, 12, c, "🐀", RunStyle::fg(fg).with_bg(rgb(0x3b, 0x2a, 0x45)));
-    c = write_run(&mut s, 12, c, " rat  ", RunStyle::fg(fg));
+    c = write_run(&mut s, 12, c, " 🐀🔥🎉🦀🌈🍕🟥🟦 ", RunStyle::fg(fg));
+    c = write_cluster(&mut s, 12, c, "\u{1F1FA}\u{1F1F8}", RunStyle::fg(fg));
+    c = write_cluster(&mut s, 12, c, "\u{1F44D}\u{1F3FD}", RunStyle::fg(fg));
+    c = write_cluster(&mut s, 12, c, "1\u{FE0F}\u{20E3}", RunStyle::fg(fg));
+    c = write_cluster(&mut s, 12, c, "\u{2764}\u{FE0F}", RunStyle::fg(fg));
+    c = write_narrow_cluster(&mut s, 12, c, "\u{2764}\u{FE0E}", RunStyle::fg(red));
+    c = write_run(&mut s, 12, c, " ", RunStyle::fg(fg));
     c = write_cluster(
         &mut s,
         12,
@@ -270,7 +275,7 @@ pub fn build_primary_screen() -> Screen {
             .with_ul(yellow)
             .with_attrs((attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT) | attrs::UNDERLINE_COLOR),
     );
-    write_run(&mut s, 12, c, " zwj+curly", RunStyle::fg(fg));
+    write_run(&mut s, 12, c, " zwj", RunStyle::fg(fg));
 
     // Row 14: regular, bold, italic, and bold-italic side by side + accented clusters
     c = 1;

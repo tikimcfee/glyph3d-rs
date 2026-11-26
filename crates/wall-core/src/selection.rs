@@ -318,6 +318,82 @@ impl TerminalSelection {
         true
     }
 
+    /// True when any currently selected cell overlaps a per-row in-place
+    /// rewritten column span `(lo, hi)` (`lo < hi`, as reported by
+    /// `glyph_vt::FillDelta::rewritten_cols`).
+    pub fn overlaps_rewritten(&self, cols: u16, rewritten_cols: &[(u16, u16)]) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let cols_usize = usize::from(cols);
+        for y in self.r0..=self.r1 {
+            let sel_lo = self.lo(y);
+            let sel_hi = self.hi(y, cols_usize);
+            if sel_hi <= sel_lo {
+                continue;
+            }
+            if let Some(&(lo, hi)) = rewritten_cols.get(y) {
+                if lo < hi && usize::from(lo) < sel_hi && usize::from(hi) > sel_lo {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Maintain selection lifetime and coordinates across a `Vt::fill` update
+    /// (`docs/architecture/terminals.md` "Text selection", mirroring
+    /// `TerminalGrid.applyScreen` in the JS wall):
+    ///
+    /// 1. Clears on terminal resize (`resized`).
+    /// 2. On a whole-screen upward scroll (`scrolled_top > 0 && !within_margins`),
+    ///    shifts the selection up with its text via [`Self::shift`], clearing
+    ///    when any selected row leaves row `0`. (Scrolls confined to margins do
+    ///    not shift the whole screen; cells moved inside margins are reported
+    ///    in `rewritten_cols`.)
+    /// 3. Clears if any selected cell was rewritten in place (`rewritten_cols`,
+    ///    covering text, SGR attributes, or colour).
+    ///
+    /// Returns `true` when an active non-empty selection moved or cleared so
+    /// the host knows to repaint selection highlights.
+    pub fn sync_after_fill(
+        &mut self,
+        screen: &Screen,
+        resized: bool,
+        scrolled_top: u32,
+        within_margins: bool,
+        rewritten_cols: &[(u16, u16)],
+    ) -> bool {
+        if !self.active {
+            return false;
+        }
+        let had_cells = !self.is_empty();
+        if resized {
+            self.clear();
+            return had_cells;
+        }
+        let mut moved = false;
+        if scrolled_top > 0 && !within_margins {
+            let max_step = isize::MAX as usize;
+            let step = usize::try_from(scrolled_top)
+                .unwrap_or(max_step)
+                .min(max_step) as isize;
+            if !self.shift(step) {
+                return had_cells;
+            }
+            moved = had_cells;
+        }
+        if screen.rows == 0 || self.r1 >= usize::from(screen.rows) {
+            self.clear();
+            return had_cells;
+        }
+        if self.overlaps_rewritten(screen.cols, rewritten_cols) {
+            self.clear();
+            return had_cells;
+        }
+        moved
+    }
+
     /// First selected column on row `y` (paired with [`Self::hi`]: selected
     /// columns are `[lo, hi)`, or none when `hi <= lo`).
     pub fn lo(&self, y: usize) -> usize {
@@ -893,5 +969,97 @@ mod tests {
         assert!(!s.extend(&src, 0.4, 1.7));
         assert!(s.extend(&src, 2.6, 1.5));
         assert_eq!(s.text(&src), "wxy");
+    }
+
+    #[test]
+    fn live_vt_selection_follows_scroll_survives_other_edits_and_clears_on_overwrite_margin_or_resize()
+    {
+        use glyph_vt::{Theme, Vt};
+
+        let pump = |vt: &mut Vt, screen: &mut Screen, sel: &mut TerminalSelection| -> bool {
+            if vt.fill(screen) {
+                let d = vt.last_fill_delta();
+                sel.sync_after_fill(
+                    screen,
+                    d.resized,
+                    d.scrolled_top,
+                    d.within_margins(),
+                    d.rewritten_cols(),
+                )
+            } else {
+                false
+            }
+        };
+
+        let theme = Theme::default();
+        let mut vt = Vt::new(20, 5, &theme);
+        let mut screen = Screen::new(20, 5);
+        let mut sel = TerminalSelection::new();
+
+        // Populate 5 rows; row 3 holds "alpha target omega".
+        vt.feed(b"line 0\r\nline 1\r\nline 2\r\nalpha target omega\r\nline 4");
+        pump(&mut vt, &mut screen, &mut sel);
+
+        // 1. Double-click "target" on row 3 (cols 6..12).
+        sel.start(&screen, 8.5, 3.5, SelectionMode::Word, false);
+        assert_eq!(sel.text(&screen), "target");
+        assert_eq!([sel.r0, sel.c0, sel.r1, sel.c1], [3, 6, 3, 12]);
+
+        // 2. Print 2 lines at the bottom: whole screen scrolls up by 2, carrying
+        //    "target" from row 3 -> row 1 with its text intact.
+        vt.feed(b"\r\nline 5\r\nline 6");
+        assert!(pump(&mut vt, &mut screen, &mut sel));
+        assert!(sel.active);
+        assert_eq!([sel.r0, sel.c0, sel.r1, sel.c1], [1, 6, 1, 12]);
+        assert_eq!(sel.text(&screen), "target");
+
+        // 3. Rewrite "alpha" -> "ALPHA" on the SAME row (cols 0..5, outside 6..12):
+        //    the selected cells were not rewritten, so the selection survives.
+        vt.feed(b"\x1b[2;1HALPHA");
+        assert!(!pump(&mut vt, &mut screen, &mut sel));
+        assert!(sel.active);
+        assert_eq!(sel.text(&screen), "target");
+
+        // 4. Overwrite one cell inside "target" (col 8, 'r' -> 'R'): selection clears!
+        vt.feed(b"\x1b[2;9HR");
+        assert!(pump(&mut vt, &mut screen, &mut sel));
+        assert!(!sel.active);
+        assert!(sel.is_empty());
+        assert_eq!(sel.text(&screen), "");
+
+        // 5. Select "omega" on row 1 (cols 13..18), then scroll 2 more lines so row 1
+        //    leaves row 0 off the top -> selection clears.
+        sel.start(&screen, 15.0, 1.5, SelectionMode::Word, false);
+        assert_eq!(sel.text(&screen), "omega");
+        vt.feed(b"\x1b[5;1H\r\nline 7\r\nline 8");
+        assert!(pump(&mut vt, &mut screen, &mut sel));
+        assert!(!sel.active);
+
+        // 6. Margin scroll (`DECSTBM` rows 3..=5, 0-based 2..=4):
+        //    - A selection on row 0 (outside the margin) stays untouched.
+        //    - A selection on row 3 (inside the margin) clears when the margin scrolls.
+        vt.feed(b"\x1b[1;1Hheader pinned");
+        pump(&mut vt, &mut screen, &mut sel);
+        sel.start(&screen, 2.0, 0.5, SelectionMode::Word, false);
+        assert_eq!(sel.text(&screen), "header");
+        vt.feed(b"\x1b[3;5r\x1b[5;1H\n\x1b[r");
+        assert!(!pump(&mut vt, &mut screen, &mut sel));
+        assert!(sel.active);
+        assert_eq!(sel.text(&screen), "header");
+
+        vt.feed(b"\x1b[4;1Hinside region");
+        pump(&mut vt, &mut screen, &mut sel);
+        sel.start(&screen, 2.0, 3.5, SelectionMode::Word, false);
+        assert_eq!(sel.text(&screen), "inside");
+        vt.feed(b"\x1b[3;5r\x1b[5;1H\n\x1b[r");
+        assert!(pump(&mut vt, &mut screen, &mut sel));
+        assert!(!sel.active);
+
+        // 7. Resize always drops an active selection even when row 0's text stays put.
+        sel.start(&screen, 2.0, 0.5, SelectionMode::Word, false);
+        assert_eq!(sel.text(&screen), "header");
+        vt.resize(24, 5);
+        assert!(pump(&mut vt, &mut screen, &mut sel));
+        assert!(!sel.active);
     }
 }

@@ -212,23 +212,19 @@ impl ZoomKeys {
 
     /// Parse a whitespace-separated `zoomKeys` setting string (`ctrl`, `alt`, `meta`, `shift`).
     pub fn parse(spec: &str) -> Result<ZoomKeys, String> {
+        let parsed = crate::chord::parse_zoom_keys(spec)?;
         let mut keys = ZoomKeys {
             ctrl: false,
             alt: false,
             meta: false,
             shift: false,
         };
-        for word in spec.split_whitespace() {
-            match word {
-                "ctrl" => keys.ctrl = true,
-                "alt" => keys.alt = true,
-                "meta" => keys.meta = true,
-                "shift" => keys.shift = true,
-                other => {
-                    return Err(format!(
-                        "\"{other}\" is not a modifier (ctrl, alt, meta, shift)"
-                    ));
-                }
+        for key in parsed {
+            match key {
+                crate::chord::ZoomKey::Ctrl => keys.ctrl = true,
+                crate::chord::ZoomKey::Alt => keys.alt = true,
+                crate::chord::ZoomKey::Meta => keys.meta = true,
+                crate::chord::ZoomKey::Shift => keys.shift = true,
             }
         }
         Ok(keys)
@@ -250,58 +246,20 @@ impl Default for ZoomKeys {
 }
 
 /// Whether `mods` inverts grid snapping during an active move, resize, or group drag
-/// (`chord.invertsSnap`: `Ctrl` on every platform).
-pub const fn inverts_snap(mods: Mods) -> bool {
-    mods.ctrl
-}
+/// (unified with [`crate::chord::inverts_snap`]).
+pub use crate::chord::inverts_snap;
 
 /// Whether `mods` requests rectangular column-block text selection on `platform`
-/// (`chord.blockSelects`: `⌘⌥` on macOS, `Alt` + `Ctrl` or `Super` elsewhere).
+/// (delegates to [`crate::chord::block_selects`]).
 pub const fn block_selects(mods: Mods, platform: Platform) -> bool {
-    if !mods.alt {
-        return false;
-    }
-    match platform {
-        Platform::Mac => mods.meta,
-        Platform::Other => mods.ctrl || mods.meta,
-    }
+    crate::chord::block_selects(platform, mods)
 }
 
-/// Terminal program DECSET mouse-reporting mode (`TerminalGrid.mouseTracking`).
-///
-/// Local seam in `pointer.rs` until `mouse.rs` lands.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum MouseTracking {
-    /// Mouse reporting off.
-    #[default]
-    None,
-    /// X10 compatibility press-only reporting (`DECSET 9`).
-    X10,
-    /// Normal press + release reporting (`DECSET 1000`).
-    Normal,
-    /// Button-event drag reporting while a button is held (`DECSET 1002`).
-    Button,
-    /// Any-event motion reporting including hover (`DECSET 1003`).
-    Any,
-}
+/// Terminal program DECSET mouse-reporting mode (unified with [`crate::mouse::MouseTracking`]).
+pub use crate::mouse::MouseTracking;
 
-/// Action reported to a mouse-tracking terminal program (`WallMouse._send`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MouseAction {
-    Press,
-    Release,
-    Move,
-}
-
-impl MouseAction {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            MouseAction::Press => "press",
-            MouseAction::Release => "release",
-            MouseAction::Move => "move",
-        }
-    }
-}
+/// Action reported to a mouse-tracking terminal program (unified with [`crate::mouse::MouseAction`]).
+pub use crate::mouse::MouseAction;
 
 /// Button identifier in a [`TerminalMouseEvent`] (`'left'`, `'middle'`, `'right'`, `8`,
 /// `9`, or `'none'` for buttonless hover motion).
@@ -351,23 +309,8 @@ impl TerminalMouseEvent {
     }
 }
 
-/// W3C modifier names in `WallMouse.modsOf` order.
-pub fn mods_of(mods: Mods) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if mods.shift {
-        out.push("Shift");
-    }
-    if mods.ctrl {
-        out.push("Control");
-    }
-    if mods.alt {
-        out.push("Alt");
-    }
-    if mods.meta {
-        out.push("Meta");
-    }
-    out
-}
+/// W3C modifier names in `WallMouse.modsOf` order (unified with [`crate::mouse::mods_of`]).
+pub use crate::mouse::mods_of;
 
 /// Primary button reported for a motion event with `held` buttons depressed, in xterm
 /// priority order (`left`, `middle`, `right`, `8`, `9`, else `'none'`; `WallMouse.heldButton`).
@@ -445,18 +388,8 @@ impl Default for PointerConfig {
 }
 
 /// Fractional and integer cell coordinates of a point over a terminal's cell grid
-/// (`GridBackground.cellAtPoint` / `TerminalGrid.cellAt`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CellPoint {
-    /// Continuous column offset from the grid's left edge, clamped to `[0.0, cols]`.
-    pub x: f64,
-    /// Continuous row offset from the grid's top edge, clamped to `[0.0, rows]`.
-    pub y: f64,
-    /// Zero-based column index clamped to `0..cols`.
-    pub col: u32,
-    /// Zero-based row index clamped to `0..rows`.
-    pub row: u32,
-}
+/// (unified with [`crate::mouse::CellPoint`]).
+pub use crate::mouse::CellPoint;
 
 /// Convert local terminal coordinates `(local_x, local_y)` (where cell `(c, r)` has its
 /// glyph slot at `(c * stride.x, -r * stride.y)`, left edge and vertical centre) into a
@@ -474,13 +407,8 @@ pub fn cell_at_point(cols: u32, rows: u32, stride: Point, local_x: f64, local_y:
     CellPoint { x, y, col, row }
 }
 
-/// Granularity of a terminal text selection drag (`CLICK_MODES` in `WallPointer.js`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SelectionMode {
-    Cell,
-    Word,
-    Line,
-}
+/// Granularity of a terminal text selection drag (unified with [`crate::selection::SelectionMode`]).
+pub use crate::selection::SelectionMode;
 
 /// Hit-test target under a world point returned by [`PointerHost::hit`].
 #[derive(Clone, Debug, PartialEq)]
@@ -506,13 +434,8 @@ impl From<Hit> for CanvasHit {
     }
 }
 
-/// Layout mode of a terminal group (`'tile' | 'freeform' | 'split'`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GroupLayoutKind {
-    Tile,
-    Freeform,
-    Split,
-}
+/// Layout mode of a terminal group (unified with [`crate::config::GroupLayout`]).
+pub use crate::config::GroupLayout as GroupLayoutKind;
 
 /// Active fullscreen state inspected by [`WallPointer`].
 #[derive(Clone, Debug, PartialEq, Eq)]

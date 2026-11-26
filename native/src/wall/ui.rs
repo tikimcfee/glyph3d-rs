@@ -155,6 +155,18 @@ impl WallUi {
         &self.ctx
     }
 
+    /// The system clipboard's text, through the window's own clipboard
+    /// (`smithay-clipboard` on Wayland, where a fresh `arboard` speaks only
+    /// X11 and fails; `arboard` elsewhere).
+    pub fn clipboard_text(&mut self) -> Option<String> {
+        self.state.clipboard_text()
+    }
+
+    /// Put text on the system clipboard, through the same door.
+    pub fn set_clipboard_text(&mut self, text: String) {
+        self.state.set_clipboard_text(text);
+    }
+
     /// **Call 1 of 3:** feed a winit [`WindowEvent`] to egui first.
     ///
     /// When no panel was open on the last frame (`!self.is_active()`), this

@@ -119,21 +119,9 @@ fn main() {
         #[cfg(feature = "windowed")]
         CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
             let ctx = pollster::block_on(gpu::init(None));
-            let open: Box<dyn FnOnce(std::sync::Arc<dyn Fn() + Send + Sync>) -> wall::app::Opened> = if pattern {
-                Box::new(|_wake| wall::app::Opened {
-                    terminals: vec![Box::new(wall::app::StaticTerminal(wall::test_pattern::build_primary_screen())) as Box<dyn wall::app::Terminal>],
-                    spawn: None,
-                })
-            } else {
-                Box::new(move |wake| match wall::session::open(&namespace, wake) {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        eprintln!("error: the wall could not reach its terminals: {e}");
-                        std::process::exit(1);
-                    }
-                })
-            };
-            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, exit_after: frames.map(u64::from), open });
+            // The test pattern needs no daemon: one fixed screen.
+            let namespace = (!pattern).then_some(namespace);
+            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, namespace, exit_after: frames.map(u64::from) });
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {

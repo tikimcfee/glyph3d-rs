@@ -604,67 +604,120 @@ impl Parser {
         }
     }
 
-    /// Consume one byte; returns exit/transition/entry actions in order.
-    pub fn next(&mut self, byte: u8) -> [Option<Action>; 3] {
+    /// Consume one byte and emit 0..=3 exit/transition/entry actions in order.
+    /// Avoids constructing `[Option<Action>; 3]` (312 bytes) on parameter,
+    /// intermediate, and payload bytes that stay in the same state.
+    #[inline]
+    pub fn step(&mut self, byte: u8, mut emit: impl FnMut(Action)) {
         let effect = TABLE[byte as usize][self.state as usize];
         let next_state = effect.state;
-        let changed = self.state != next_state;
-
-        // When going from one state to another, the actions take place in
-        // this order: exit action from the old state, transition action,
-        // entry action into the new state.
-        let exit = if !changed {
-            None
-        } else {
-            match self.state {
-                State::OscString => self.osc_parser.end(Some(byte)).map(Action::OscDispatch),
-                State::DcsPassthrough => Some(Action::DcsUnhook),
-                State::SosPmApcString => Some(Action::ApcEnd),
-                _ => None,
+        if self.state == next_state {
+            if let Some(action) = self.do_action(effect.action, byte) {
+                emit(action);
             }
+            return;
+        }
+
+        // State transition: exit action from old state, transition action,
+        // then entry action into new state.
+        let exit = match self.state {
+            State::OscString => self.osc_parser.end(Some(byte)).map(Action::OscDispatch),
+            State::DcsPassthrough => Some(Action::DcsUnhook),
+            State::SosPmApcString => Some(Action::ApcEnd),
+            _ => None,
         };
+        if let Some(action) = exit {
+            emit(action);
+        }
 
-        let transition = self.do_action(effect.action, byte);
+        if let Some(action) = self.do_action(effect.action, byte) {
+            emit(action);
+        }
 
-        let entry = if !changed {
-            None
-        } else {
-            match next_state {
-                State::Escape | State::DcsEntry | State::CsiEntry => {
-                    self.clear();
+        let entry = match next_state {
+            State::Escape | State::DcsEntry | State::CsiEntry => {
+                self.clear();
+                None
+            }
+            State::OscString => {
+                self.osc_parser.reset();
+                None
+            }
+            State::DcsPassthrough => {
+                if self.params_idx >= MAX_PARAMS {
                     None
-                }
-                State::OscString => {
-                    self.osc_parser.reset();
-                    None
-                }
-                State::DcsPassthrough => {
-                    // Ignore too many parameters
-                    if self.params_idx >= MAX_PARAMS {
-                        None
-                    } else {
-                        // Finalize parameters
-                        if self.param_acc_idx > 0 {
-                            self.params[self.params_idx] = self.param_acc;
-                            self.params_idx += 1;
-                        }
-                        Some(Action::DcsHook(Dcs {
-                            intermediates: self.intermediates,
-                            intermediates_len: self.intermediates_idx,
-                            params: self.params,
-                            params_len: self.params_idx,
-                            final_byte: byte,
-                        }))
+                } else {
+                    if self.param_acc_idx > 0 {
+                        self.params[self.params_idx] = self.param_acc;
+                        self.params_idx += 1;
                     }
+                    Some(Action::DcsHook(Dcs {
+                        intermediates: self.intermediates,
+                        intermediates_len: self.intermediates_idx,
+                        params: self.params,
+                        params_len: self.params_idx,
+                        final_byte: byte,
+                    }))
                 }
-                State::SosPmApcString => Some(Action::ApcStart),
-                _ => None,
             }
+            State::SosPmApcString => Some(Action::ApcStart),
+            _ => None,
         };
-
         self.state = next_state;
+        if let Some(action) = entry {
+            emit(action);
+        }
+    }
 
-        [exit, transition, entry]
+    /// Consume one byte; returns exit/transition/entry actions in order (test helper).
+    #[cfg(test)]
+    pub fn next(&mut self, byte: u8) -> [Option<Action>; 3] {
+        let effect = TABLE[byte as usize][self.state as usize];
+        let changed = self.state != effect.state;
+        let mut out: [Option<Action>; 3] = [None, None, None];
+        if !changed {
+            out[1] = self.do_action(effect.action, byte);
+            return out;
+        }
+        let next_state = effect.state;
+        out[0] = match self.state {
+            State::OscString => self.osc_parser.end(Some(byte)).map(Action::OscDispatch),
+            State::DcsPassthrough => Some(Action::DcsUnhook),
+            State::SosPmApcString => Some(Action::ApcEnd),
+            _ => None,
+        };
+        out[1] = self.do_action(effect.action, byte);
+        out[2] = match next_state {
+            State::Escape | State::DcsEntry | State::CsiEntry => {
+                self.clear();
+                None
+            }
+            State::OscString => {
+                self.osc_parser.reset();
+                None
+            }
+            State::DcsPassthrough => {
+                if self.params_idx >= MAX_PARAMS {
+                    None
+                } else {
+                    if self.param_acc_idx > 0 {
+                        self.params[self.params_idx] = self.param_acc;
+                        self.params_idx += 1;
+                    }
+                    Some(Action::DcsHook(Dcs {
+                        intermediates: self.intermediates,
+                        intermediates_len: self.intermediates_idx,
+                        params: self.params,
+                        params_len: self.params_idx,
+                        final_byte: byte,
+                    }))
+                }
+            }
+            State::SosPmApcString => Some(Action::ApcStart),
+            _ => None,
+        };
+        self.state = next_state;
+        out
     }
 
     #[inline]

@@ -392,278 +392,45 @@ pub fn gomux_screen_id(name: &str) -> String {
     format!("gx-{cleaned}")
 }
 
-// ── Minimal private knob schema helper (until `config.rs` / `settings.rs` land) ──
+// ── Knob schema helpers backed by `config.rs` and `settings.rs` ──────────────
 
-#[derive(Clone, Copy)]
-enum FallbackKnobKind {
-    Bool,
-    Color,
-    Enum(&'static [&'static str]),
-    Number {
-        min: Option<f64>,
-        above: Option<f64>,
-        max: Option<f64>,
-        whole: bool,
-    },
-    Text,
+fn knob_value_to_json(val: crate::settings::KnobValue) -> Value {
+    match val {
+        crate::settings::KnobValue::Bool(b) => Value::Bool(b),
+        crate::settings::KnobValue::Number(n) => json!(n),
+        crate::settings::KnobValue::Text(s) => Value::String(s),
+    }
 }
 
-struct FallbackKnobDef {
-    key: &'static str,
-    section: &'static str,
-    section_title: &'static str,
-    label: &'static str,
-    description: &'static str,
-    default_val: &'static str,
-    kind: FallbackKnobKind,
-}
-
-const FALLBACK_KNOBS: &[FallbackKnobDef] = &[
-    FallbackKnobDef {
-        key: "background",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Background",
-        description: "The canvas colour behind every terminal and group.",
-        default_val: "#07080b",
-        kind: FallbackKnobKind::Color,
-    },
-    FallbackKnobDef {
-        key: "renderLoop",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Render loop",
-        description: "demand draws the canvas only when something changed (input, output, a move) and idles the GPU otherwise; always draws every display frame — a check when something looks stale.",
-        default_val: "demand",
-        kind: FallbackKnobKind::Enum(&["demand", "always"]),
-    },
-    FallbackKnobDef {
-        key: "gridShow",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Show grid",
-        description: "Draw the drafting-paper grid on the canvas. Snapping works with the grid hidden too.",
-        default_val: "true",
-        kind: FallbackKnobKind::Bool,
-    },
-    FallbackKnobDef {
-        key: "gridMinor",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Grid spacing",
-        description: "Distance between the fine grid lines — the step moves and resizes snap to.",
-        default_val: "4",
-        kind: FallbackKnobKind::Number { min: None, above: Some(0.0), max: None, whole: false },
-    },
-    FallbackKnobDef {
-        key: "gridMajorEvery",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Major line every",
-        description: "Every Nth line is a major (brighter) line; 1 makes every line major.",
-        default_val: "5",
-        kind: FallbackKnobKind::Number { min: Some(1.0), above: None, max: None, whole: true },
-    },
-    FallbackKnobDef {
-        key: "gridMinPx",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Hide lines closer than",
-        description: "Zoomed out, a level of lines packed closer than this on screen is not drawn, and snapping steps to the major lines.",
-        default_val: "6",
-        kind: FallbackKnobKind::Number { min: Some(0.0), above: None, max: None, whole: false },
-    },
-    FallbackKnobDef {
-        key: "gridLinePx",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Line width",
-        description: "How thick each grid line is on screen.",
-        default_val: "1",
-        kind: FallbackKnobKind::Number { min: None, above: Some(0.0), max: None, whole: false },
-    },
-    FallbackKnobDef {
-        key: "gridMinorColor",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Line colour",
-        description: "The colour of the fine grid lines.",
-        default_val: "#0f1219",
-        kind: FallbackKnobKind::Color,
-    },
-    FallbackKnobDef {
-        key: "gridMajorColor",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Major line colour",
-        description: "The colour of every major grid line.",
-        default_val: "#181c26",
-        kind: FallbackKnobKind::Color,
-    },
-    FallbackKnobDef {
-        key: "snap",
-        section: "canvas",
-        section_title: "Canvas",
-        label: "Snap to grid",
-        description: "Moving a terminal puts its top-left corner on a grid crossing; resizing lands the dragged edge on or just inside a line. Hold Ctrl (⌃) while dragging to do the opposite.",
-        default_val: "true",
-        kind: FallbackKnobKind::Bool,
-    },
-    FallbackKnobDef {
-        key: "closeHoldMs",
-        section: "terminals",
-        section_title: "Terminals",
-        label: "Hold to close",
-        description: "How long the close button (or the close chord, X) must be held before the terminal is killed; its ring fills over this time.",
-        default_val: "650",
-        kind: FallbackKnobKind::Number { min: Some(0.0), above: None, max: None, whole: false },
-    },
-    FallbackKnobDef {
-        key: "optionAsAlt",
-        section: "input",
-        section_title: "Input",
-        label: "Option as Alt",
-        description: "Whether ⌥/Alt is Alt for the terminal: auto sends Option's character when it made one (å), else Alt; true always Alt (Option+A is ESC a); false types characters. Takes the next key.",
-        default_val: "auto",
-        kind: FallbackKnobKind::Enum(&["auto", "true", "false"]),
-    },
-    FallbackKnobDef {
-        key: "zoomKeys",
-        section: "input",
-        section_title: "Input",
-        label: "Zoom keys",
-        description: "Held with the wheel, any of these zooms the canvas instead of panning it: ctrl, alt, meta, shift, separated by spaces.",
-        default_val: "ctrl alt meta",
-        kind: FallbackKnobKind::Text,
-    },
-];
-
-/// Validate a knob value against the built-in fallback schema (stand-in helper until
-/// `config.rs` / `settings.rs` land).
+/// Validate a knob value against the full wall knob schema (`config::check_config`).
 pub fn check_fallback_knob(key: &str, raw: &str) -> Result<Value, String> {
-    let Some(def) = FALLBACK_KNOBS.iter().find(|d| d.key == key) else {
-        let names = FALLBACK_KNOBS.iter().map(|d| d.key).collect::<Vec<_>>().join(", ");
-        return Err(format!("unknown wall knob '{key}' (knobs: {names})"));
-    };
-    match def.kind {
-        FallbackKnobKind::Bool => match raw.to_lowercase().as_str() {
-            "true" | "on" | "1" | "yes" => Ok(Value::Bool(true)),
-            "false" | "off" | "0" | "no" => Ok(Value::Bool(false)),
-            _ => Err(format!("{key} is on or off, not '{raw}'")),
-        },
-        FallbackKnobKind::Color => {
-            let s = raw.trim();
-            let valid = s.len() == 7
-                && s.starts_with('#')
-                && s.bytes().skip(1).all(|b| b.is_ascii_hexdigit());
-            if !valid {
-                return Err(format!("{key} takes a colour as #rrggbb, not '{raw}'"));
-            }
-            Ok(Value::String(s.to_lowercase()))
-        }
-        FallbackKnobKind::Enum(opts) => {
-            if !opts.contains(&raw) {
-                return Err(format!("{key} is {}, not '{raw}'", opts.join(", ")));
-            }
-            Ok(Value::String(raw.to_string()))
-        }
-        FallbackKnobKind::Text => {
-            if key == "zoomKeys" {
-                let parsed = crate::chord::parse_zoom_keys(raw)
-                    .map_err(|e| format!("{key}: {e}"))?;
-                let joined = parsed
-                    .iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Ok(Value::String(joined))
-            } else {
-                Ok(Value::String(raw.trim().to_string()))
-            }
-        }
-        FallbackKnobKind::Number { min, above, max, whole } => {
-            let trimmed = raw.trim();
-            let n: f64 = if trimmed.is_empty() {
-                return Err(format!("{key} takes a number, not '{raw}'"));
-            } else {
-                trimmed
-                    .parse()
-                    .map_err(|_| format!("{key} takes a number, not '{raw}'"))?
-            };
-            if !n.is_finite() {
-                return Err(format!("{key} takes a number, not '{raw}'"));
-            }
-            if let Some(lo) = min {
-                if n < lo {
-                    return Err(format!(
-                        "{key} takes a number ≥ {}, not '{raw}'",
-                        fmt_num(lo)
-                    ));
-                }
-            }
-            if let Some(gt) = above {
-                if n <= gt {
-                    return Err(format!(
-                        "{key} takes a number > {}, not '{raw}'",
-                        fmt_num(gt)
-                    ));
-                }
-            }
-            if let Some(hi) = max {
-                if n > hi {
-                    return Err(format!(
-                        "{key} takes a number ≤ {}, not '{raw}'",
-                        fmt_num(hi)
-                    ));
-                }
-            }
-            if whole && n.fract() != 0.0 {
-                return Err(format!("{key} takes a whole number, not '{raw}'"));
-            }
-            Ok(json!(n))
-        }
-    }
+    crate::config::check_config(key, raw).map(knob_value_to_json)
 }
 
-/// Default value of a knob from the fallback schema.
+/// Default value of a knob from the wall configuration schema (`config::default_knob_value`).
 pub fn default_fallback_knob(key: &str) -> Result<Value, String> {
-    let Some(def) = FALLBACK_KNOBS.iter().find(|d| d.key == key) else {
-        return Err(format!("unknown wall knob '{key}'"));
-    };
-    check_fallback_knob(key, def.default_val)
+    crate::config::default_knob_value(key)
+        .map(knob_value_to_json)
+        .ok_or_else(|| format!("unknown wall knob '{key}'"))
 }
 
-/// Search the fallback knob schema (`searchSettings` subset for `wall.config.find`).
+/// Search the wall knob schema (`settings::search_settings` for `wall.config.find`).
 pub fn search_fallback_knobs(query: &str) -> Vec<ConfigSearchGroup> {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    let mut out = Vec::new();
-    for &section_id in SETTINGS_SECTION_IDS {
-        let mut items = Vec::new();
-        let mut section_title = "";
-        for def in FALLBACK_KNOBS.iter().filter(|d| d.section == section_id) {
-            section_title = def.section_title;
-            let hay = [
-                def.label.to_lowercase(),
-                def.key.to_lowercase(),
-                def.description.to_lowercase(),
-                def.section_title.to_lowercase(),
-            ];
-            if terms.iter().all(|t| hay.iter().any(|h| h.contains(t))) {
-                items.push(ConfigSearchItem {
-                    key: def.key.to_string(),
-                    label: def.label.to_string(),
-                });
-            }
-        }
-        if !items.is_empty() {
-            out.push(ConfigSearchGroup {
-                section_id: section_id.to_string(),
-                section_title: section_title.to_string(),
-                items,
-            });
-        }
-    }
-    out
+    crate::settings::search_settings(query)
+        .into_iter()
+        .map(|g| ConfigSearchGroup {
+            section_id: g.section.id.to_string(),
+            section_title: g.section.title.to_string(),
+            items: g
+                .items
+                .into_iter()
+                .map(|it| ConfigSearchItem {
+                    key: it.key.to_string(),
+                    label: it.def.label.to_string(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 // ── Shared data records for `WallApi` ────────────────────────────────────────
@@ -771,14 +538,9 @@ pub enum PanelKind {
     Help,
 }
 
-/// Screen-space bounding box (CSS px) returned for positioning `wall.menu`.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ScreenBox {
-    pub left: f64,
-    pub top: f64,
-    pub right: f64,
-    pub bottom: f64,
-}
+/// Screen-space bounding box (CSS px) returned for positioning `wall.menu`
+/// (unified with [`crate::camera::ScreenBox`]).
+pub use crate::camera::ScreenBox;
 
 /// Target passed to [`WallApi::open_menu`] (`MenuTarget` in `contextMenu.js`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -924,6 +686,11 @@ pub trait WallApi {
     fn selection_clipboard(&self) -> String;
     fn write_clipboard(&mut self, text: &str) -> Result<(), String>;
     fn read_clipboard(&mut self) -> Result<String, String>;
+    /// Read the system clipboard synchronously (`Ok(Some(text))`), or emit an async
+    /// read-clipboard request for `id` (`Ok(None)`). Defaults to [`Self::read_clipboard`].
+    fn request_clipboard_paste(&mut self, _id: &str) -> Result<Option<String>, String> {
+        self.read_clipboard().map(Some)
+    }
     fn paste_into_terminal(&mut self, id: &str, text: &str) -> Result<bool, String>;
     fn notify(&mut self, message: &str);
 
@@ -1599,8 +1366,14 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
             let text = if from_selection {
                 wall.selection_clipboard()
             } else {
-                match wall.read_clipboard() {
-                    Ok(t) => t,
+                match wall.request_clipboard_paste(&id) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return Ok(CommandReply::ok(
+                            format!("requested clipboard paste into {id}"),
+                            Some(json!({ "id": id, "pending": true })),
+                        ));
+                    }
                     Err(e) => {
                         wall.notify(&format!("paste: {e}"));
                         return Err(e);
@@ -2713,10 +2486,10 @@ mod tests {
     impl Default for FakeWall {
         fn default() -> Self {
             let mut config = BTreeMap::new();
-            for def in FALLBACK_KNOBS {
+            for &key in crate::config::WALL_CONFIG_KEYS {
                 config.insert(
-                    def.key.to_string(),
-                    check_fallback_knob(def.key, def.default_val).unwrap(),
+                    key.to_string(),
+                    default_fallback_knob(key).unwrap(),
                 );
             }
             Self {
@@ -3283,7 +3056,7 @@ mod tests {
 
         fn config_get(&self, key: &str) -> Result<Value, String> {
             self.config.get(key).cloned().ok_or_else(|| {
-                let names = FALLBACK_KNOBS.iter().map(|d| d.key).collect::<Vec<_>>().join(", ");
+                let names = crate::config::WALL_CONFIG_KEYS.join(", ");
                 format!("unknown wall knob '{key}' (knobs: {names})")
             })
         }

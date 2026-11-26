@@ -25,8 +25,35 @@ impl Stream {
     }
 
     pub fn process(&mut self, bytes: &[u8], terminal: &mut Terminal) {
-        for &b in bytes {
-            self.next(b, terminal);
+        let mut i = 0;
+        let len = bytes.len();
+        while i < len {
+            if self.parser.state == State::Ground && self.utf8.is_ground() {
+                let start = i;
+                while i < len {
+                    let b = bytes[i];
+                    if (0x20..=0x7e).contains(&b) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if i > start {
+                    terminal.print_ascii_slice(&bytes[start..i]);
+                    if i >= len {
+                        break;
+                    }
+                }
+                // Fast ESC entry without routing through Utf8Decoder.
+                if bytes[i] == 0x1b {
+                    self.parser.state = State::Escape;
+                    self.parser.clear();
+                    i += 1;
+                    continue;
+                }
+            }
+            self.next(bytes[i], terminal);
+            i += 1;
         }
     }
 
@@ -75,10 +102,9 @@ impl Stream {
         terminal.print(cp);
     }
 
+    #[inline]
     fn next_non_utf8(&mut self, byte: u8, terminal: &mut Terminal) {
         debug_assert!(self.parser.state != State::Ground);
-        for action in self.parser.next(byte).into_iter().flatten() {
-            terminal.dispatch(action);
-        }
+        self.parser.step(byte, |action| terminal.dispatch(action));
     }
 }

@@ -4,6 +4,8 @@
 //! `stream_terminal.zig`, on the row-based Screen in this crate. Kitty
 //! graphics, sixel, tmux control mode and the status line are not ported.
 
+use std::collections::{HashMap, VecDeque};
+
 use crate::cell_width::{char_width, grapheme_break, GraphemeState};
 use crate::term::charsets::{Charset, Slot};
 use crate::term::color::{default_palette, encode_color_reply, Palette, Rgb};
@@ -14,17 +16,32 @@ use crate::term::parser::{Action, Csi, Dcs, Esc};
 use crate::term::screen::{CursorStyle, SavedCursor, Screen};
 use crate::term::sgr::{attributes, Attribute};
 use crate::term::style::{StyleColor, StyleFlags};
-use term_cells::MouseTracking;
+use term_cells::{MouseFormat, MouseTracking};
 
 #[cfg(test)]
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
+/// Maximum codepoints accumulated into a single cell's grapheme cluster.
+/// Prevents both unbounded per-cell allocation and O(N^2) UAX #29 break replay
+/// under combining-mark floods.
+const MAX_CLUSTER_CPS: usize = 32;
+
+/// Maximum unread host events buffered per [`Terminal`]. Oldest entries are
+/// evicted if the host never drains events, keeping memory strictly bounded.
+const MAX_PENDING_EVENTS: usize = 256;
+
+/// Soft threshold at which unreferenced `OSC 8` URIs are garbage-collected,
+/// and hard cap on simultaneously live distinct URIs across the screens.
+const HYPERLINK_GC_THRESHOLD: usize = 512;
+const HYPERLINK_HARD_LIMIT: usize = 4_096;
+
 /// Host-facing events that are not PTY reply bytes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TermEvent {
     TitleChanged(String),
     Bell,
     ClipboardSet { kind: u8, text: String },
+    ClipboardRead { kind: u8 },
     PwdChanged(String),
     Notification { title: String, body: String },
 }
@@ -68,6 +85,8 @@ pub struct Terminal {
 
     /// Active pointer-tracking mode ("last DECSET wins" across 9/1000/1002/1003).
     pub mouse_tracking: MouseTracking,
+    /// Active pointer-encoding format ("last DECSET wins" across 1005/1006/1015/1016).
+    pub mouse_format: MouseFormat,
 
     /// Kitty keyboard flag stacks, one per screen (the spec keeps them
     /// separate so alt-screen apps can't corrupt the shell's state).
@@ -78,22 +97,32 @@ pub struct Terminal {
 
     /// Hyperlink table; cells store 1-based ids into this.
     pub hyperlinks: Vec<String>,
+    hyperlink_ids: HashMap<String, u32>,
     current_hyperlink: u32,
 
     /// Last printed codepoint, for REP.
     previous_printed: Option<u32>,
 
     /// Passive viewer mode (`g3d-termd` owns the PTY and answers all queries):
-    /// discards query replies (`outbound`), host events (`events`), and OSC 8
-    /// URI accumulation as they arrive so no side buffer can grow unboundedly.
+    /// discards query replies (`outbound`) as they arrive so `outbound` never
+    /// grows. Host side-channel events (`events`) and `OSC 8` hyperlinks remain
+    /// available in bounded structures.
     pub passive: bool,
 
     /// Reply bytes to write back to the PTY (DSR/DA/OSC queries...).
     pub outbound: Vec<u8>,
-    /// Host-facing events since last take.
-    pub events: Vec<TermEvent>,
-    /// Any visible state changed since last take (render dirty).
+    /// Bounded ring of host-facing events since last drain.
+    pub events: VecDeque<TermEvent>,
+    /// Any visible state (cells, cursor, modes, title, colours) changed since last fill.
     pub dirty: bool,
+    /// Screen-wide change (theme, palette, dynamic fg/bg, DECSCNM, screen switch,
+    /// resize, reset) requiring every row to be re-resolved regardless of `Row::dirty`.
+    pub all_rows_dirty: bool,
+    /// Grid dimensions changed via `Terminal::resize` since the last `Vt::fill`.
+    pub resized_since_fill: bool,
+    /// Active screen buffer switched (`?47`/`?1047`/`?1049`) or `RIS` (`ESC c`)
+    /// ran since the last `Vt::fill`.
+    pub screen_switched_since_fill: bool,
 
     // DCS accumulation (DECRQSS / XTGETTCAP replies only).
     dcs_kind: DcsKind,
@@ -132,16 +161,21 @@ impl Terminal {
             background_override: false,
             known_theme_colors: [true; 259],
             mouse_tracking: MouseTracking::Off,
+            mouse_format: MouseFormat::X10,
             kitty_flags_primary: Vec::new(),
             kitty_flags_alternate: Vec::new(),
             modify_other_keys: 0,
             hyperlinks: Vec::new(),
+            hyperlink_ids: HashMap::new(),
             current_hyperlink: 0,
             previous_printed: None,
             passive: false,
             outbound: Vec::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             dirty: true,
+            all_rows_dirty: true,
+            resized_since_fill: false,
+            screen_switched_since_fill: false,
             dcs_kind: DcsKind::Ignore,
             dcs_buf: Vec::new(),
         }
@@ -156,9 +190,10 @@ impl Terminal {
 
     #[inline]
     fn push_event(&mut self, event: TermEvent) {
-        if !self.passive {
-            self.events.push(event);
+        if self.events.len() >= MAX_PENDING_EVENTS {
+            self.events.pop_front();
         }
+        self.events.push_back(event);
     }
 
     pub fn screen(&self) -> &Screen {
@@ -190,7 +225,21 @@ impl Terminal {
 
     #[cfg(test)]
     pub fn take_events(&mut self) -> Vec<TermEvent> {
-        std::mem::take(&mut self.events)
+        self.events.drain(..).collect()
+    }
+
+    pub fn cell_hyperlink(&self, col: usize, row: usize) -> Option<&str> {
+        let s = self.screen();
+        if row >= s.rows || col >= s.cols {
+            return None;
+        }
+        let r = s.row(row);
+        let head_col = r.head_of(col);
+        let id = r.cell(head_col)?.hyperlink;
+        if id == 0 {
+            return None;
+        }
+        self.hyperlinks.get((id - 1) as usize).map(String::as_str)
     }
 
     pub fn kitty_flags(&self) -> u8 {
@@ -211,13 +260,22 @@ impl Terminal {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        // Ghostty `stream_terminal.zig`: resize ends any open synchronized-output hold.
+        if self.modes.get(Mode::SynchronizedOutput) {
+            self.modes.set(Mode::SynchronizedOutput, false);
+            self.dirty = true;
+        }
         if cols == self.cols() && rows == self.rows() {
             return;
         }
         self.primary.resize_reflow(cols, rows);
         self.alternate.resize_clamped(cols, rows);
         self.tabstops.resize(cols);
+        self.primary.pending_scroll.reset();
+        self.alternate.pending_scroll.reset();
+        self.resized_since_fill = true;
         self.dirty = true;
+        self.all_rows_dirty = true;
         if self.modes.get(Mode::InBandSizeReports) {
             self.report_in_band_size();
         }
@@ -269,6 +327,86 @@ impl Terminal {
         }
     }
 
+    /// Batched ground-state fast path for printable ASCII (`0x20..=0x7e`),
+    /// semantically identical to calling [`Self::print`] per byte (ported from
+    /// Ghostty's `Terminal.printSliceAscii`).
+    pub fn print_ascii_slice(&mut self, ascii: &[u8]) {
+        if ascii.is_empty() {
+            return;
+        }
+        let can_batch = !self.modes.get(Mode::Insert)
+            && self.modes.get(Mode::Wraparound)
+            && self.screen().charsets.single_shift.is_none()
+            && matches!(
+                self.screen().charsets.charsets[self.screen().charsets.gl as usize],
+                Charset::Utf8 | Charset::Ascii
+            );
+        if !can_batch {
+            for &b in ascii {
+                self.print(u32::from(b));
+            }
+            return;
+        }
+
+        self.dirty = true;
+        self.previous_printed = ascii.last().map(|&b| u32::from(b));
+        let link = self.current_hyperlink;
+
+        let mut rem = ascii;
+        while !rem.is_empty() {
+            if self.screen().cursor.pending_wrap {
+                self.print_wrap();
+            }
+            let right_limit = self.right_limit();
+            let pen = self.screen().cursor.style;
+            let sm = self.screen_mut();
+            let x = sm.cursor.x;
+            let y = sm.cursor.y;
+            let avail = right_limit.saturating_sub(x).max(1);
+            let take = rem.len().min(avail);
+
+            let row = sm.row_mut(y);
+            row.dirty = true;
+            if row.cells.len() < x {
+                row.cells.resize(x, Cell::default());
+            }
+            row.split_wide_at(x, &pen);
+            if take > 1 {
+                row.split_wide_at(x + take - 1, &pen);
+            }
+            let overwrite_end = row.cells.len().min(x + take);
+            let overwrite_len = overwrite_end - x;
+            for (dst, &byte) in row.cells[x..overwrite_end]
+                .iter_mut()
+                .zip(&rem[..overwrite_len])
+            {
+                *dst = Cell {
+                    content: CellContent::Char(byte as char),
+                    style: pen,
+                    hyperlink: link,
+                };
+            }
+            if overwrite_len < take {
+                row.cells.reserve(take - overwrite_len);
+                for &byte in &rem[overwrite_len..take] {
+                    row.cells.push(Cell {
+                        content: CellContent::Char(byte as char),
+                        style: pen,
+                        hyperlink: link,
+                    });
+                }
+            }
+
+            if x + take >= right_limit {
+                sm.cursor.x = right_limit - 1;
+                sm.cursor.pending_wrap = true;
+            } else {
+                sm.cursor.x = x + take;
+            }
+            rem = &rem[take..];
+        }
+    }
+
     pub fn print(&mut self, cp: u32) {
         self.dirty = true;
         let right_limit = self.right_limit();
@@ -277,7 +415,7 @@ impl Terminal {
         // UAX #29 says there is no boundary.
         if cp > 255
             && self.modes.get(Mode::GraphemeCluster)
-            && self.screen().cursor.x > 0
+            && (self.screen().cursor.x > 0 || self.screen().cursor.pending_wrap)
             && self.try_grapheme_attach(cp, right_limit)
         {
             return;
@@ -320,7 +458,9 @@ impl Terminal {
                         }
                         if right_limit == self.cols() {
                             let y = self.screen().cursor.y;
-                            self.screen_mut().row_mut(y).wrapped = true;
+                            let row = self.screen_mut().row_mut(y);
+                            row.wrapped = true;
+                            row.dirty = true;
                             self.put_content(CellContent::WideSpacerHead);
                         } else {
                             self.put_content(CellContent::Empty);
@@ -392,7 +532,12 @@ impl Terminal {
         };
         let cps: Vec<char> = match &prev_content {
             CellContent::Char(c) | CellContent::WideChar(c) => vec![*c],
-            CellContent::Cluster(cl) => cl.cps.clone(),
+            CellContent::Cluster(cl) => {
+                if cl.cps.len() >= MAX_CLUSTER_CPS {
+                    return true;
+                }
+                cl.cps.clone()
+            }
             _ => return false,
         };
 
@@ -437,17 +582,40 @@ impl Terminal {
         // frees its tail.
         if new_width == 2 {
             let cols = self.cols();
+            let left = self.screen().left_margin;
+            if right_limit.min(cols).saturating_sub(left) < 2 {
+                // A 1-wide region or 1-column grid cannot hold a 2-column cluster.
+                let mut narrow_cluster = cluster;
+                if let CellContent::Cluster(ref mut cl) = narrow_cluster {
+                    cl.width = 1;
+                }
+                self.screen_mut().row_mut(py).cell_mut(px).content = narrow_cluster;
+                return true;
+            }
             if px + 1 >= right_limit.min(cols) {
                 // No room: wrap the (now wide) cluster to the next line.
                 if !wraparound {
                     return true;
                 }
+                let head_style = self
+                    .screen()
+                    .row(py)
+                    .cell(px)
+                    .map(|c| c.style)
+                    .unwrap_or_default();
+                let head_link = self
+                    .screen()
+                    .row(py)
+                    .cell(px)
+                    .map(|c| c.hyperlink)
+                    .unwrap_or(0);
                 let pen = self.screen().cursor.style;
                 {
                     let sm = self.screen_mut();
                     sm.cursor.x = px;
                     sm.cursor.y = py;
                     let row = sm.row_mut(py);
+                    row.split_wide_at(px, &pen);
                     *row.cell_mut(px) = Cell {
                         content: if right_limit == cols {
                             CellContent::WideSpacerHead
@@ -463,21 +631,25 @@ impl Terminal {
                     if right_limit == cols {
                         row.wrapped = true;
                     }
+                    row.dirty = true;
                 }
                 self.print_wrap();
                 let sm = self.screen_mut();
                 let (x, y) = (sm.cursor.x, sm.cursor.y);
-                let head_cell = sm.row_mut(y).cell_mut(x);
-                head_cell.content = cluster;
-                let head_style = head_cell.style;
-                let head_link = head_cell.hyperlink;
+                let row = sm.row_mut(y);
+                row.split_wide_at(x, &head_style);
+                row.split_wide_at(x + 1, &head_style);
+                *row.cell_mut(x) = Cell {
+                    content: cluster,
+                    style: head_style,
+                    hyperlink: head_link,
+                };
+                *row.cell_mut(x + 1) = Cell {
+                    content: CellContent::WideTail,
+                    style: head_style,
+                    hyperlink: head_link,
+                };
                 sm.cursor.x = x + 1;
-                let ry = sm.cursor.y;
-                let rx = sm.cursor.x;
-                let tail = sm.row_mut(ry).cell_mut(rx);
-                tail.content = CellContent::WideTail;
-                tail.style = head_style;
-                tail.hyperlink = head_link;
                 let rl = if sm.cursor.x > sm.right_margin {
                     sm.cols
                 } else {
@@ -490,11 +662,13 @@ impl Terminal {
                 }
             } else {
                 let sm = self.screen_mut();
-                let head_cell = sm.row_mut(py).cell_mut(px);
+                let row = sm.row_mut(py);
+                let head_cell = row.cell_mut(px);
                 head_cell.content = cluster;
                 let head_style = head_cell.style;
                 let head_link = head_cell.hyperlink;
-                let tail = sm.row_mut(py).cell_mut(px + 1);
+                row.split_wide_at(px + 1, &head_style);
+                let tail = row.cell_mut(px + 1);
                 tail.content = CellContent::WideTail;
                 tail.style = head_style;
                 tail.hyperlink = head_link;
@@ -505,11 +679,16 @@ impl Terminal {
         } else {
             // Wide -> narrow: drop the tail.
             let sm = self.screen_mut();
+            let head_style = sm
+                .row(py)
+                .cell(px)
+                .map(|c| c.style)
+                .unwrap_or_default();
             sm.row_mut(py).cell_mut(px).content = cluster;
             if px + 1 < sm.cols {
                 let tail = sm.row_mut(py).cell_mut(px + 1);
                 if tail.content == CellContent::WideTail {
-                    tail.content = CellContent::Empty;
+                    *tail = Cell::blank_with_bg(&head_style);
                 }
             }
             sm.cursor.pending_wrap = false;
@@ -551,7 +730,9 @@ impl Terminal {
                     width: 2,
                 }));
             }
-            CellContent::Cluster(cl) => cl.cps.push(ch),
+            CellContent::Cluster(cl) if cl.cps.len() < MAX_CLUSTER_CPS => {
+                cl.cps.push(ch);
+            }
             _ => {}
         }
     }
@@ -562,7 +743,9 @@ impl Terminal {
         let at_edge = self.screen().cursor.x == self.cols() - 1;
         let y = self.screen().cursor.y;
         if at_edge {
-            self.screen_mut().row_mut(y).wrapped = true;
+            let row = self.screen_mut().row_mut(y);
+            row.wrapped = true;
+            row.dirty = true;
         }
         let old_semantic = self.screen().row(y).semantic;
         self.index();
@@ -638,6 +821,7 @@ impl Terminal {
     }
 
     fn carriage_return(&mut self) {
+        self.dirty = true;
         let s = self.screen_mut();
         s.cursor.x = if s.cursor.x >= s.left_margin {
             s.left_margin
@@ -648,6 +832,7 @@ impl Terminal {
     }
 
     fn horizontal_tab(&mut self) {
+        self.dirty = true;
         let right_limit = self.right_limit();
         let s = self.screen();
         let next = self.tabstops.next_after(s.cursor.x).min(right_limit - 1);
@@ -657,6 +842,7 @@ impl Terminal {
     }
 
     fn horizontal_tab_back(&mut self, count: usize) {
+        self.dirty = true;
         let s = self.screen();
         let mut x = s.cursor.x;
         for _ in 0..count.max(1) {
@@ -717,6 +903,7 @@ impl Terminal {
     // ==================================================================
 
     fn cursor_up(&mut self, count: usize) {
+        self.dirty = true;
         let count = count.max(1);
         let s = self.screen_mut();
         // Clamp to the scroll region top only if we start below it.
@@ -730,6 +917,7 @@ impl Terminal {
     }
 
     fn cursor_down(&mut self, count: usize) {
+        self.dirty = true;
         let count = count.max(1);
         let s = self.screen_mut();
         let max_y = if s.cursor.y <= s.scroll_bottom {
@@ -737,11 +925,12 @@ impl Terminal {
         } else {
             s.rows - 1
         };
-        s.cursor.y = (s.cursor.y + count).min(max_y);
+        s.cursor.y = s.cursor.y.saturating_add(count).min(max_y);
         s.cursor.pending_wrap = false;
     }
 
     fn cursor_right(&mut self, count: usize) {
+        self.dirty = true;
         let count = count.max(1);
         let s = self.screen_mut();
         let max_x = if s.cursor.x <= s.right_margin {
@@ -749,12 +938,13 @@ impl Terminal {
         } else {
             s.cols - 1
         };
-        s.cursor.x = (s.cursor.x + count).min(max_x);
+        s.cursor.x = s.cursor.x.saturating_add(count).min(max_x);
         s.cursor.pending_wrap = false;
     }
 
     /// CUB with reverse-wrap modes (ghostty cursorLeft).
     fn cursor_left(&mut self, count: usize) {
+        self.dirty = true;
         #[derive(PartialEq)]
         enum WrapMode {
             None,
@@ -810,10 +1000,10 @@ impl Terminal {
 
         loop {
             let s = self.screen_mut();
-            let max = s.cursor.x - left_margin;
+            let max = s.cursor.x.saturating_sub(left_margin);
             let amount = max.min(count);
             count -= amount;
-            s.cursor.x -= amount;
+            s.cursor.x = s.cursor.x.saturating_sub(amount);
             if count == 0 {
                 break;
             }
@@ -858,8 +1048,8 @@ impl Terminal {
         s.cursor.pending_wrap = false;
         let row = row_req.max(1);
         let col = col_req.max(1);
-        s.cursor.x = (col + x_off).min(x_max) - 1;
-        s.cursor.y = (row + y_off).min(y_max) - 1;
+        s.cursor.x = col.saturating_add(x_off).min(x_max).saturating_sub(1);
+        s.cursor.y = row.saturating_add(y_off).min(y_max).saturating_sub(1);
     }
 
     // ==================================================================
@@ -880,6 +1070,7 @@ impl Terminal {
     }
 
     fn restore_cursor(&mut self) {
+        self.dirty = true;
         let Some(saved) = self.screen().saved_cursor.clone() else {
             // No save: restore to defaults (xterm behavior).
             self.modes.set(Mode::Origin, false);
@@ -898,7 +1089,6 @@ impl Terminal {
         s.cursor.style = saved.style;
         s.cursor.pending_wrap = saved.pending_wrap;
         s.charsets = saved.charsets;
-        self.dirty = true;
     }
 
     // ==================================================================
@@ -944,7 +1134,7 @@ impl Terminal {
         s.scroll_top = y;
         s.max_scrollback = 0; // region delete never feeds history
         let save_len = s.scrollback.len();
-        s.scroll_up(count, &pen);
+        s.scroll_up_delete_lines(count, &pen);
         debug_assert_eq!(save_len, s.scrollback.len());
         s.max_scrollback = old_max;
         s.scroll_top = old_top;
@@ -965,7 +1155,9 @@ impl Terminal {
         s.cursor.pending_wrap = false;
         let count = count.max(1).min(right + 1 - x);
         let row = s.row_mut(y);
+        row.dirty = true;
         row.split_wide_at(x, &pen);
+        row.split_wide_at(right, &pen);
         // Make sure storage covers the margin span, then shift.
         row.cell_mut(right);
         for col in ((x + count)..=right).rev() {
@@ -999,7 +1191,9 @@ impl Terminal {
         s.cursor.pending_wrap = false;
         let count = count.max(1).min(right + 1 - x);
         let row = s.row_mut(y);
+        row.dirty = true;
         row.split_wide_at(x, &pen);
+        row.split_wide_at(right, &pen);
         row.cell_mut(right);
         for col in x..=right {
             if col + count <= right {
@@ -1024,9 +1218,14 @@ impl Terminal {
         let pen = self.screen().cursor.style;
         let s = self.screen_mut();
         let (x, y) = (s.cursor.x, s.cursor.y);
-        let count = count.max(1).min(s.cols - x);
+        let avail = s.cols.saturating_sub(x);
+        if avail == 0 {
+            return;
+        }
+        let count = count.max(1).min(avail);
         s.cursor.pending_wrap = false;
         let row = s.row_mut(y);
+        row.dirty = true;
         row.split_wide_at(x, &pen);
         row.split_wide_at(x + count - 1, &pen);
         let blank = Cell::blank_with_bg(&pen);
@@ -1067,6 +1266,7 @@ impl Terminal {
         s.cursor.pending_wrap = false;
         let blank = Cell::blank_with_bg(&pen);
         let row = s.row_mut(y);
+        row.dirty = true;
         if start == 0 && end == cols && blank.is_default() {
             row.cells.clear();
             return;
@@ -1127,6 +1327,7 @@ impl Terminal {
                         .any(|r| r.cells.iter().any(|c| c.hyperlink != 0));
                     if !other_has_links && !own_scrollback_links {
                         self.hyperlinks.clear();
+                        self.hyperlink_ids.clear();
                     }
                 }
             }
@@ -1218,9 +1419,8 @@ impl Terminal {
     // ==================================================================
 
     fn apply_sgr(&mut self, csi: &Csi) {
-        let attrs: Vec<Attribute> = attributes(csi).collect();
         let style = &mut self.screen_mut().cursor.style;
-        for attr in attrs {
+        for attr in attributes(csi) {
             match attr {
                 Attribute::Unset => *style = Default::default(),
                 Attribute::Bold => style.flags.set(StyleFlags::BOLD, true),
@@ -1308,6 +1508,9 @@ impl Terminal {
             Mode::Origin => {
                 self.set_cursor_pos(1, 1);
             }
+            Mode::ReverseColors => {
+                self.all_rows_dirty = true;
+            }
             Mode::EnableLeftAndRightMargin => {
                 if !enable {
                     let s = self.screen_mut();
@@ -1320,6 +1523,12 @@ impl Terminal {
             | Mode::MouseEventButton
             | Mode::MouseEventAny => {
                 self.apply_mouse_mode(mode, enable);
+            }
+            Mode::MouseFormatUtf8
+            | Mode::MouseFormatSgr
+            | Mode::MouseFormatUrxvt
+            | Mode::MouseFormatSgrPixels => {
+                self.apply_mouse_format(mode, enable);
             }
             _ => {}
         }
@@ -1350,8 +1559,34 @@ impl Terminal {
         }
     }
 
+    fn apply_mouse_format(&mut self, mode: Mode, enable: bool) {
+        let target = match mode {
+            Mode::MouseFormatUtf8 => MouseFormat::Utf8,
+            Mode::MouseFormatSgr => MouseFormat::Sgr,
+            Mode::MouseFormatUrxvt => MouseFormat::Urxvt,
+            Mode::MouseFormatSgrPixels => MouseFormat::SgrPixels,
+            _ => return,
+        };
+        if enable {
+            for sibling in [
+                Mode::MouseFormatUtf8,
+                Mode::MouseFormatSgr,
+                Mode::MouseFormatUrxvt,
+                Mode::MouseFormatSgrPixels,
+            ] {
+                if sibling != mode {
+                    self.modes.set(sibling, false);
+                }
+            }
+            self.mouse_format = target;
+        } else if self.mouse_format == target {
+            self.mouse_format = MouseFormat::X10;
+        }
+    }
+
     fn switch_screen(&mut self, to_alt: bool, save_cursor: bool, clear_on_leave: bool) {
         self.dirty = true;
+        self.all_rows_dirty = true;
         self.current_hyperlink = 0;
         if to_alt && self.active == ActiveScreen::Primary {
             if save_cursor {
@@ -1360,6 +1595,9 @@ impl Terminal {
             // Cursor position and pen carry over (xterm shares the cursor).
             let cursor = self.primary.cursor.clone();
             self.active = ActiveScreen::Alternate;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             let s = self.screen_mut();
             s.cursor = cursor;
             s.cursor.x = s.cursor.x.min(s.cols - 1);
@@ -1374,6 +1612,9 @@ impl Terminal {
             }
             let cursor = self.alternate.cursor.clone();
             self.active = ActiveScreen::Primary;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             let s = self.screen_mut();
             s.cursor = cursor;
             s.cursor.x = s.cursor.x.min(s.cols - 1);
@@ -1386,10 +1627,14 @@ impl Terminal {
 
     fn switch_screen_1049(&mut self, enable: bool) {
         self.dirty = true;
+        self.all_rows_dirty = true;
         self.current_hyperlink = 0;
         if enable && self.active == ActiveScreen::Primary {
             self.save_cursor();
             self.active = ActiveScreen::Alternate;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             // Clear alt and home the cursor, keeping the pen.
             let pen = self.primary.cursor.style;
             let s = self.screen_mut();
@@ -1402,6 +1647,9 @@ impl Terminal {
             s.reset_margins();
         } else if !enable && self.active == ActiveScreen::Alternate {
             self.active = ActiveScreen::Primary;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             self.restore_cursor();
         }
     }
@@ -1436,7 +1684,7 @@ impl Terminal {
                 } else {
                     (0, s.cols)
                 };
-                s.cursor.x = (col + off).min(max) - 1;
+                s.cursor.x = col.saturating_add(off).min(max).saturating_sub(1);
                 s.cursor.pending_wrap = false;
                 self.dirty = true;
             }
@@ -1445,8 +1693,13 @@ impl Terminal {
                 self.dirty = true;
             }
             (b'I', []) => {
-                for _ in 0..csi.get(0, 1) {
+                let limit = (csi.get(0, 1) as usize).min(self.cols());
+                for _ in 0..limit {
+                    let prev_x = self.screen().cursor.x;
                     self.horizontal_tab();
+                    if self.screen().cursor.x == prev_x {
+                        break;
+                    }
                 }
             }
             (b'J', []) => self.erase_display(csi.get_allow_zero(0, 0)),
@@ -1478,7 +1731,7 @@ impl Terminal {
                 } else {
                     (0, s.rows)
                 };
-                s.cursor.y = (row + off).min(max) - 1;
+                s.cursor.y = row.saturating_add(off).min(max).saturating_sub(1);
                 s.cursor.pending_wrap = false;
                 self.dirty = true;
             }
@@ -1514,6 +1767,7 @@ impl Terminal {
                 // XTMODKEYS: CSI > Pp ; Pv m
                 if csi.get_allow_zero(0, 0) == 4 {
                     self.modify_other_keys = csi.get_allow_zero(1, 0).min(2) as u8;
+                    self.dirty = true;
                 }
             }
             (b'm', [b'?']) => {
@@ -1534,8 +1788,8 @@ impl Terminal {
                             let s = self.screen();
                             let (row, col) = if origin {
                                 (
-                                    s.cursor.y - s.scroll_top + 1,
-                                    s.cursor.x - s.left_margin.min(s.cursor.x) + 1,
+                                    s.cursor.y.saturating_sub(s.scroll_top) + 1,
+                                    s.cursor.x.saturating_sub(s.left_margin) + 1,
                                 )
                             } else {
                                 (s.cursor.y + 1, s.cursor.x + 1)
@@ -1653,7 +1907,11 @@ impl Terminal {
                         // Screen-switch pseudo modes never land here (they
                         // are not in the registry), so a plain set is right.
                         self.modes.set(mode, v);
+                        if mode == Mode::ReverseColors {
+                            self.all_rows_dirty = true;
+                        }
                         self.apply_mouse_mode(mode, v);
+                        self.apply_mouse_format(mode, v);
                     }
                 }
                 self.dirty = true;
@@ -1695,6 +1953,7 @@ impl Terminal {
                     stack.remove(0);
                 }
                 stack.push(flags);
+                self.dirty = true;
             }
             (b'u', [b'<']) => {
                 let n = csi.get(0, 1) as usize;
@@ -1704,6 +1963,7 @@ impl Terminal {
                         break;
                     }
                 }
+                self.dirty = true;
             }
             (b'u', [b'=']) => {
                 let flags = csi.get_allow_zero(0, 0).min(31) as u8;
@@ -1721,6 +1981,7 @@ impl Terminal {
                 } else {
                     stack.push(new);
                 }
+                self.dirty = true;
             }
             _ => {}
         }
@@ -1752,8 +2013,14 @@ impl Terminal {
                 self.screen_mut().charsets.single_shift = Some(Slot::G3);
             }
             ([], b'c') => self.full_reset(),
-            ([], b'=') => self.modes.set(Mode::KeypadKeys, true),
-            ([], b'>') => self.modes.set(Mode::KeypadKeys, false),
+            ([], b'=') => {
+                self.modes.set(Mode::KeypadKeys, true);
+                self.dirty = true;
+            }
+            ([], b'>') => {
+                self.modes.set(Mode::KeypadKeys, false);
+                self.dirty = true;
+            }
             // Charset designations.
             ([i], final_byte) if matches!(i, b'(' | b')' | b'*' | b'+') => {
                 let slot = match i {
@@ -1790,16 +2057,7 @@ impl Terminal {
             OscCommand::ChangeWindowIcon(_) => {}
             OscCommand::Colors { ops, terminator } => self.color_ops(ops, terminator),
             OscCommand::Hyperlink { id: _, uri } => {
-                if self.passive {
-                    self.current_hyperlink = 0;
-                } else if self.hyperlinks.last().is_some_and(|last| last == &uri) {
-                    self.current_hyperlink = self.hyperlinks.len() as u32;
-                } else if self.hyperlinks.len() < 4096 {
-                    self.hyperlinks.push(uri);
-                    self.current_hyperlink = self.hyperlinks.len() as u32;
-                } else {
-                    self.current_hyperlink = 0;
-                }
+                self.current_hyperlink = self.intern_hyperlink(uri);
             }
             OscCommand::HyperlinkEnd => self.current_hyperlink = 0,
             OscCommand::ClipboardContents {
@@ -1807,15 +2065,15 @@ impl Terminal {
                 data,
                 terminator,
             } => {
-                if self.passive {
-                    return;
-                }
                 if data == "?" {
-                    // Clipboard reads are denied (secure default): reply
-                    // with an empty payload.
-                    let mut reply = format!("\x1b]52;{};", kind as char).into_bytes();
-                    reply.extend_from_slice(terminator.bytes());
-                    self.push_outbound(&reply);
+                    self.push_event(TermEvent::ClipboardRead { kind });
+                    if !self.passive {
+                        // Clipboard reads are denied (secure default): reply
+                        // with an empty payload.
+                        let mut reply = format!("\x1b]52;{};", kind as char).into_bytes();
+                        reply.extend_from_slice(terminator.bytes());
+                        self.push_outbound(&reply);
+                    }
                 } else if let Some(text) = base64_decode(data.as_bytes()) {
                     if let Ok(text) = String::from_utf8(text) {
                         self.push_event(TermEvent::ClipboardSet { kind, text });
@@ -1845,6 +2103,74 @@ impl Terminal {
         }
     }
 
+    fn intern_hyperlink(&mut self, uri: String) -> u32 {
+        if let Some(&id) = self.hyperlink_ids.get(&uri) {
+            return id;
+        }
+        if self.hyperlinks.len() >= HYPERLINK_GC_THRESHOLD {
+            self.gc_hyperlinks();
+            if let Some(&id) = self.hyperlink_ids.get(&uri) {
+                return id;
+            }
+        }
+        if self.hyperlinks.len() >= HYPERLINK_HARD_LIMIT {
+            return 0;
+        }
+        let id = (self.hyperlinks.len() + 1) as u32;
+        self.hyperlink_ids.insert(uri.clone(), id);
+        self.hyperlinks.push(uri);
+        id
+    }
+
+    /// Compact `self.hyperlinks` to only URIs currently referenced by cells on
+    /// `primary`, `alternate`, or `self.current_hyperlink`.
+    fn gc_hyperlinks(&mut self) {
+        let len = self.hyperlinks.len();
+        if len == 0 {
+            return;
+        }
+        let mut remap = vec![0u32; len + 1];
+        let mut kept: Vec<String> = Vec::new();
+        let mut new_ids: HashMap<String, u32> = HashMap::new();
+
+        let mut mark_and_remap = |link: &mut u32, old_links: &[String]| {
+            let old = *link as usize;
+            if old == 0 || old > old_links.len() {
+                *link = 0;
+                return;
+            }
+            if remap[old] == 0 {
+                let new_id = (kept.len() + 1) as u32;
+                let uri = old_links[old - 1].clone();
+                new_ids.insert(uri.clone(), new_id);
+                kept.push(uri);
+                remap[old] = new_id;
+            }
+            *link = remap[old];
+        };
+
+        let old_links = std::mem::take(&mut self.hyperlinks);
+        for row in self
+            .primary
+            .active
+            .iter_mut()
+            .chain(self.primary.scrollback.iter_mut())
+            .chain(self.alternate.active.iter_mut())
+        {
+            for cell in &mut row.cells {
+                if cell.hyperlink != 0 {
+                    mark_and_remap(&mut cell.hyperlink, &old_links);
+                }
+            }
+        }
+        if self.current_hyperlink != 0 {
+            mark_and_remap(&mut self.current_hyperlink, &old_links);
+        }
+
+        self.hyperlinks = kept;
+        self.hyperlink_ids = new_ids;
+    }
+
     fn color_ops(&mut self, ops: Vec<ColorOp>, terminator: OscTerminator) {
         for op in ops {
             match op {
@@ -1854,14 +2180,17 @@ impl Terminal {
                         ColorKind::Palette(i) => {
                             self.palette[i as usize] = rgb;
                             self.palette_overrides[i as usize] = true;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Foreground => {
                             self.default_fg = rgb;
                             self.foreground_override = true;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Background => {
                             self.default_bg = rgb;
                             self.background_override = true;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Cursor => self.cursor_color = Some(rgb),
                     }
@@ -1872,14 +2201,17 @@ impl Terminal {
                         ColorKind::Palette(i) => {
                             self.palette[i as usize] = self.base_palette[i as usize];
                             self.palette_overrides[i as usize] = false;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Foreground => {
                             self.default_fg = self.base_fg;
                             self.foreground_override = false;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Background => {
                             self.default_bg = self.base_bg;
                             self.background_override = false;
+                            self.all_rows_dirty = true;
                         }
                         ColorKind::Cursor => self.cursor_color = None,
                     }
@@ -2009,7 +2341,10 @@ impl Terminal {
         self.cursor_style = CursorStyle::Default;
         self.modify_other_keys = 0;
         self.current_hyperlink = 0;
-        self.palette = self.base_palette;
+        if self.palette != self.base_palette {
+            self.palette = self.base_palette;
+            self.all_rows_dirty = true;
+        }
         self.palette_overrides.fill(false);
         let s = self.screen_mut();
         s.reset_margins();
@@ -2033,6 +2368,7 @@ impl Terminal {
         self.active = ActiveScreen::Primary;
         self.modes.reset();
         self.mouse_tracking = MouseTracking::Off;
+        self.mouse_format = MouseFormat::X10;
         self.tabstops = crate::term::tabstops::Tabstops::new(cols);
         self.palette = self.base_palette;
         self.default_fg = self.base_fg;
@@ -2048,11 +2384,14 @@ impl Terminal {
         self.kitty_flags_alternate.clear();
         self.modify_other_keys = 0;
         self.hyperlinks.clear();
+        self.hyperlink_ids.clear();
         self.current_hyperlink = 0;
         self.previous_printed = None;
         self.dcs_kind = DcsKind::Ignore;
         self.dcs_buf.clear();
+        self.screen_switched_since_fill = true;
         self.dirty = true;
+        self.all_rows_dirty = true;
     }
 }
 

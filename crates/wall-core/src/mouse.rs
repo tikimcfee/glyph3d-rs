@@ -131,6 +131,30 @@ pub enum MouseTracking {
     Any,
 }
 
+impl From<term_cells::MouseTracking> for MouseTracking {
+    fn from(mode: term_cells::MouseTracking) -> Self {
+        match mode {
+            term_cells::MouseTracking::Off => MouseTracking::None,
+            term_cells::MouseTracking::X10 => MouseTracking::X10,
+            term_cells::MouseTracking::Normal => MouseTracking::Normal,
+            term_cells::MouseTracking::Button => MouseTracking::Button,
+            term_cells::MouseTracking::Any => MouseTracking::Any,
+        }
+    }
+}
+
+impl From<MouseTracking> for term_cells::MouseTracking {
+    fn from(mode: MouseTracking) -> Self {
+        match mode {
+            MouseTracking::None => term_cells::MouseTracking::Off,
+            MouseTracking::X10 => term_cells::MouseTracking::X10,
+            MouseTracking::Normal => term_cells::MouseTracking::Normal,
+            MouseTracking::Button => term_cells::MouseTracking::Button,
+            MouseTracking::Any => term_cells::MouseTracking::Any,
+        }
+    }
+}
+
 /// Which part of a terminal window a pointer hit landed on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HitPart {
@@ -256,6 +280,16 @@ pub enum MouseAction {
     Press,
     Release,
     Move,
+}
+
+impl MouseAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MouseAction::Press => "press",
+            MouseAction::Release => "release",
+            MouseAction::Move => "move",
+        }
+    }
 }
 
 /// One outgoing mouse report emitted by [`WallMouseState`].
