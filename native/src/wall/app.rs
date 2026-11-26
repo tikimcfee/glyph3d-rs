@@ -149,6 +149,64 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
+    /// Persistent banner shown while `g3d-termd` is stopped/offline.
+    offline_notice: Option<String>,
+    perf: WallPerf,
+}
+
+#[derive(Default)]
+struct WallPerf {
+    log_enabled: bool,
+    last_log: Option<Instant>,
+    draw_us: Vec<u64>,
+    pump_us: Vec<u64>,
+    rows_uploaded: u64,
+}
+
+impl WallPerf {
+    fn summary(&mut self, reset: bool) -> String {
+        self.draw_us.sort_unstable();
+        self.pump_us.sort_unstable();
+        let pct = |v: &[u64], p: usize| -> f64 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v[((v.len() - 1) * p) / 100] as f64
+            }
+        };
+        let draw_mean_ms = if self.draw_us.is_empty() {
+            0.0
+        } else {
+            (self.draw_us.iter().sum::<u64>() as f64 / self.draw_us.len() as f64) / 1000.0
+        };
+        let pump_total_us: u64 = self.pump_us.iter().sum();
+        let pump_mean_us = if self.pump_us.is_empty() {
+            0.0
+        } else {
+            pump_total_us as f64 / self.pump_us.len() as f64
+        };
+        let s = format!(
+            "frames={} draw_ms(mean={:.2} p50={:.2} p95={:.2} max={:.2}) pump(calls={} total_ms={:.2} mean_us={:.1} p50_us={:.1} p95_us={:.1} max_us={:.1}) rows_uploaded={}",
+            self.draw_us.len(),
+            draw_mean_ms,
+            pct(&self.draw_us, 50) / 1000.0,
+            pct(&self.draw_us, 95) / 1000.0,
+            pct(&self.draw_us, 100) / 1000.0,
+            self.pump_us.len(),
+            pump_total_us as f64 / 1000.0,
+            pump_mean_us,
+            pct(&self.pump_us, 50),
+            pct(&self.pump_us, 95),
+            pct(&self.pump_us, 100),
+            self.rows_uploaded,
+        );
+        if reset {
+            self.draw_us.clear();
+            self.pump_us.clear();
+            self.rows_uploaded = 0;
+        }
+        s
+    }
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -259,6 +317,31 @@ impl App {
     }
 
     fn open(&mut self, event_loop: &ActiveEventLoop) {
+        let opts = self.opts.take().expect("the window opens once");
+        self.exit_after = opts.exit_after;
+
+        let proxy = self.proxy.clone();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            // The loop may be gone at shutdown; nothing is left to wake.
+            let _ = proxy.send_event(Wake);
+        });
+        // Single-owner gate per namespace: refuse before creating a second GPU
+        // window, opening a second `WallStore` writer, or stealing `Role::Own`
+        // size ownership from the running wall window.
+        if let Some(ns) = &opts.namespace {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
+                Ok(server) => self.control = Some(server),
+                Err(wall_control::Error::AlreadyRunning { path, .. }) => {
+                    eprintln!(
+                        "error: another wall window is already open on namespace `{ns}` ({}); close it first or choose another namespace with --wall-ns",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
+            }
+        }
+
         let window = Arc::new(
             event_loop
                 .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
@@ -282,8 +365,6 @@ impl App {
         surface.configure(&self.ctx.device, &config);
         let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
 
-        let opts = self.opts.take().expect("the window opens once");
-        self.exit_after = opts.exit_after;
         let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
@@ -305,18 +386,6 @@ impl App {
         let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
 
         // The terminals.
-        let proxy = self.proxy.clone();
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            // The loop may be gone at shutdown; nothing is left to wake.
-            let _ = proxy.send_event(Wake);
-        });
-        // The door for `wallctl`: verbs arrive on a socket beside termd's.
-        if let Some(ns) = &opts.namespace {
-            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
-                Ok(server) => self.control = Some(server),
-                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
-            }
-        }
         let terms = match &opts.namespace {
             Some(ns) => {
                 let mut sessions = match Sessions::open(ns, wake) {
@@ -369,6 +438,8 @@ impl App {
             wall.run("wall.fit");
         }
         self.apply_effects();
+        self.serve_control();
+        self.pump();
         self.redraw();
     }
 
@@ -507,6 +578,39 @@ impl App {
                     responder.send(reply);
                     continue;
                 }
+                Some("app.perf") => {
+                    let reset = argv.get(1).map(String::as_str) == Some("reset");
+                    responder.send(self.perf.summary(reset));
+                    continue;
+                }
+                Some("app.state") => {
+                    let reply = match &self.wall {
+                        Some(wall) => {
+                            let snap = wall.model().snapshot();
+                            let notice = snap.notice.or_else(|| self.offline_notice.clone());
+                            let terms_desc: Vec<_> = snap
+                                .terminals
+                                .iter()
+                                .map(|t| {
+                                    let pos = wall
+                                        .model()
+                                        .terminal(&t.id)
+                                        .map_or((0.0, 0.0), |e| {
+                                            ((e.position.x * 10.0).round() / 10.0, (e.position.y * 10.0).round() / 10.0)
+                                        });
+                                    (t.id.clone(), t.name.clone(), pos, (t.cols, t.rows))
+                                })
+                                .collect();
+                            format!(
+                                "connected={} focused={:?} notice={:?} terminals={:?}",
+                                snap.connected, snap.focused_id, notice, terms_desc
+                            )
+                        }
+                        None => "ERR: the wall is not open yet".to_string(),
+                    };
+                    responder.send(reply);
+                    continue;
+                }
                 Some("app.quit") => {
                     responder.send("OK: quitting");
                     self.quit = true;
@@ -561,8 +665,9 @@ impl App {
     /// Take in what the terminals' reader thread queued.
     fn pump(&mut self) {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
+        let t_pump = Instant::now();
         let (changed, news) = sessions.pump();
-        let heard = !news.is_empty();
+        let mut heard = !news.is_empty();
         for n in news {
             match n {
                 News::Resized { id, cols, rows } => wall.terminal_resized(&id, u32::from(cols), u32::from(rows)),
@@ -572,9 +677,40 @@ impl App {
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
+                    self.offline_notice = Some(format!(
+                        "termd ({}) disconnected — waiting for daemon",
+                        wall.termd().namespace()
+                    ));
                 }
             }
         }
+        if let Some(live_ids) = sessions.take_reconnected() {
+            log::info!("termd came back ({} terminal(s))", live_ids.len());
+            self.offline_notice = None;
+            if !live_ids.is_empty() {
+                wall.set_live_terminals(&live_ids);
+            }
+            for id in &live_ids {
+                match sessions.adopt(id) {
+                    Ok((cols, rows)) => {
+                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                    }
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+            wall.set_connected(true);
+            heard = true;
+        }
+        for id in sessions.take_external_appeared() {
+            match sessions.adopt(&id) {
+                Ok((cols, rows)) => {
+                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    heard = true;
+                }
+                Err(e) => log::error!("{e}"),
+            }
+        }
+        self.perf.pump_us.push(t_pump.elapsed().as_micros() as u64);
         if heard {
             self.apply_effects();
         }
@@ -609,9 +745,13 @@ impl App {
         let now_ms = self.now_ms();
         let Some(wall) = &mut self.wall else { return };
         let moving = wall.tick(dt, now_ms);
-        let described: Described = wall.frame();
+        let mut described: Described = wall.frame();
         self.animating = moving || described.animating;
         self.apply_effects();
+        // A daemon that went away says so on the notice line until it is back.
+        if described.notice.is_none() {
+            described.notice.clone_from(&self.offline_notice);
+        }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
 
@@ -693,7 +833,7 @@ impl App {
             }
             _ => super::renderer::UploadStats::default(),
         };
-        let _ = stats;
+        self.perf.rows_uploaded += stats.rows_uploaded as u64;
 
         #[cfg(feature = "egui-ui")]
         let mut panel_verbs: Vec<String> = Vec::new();
@@ -742,6 +882,14 @@ impl App {
         if let (Some(enc), Some(frame)) = (encoder, frame) {
             self.ctx.queue.submit([enc.finish()]);
             self.ctx.queue.present(frame);
+            self.perf.draw_us.push(now.elapsed().as_micros() as u64);
+            if self.perf.log_enabled {
+                let due = self.perf.last_log.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0);
+                if due {
+                    self.perf.last_log = Some(Instant::now());
+                    log::info!("[wall-perf] {}", self.perf.summary(true));
+                }
+            }
         }
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
@@ -1144,6 +1292,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.serve_control();
         if self.quit {
             event_loop.exit();
             return;
@@ -1230,6 +1379,11 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
+        offline_notice: None,
+        perf: WallPerf {
+            log_enabled: std::env::var("GLYPH_WALL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"),
+            ..WallPerf::default()
+        },
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);

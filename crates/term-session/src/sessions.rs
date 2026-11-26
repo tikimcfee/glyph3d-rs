@@ -11,13 +11,20 @@
 //! - Input and control calls (`key`, `paste`, `mouse`, `scroll`, `resize`, `kill`, `repaint`)
 //!   dispatch onto the hub's background IO worker so socket round-trips and `kill_grace` waits
 //!   never stall the window's event loop.
+//! - When `g3d-termd` stops (`DaemonEvent::Gone`), [`Sessions`] passively watches for a daemon
+//!   returning on the same [`Target`] (`SessionHub::connect_with`, never restarting a stopped
+//!   daemon behind the user's back) and surfaces the restored hub via [`Sessions::take_reconnected`].
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use term_cells::{Modes, Screen};
 use termd_client::{
-    Create, Key, KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Target, View,
+    ConnectOptions, Create, Key, KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Target,
+    View,
 };
 use wall_core::keymap::{self, TerminalKey, TerminalKeyAction};
 use wall_core::mouse::MouseAction as WallMouseAction;
@@ -29,6 +36,14 @@ use crate::session::{ExitInfo, ScrollbackState, TerminalSession};
 /// The namespace the native wall keeps its terminals in (`rs-wall`, separate from the browser
 /// wall's `wall` namespace so two owners do not fight over terminal sizes).
 pub const NAMESPACE: &str = "rs-wall";
+
+/// Reconnect grace window for brain crashes / `upgrade` handoffs before declaring `g3d-termd`
+/// offline (`g3d-termd`'s brain restart delay is 100 ms and `upgrade` completes in < 200 ms, so
+/// 2 s rides restarts comfortably while surfacing `g3d stop` promptly).
+const WALL_RECONNECT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Passive poll cadence while waiting for an externally stopped `g3d-termd` to return.
+const PASSIVE_RECONNECT_POLL: Duration = Duration::from_millis(300);
 
 /// What happened to a terminal or the daemon since the last [`Sessions::pump`], for the wall's
 /// state machine (`wall_core::wall::Wall`) to hear.
@@ -73,8 +88,21 @@ impl TrackedSession {
 /// All live terminals attached in one `g3d-termd` namespace, keyed by terminal `id`, with one
 /// background emulator thread per terminal.
 pub struct Sessions {
+    target: Target,
+    options: HubOptions,
+    wake: Arc<dyn Fn() + Send + Sync>,
     hub: SessionHub,
     live: BTreeMap<String, TrackedSession>,
+    external_appeared: BTreeSet<String>,
+    reconnected_hub: Arc<Mutex<Option<SessionHub>>>,
+    watching_reconnect: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for Sessions {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
 }
 
 impl Sessions {
@@ -82,14 +110,14 @@ impl Sessions {
     /// whenever a terminal publishes a coalesced screen update or a daemon lifecycle event arrives.
     pub fn open(namespace: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let target = Target::namespace(namespace);
-        Self::open_with(&target, HubOptions::default(), wake)
+        Self::open_with(&target, default_wall_hub_options(), wake)
             .map_err(|e| format!("termd namespace `{namespace}`: {e}"))
     }
 
     /// Connects to an explicit [`Target`] (such as `Target::namespace_in` in scratch tests),
     /// starting `g3d-termd` if needed.
     pub fn open_target(target: &Target, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
-        Self::open_with(target, HubOptions::default(), wake)
+        Self::open_with(target, default_wall_hub_options(), wake)
             .map_err(|e| format!("termd target: {e}"))
     }
 
@@ -99,10 +127,18 @@ impl Sessions {
         options: HubOptions,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, termd_client::Error> {
-        let hub = SessionHub::open_with(target, options, wake)?;
+        let hub = SessionHub::open_with(target, options.clone(), Arc::clone(&wake))?;
+        let _ = hub.status_follow(Some(500));
         Ok(Self {
+            target: target.clone(),
+            options,
+            wake,
             hub,
             live: BTreeMap::new(),
+            external_appeared: BTreeSet::new(),
+            reconnected_hub: Arc::new(Mutex::new(None)),
+            watching_reconnect: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -114,6 +150,75 @@ impl Sessions {
     /// Underlying [`TerminalSession`] for `id`, if currently adopted.
     pub fn session(&self, id: &str) -> Option<&TerminalSession> {
         self.live.get(id).map(|t| &t.session)
+    }
+
+    /// If a stopped daemon has returned and our passive watcher connected to it, swaps in the new
+    /// [`SessionHub`] and returns the sorted list of live terminal ids on that daemon so the host
+    /// can re-adopt them at their saved spots and clear its offline state.
+    pub fn take_reconnected(&mut self) -> Option<Vec<String>> {
+        let next_hub = self
+            .reconnected_hub
+            .lock()
+            .expect("reconnected_hub mutex poisoned")
+            .take()?;
+        self.hub = next_hub;
+        self.external_appeared.clear();
+        let ids = self.list().unwrap_or_default();
+        Some(ids)
+    }
+
+    /// Drains terminal ids that appeared externally in this namespace (discovered via
+    /// `status_follow`) and are not yet adopted in `self.live`.
+    pub fn take_external_appeared(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .external_appeared
+            .iter()
+            .filter(|id| !self.live.contains_key(*id))
+            .cloned()
+            .collect();
+        self.external_appeared.clear();
+        ids
+    }
+
+    fn start_passive_reconnect_watcher(&self) {
+        if self.dropped.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .watching_reconnect
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let target = self.target.clone();
+        let mut opts = self.options.clone();
+        opts.connect.reconnect_window = WALL_RECONNECT_WINDOW;
+        let wake = Arc::clone(&self.wake);
+        let slot = Arc::clone(&self.reconnected_hub);
+        let watching = Arc::clone(&self.watching_reconnect);
+        let dropped = Arc::clone(&self.dropped);
+
+        let _ = thread::Builder::new()
+            .name("term-reconnect".into())
+            .spawn(move || {
+                while !dropped.load(Ordering::Acquire) {
+                    thread::sleep(PASSIVE_RECONNECT_POLL);
+                    if dropped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Ok(new_hub) =
+                        SessionHub::connect_with(&target, opts.clone(), Arc::clone(&wake))
+                    {
+                        let _ = new_hub.status_follow(Some(500));
+                        *slot.lock().expect("reconnected_hub mutex poisoned") = Some(new_hub);
+                        watching.store(false, Ordering::Release);
+                        wake();
+                        return;
+                    }
+                }
+                watching.store(false, Ordering::Release);
+            });
     }
 
     /// The ids of the terminals the daemon holds, sorted.
@@ -137,6 +242,7 @@ impl Sessions {
     /// Takes terminal `id` as its size owner (`Role::Own`), spawns its dedicated emulator thread,
     /// and starts drawing it. Returns its `(cols, rows)`.
     pub fn adopt(&mut self, id: &str) -> Result<(u16, u16), String> {
+        self.external_appeared.remove(id);
         let session = self
             .hub
             .attach_owner(id, None)
@@ -182,6 +288,7 @@ impl Sessions {
             .map_err(|e| format!("termd spawn {}: {e}", opts.id))?;
         let id = session.id().to_owned();
         let dims = (session.screen().cols, session.screen().rows);
+        self.external_appeared.remove(&id);
         self.live.insert(id.clone(), TrackedSession::new(session));
         Ok((id, dims.0, dims.1))
     }
@@ -249,18 +356,35 @@ impl Sessions {
     /// The returned `bool` is `true` iff at least one terminal's [`Screen`] changed.
     pub fn pump(&mut self) -> (bool, Vec<News>) {
         let mut news = Vec::new();
+        let mut daemon_gone = false;
+
         for ev in self.hub.poll_daemon_events() {
             match ev {
                 DaemonEvent::Reconnected { restart, .. } => {
                     log::info!("termd came back (restart: {restart}); its terminals repaint");
                 }
                 DaemonEvent::Gone { message, .. } => {
+                    daemon_gone = true;
                     news.push(News::Disconnected { message });
                 }
                 DaemonEvent::UpgradeFailed { message } => {
                     log::warn!("termd upgrade failed: {message}");
                 }
-                DaemonEvent::Status(_) => {}
+                DaemonEvent::Status(doc) => {
+                    if let Some(terms) = doc.get("terminals").and_then(|v| v.as_array()) {
+                        for item in terms {
+                            let exited = item.get("exit").is_some_and(|e| !e.is_null());
+                            if exited {
+                                continue;
+                            }
+                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                if !self.live.contains_key(id) {
+                                    self.external_appeared.insert(id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -337,6 +461,19 @@ impl Sessions {
             self.live.remove(&id);
         }
 
+        if daemon_gone {
+            // Any remaining sessions whose socket dropped at EOF before `EVENT closed` arrived
+            // belong to the dead daemon: unmount them cleanly (preserving their saved spots in
+            // `WallStore`) and start passively watching for a daemon returning on `target`.
+            let lingering: Vec<String> = self.live.keys().cloned().collect();
+            self.live.clear();
+            self.external_appeared.clear();
+            for id in lingering {
+                news.insert(0, News::Ended { id });
+            }
+            self.start_passive_reconnect_watcher();
+        }
+
         (any_screen_changed, news)
     }
 
@@ -350,7 +487,8 @@ impl Sessions {
     pub fn resize(&mut self, id: &str, cols: u16, rows: u16) {
         let Some(tracked) = self.live.get(id) else {
             return;
-        };
+        }
+        ;
         tracked.session.send_resize(cols, rows);
     }
 
@@ -454,5 +592,15 @@ impl Sessions {
             return;
         };
         tracked.session.send_repaint();
+    }
+}
+
+fn default_wall_hub_options() -> HubOptions {
+    HubOptions {
+        connect: ConnectOptions {
+            reconnect_window: WALL_RECONNECT_WINDOW,
+            ..ConnectOptions::default()
+        },
+        ..HubOptions::default()
     }
 }
