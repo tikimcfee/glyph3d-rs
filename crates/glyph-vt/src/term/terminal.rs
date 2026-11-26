@@ -118,6 +118,11 @@ pub struct Terminal {
     /// Screen-wide change (theme, palette, dynamic fg/bg, DECSCNM, screen switch,
     /// resize, reset) requiring every row to be re-resolved regardless of `Row::dirty`.
     pub all_rows_dirty: bool,
+    /// Grid dimensions changed via `Terminal::resize` since the last `Vt::fill`.
+    pub resized_since_fill: bool,
+    /// Active screen buffer switched (`?47`/`?1047`/`?1049`) or `RIS` (`ESC c`)
+    /// ran since the last `Vt::fill`.
+    pub screen_switched_since_fill: bool,
 
     // DCS accumulation (DECRQSS / XTGETTCAP replies only).
     dcs_kind: DcsKind,
@@ -169,6 +174,8 @@ impl Terminal {
             events: VecDeque::new(),
             dirty: true,
             all_rows_dirty: true,
+            resized_since_fill: false,
+            screen_switched_since_fill: false,
             dcs_kind: DcsKind::Ignore,
             dcs_buf: Vec::new(),
         }
@@ -264,6 +271,9 @@ impl Terminal {
         self.primary.resize_reflow(cols, rows);
         self.alternate.resize_clamped(cols, rows);
         self.tabstops.resize(cols);
+        self.primary.pending_scroll.reset();
+        self.alternate.pending_scroll.reset();
+        self.resized_since_fill = true;
         self.dirty = true;
         self.all_rows_dirty = true;
         if self.modes.get(Mode::InBandSizeReports) {
@@ -707,6 +717,19 @@ impl Terminal {
         };
         let sm = self.screen_mut();
         let cell = sm.row_mut(py).cell_mut(px);
+        // Ghostty (`Terminal.zig` `print` zero-width path when mode 2027 is off):
+        // variation selectors (`U+FE0E` / `U+FE0F`) are ignored on ASCII bases
+        // (`< 0x80`, e.g. `'1'`), since in non-2027 mode the cell stays width 1.
+        if matches!(cp, 0xfe0e | 0xfe0f) {
+            let ascii_base = match &cell.content {
+                CellContent::Char(c) | CellContent::WideChar(c) => (*c as u32) < 0x80,
+                CellContent::Cluster(cl) => cl.cps.first().is_some_and(|&c| (c as u32) < 0x80),
+                _ => false,
+            };
+            if ascii_base {
+                return;
+            }
+        }
         match &mut cell.content {
             CellContent::Char(c) => {
                 cell.content = CellContent::Cluster(Box::new(Cluster {
@@ -787,6 +810,7 @@ impl Terminal {
     // C0 controls
     // ==================================================================
 
+    #[inline]
     pub fn execute(&mut self, byte: u8) {
         match byte {
             0x05 => {} // ENQ: no answerback
@@ -1124,7 +1148,7 @@ impl Terminal {
         s.scroll_top = y;
         s.max_scrollback = 0; // region delete never feeds history
         let save_len = s.scrollback.len();
-        s.scroll_up(count, &pen);
+        s.scroll_up_delete_lines(count, &pen);
         debug_assert_eq!(save_len, s.scrollback.len());
         s.max_scrollback = old_max;
         s.scroll_top = old_top;
@@ -1585,6 +1609,9 @@ impl Terminal {
             // Cursor position and pen carry over (xterm shares the cursor).
             let cursor = self.primary.cursor.clone();
             self.active = ActiveScreen::Alternate;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             let s = self.screen_mut();
             s.cursor = cursor;
             s.cursor.x = s.cursor.x.min(s.cols - 1);
@@ -1599,6 +1626,9 @@ impl Terminal {
             }
             let cursor = self.alternate.cursor.clone();
             self.active = ActiveScreen::Primary;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             let s = self.screen_mut();
             s.cursor = cursor;
             s.cursor.x = s.cursor.x.min(s.cols - 1);
@@ -1616,6 +1646,9 @@ impl Terminal {
         if enable && self.active == ActiveScreen::Primary {
             self.save_cursor();
             self.active = ActiveScreen::Alternate;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             // Clear alt and home the cursor, keeping the pen.
             let pen = self.primary.cursor.style;
             let s = self.screen_mut();
@@ -1628,6 +1661,9 @@ impl Terminal {
             s.reset_margins();
         } else if !enable && self.active == ActiveScreen::Alternate {
             self.active = ActiveScreen::Primary;
+            self.screen_switched_since_fill = true;
+            self.primary.pending_scroll.reset();
+            self.alternate.pending_scroll.reset();
             self.restore_cursor();
         }
     }
@@ -2367,6 +2403,7 @@ impl Terminal {
         self.previous_printed = None;
         self.dcs_kind = DcsKind::Ignore;
         self.dcs_buf.clear();
+        self.screen_switched_since_fill = true;
         self.dirty = true;
         self.all_rows_dirty = true;
     }

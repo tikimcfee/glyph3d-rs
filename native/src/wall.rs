@@ -12,11 +12,14 @@
 pub mod app;
 pub mod camera;
 pub mod cell;
+pub mod chrome;
 pub mod glyphs;
 #[cfg(feature = "windowed")]
 pub mod keys;
 pub mod labels;
 pub mod metrics;
+#[cfg(feature = "egui-ui")]
+pub mod mount;
 #[cfg(feature = "egui-ui")]
 pub mod panels;
 pub mod paper;
@@ -26,6 +29,8 @@ pub mod perf;
 pub mod renderer;
 pub mod replay;
 #[cfg(feature = "windowed")]
+pub mod script;
+#[cfg(feature = "windowed")]
 pub mod session;
 pub mod shapes;
 pub mod test_pattern;
@@ -34,8 +39,9 @@ pub mod ui;
 
 pub use camera::WallCamera;
 pub use cell::{
-    CellGpu, dirty_row_ranges, pack_cell, pack_cell_resolved, pack_cell_style, resolve_cell_glyph,
-    resolve_str_glyphs,
+    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges,
+    dirty_row_ranges_with_selection, pack_cell, pack_cell_resolved, pack_cell_style,
+    resolve_cell_glyph, resolve_str_glyphs,
 };
 pub use glyphs::{EmojiSheetArchive, SparseEmojiSource};
 #[cfg(feature = "wgpu")]
@@ -46,7 +52,8 @@ pub use paper::PaperStyle;
 #[cfg(feature = "wgpu")]
 pub use renderer::{
     TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallFrame, WallRenderer, WallStyle, WallTarget,
-    render_test_pattern_offscreen, render_wall_to_png, render_wall_to_png_with_overlay,
+    render_chrome_pattern_offscreen, render_test_pattern_offscreen, render_wall_to_png,
+    render_wall_to_png_with_overlay,
 };
 #[cfg(feature = "wgpu")]
 pub use replay::render_replay_offscreen;

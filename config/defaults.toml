@@ -405,12 +405,15 @@ border_focused_scale = 1.6                        # thickness multiplier when fo
 border_focused_color = [0.431, 0.906, 0.627, 1.0] # #6ee7a0 focus green
 border_unfocused_color = [0.24, 0.28, 0.36, 0.85] # muted slate hairline
 cursor_color = [0.431, 0.906, 0.627, 1.0]         # #6ee7a0 focus green
-cursor_fill_opacity = 0.50                        # solid focused block alpha
+cursor_fill_opacity = 1.00                        # solid focused block alpha (glyph draws over it in cell bg)
 cursor_border_px = 1.5                            # hollow unfocused outline in screen px
+cursor_blink_ms = 530                             # blink half-period in ms (0 = steady, never blinks)
 greek_px = 8.0                                    # cell height px below which text greeks
-underline_y = 0.12                                # underline centre from cell bottom (0..1)
-strike_y = 0.42                                   # strikethrough centre from cell bottom (0..1)
-line_thickness = 0.05                             # decoration line thickness in cell heights
+underline_y = 0.12                                # fallback underline centre from cell bottom (0..1; overridden by font post table)
+strike_y = 0.42                                   # fallback strikethrough centre from cell bottom (0..1; overridden by font OS/2 table)
+line_thickness = 0.05                             # fallback decoration thickness in cell heights (overridden by font post table)
+line_thickness_scale = 1.0                        # user multiplier on font underline thickness (GLYPH_LINE_DEFAULTS.lineThickness)
+underline_raise = 0.0                             # vertical offset added to font underline_y in cell heights (GLYPH_LINE_DEFAULTS.underlineRaise)
 curly_amplitude = 1.5                             # curly underline amplitude x thickness
 dim_alpha = 0.50                                  # SGR 2 faint ink/line opacity
 # Drafting paper behind terminals (matches wall-core WallConfig defaults).

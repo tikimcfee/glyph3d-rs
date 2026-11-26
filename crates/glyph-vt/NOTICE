@@ -57,13 +57,22 @@ Local changes to the vendored core (`src/term/`)
      `cursor_right`, `cursor_left`, `carriage_return`, `horizontal_tab`,
      `horizontal_tab_back`, `restore_cursor` (default branch), `OscCommand::ChangeWindowTitle`,
      Kitty keyboard `CSI > / < / = u`, `XTMODKEYS`, and `DECKPAM`/`DECKPNM`.
+   - Matched Ghostty / `libghostty-vt` in `Terminal::attach_zero_width` when
+     mode `2027` (`GraphemeCluster`) is off: ignore `U+FE0E`/`U+FE0F` variation
+     selectors on ASCII base characters (`< 0x80`, e.g. `'1'` in `1\u{FE0F}\u{20E3}`).
 4. Hot-path performance (`page.rs`, `screen.rs`, `stream.rs`, `parser.rs`, `terminal.rs`):
    - Added per-row `Row::dirty` + `Terminal::all_rows_dirty` so incremental
-     `Vt::fill` skips clean rows instead of re-resolving the whole grid.
+     `Vt::fill` skips clean rows instead of re-resolving the whole grid, plus
+     `Screen::pending_scroll`, `Terminal::resized_since_fill`, and
+     `Terminal::screen_switched_since_fill` so `Vt::fill` reports whole-screen
+     vs margin scroll counts and per-row in-place rewritten column spans for
+     terminal text-selection tracking.
    - Recycled evicted `Row` buffers in full-width `scroll_up` / `scroll_down`
-     instead of dropping and reallocating `Vec<Cell>` on every linefeed.
+     via in-place `Row::clear` + `slice::rotate_left` instead of dropping and
+     reallocating `Vec<Cell>` or re-marking all rows dirty on every linefeed.
    - Added `Stream::process` + `Terminal::print_ascii_slice` batched ground-state
-     fast path for printable ASCII runs (`0x20..=0x7e`) and direct `ESC` entry.
+     fast path for printable ASCII runs (`0x20..=0x7e`) plus direct `ESC`, `CR`,
+     and `LF` ground handling.
    - Added `Parser::step` callback dispatch (avoiding 312-byte `[Option<Action>; 3]`
      stack copies per non-ground byte) and eliminated per-SGR `Vec<Attribute>`
      heap allocation in `Terminal::apply_sgr`.

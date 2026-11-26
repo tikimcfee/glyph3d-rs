@@ -248,11 +248,16 @@ fn format_summary_from_inner(
     let draw_sum_ms = ns_to_ms(inner.frame_draw_ns.iter().copied().sum());
     let wait_sum_ms = ns_to_ms(inner.frame_wait_ns.iter().copied().sum());
     let wakes = inner.pump_wakes.max(pump_calls_started);
+    let wake_hz = if wall_s > 0.0 {
+        wakes as f64 / wall_s
+    } else {
+        0.0
+    };
     let cpu_field = proc_cpu_ns.map_or_else(|| "na".to_owned(), |ns| format!("{:.3}", ns_to_ms(ns)));
 
     let mut line = format!(
         "wall-perf: frames={frames} wall_ms={wall_ms:.2} fps={fps:.2} \
-         pump_ms=p50:{pump_p50:.3},p95:{pump_p95:.3},max:{pump_max:.3},sum:{pump_sum_ms:.2},wakes:{wakes} \
+         pump_ms=p50:{pump_p50:.3},p95:{pump_p95:.3},max:{pump_max:.3},sum:{pump_sum_ms:.2},wakes:{wakes},wake_hz:{wake_hz:.1} \
          draw_ms=p50:{draw_p50:.3},p95:{draw_p95:.3},max:{draw_max:.3},sum:{draw_sum_ms:.2} \
          wait_ms=p50:{wait_p50:.3},sum:{wait_sum_ms:.2} \
          proc_cpu_ms={cpu_field} \
@@ -324,6 +329,16 @@ impl WallPerf {
                 }),
             }),
         }
+    }
+
+    /// Whether `GLYPH_WALL_PERF` collection is active for this process.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Drop any offscreen GPU texture before the window's surface/device tears down.
+    pub fn clear_gpu(&mut self) {
+        self.occluded_backing = None;
     }
 
     /// Record when the window, renderer, and initial terminals have opened.
@@ -674,7 +689,7 @@ mod tests {
             0,
         );
         assert!(summary.starts_with("wall-perf: frames=20 wall_ms=1000.00 fps=20.00 "));
-        assert!(summary.contains("pump_ms=p50:1.000,p95:1.900,max:2.000,sum:21.00,wakes:20"));
+        assert!(summary.contains("pump_ms=p50:1.000,p95:1.900,max:2.000,sum:21.00,wakes:20,wake_hz:20.0"));
         assert!(summary.contains("draw_ms=p50:0.500,p95:0.950,max:1.000,sum:10.50"));
         assert!(summary.contains("proc_cpu_ms=42.500"));
         assert!(summary.contains("uploads=drawn:80,uploaded:40,rows:960,writes:40"));

@@ -29,10 +29,14 @@ term-cells = { path = "../crates/term-cells" }
 # The wall's rules and its input types (keys named as the web names them),
 # with no window in them (2026-11-26).
 wall-core = { path = "../crates/wall-core" }
-# The wall's live terminals (2026-11-26): the daemon's socket protocol, and
-# the emulator that turns a terminal's bytes into a term-cells Screen.
+# The wall's live terminals (2026-11-26): the daemon's socket protocol, the
+# emulator that turns a terminal's bytes into a term-cells Screen, and the
+# per-terminal session threads that coalesce floods off the window thread.
 termd-client = { path = "../crates/termd-client" }
 glyph-vt = { path = "../crates/glyph-vt" }
+# The door a command line reaches the running wall by: `wallctl <verb ...>`.
+wall-control = { path = "../crates/wall-control" }
+term-session = { path = "../crates/term-session" }
 # The wall's runtime Slug font encoder, sprites, clusters, and growable atlas.
 glyph-font = { path = "../crates/glyph-font" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a

@@ -90,6 +90,7 @@ fn main() {
         | CliCommand::Render(_)
         | CliCommand::Wall { .. }
         | CliCommand::WallTestPattern { .. }
+        | CliCommand::WallChromePattern { .. }
         | CliCommand::WallReplay { .. } => {
             eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
             std::process::exit(1);
@@ -141,6 +142,20 @@ fn main() {
             };
             let ctx = pollster::block_on(gpu::init(None));
             wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallChromePattern {
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-chrome-pattern requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_chrome_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::WallReplay {

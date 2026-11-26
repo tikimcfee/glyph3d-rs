@@ -110,6 +110,28 @@ fn assert_screen_invariants(case_id: usize, vt: &Vt, screen: &Screen) {
         screen.cursor.row,
         rows
     );
+    assert_eq!(
+        screen.cursor_color,
+        vt.cursor_color(),
+        "case {case_id}: cursor_color mismatch"
+    );
+    let cursor_alpha = screen.cursor_color & 0xff00_0000;
+    assert!(
+        cursor_alpha == 0 || cursor_alpha == 0xff00_0000,
+        "case {case_id}: invalid cursor_color alpha {cursor_alpha:#x}"
+    );
+    let delta = vt.last_fill_delta();
+    assert_eq!(
+        delta.rewritten_cols().len(),
+        usize::from(rows),
+        "case {case_id}: delta.rewritten_cols().len() mismatch"
+    );
+    for (r_idx, &(lo, hi)) in delta.rewritten_cols().iter().enumerate() {
+        assert!(
+            lo <= hi && hi <= cols,
+            "case {case_id}: invalid rewritten span ({lo}, {hi}) on row {r_idx} for cols {cols}"
+        );
+    }
 
     let cols_usize = usize::from(cols);
     for r in 0..rows {

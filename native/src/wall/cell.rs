@@ -235,6 +235,161 @@ pub fn dirty_row_ranges(row_gen: &[u64], uploaded_gen: u64) -> Vec<Range<usize>>
     ranges
 }
 
+/// Cell-coordinate text selection highlight for one terminal (wall-core-free).
+///
+/// Matches the JS wall's `TerminalSelection` / `TerminalGrid`:
+/// - Linear stream (`block == false`): from `(start_row, start_col)` through
+///   `(end_row, end_col)` in reading order (`end_col` exclusive), selecting full
+///   rows `0..cols` on any interior row.
+/// - Column block (`block == true`): rows `start_row..=end_row` and columns
+///   `start_col..end_col` on every row.
+/// - `background` replaces each selected cell's fill (opaque sRGB RGBA8; default
+///   `#cccccc`). `foreground` replaces each selected cell's text colour (`#0a0a1e`
+///   by default), or `None` keeps each cell's own foreground (`"keep"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellSelection {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    pub block: bool,
+    /// Selection fill colour (packed sRGB RGBA8; alpha 0 is promoted to opaque 0xFF).
+    pub background: u32,
+    /// Optional selection text colour (packed sRGB RGBA8); `None` keeps cell fg.
+    pub foreground: Option<u32>,
+}
+
+impl CellSelection {
+    /// Default JS wall selection fill (`#cccccc`, `TERMINAL_SELECTION_DEFAULTS.background`).
+    pub const DEFAULT_BACKGROUND: u32 = term_cells::rgb(0xcc, 0xcc, 0xcc);
+    /// Default JS wall selection text (`#0a0a1e`, `TERMINAL_SELECTION_DEFAULTS.foreground`).
+    pub const DEFAULT_FOREGROUND: u32 = term_cells::rgb(0x0a, 0x0a, 0x1e);
+
+    /// Construct a linear (stream) selection from `(start_row, start_col)` to
+    /// `(end_row, end_col)` (end column exclusive) with the default JS wall colours.
+    pub const fn linear(start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> Self {
+        Self {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            block: false,
+            background: Self::DEFAULT_BACKGROUND,
+            foreground: Some(Self::DEFAULT_FOREGROUND),
+        }
+    }
+
+    /// Construct a rectangular column-block selection over rows `start_row..=end_row`
+    /// and columns `start_col..end_col` with the default JS wall colours.
+    pub const fn block(start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> Self {
+        Self {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            block: true,
+            background: Self::DEFAULT_BACKGROUND,
+            foreground: Some(Self::DEFAULT_FOREGROUND),
+        }
+    }
+
+    /// Override the fill and optional text colour (`None` keeps each cell's own `fg`).
+    pub const fn with_colors(mut self, background: u32, foreground: Option<u32>) -> Self {
+        self.background = background;
+        self.foreground = foreground;
+        self
+    }
+
+    /// True when this selection covers zero cells.
+    pub const fn is_empty(&self) -> bool {
+        if self.block {
+            self.start_row > self.end_row || self.start_col >= self.end_col
+        } else {
+            self.start_row > self.end_row
+                || (self.start_row == self.end_row && self.start_col >= self.end_col)
+        }
+    }
+
+    /// Selected column span `[lo, hi)` on `row` for a grid of `cols` columns
+    /// (`0..0` when `row` has no selected cells).
+    pub fn row_span(&self, row: u16, cols: u16) -> Range<u16> {
+        if self.is_empty() || row < self.start_row || row > self.end_row {
+            return 0..0;
+        }
+        let lo = if self.block || row == self.start_row {
+            self.start_col.min(cols)
+        } else {
+            0
+        };
+        let hi = if self.block || row == self.end_row {
+            self.end_col.min(cols)
+        } else {
+            cols
+        };
+        if hi <= lo { 0..0 } else { lo..hi }
+    }
+}
+
+/// Apply `selection`'s fill and optional text colour to a packed [`CellGpu`].
+pub fn apply_selection_to_cell(cell: &mut CellGpu, selection: &CellSelection) {
+    let bg = if (selection.background >> 24) == 0 {
+        selection.background | 0xFF00_0000
+    } else {
+        selection.background
+    };
+    cell.bg = bg;
+    if let Some(fg) = selection.foreground {
+        cell.fg = if (fg >> 24) == 0 { fg | 0xFF00_0000 } else { fg };
+    }
+}
+
+/// Coalesce rows that need GPU re-upload due to either screen mutations
+/// (`row_gen[r] > uploaded_gen` when `screen_gen != uploaded_gen`) or a change
+/// in the terminal's active [`CellSelection`] affecting that row.
+pub fn dirty_row_ranges_with_selection(
+    row_gen: &[u64],
+    cols: u16,
+    screen_gen: u64,
+    uploaded_gen: u64,
+    old_sel: Option<CellSelection>,
+    new_sel: Option<CellSelection>,
+) -> Vec<Range<usize>> {
+    let old_sel = old_sel.filter(|s| !s.is_empty());
+    let new_sel = new_sel.filter(|s| !s.is_empty());
+    let screen_dirty = screen_gen != uploaded_gen;
+    let sel_dirty = old_sel != new_sel;
+    if !screen_dirty && !sel_dirty {
+        return Vec::new();
+    }
+    let colors_changed = old_sel.map(|s| (s.background, s.foreground))
+        != new_sel.map(|s| (s.background, s.foreground));
+
+    let mut ranges = Vec::new();
+    let mut start: Option<usize> = None;
+    for (row_idx, &gen) in row_gen.iter().enumerate() {
+        let r = row_idx as u16;
+        let row_screen_dirty = screen_dirty && gen > uploaded_gen;
+        let row_sel_dirty = if sel_dirty {
+            let old_span = old_sel.map_or(0..0, |s| s.row_span(r, cols));
+            let new_span = new_sel.map_or(0..0, |s| s.row_span(r, cols));
+            old_span != new_span || (colors_changed && !new_span.is_empty())
+        } else {
+            false
+        };
+        if row_screen_dirty || row_sel_dirty {
+            if start.is_none() {
+                start = Some(row_idx);
+            }
+        } else if let Some(run_start) = start.take() {
+            ranges.push(run_start..row_idx);
+        }
+    }
+    if let Some(run_start) = start {
+        ranges.push(run_start..row_gen.len());
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -397,5 +552,101 @@ mod tests {
         assert_eq!(dirty_row_ranges(&[1, 6, 7, 2, 8, 2, 9, 10], 5), vec![1..3, 4..5, 6..8]);
         assert_eq!(dirty_row_ranges(&[6, 7, 8], 5), vec![0..3]);
         assert_eq!(dirty_row_ranges(&[6, 1, 1], 5), vec![0..1]);
+    }
+
+    #[test]
+    fn cell_selection_row_span_linear_and_block() {
+        let linear = CellSelection::linear(1, 5, 3, 10);
+        assert!(!linear.is_empty());
+        assert_eq!(linear.row_span(0, 80), 0..0);
+        assert_eq!(linear.row_span(1, 80), 5..80);
+        assert_eq!(linear.row_span(2, 80), 0..80);
+        assert_eq!(linear.row_span(3, 80), 0..10);
+        assert_eq!(linear.row_span(4, 80), 0..0);
+
+        // Single-row linear selection.
+        let single = CellSelection::linear(2, 4, 2, 9);
+        assert_eq!(single.row_span(2, 80), 4..9);
+        assert_eq!(single.row_span(1, 80), 0..0);
+
+        // Linear ending at col 0 of last row leaves that row untouched.
+        let end_zero = CellSelection::linear(1, 4, 2, 0);
+        assert_eq!(end_zero.row_span(1, 20), 4..20);
+        assert_eq!(end_zero.row_span(2, 20), 0..0);
+
+        // Column block selection selects the same columns on every covered row.
+        let block = CellSelection::block(1, 3, 3, 8);
+        assert_eq!(block.row_span(0, 20), 0..0);
+        assert_eq!(block.row_span(1, 20), 3..8);
+        assert_eq!(block.row_span(2, 20), 3..8);
+        assert_eq!(block.row_span(3, 20), 3..8);
+        assert_eq!(block.row_span(4, 20), 0..0);
+
+        // Empty and inverted selections yield empty spans.
+        assert!(CellSelection::linear(2, 5, 2, 5).is_empty());
+        assert!(CellSelection::linear(3, 0, 2, 5).is_empty());
+        assert!(CellSelection::block(1, 5, 3, 5).is_empty());
+        assert!(CellSelection::block(3, 1, 1, 5).is_empty());
+    }
+
+    #[test]
+    fn dirty_row_ranges_with_selection_touches_only_changed_rows() {
+        let row_gen = [1u64; 10];
+        let cols = 40;
+
+        // 1. Steady state (unchanged screen + unchanged selection) -> 0 rows.
+        let s1 = CellSelection::linear(2, 5, 4, 12);
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s1), Some(s1)),
+            Vec::<Range<usize>>::new()
+        );
+
+        // 2. Initial selection on rows 2..=4 -> only rows 2..5.
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, None, Some(s1)),
+            vec![2..5]
+        );
+
+        // 3. Extending drag right on the final row -> ONLY row 4!
+        let s2 = CellSelection::linear(2, 5, 4, 25);
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s1), Some(s2)),
+            vec![4..5]
+        );
+
+        // 4. Extending drag down from row 4 to row 6 -> only rows 4..7 (rows 2 & 3 untouched!).
+        let s3 = CellSelection::linear(2, 5, 6, 8);
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s2), Some(s3)),
+            vec![4..7]
+        );
+
+        // 5. Jumping selection to row 8 -> two disjoint ranges (old 2..7 + new 8..9).
+        let s4 = CellSelection::linear(8, 1, 8, 10);
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s3), Some(s4)),
+            vec![2..7, 8..9]
+        );
+
+        // 6. Changing selection colours -> only currently selected row 8.
+        let s4_keep = s4.with_colors(rgb(0x40, 0x60, 0xc0), None);
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s4), Some(s4_keep)),
+            vec![8..9]
+        );
+
+        // 7. Clearing selection -> only previously selected row 8.
+        assert_eq!(
+            dirty_row_ranges_with_selection(&row_gen, cols, 1, 1, Some(s4_keep), None),
+            vec![8..9]
+        );
+
+        // 8. Unrelated screen edit on row 0 while selection sits steady on row 8 -> only row 0.
+        let mut edited = row_gen;
+        edited[0] = 2;
+        assert_eq!(
+            dirty_row_ranges_with_selection(&edited, cols, 2, 1, Some(s4), Some(s4)),
+            vec![0..1]
+        );
     }
 }

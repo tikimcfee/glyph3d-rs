@@ -36,7 +36,7 @@ use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Descri
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 #[cfg(feature = "egui-ui")]
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
@@ -45,6 +45,7 @@ use winit::window::{Window, WindowId};
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
+use super::cell::CellSelection;
 use super::labels::{Label, LabelHeight};
 use super::metrics::WorldRect;
 use super::paper::PaperStyle;
@@ -99,25 +100,38 @@ impl Terminals {
 }
 
 /// What exists once there is a window.
+///
+/// Field order is drop order, and it matters on Wayland: the egui layer
+/// (whose clipboard worker borrows the display) and the surface must go
+/// before the window (found on workstation, 2026-11-26: a segfault in
+/// `wl_proxy_destroy` at every exit).
 struct Gfx {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    depth: wgpu::TextureView,
-    renderer: WallRenderer,
-    /// Renderer scale that makes a cell [`WORLD_CELL_HEIGHT`] tall.
-    cell_scale: f32,
     #[cfg(feature = "egui-ui")]
     ui: WallUi,
+    renderer: WallRenderer,
+    depth: wgpu::TextureView,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    window: Arc<Window>,
+    /// Renderer scale that makes a cell [`WORLD_CELL_HEIGHT`] tall.
+    cell_scale: f32,
 }
 
 struct App {
+    /// Before `ctx`: dropped first, and cleared in `exiting` while the event
+    /// loop's display connection is still open.
+    gfx: Option<Gfx>,
     ctx: GpuContext,
     opts: Option<WallOptions>,
     proxy: EventLoopProxy<Wake>,
-    gfx: Option<Gfx>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
+    /// The socket `wallctl` reaches this wall by; None if it could not bind
+    /// (another wall holds the namespace) or the wall has no namespace.
+    control: Option<wall_control::Server>,
+    /// A frame `wallctl app.shot PATH` asked to keep, answered once it is written.
+    pending_shot: Option<(PathBuf, wall_control::Responder)>,
+    quit: bool,
     modifiers: ModifiersState,
     /// The pointer in logical pixels from the window's top-left.
     cursor: Point,
@@ -136,22 +150,36 @@ struct App {
     #[cfg(feature = "egui-ui")]
     hud_open: bool,
     #[cfg(feature = "egui-ui")]
+    panels: super::mount::Panels,
+    #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
+    blink_repaint_at: Option<Instant>,
+    occluded: bool,
     perf: super::perf::WallPerf,
 }
 
-/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
-fn css_color(s: &str, alpha: f32) -> [f32; 4] {
+fn parse_css_hex(s: &str) -> Option<u32> {
     let h = s.trim().trim_start_matches('#');
     let full = match h.len() {
         3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
         6 => h.to_string(),
-        _ => String::new(),
+        _ => return None,
     };
-    match u32::from_str_radix(&full, 16) {
-        Ok(v) if full.len() == 6 => srgb_hex(v, alpha),
-        _ => [1.0, 0.0, 1.0, alpha],
+    u32::from_str_radix(&full, 16).ok()
+}
+
+/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
+fn css_color(s: &str, alpha: f32) -> [f32; 4] {
+    match parse_css_hex(s) {
+        Some(v) => srgb_hex(v, alpha),
+        None => [1.0, 0.0, 1.0, alpha],
     }
+}
+
+/// `#rrggbb` (or `#rgb`) as packed opaque sRGB RGBA8; anything else is magenta.
+fn css_rgb_u32(s: &str) -> u32 {
+    let v = parse_css_hex(s).unwrap_or(0xff00ff);
+    term_cells::rgb(((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8)
 }
 
 fn world_rect(r: Rect) -> WorldRect {
@@ -190,6 +218,20 @@ fn cursor_of(c: CursorIcon) -> winit::window::CursorIcon {
         CursorIcon::Resize(ResizeCursor::EwResize) => W::EwResize,
         CursorIcon::Resize(ResizeCursor::NsResize) => W::NsResize,
     }
+}
+
+/// A screen as text, a line a row, trailing blanks and blank rows dropped.
+fn screen_text(s: &Screen) -> String {
+    let mut out = String::new();
+    for r in 0..s.rows {
+        let line: String = s.row(r).iter().map(|c| if c.content == 0 { " ".into() } else { s.content_str(c).into_owned() }).collect();
+        let line = line.trim_end();
+        if !line.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Where the wall keeps its state between runs. A scratch daemon directory
@@ -287,6 +329,13 @@ impl App {
             // The loop may be gone at shutdown; nothing is left to wake.
             let _ = proxy.send_event(Wake);
         });
+        // The door for `wallctl`: verbs arrive on a socket beside termd's.
+        if let Some(ns) = &opts.namespace {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
+                Ok(server) => self.control = Some(server),
+                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
+            }
+        }
         let terms = match &opts.namespace {
             Some(ns) => {
                 let mut sessions = match Sessions::open(ns, wake) {
@@ -323,14 +372,14 @@ impl App {
         };
 
         self.gfx = Some(Gfx {
-            window,
-            surface,
-            config,
-            depth,
-            renderer,
-            cell_scale,
             #[cfg(feature = "egui-ui")]
             ui,
+            renderer,
+            depth,
+            surface,
+            config,
+            window,
+            cell_scale,
         });
         self.wall = Some(wall);
         self.terms = Some(terms);
@@ -339,8 +388,8 @@ impl App {
             wall.run("wall.fit");
         }
         self.apply_effects();
-        self.redraw();
         self.perf.mark_opened(&self.proxy);
+        self.redraw();
     }
 
     /// Carry out what the wall asked for, until it asks for nothing more.
@@ -360,7 +409,48 @@ impl App {
         log::warn!("the wall kept asking for more after eight rounds of effects; leaving the rest for the next event");
     }
 
+    /// The clipboard's text. On Linux it is read through the window's own
+    /// clipboard, which speaks Wayland; a fresh `arboard` there speaks X11
+    /// alone.
+    fn read_clipboard(&mut self) -> Option<String> {
+        #[cfg(all(target_os = "linux", feature = "egui-ui"))]
+        if let Some(g) = &mut self.gfx {
+            return g.ui.clipboard_text();
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                log::warn!("paste: the clipboard gave no text: {e}");
+                None
+            }
+        }
+    }
+
+    fn write_clipboard(&mut self, text: String) {
+        #[cfg(all(target_os = "linux", feature = "egui-ui"))]
+        if let Some(g) = &mut self.gfx {
+            g.ui.set_clipboard_text(text);
+            return;
+        }
+        if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            log::warn!("copy: the clipboard refused the text: {e}");
+        }
+    }
+
     fn apply(&mut self, effect: WallEffect) {
+        let effect = match effect {
+            WallEffect::WriteClipboard { text } => {
+                self.write_clipboard(text);
+                return;
+            }
+            WallEffect::ReadClipboard { target } => {
+                if let (Some(text), Some(wall)) = (self.read_clipboard(), &mut self.wall) {
+                    wall.deliver_clipboard(&target, &text);
+                }
+                return;
+            }
+            other => other,
+        };
         let (Some(wall), Some(terms)) = (&mut self.wall, &mut self.terms) else { return };
         match effect {
             WallEffect::Redraw => {
@@ -373,15 +463,6 @@ impl App {
                     g.window.set_cursor(cursor_of(cursor));
                 }
             }
-            WallEffect::WriteClipboard { text } => {
-                if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-                    log::warn!("copy: the clipboard refused the text: {e}");
-                }
-            }
-            WallEffect::ReadClipboard { target } => match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                Ok(text) => wall.deliver_clipboard(&target, &text),
-                Err(e) => log::warn!("paste: the clipboard gave no text: {e}"),
-            },
             WallEffect::ConfigKnobChanged { key, value } => {
                 // The renderer's own knobs follow here as they are wired; the
                 // rules have already taken the value.
@@ -404,7 +485,8 @@ impl App {
                     WallEffect::SendKey { id, key } => sessions.key(&id, &key),
                     WallEffect::PasteTerminal { id, text } => sessions.paste(&id, &text),
                     WallEffect::SendMouse { id, event } => sessions.mouse(&id, &event),
-                    WallEffect::ScrollTerminal { id, lines, cell } => sessions.scroll(&id, lines, cell.x, cell.y),
+                    // wall-core emits +lines for up-into-history; Sessions::scroll takes negative for up.
+                    WallEffect::ScrollTerminal { id, lines, cell } => sessions.scroll(&id, lines.saturating_neg(), cell.x, cell.y),
                     WallEffect::RefreshTerminal { id } => sessions.repaint(&id),
                     _ => {}
                 }
@@ -412,10 +494,94 @@ impl App {
         }
     }
 
+    /// Run the verb lines `wallctl` sent, and answer each.
+    fn serve_control(&mut self) {
+        if self.control.is_none() {
+            return;
+        }
+        let mut ran = false;
+        while let Some(request) = self.control.as_ref().and_then(wall_control::Server::try_recv) {
+            let (line, responder) = request.into_parts();
+            // The window's own few verbs: what a script needs that the wall's
+            // rules cannot give (pixels, a terminal's text, quitting).
+            let argv = wall_core::router::CommandRouter::<()>::parse_line(&line);
+            match argv.first().map(String::as_str) {
+                Some("app.shot") => {
+                    match argv.get(1) {
+                        Some(path) if argv.len() == 2 => self.pending_shot = Some((PathBuf::from(path), responder)),
+                        _ => {
+                            responder.send("ERR: usage: app.shot <path.png>");
+                        }
+                    }
+                    ran = true;
+                    continue;
+                }
+                Some("app.text") => {
+                    let reply = match (argv.get(1), &self.terms) {
+                        (Some(id), Some(terms)) if argv.len() == 2 => match terms.screen(id) {
+                            Some(s) => screen_text(s),
+                            None => format!("ERR: no terminal '{id}'"),
+                        },
+                        _ => "ERR: usage: app.text <terminal id>".to_string(),
+                    };
+                    responder.send(reply);
+                    continue;
+                }
+                Some("app.quit") => {
+                    responder.send("OK: quitting");
+                    self.quit = true;
+                    ran = true;
+                    continue;
+                }
+                Some("app.palette") => {
+                    let reply = match &mut self.wall {
+                        Some(wall) => {
+                            let next = match argv.get(1).map(String::as_str) {
+                                Some("open") => true,
+                                Some("close") => false,
+                                Some("toggle") | None => !wall.palette_open(),
+                                Some(other) => {
+                                    responder.send(format!("ERR: takes toggle|open|close, not '{other}'"));
+                                    continue;
+                                }
+                            };
+                            wall.set_palette_open(next);
+                            format!("OK: palette {}", if next { "open" } else { "closed" })
+                        }
+                        None => "ERR: the wall is not open yet".to_string(),
+                    };
+                    responder.send(reply);
+                    ran = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(parsed) = super::script::parse_script_line(&line) {
+                let reply = match parsed {
+                    Ok(cmd) => self.run_script(cmd),
+                    Err(err) => format!("ERR: {err}"),
+                };
+                responder.send(reply);
+                ran = true;
+                continue;
+            }
+            let reply = match (&mut self.wall, &self.terms) {
+                (Some(wall), Some(terms)) => wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text,
+                _ => "ERR: the wall is not open yet".to_string(),
+            };
+            responder.send(reply);
+            ran = true;
+        }
+        if ran {
+            self.apply_effects();
+            self.redraw();
+        }
+    }
+
     /// Take in what the terminals' reader thread queued.
     fn pump(&mut self) {
+        let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let _pump = self.perf.pump_scope();
         let (changed, news) = sessions.pump();
         let heard = !news.is_empty();
         for n in news {
@@ -457,7 +623,7 @@ impl App {
 
     /// The wall's description of a frame as the renderer's draw lists.
     #[expect(clippy::too_many_lines, reason = "one arm per kind of thing the wall describes; splitting it scatters the mapping")]
-    fn draw(&mut self) {
+    fn draw(&mut self, to_surface: bool) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(1.0 / 30.0);
         self.last_tick = now;
@@ -472,30 +638,42 @@ impl App {
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
-        let t_acquire = Instant::now();
-        let (frame, view) = match g.surface.get_current_texture() {
-            Cst::Success(f) | Cst::Suboptimal(f) => {
-                let v = f.texture.create_view(&Default::default());
-                (Some(f), v)
+        let t_acq = Instant::now();
+        let frame = if to_surface {
+            match g.surface.get_current_texture() {
+                Cst::Success(f) | Cst::Suboptimal(f) => {
+                    self.occluded = false;
+                    Some(f)
+                }
+                Cst::Lost | Cst::Outdated => {
+                    g.surface.configure(&self.ctx.device, &g.config);
+                    g.window.request_redraw();
+                    None
+                }
+                // Covered or asleep: skip surface present, unless an offscreen shot is waiting.
+                Cst::Occluded | Cst::Timeout => {
+                    self.occluded = true;
+                    None
+                }
+                Cst::Validation => {
+                    log::error!("the wall's surface failed validation; skipping the frame");
+                    None
+                }
             }
-            Cst::Lost | Cst::Outdated => {
-                g.surface.configure(&self.ctx.device, &g.config);
-                g.window.request_redraw();
-                return;
-            }
-            // Covered or asleep: the next event that matters asks again, unless
-            // GLYPH_WALL_PERF is measuring rendering on an occluded screen.
-            Cst::Occluded | Cst::Timeout => match self.perf.occluded_view(&self.ctx.device, g.config.format, g.config.width, g.config.height) {
-                Some(v) => (None, v),
-                None => return,
-            },
-            Cst::Validation => {
-                log::error!("the wall's surface failed validation; skipping the frame");
-                return;
-            }
+        } else {
+            None
         };
-        let t_post_acquire = Instant::now();
-        let target = WallTarget { color_view: &view, depth_view: &g.depth, width: g.config.width, height: g.config.height };
+        let t_post_acq = Instant::now();
+        let need_offscreen = self.pending_shot.is_some()
+            || self.perf.is_enabled()
+            || (self.exit_after == Some(self.frames + 1) && std::env::var_os("GLYPH_WALL_SHOT").is_some());
+        if frame.is_none() && !need_offscreen {
+            if !to_surface && self.exit_after.is_some() {
+                self.frames += 1;
+                self.scripted();
+            }
+            return;
+        }
         let sf = g.window.scale_factor() as f32;
         // The wall's camera is in logical pixels per world unit; the
         // renderer's is in physical ones.
@@ -516,6 +694,19 @@ impl App {
                 focused: t.focused,
                 panel_opacity: None,
                 border_color: t.hovered.then_some(term_cells::rgb(0x5a, 0x6b, 0x86)).filter(|_| !t.focused),
+                selection: t.text_selection.as_ref().map(|sel| {
+                    let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
+                        .then(|| css_rgb_u32(&sel.foreground));
+                    CellSelection {
+                        start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
+                        start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
+                        end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
+                        end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
+                        block: sel.block,
+                        background: css_rgb_u32(&sel.background),
+                        foreground: fg,
+                    }
+                }),
             });
         }
 
@@ -622,12 +813,27 @@ impl App {
             min_px: described.paper.grid.grid_min_px as f32 * sf,
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
-        let stats = g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &camera, &wall_frame);
+        self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
+        let view = frame
+            .as_ref()
+            .map(|f| f.texture.create_view(&Default::default()))
+            .or_else(|| self.perf.occluded_view(&self.ctx.device, g.config.format, g.config.width, g.config.height));
+        let mut encoder = view.as_ref().map(|_| self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") }));
+        let stats = match (&view, &mut encoder) {
+            (Some(v), Some(enc)) => {
+                let target = WallTarget { color_view: v, depth_view: &g.depth, width: g.config.width, height: g.config.height };
+                g.renderer.render(&self.ctx.device, &self.ctx.queue, enc, &target, &camera, &wall_frame)
+            }
+            _ => super::renderer::UploadStats::default(),
+        };
         let _ = stats;
 
         #[cfg(feature = "egui-ui")]
-        let mut ui_painted = if self.hud_open || g.ui.is_active() {
+        let mut panel_verbs: Vec<String> = Vec::new();
+        #[cfg(feature = "egui-ui")]
+        let mut panel_egui_keys = false;
+        #[cfg(feature = "egui-ui")]
+        let mut ui_painted = if self.hud_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
             let hud_terms: Vec<HudTerminalInfo<'_>> = described
                 .terminals
                 .iter()
@@ -639,13 +845,19 @@ impl App {
                 .collect();
             let hud_input = DebugHudInput { camera_zoom: camera.zoom, camera_center: camera.center, viewport, stats, terminals: &hud_terms };
             let hud_open = &mut self.hud_open;
+            let panels = &mut self.panels;
+            let wall_ref = self.wall.as_ref();
             let mut ui_frame = g.ui.run(&g.window, viewport, |ctx| {
+                if let Some(w) = wall_ref {
+                    panel_verbs = panels.show(ctx, w, &described);
+                }
                 if *hud_open {
                     show_debug_hud(ctx, hud_open, &hud_input);
                 }
             });
-            if let Some(painted) = ui_frame.painted.as_mut() {
-                g.ui.paint(&self.ctx.device, &self.ctx.queue, &mut encoder, &view, painted);
+            panel_egui_keys = ui_frame.wants_keyboard;
+            if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
+                g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
             }
             match ui_frame.repaint_after {
                 Some(delay) if delay.is_zero() => {
@@ -660,13 +872,16 @@ impl App {
             self.ui_repaint_at = None;
             None
         };
-        self.perf.submit_and_record(&self.ctx, encoder, frame, (now, t_acquire, t_post_acquire), stats);
+        if let Some(enc) = encoder {
+            self.perf.submit_and_record(&self.ctx, enc, frame, (now, t_acq, t_post_acq), stats);
+        }
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
         // draws the same frame once more offscreen and saves it.
-        if self.exit_after == Some(self.frames + 1) {
-            if let Ok(path) = std::env::var("GLYPH_WALL_SHOT") {
-                let path = PathBuf::from(path);
+        let asked = self.pending_shot.take();
+        let counted = (self.exit_after == Some(self.frames + 1)).then(|| std::env::var("GLYPH_WALL_SHOT").ok().map(PathBuf::from)).flatten();
+        if asked.is_some() || counted.is_some() {
+            for path in asked.iter().map(|(p, _)| p.clone()).chain(counted) {
                 super::renderer::render_wall_to_png_with_overlay(&self.ctx, &mut g.renderer, &camera, &wall_frame, viewport, 1, &path, |enc, color_view| {
                     #[cfg(feature = "egui-ui")]
                     if let Some(painted) = ui_painted.as_mut() {
@@ -687,6 +902,27 @@ impl App {
                         }
                     }
                 }
+            }
+            if let Some((path, responder)) = asked {
+                responder.send(format!("OK: wrote {}", path.display()));
+            }
+        }
+        #[cfg(feature = "egui-ui")]
+        {
+            let mut changed = false;
+            if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                changed |= self.panels.sync_after_pass(wall, panel_egui_keys);
+                if !panel_verbs.is_empty() {
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    for verb in &panel_verbs {
+                        let reply = wall.run_with_screens(verb.as_str(), &lookup);
+                        self.panels.record_verb_reply(verb, &reply.text);
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                self.apply_effects();
             }
         }
         self.frames += 1;
@@ -731,6 +967,24 @@ impl App {
         self.apply_effects();
     }
 
+    fn move_cursor(&mut self, x: f64, y: f64) {
+        self.cursor = Point::new(x, y);
+        let ev = self.pointer(None);
+        if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+            let lookup = screen_lookup(|id| terms.screen(id));
+            wall.pointer_move(&ev, &lookup);
+        }
+        self.apply_effects();
+    }
+
+    fn pinch(&mut self, delta: f64) {
+        if let Some(wall) = &mut self.wall {
+            wall.pinch(self.cursor.x, self.cursor.y, 1.0 + delta);
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
     fn wheel(&mut self, delta: MouseScrollDelta) {
         let sf = self.scale_factor();
         // winit: positive means the content moves right and down. The web's
@@ -748,18 +1002,145 @@ impl App {
         self.redraw();
     }
 
-    fn key(&mut self, ev: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
-        let key = super::keys::key_event(ev, self.modifiers);
-        // Quitting is the window's, not the wall's.
-        if key.pressed && key.mods.meta && !key.mods.ctrl && !key.mods.alt && key.code == "KeyQ" {
-            event_loop.exit();
+    fn key_input(&mut self, key: KeyEvent) {
+        // Quitting is the window's, not the wall's (Command+Q on macOS, Ctrl+Alt+Q elsewhere).
+        if key.pressed && key.code == "KeyQ" && key.mods == wall_core::chord::chord_mods(Platform::host()) {
+            self.quit = true;
             return;
         }
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+        #[cfg(feature = "egui-ui")]
+        if key.pressed && key.code == "Escape" && !key.mods.ctrl && !key.mods.alt && !key.mods.meta {
+            if self.panels.close_open_on_escape(wall) {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            if self.hud_open {
+                self.hud_open = false;
+                self.redraw();
+                return;
+            }
+        }
         let lookup = screen_lookup(|id| terms.screen(id));
         let _decision = wall.key(&key, &lookup);
         self.apply_effects();
         self.redraw();
+    }
+
+    fn key(&mut self, ev: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
+        let key = super::keys::key_event(ev, self.modifiers);
+        self.key_input(key);
+        if self.quit {
+            event_loop.exit();
+        }
+    }
+
+    fn run_script(&mut self, cmd: super::script::ScriptCommand) -> String {
+        use super::script::{button_label, keys_for_typed_text, ScriptCommand};
+        match cmd {
+            ScriptCommand::Where => match &mut self.wall {
+                Some(wall) => super::script::format_where(&wall.frame(), self.cursor),
+                None => "ERR: the wall is not open yet".to_string(),
+            },
+            ScriptCommand::Move { x, y } => {
+                self.move_cursor(x, y);
+                format!("OK: moved to ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::Down { button, mods } => {
+                let prev = self.modifiers;
+                if let Some(m) = mods {
+                    self.modifiers = m;
+                }
+                self.mouse(ElementState::Pressed, button);
+                if mods.is_some() {
+                    self.modifiers = prev;
+                }
+                format!("OK: down {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
+            }
+            ScriptCommand::Up { button, mods } => {
+                let prev = self.modifiers;
+                if let Some(m) = mods {
+                    self.modifiers = m;
+                }
+                self.mouse(ElementState::Released, button);
+                if mods.is_some() {
+                    self.modifiers = prev;
+                }
+                format!("OK: up {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
+            }
+            ScriptCommand::Click { x, y, button, mods } => {
+                let prev = self.modifiers;
+                self.modifiers = mods;
+                self.last_release = None;
+                self.move_cursor(x, y);
+                self.mouse(ElementState::Pressed, button);
+                self.mouse(ElementState::Released, button);
+                self.modifiers = prev;
+                format!("OK: clicked {} at ({x:.2}, {y:.2})", button_label(button))
+            }
+            ScriptCommand::DblClick { x, y } => {
+                self.last_release = None;
+                self.move_cursor(x, y);
+                self.mouse(ElementState::Pressed, MouseButton::Left);
+                self.mouse(ElementState::Released, MouseButton::Left);
+                self.mouse(ElementState::Pressed, MouseButton::Left);
+                self.mouse(ElementState::Released, MouseButton::Left);
+                format!("OK: dblclick at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::Drag { x0, y0, x1, y1, steps, button, mods } => {
+                let prev = self.modifiers;
+                self.modifiers = mods;
+                self.last_release = None;
+                self.move_cursor(x0, y0);
+                self.mouse(ElementState::Pressed, button);
+                for i in 1..=steps {
+                    let t = i as f64 / steps as f64;
+                    self.move_cursor(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+                }
+                self.mouse(ElementState::Released, button);
+                self.modifiers = prev;
+                format!("OK: dragged {} ({x0:.2}, {y0:.2}) -> ({x1:.2}, {y1:.2}) in {steps} steps", button_label(button))
+            }
+            ScriptCommand::Wheel { x, y, dx, dy, mods } => {
+                let prev = self.modifiers;
+                self.modifiers = mods;
+                self.move_cursor(x, y);
+                let sf = self.scale_factor();
+                self.wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf)));
+                self.modifiers = prev;
+                format!("OK: wheel ({dx:.2}, {dy:.2}) at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::Pinch { x, y, factor } => {
+                self.move_cursor(x, y);
+                self.pinch(factor - 1.0);
+                format!("OK: pinch {factor:.4} at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::Key(k) => {
+                let prev = self.modifiers;
+                self.modifiers = k.mods;
+                let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                self.key_input(down);
+                self.key_input(up);
+                self.modifiers = prev;
+                "OK: key".to_string()
+            }
+            ScriptCommand::Type(text) => {
+                let seq = keys_for_typed_text(&text);
+                let count = seq.len();
+                let prev = self.modifiers;
+                for k in seq {
+                    self.modifiers = k.mods;
+                    let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                    let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                    self.key_input(down);
+                    self.key_input(up);
+                }
+                self.modifiers = prev;
+                format!("OK: typed {count} key(s)")
+            }
+        }
     }
 
     fn mouse(&mut self, state: ElementState, button: MouseButton) {
@@ -772,11 +1153,13 @@ impl App {
             self.buttons &= !bit;
         }
         let ev = self.pointer(Some(b));
+        let secondary = wall_core::menu::is_secondary_press(b, ev.mods, Platform::host());
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
         let lookup = screen_lookup(|id| terms.screen(id));
         if pressed {
-            // A right press may be the wall's menu, or the focused program's.
-            if b == Button::Right && wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+            // A secondary press (right-click, or Ctrl+left-click on macOS) may be
+            // the wall's menu, or the focused program's.
+            if secondary && wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
                 self.apply_effects();
                 self.redraw();
                 return;
@@ -784,7 +1167,7 @@ impl App {
             wall.pointer_down(&ev, &lookup);
         } else {
             wall.pointer_up(&ev, &lookup);
-            if b == Button::Left {
+            if b == Button::Left && !secondary {
                 let here = Point::new(ev.x, ev.y);
                 let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
                 if double {
@@ -808,30 +1191,46 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _wake: Wake) {
-        if self.perf.should_exit_on_wake(event_loop.exiting()) {
+        if self.perf.should_exit_on_wake(self.quit) {
             event_loop.exit();
             return;
         }
+        self.serve_control();
         self.pump();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         #[cfg(feature = "egui-ui")]
-        let ui_outcome = match &mut self.gfx {
-            Some(g) => g.ui.on_window_event(&g.window, &event),
-            None => UiEventOutcome::default(),
+        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        #[cfg(feature = "egui-ui")]
+        let feed_ui = !matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+            || panels_want_keys
+            || self.gfx.as_ref().is_some_and(|g| g.ui.context().egui_wants_keyboard_input());
+        #[cfg(feature = "egui-ui")]
+        let ui_outcome = match (&mut self.gfx, feed_ui) {
+            (Some(g), true) => g.ui.on_window_event(&g.window, &event),
+            _ => UiEventOutcome::default(),
         };
         #[cfg(feature = "egui-ui")]
         if ui_outcome.repaint {
             self.redraw();
         }
         #[cfg(feature = "egui-ui")]
-        let (ui_pointer, ui_keys) = (ui_outcome.consumed || ui_outcome.wants_pointer, ui_outcome.consumed || ui_outcome.wants_keyboard);
+        let (ui_pointer, ui_keys) = (
+            ui_outcome.consumed || ui_outcome.wants_pointer,
+            ui_outcome.consumed || ui_outcome.wants_keyboard || panels_want_keys,
+        );
         #[cfg(not(feature = "egui-ui"))]
         let (ui_pointer, ui_keys) = (false, false);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded {
+                    self.redraw();
+                }
+            }
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(g) = &self.gfx {
@@ -839,20 +1238,16 @@ impl ApplicationHandler<Wake> for App {
                     self.resize(size.width, size.height);
                 }
             }
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::RedrawRequested => self.draw(true),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.scale_factor();
-                self.cursor = Point::new(position.x / sf, position.y / sf);
+                let (x, y) = (position.x / sf, position.y / sf);
                 if ui_pointer && self.buttons == 0 {
+                    self.cursor = Point::new(x, y);
                     return;
                 }
-                let ev = self.pointer(None);
-                if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
-                    let lookup = screen_lookup(|id| terms.screen(id));
-                    wall.pointer_move(&ev, &lookup);
-                }
-                self.apply_effects();
+                self.move_cursor(x, y);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 // A release always reaches the wall, so no gesture is left hanging.
@@ -862,14 +1257,13 @@ impl ApplicationHandler<Wake> for App {
                 self.mouse(state, button);
             }
             WindowEvent::MouseWheel { delta, .. } if !ui_pointer => self.wheel(delta),
-            WindowEvent::PinchGesture { delta, .. } if !ui_pointer => {
-                if let Some(wall) = &mut self.wall {
-                    wall.pinch(self.cursor.x, self.cursor.y, 1.0 + delta);
-                }
-                self.apply_effects();
-                self.redraw();
-            }
+            WindowEvent::PinchGesture { delta, .. } if !ui_pointer => self.pinch(delta),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                #[cfg(feature = "egui-ui")]
+                if event.state == ElementState::Pressed && self.modifiers.super_key() && !self.modifiers.control_key() && !self.modifiers.alt_key() && event.physical_key == PhysicalKey::Code(KeyCode::KeyQ) {
+                    event_loop.exit();
+                    return;
+                }
                 #[cfg(feature = "egui-ui")]
                 if event.state == ElementState::Pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F1) && !ui_outcome.consumed {
                     self.hud_open = !self.hud_open;
@@ -884,34 +1278,95 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The egui layer, the surface and the window go while the event
+        // loop's display connection is still alive (see `Gfx`).
+        self.perf.clear_gpu();
+        self.control = None;
+        self.gfx = None;
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.exit_after {
-            Some(n) if self.frames >= n => event_loop.exit(),
-            // A counted run draws without waiting to be asked.
-            Some(_) => self.redraw(),
-            None => {}
-        }
-        // Something is still moving (an eased camera, a glide): keep drawing.
-        if self.animating {
-            self.redraw();
-        }
-        #[cfg(feature = "egui-ui")]
-        let ui_wake_at = match self.ui_repaint_at {
-            Some(at) if Instant::now() >= at => {
-                self.ui_repaint_at = None;
-                self.redraw();
-                None
-            }
-            other => other,
-        };
-        #[cfg(not(feature = "egui-ui"))]
-        let ui_wake_at = None;
-        let (exit_perf, flow) = self.perf.control_flow(self.frames, ui_wake_at);
-        if exit_perf {
+        const COVERED_TICK: std::time::Duration = std::time::Duration::from_millis(32);
+        if self.quit || self.perf.should_exit_on_wake(false) {
             event_loop.exit();
             return;
         }
-        event_loop.set_control_flow(flow);
+        // Something is still moving (an eased camera, a glide), a counted run
+        // is advancing, or an offscreen shot is pending: ask for a redraw, and
+        // when covered tick at a low rate (~31 Hz) instead of spinning.
+        if self.pending_shot.is_some() {
+            self.draw(false);
+        }
+        if self.exit_after.is_some_and(|n| self.frames >= n) {
+            event_loop.exit();
+            return;
+        }
+        let counted = self.exit_after.is_some();
+        if counted || self.animating {
+            if self.occluded && !self.perf.is_enabled() {
+                if self.last_tick.elapsed() >= COVERED_TICK {
+                    self.draw(false);
+                    if self.exit_after.is_some_and(|n| self.frames >= n) {
+                        event_loop.exit();
+                        return;
+                    }
+                    self.redraw();
+                }
+                if self.exit_after.is_some() || self.animating {
+                    let wait = COVERED_TICK.saturating_sub(self.last_tick.elapsed());
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+                    return;
+                }
+            } else {
+                self.redraw();
+                if self.last_tick.elapsed() >= COVERED_TICK {
+                    self.occluded = true;
+                    self.draw(false);
+                    if self.exit_after.is_some_and(|n| self.frames >= n) {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if self.animating || counted {
+                    let (perf_exit, cf) = self.perf.control_flow(
+                        self.frames,
+                        Some(Instant::now() + std::time::Duration::from_millis(16)),
+                    );
+                    if perf_exit {
+                        event_loop.exit();
+                    } else {
+                        event_loop.set_control_flow(cf);
+                    }
+                    return;
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut next_repaint: Option<Instant> = None;
+        #[cfg(feature = "egui-ui")]
+        if let Some(deadline) = self.ui_repaint_at {
+            if now >= deadline {
+                self.ui_repaint_at = None;
+                self.redraw();
+            } else {
+                next_repaint = Some(deadline);
+            }
+        }
+        if let Some(deadline) = self.blink_repaint_at {
+            if now >= deadline {
+                self.blink_repaint_at = None;
+                self.redraw();
+            } else {
+                next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
+            }
+        }
+        let (perf_exit, cf) = self.perf.control_flow(self.frames, next_repaint);
+        if perf_exit {
+            event_loop.exit();
+        } else {
+            event_loop.set_control_flow(cf);
+        }
     }
 }
 
@@ -920,12 +1375,15 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("event loop creation failed");
     let now = Instant::now();
     let mut app = App {
+        gfx: None,
         ctx,
         opts: Some(opts),
         proxy: event_loop.create_proxy(),
-        gfx: None,
         wall: None,
         terms: None,
+        control: None,
+        pending_shot: None,
+        quit: false,
         modifiers: ModifiersState::empty(),
         cursor: Point::new(0.0, 0.0),
         buttons: 0,
@@ -939,7 +1397,11 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         hud_open: std::env::var("GLYPH_WALL_HUD").is_ok_and(|v| !v.is_empty() && v != "0"),
         #[cfg(feature = "egui-ui")]
+        panels: super::mount::Panels::new(),
+        #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
+        blink_repaint_at: None,
+        occluded: false,
         perf: super::perf::WallPerf::from_env(),
     };
     event_loop.run_app(&mut app).expect("event loop error");
@@ -953,13 +1415,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
             for t in &described.terminals {
                 let Some(s) = terms.screen(&t.id) else { continue };
                 println!("--- terminal {} ({}x{}) at ({:.1}, {:.1}) z {:.1}{}", t.id, s.cols, s.rows, t.cell_origin.x, t.cell_origin.y, t.z, if t.focused { " focused" } else { "" });
-                for r in 0..s.rows {
-                    let line: String = s.row(r).iter().map(|c| if c.content == 0 { " ".into() } else { s.content_str(c).into_owned() }).collect();
-                    let line = line.trim_end();
-                    if !line.is_empty() {
-                        println!("{line}");
-                    }
-                }
+                print!("{}", screen_text(s));
             }
         }
     }

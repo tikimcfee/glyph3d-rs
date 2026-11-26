@@ -106,6 +106,9 @@ pub struct Cli {
     /// Render the terminal wall test pattern (with --screenshot PATH)
     #[arg(long)]
     pub wall_test_pattern: bool,
+    /// Render the terminal wall chrome showcase pattern (with --screenshot PATH)
+    #[arg(long)]
+    pub wall_chrome_pattern: bool,
     /// Replay a recorded terminal byte stream through crates/glyph-vt (with --screenshot PATH)
     #[arg(long, value_name = "PATH")]
     pub wall_replay: Option<PathBuf>,
