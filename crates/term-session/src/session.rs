@@ -71,6 +71,138 @@ pub struct SessionStats {
     pub repaints_sent: u64,
 }
 
+/// Accumulated per-fill delta across all [`Vt::fill`] runs between two window
+/// [`TerminalSession::pump`] drains.
+///
+/// Mirrors `glyph_vt::FillDelta` with plain owned types so `Sessions::pump`
+/// can hand it to `wall_core::wall::Wall::terminal_screen_filled` without
+/// coupling `wall-core` to `glyph-vt`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenFillDelta {
+    /// Whether the grid resized in any fill since the previous drain.
+    pub resized: bool,
+    /// Cumulative rows scrolled off row `0` since the previous drain.
+    pub scrolled_top: u32,
+    /// Whether any scroll since the previous drain was confined to margins
+    /// (`DECSTBM` / `DECSLRM`), downward, or line-delete rather than a
+    /// whole-screen upward scroll.
+    pub within_margins: bool,
+    /// Per-row half-open `(lo, hi)` column spans rewritten in place, aligned to
+    /// the post-scroll row indices of the published [`Screen`] and trimmed of
+    /// trailing `(0, 0)` rows (empty when no cells were rewritten in place).
+    pub rewritten_cols: Vec<(u16, u16)>,
+}
+
+/// Worker-to-window accumulator for [`ScreenFillDelta`] stored inside [`PublishedSlot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingFillDelta {
+    has_fill: bool,
+    delta: ScreenFillDelta,
+}
+
+impl PendingFillDelta {
+    fn capture_from_vt(&mut self, d: &glyph_vt::FillDelta) {
+        self.has_fill = true;
+        self.delta.resized = d.resized;
+        self.delta.scrolled_top = d.scrolled_top;
+        self.delta.within_margins = d.within_margins();
+        self.delta.rewritten_cols.clear();
+        if !d.resized {
+            let rw = d.rewritten_cols();
+            let rw_len = rw.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+            if rw_len > 0 {
+                self.delta.rewritten_cols.extend_from_slice(&rw[..rw_len]);
+            }
+        }
+    }
+
+    fn merge(&mut self, next: &ScreenFillDelta, cols: u16, rows: u16) {
+        if !self.has_fill {
+            self.has_fill = true;
+            self.delta.resized = next.resized;
+            self.delta.scrolled_top = next.scrolled_top;
+            self.delta.within_margins = next.within_margins;
+            self.delta.rewritten_cols.clear();
+            if !next.resized && !next.rewritten_cols.is_empty() {
+                self.delta
+                    .rewritten_cols
+                    .extend_from_slice(&next.rewritten_cols);
+            }
+            return;
+        }
+        if self.delta.resized || next.resized {
+            self.delta.resized = true;
+            self.delta.scrolled_top = 0;
+            self.delta.within_margins = false;
+            self.delta.rewritten_cols.clear();
+            return;
+        }
+
+        let prev_whole_scroll = !self.delta.within_margins && self.delta.scrolled_top > 0;
+        let next_whole_scroll = !next.within_margins && next.scrolled_top > 0;
+
+        if (prev_whole_scroll && next.within_margins)
+            || (self.delta.within_margins && next_whole_scroll)
+        {
+            // A margin scroll dominates a whole-screen scroll; because rows
+            // outside the margin also shifted, mark all rows rewritten so no
+            // selection is left pointing at stale rows.
+            self.delta.within_margins = true;
+            self.delta.scrolled_top = self.delta.scrolled_top.saturating_add(next.scrolled_top);
+            self.delta.rewritten_cols.clear();
+            if cols > 0 && rows > 0 {
+                self.delta
+                    .rewritten_cols
+                    .resize(usize::from(rows), (0, cols));
+            }
+            return;
+        }
+
+        if next_whole_scroll {
+            let shift = next.scrolled_top as usize;
+            if shift >= self.delta.rewritten_cols.len() {
+                self.delta.rewritten_cols.clear();
+            } else if shift > 0 {
+                self.delta.rewritten_cols.drain(..shift);
+            }
+        }
+        if next.within_margins {
+            self.delta.within_margins = true;
+        }
+        self.delta.scrolled_top = self.delta.scrolled_top.saturating_add(next.scrolled_top);
+        union_rewritten_cols(&mut self.delta.rewritten_cols, &next.rewritten_cols);
+    }
+
+    fn take(&mut self) -> Option<ScreenFillDelta> {
+        if !self.has_fill {
+            return None;
+        }
+        self.has_fill = false;
+        Some(std::mem::take(&mut self.delta))
+    }
+}
+
+fn union_rewritten_cols(dst: &mut Vec<(u16, u16)>, src: &[(u16, u16)]) {
+    let src_len = src.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+    if src_len == 0 {
+        return;
+    }
+    if dst.len() < src_len {
+        dst.resize(src_len, (0, 0));
+    }
+    for (y, &(slo, shi)) in src[..src_len].iter().enumerate() {
+        if slo >= shi {
+            continue;
+        }
+        let (dlo, dhi) = dst[y];
+        dst[y] = if dlo < dhi {
+            (dlo.min(slo), dhi.max(shi))
+        } else {
+            (slo, shi)
+        };
+    }
+}
+
 #[derive(Clone)]
 struct PublishedMeta {
     osc_title: String,
@@ -90,6 +222,7 @@ struct PublishedMeta {
 struct PublishedSlot {
     screen: Screen,
     meta: PublishedMeta,
+    pending_delta: PendingFillDelta,
 }
 
 pub(crate) struct SessionShared {
@@ -220,6 +353,7 @@ pub struct TerminalSession {
     inbox: Arc<SessionInbox>,
     shared: Arc<SessionShared>,
     front_screen: Screen,
+    last_fill_delta: Option<ScreenFillDelta>,
     meta: PublishedMeta,
     display_title: String,
     seen_bells: u64,
@@ -283,6 +417,7 @@ impl TerminalSession {
             published: Mutex::new(PublishedSlot {
                 screen: initial_screen,
                 meta: initial_meta.clone(),
+                pending_delta: PendingFillDelta::default(),
             }),
             has_news: AtomicBool::new(false),
             bytes_parsed: AtomicU64::new(0),
@@ -327,6 +462,7 @@ impl TerminalSession {
             inbox,
             shared,
             front_screen,
+            last_fill_delta: None,
             meta: initial_meta,
             seen_bells: 0,
             seen_meta_gen: 0,
@@ -455,8 +591,9 @@ impl TerminalSession {
         if !self.shared.has_news.swap(false, Ordering::Acquire) {
             return false;
         }
-        let guard = self.shared.published.lock().expect("published mutex poisoned");
+        let mut guard = self.shared.published.lock().expect("published mutex poisoned");
         let screen_changed = sync_screen_into(&guard.screen, &guard.screen.title, &mut self.front_screen);
+        let fill_delta = guard.pending_delta.take();
         let meta_changed = guard.meta.meta_gen != self.seen_meta_gen;
         if meta_changed {
             self.meta = guard.meta.clone();
@@ -469,7 +606,27 @@ impl TerminalSession {
                 self.display_title.clone_from(&self.meta.osc_title);
             }
         }
+        drop(guard);
+        if let Some(next) = fill_delta {
+            match &mut self.last_fill_delta {
+                Some(existing) => {
+                    let mut acc = PendingFillDelta {
+                        has_fill: true,
+                        delta: std::mem::take(existing),
+                    };
+                    acc.merge(&next, self.front_screen.cols, self.front_screen.rows);
+                    *existing = acc.delta;
+                }
+                None => self.last_fill_delta = Some(next),
+            }
+        }
         screen_changed || meta_changed
+    }
+
+    /// Takes the accumulated [`ScreenFillDelta`] from every worker fill drained by [`Self::pump`]
+    /// since the previous take (`None` when no screen fill occurred).
+    pub fn take_fill_delta(&mut self) -> Option<ScreenFillDelta> {
+        self.last_fill_delta.take()
     }
 
     /// Extracts stream selection text between `(col0, row0)` and `(col1, row1)` (`col` in
@@ -690,6 +847,7 @@ fn session_worker_loop(
 
     let mut coalescer = Coalescer::new(policy);
     let mut batch: Vec<Event> = Vec::with_capacity(32);
+    let mut fill_scratch = PendingFillDelta::default();
 
     let mut osc_title = String::new();
     let mut prev_vt_title = String::new();
@@ -869,6 +1027,7 @@ fn session_worker_loop(
                 publish_snapshot(
                     &vt_mutex,
                     &mut working_screen,
+                    &mut fill_scratch,
                     &shared,
                     &mut osc_title,
                     &mut prev_vt_title,
@@ -892,6 +1051,7 @@ fn session_worker_loop(
                     publish_snapshot(
                         &vt_mutex,
                         &mut working_screen,
+                        &mut fill_scratch,
                         &shared,
                         &mut osc_title,
                         &mut prev_vt_title,
@@ -932,6 +1092,7 @@ fn session_worker_loop(
 fn publish_snapshot(
     vt_mutex: &Arc<Mutex<Vt>>,
     working_screen: &mut Screen,
+    fill_scratch: &mut PendingFillDelta,
     shared: &Arc<SessionShared>,
     osc_title: &mut String,
     prev_vt_title: &mut String,
@@ -947,9 +1108,13 @@ fn publish_snapshot(
     meta_dirty: &mut bool,
     wake: &(dyn Fn() + Send + Sync),
 ) {
+    fill_scratch.has_fill = false;
     let (mut screen_changed, cursor_color) = {
         let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
         let changed = vt.fill(working_screen);
+        if changed {
+            fill_scratch.capture_from_vt(vt.last_fill_delta());
+        }
         (changed, vt.cursor_color())
     };
 
@@ -969,6 +1134,10 @@ fn publish_snapshot(
 
     let mut slot = shared.published.lock().expect("published mutex poisoned");
     let copied = sync_screen_into(working_screen, osc_title, &mut slot.screen);
+    if fill_scratch.has_fill {
+        slot.pending_delta
+            .merge(&fill_scratch.delta, working_screen.cols, working_screen.rows);
+    }
 
     let mut metadata_updated = *meta_dirty;
     if slot.meta.modes != slot.screen.modes {
@@ -1188,6 +1357,7 @@ mod tests {
                     last_error: None,
                     meta_gen: 0,
                 },
+                pending_delta: PendingFillDelta::default(),
             }),
             has_news: AtomicBool::new(false),
             bytes_parsed: AtomicU64::new(0),
@@ -1240,5 +1410,86 @@ mod tests {
             popped[2],
             AsyncCmd::Resize { handle: 2, cols: 100, rows: 30, .. }
         ));
+    }
+
+    fn delta(
+        resized: bool,
+        scrolled_top: u32,
+        within_margins: bool,
+        rewritten_cols: Vec<(u16, u16)>,
+    ) -> ScreenFillDelta {
+        ScreenFillDelta {
+            resized,
+            scrolled_top,
+            within_margins,
+            rewritten_cols,
+        }
+    }
+
+    #[test]
+    fn fill_delta_accumulates_scrolls_shifts_prior_rewrites_and_unions_spans() {
+        let mut acc = PendingFillDelta::default();
+        assert_eq!(acc.take(), None);
+
+        // First fill: in-place rewrite on row 4 cols 2..6.
+        acc.merge(&delta(false, 0, false, vec![(0, 0), (0, 0), (0, 0), (0, 0), (2, 6)]), 20, 6);
+        // Second fill: whole-screen scroll up by 2 rows, plus rewrite on new row 2 cols 8..12
+        // (same original row 4!) and new row 5 cols 0..4.
+        acc.merge(
+            &delta(false, 2, false, vec![(0, 0), (0, 0), (8, 12), (0, 0), (0, 0), (0, 4)]),
+            20,
+            6,
+        );
+        // Third fill: whole-screen scroll up by 1 row with no in-place rewrites.
+        acc.merge(&delta(false, 1, false, Vec::new()), 20, 6);
+
+        let merged = acc.take().expect("accumulated delta");
+        assert!(!merged.resized);
+        assert_eq!(merged.scrolled_top, 3);
+        assert!(!merged.within_margins);
+        // Row 4 shifted up 2 -> row 2 unioned (2,6)U(8,12) = (2,12), then shifted up 1 -> row 1.
+        // Row 5 shifted up 1 -> row 4.
+        assert_eq!(
+            merged.rewritten_cols,
+            vec![(0, 0), (2, 12), (0, 0), (0, 0), (0, 4)]
+        );
+        assert_eq!(acc.take(), None);
+    }
+
+    #[test]
+    fn fill_delta_preserves_margin_scroll_and_ors_resize_and_avoids_empty_alloc() {
+        // Pure scroll without in-place rewrites keeps rewritten_cols unallocated.
+        let mut pure = PendingFillDelta::default();
+        pure.merge(&delta(false, 2, false, Vec::new()), 20, 6);
+        pure.merge(&delta(false, 3, false, Vec::new()), 20, 6);
+        let d = pure.take().expect("pure scroll");
+        assert_eq!(d.scrolled_top, 5);
+        assert!(!d.within_margins);
+        assert_eq!(d.rewritten_cols.capacity(), 0);
+
+        // Margin scroll followed by non-scrolling edit stays a margin scroll with spans unioned.
+        let mut margin = PendingFillDelta::default();
+        margin.merge(&delta(false, 0, true, vec![(0, 0), (0, 20)]), 20, 6);
+        margin.merge(&delta(false, 0, false, vec![(3, 7)]), 20, 6);
+        let d = margin.take().expect("margin scroll");
+        assert!(d.within_margins);
+        assert_eq!(d.rewritten_cols, vec![(3, 7), (0, 20)]);
+
+        // Whole-screen scroll mixed with margin scroll stays a margin scroll and marks all rows.
+        let mut mixed = PendingFillDelta::default();
+        mixed.merge(&delta(false, 2, false, Vec::new()), 20, 4);
+        mixed.merge(&delta(false, 0, true, vec![(0, 0), (0, 20)]), 20, 4);
+        let d = mixed.take().expect("mixed");
+        assert!(d.within_margins);
+        assert_eq!(d.rewritten_cols, vec![(0, 20); 4]);
+
+        // Resize ORs in either order and clears rewritten_cols.
+        let mut resized = PendingFillDelta::default();
+        resized.merge(&delta(false, 1, false, vec![(1, 5)]), 20, 4);
+        resized.merge(&delta(true, 0, false, Vec::new()), 30, 8);
+        resized.merge(&delta(false, 0, false, vec![(0, 10)]), 30, 8);
+        let d = resized.take().expect("resized");
+        assert!(d.resized);
+        assert!(d.rewritten_cols.is_empty());
     }
 }

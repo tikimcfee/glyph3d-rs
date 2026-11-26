@@ -677,6 +677,9 @@ pub trait PointerHost {
     /// Update the hovered terminal ID for border highlighting.
     fn set_hovered(&mut self, _id: Option<&str>) {}
 
+    /// Update the hovered group ID when the pointer rests over a group header.
+    fn set_hovered_group(&mut self, _group_id: Option<&str>) {}
+
     /// Update the pointer cursor icon.
     fn set_cursor(&mut self, _cursor: CursorIcon) {}
 
@@ -2225,7 +2228,15 @@ impl WallPointer {
                 if host.is_shown(&focused_owned) {
                     if let Some(rect) = host.terminal_rect(&focused_owned) {
                         let world = host.to_world(event.x, event.y);
-                        if rect.contains(world) {
+                        // Require the topmost hit at `world` to be the focused terminal so an
+                        // unfocused terminal raised over it pans the canvas instead of scrolling
+                        // the occluded focused terminal underneath.
+                        if rect.contains(world)
+                            && matches!(
+                                host.hit(world),
+                                Some(CanvasHit::Terminal { ref id, .. }) if id == &focused_owned
+                            )
+                        {
                             hit_focused = Some(focused_owned);
                         }
                     }
@@ -2468,6 +2479,10 @@ impl WallPointer {
             Some(CanvasHit::Terminal { id, .. }) => Some(id.as_str()),
             _ => None,
         };
+        let hovered_group_id = match &hit {
+            Some(CanvasHit::GroupHeader { group }) => Some(group.as_str()),
+            _ => None,
+        };
         let claim_mods = Mods {
             shift: mods.shift,
             alt: mods.alt,
@@ -2475,6 +2490,7 @@ impl WallPointer {
         };
 
         if let Some(fs) = host.fullscreen() {
+            host.set_hovered_group(None);
             match fs {
                 FullscreenState::Group { group_layout, .. } => {
                     host.set_hovered(hovered_id);
@@ -2530,6 +2546,7 @@ impl WallPointer {
         }
 
         host.set_hovered(hovered_id);
+        host.set_hovered_group(hovered_group_id);
         self.mouse.hover(host, screen_x, screen_y, mods, hit.as_ref());
         let cursor = match &hit {
             None => {
