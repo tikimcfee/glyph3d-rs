@@ -27,6 +27,23 @@ pub struct TerminalScrollback {
     pub max: u64,
     pub viewing: bool,
 }
+
+/// Hit region of a rendered scrolled-back jump-to-live pill, in both world units
+/// and logical CSS screen pixels (`[min_x, min_y, max_x, max_y]`, Y down).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollbackPillHit {
+    pub terminal_id: String,
+    pub world_rect: WorldRect,
+    pub screen_rect: [f64; 4],
+}
+
+impl ScrollbackPillHit {
+    /// Whether logical screen point `(x, y)` lies inside this pill's hit rect.
+    pub fn contains_screen(&self, x: f64, y: f64) -> bool {
+        let [x0, y0, x1, y1] = self.screen_rect;
+        x >= x0 && x <= x1 && y >= y0 && y <= y1
+    }
+}
 use super::labels::Label;
 use super::metrics::WorldRect;
 use super::paper::PaperStyle;
@@ -166,6 +183,40 @@ pub fn describe_frame_chrome_with_scrollback(
     labels: &mut Vec<Label<'static>>,
     scrollback: impl Fn(&str) -> Option<TerminalScrollback>,
 ) -> PaperStyle {
+    let mut unused_hits = Vec::new();
+    describe_frame_chrome_with_scrollback_hits(
+        described,
+        camera,
+        viewport,
+        scale_factor,
+        fonts,
+        shapes,
+        labels,
+        scrollback,
+        None,
+        &mut unused_hits,
+    )
+}
+
+/// Same as [`describe_frame_chrome_with_scrollback`], also highlighting
+/// `hovered_pill` and appending each emitted badge's hit rectangle to `pill_hits`
+/// (in back-to-front terminal order, so callers hit-test `.iter().rev()`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "extends describe_frame_chrome_with_scrollback with hover state and pill hit output"
+)]
+pub fn describe_frame_chrome_with_scrollback_hits(
+    described: &DescribedFrame,
+    camera: &WallCamera,
+    viewport: (u32, u32),
+    scale_factor: f32,
+    fonts: &mut ChromeFonts<'_>,
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    scrollback: impl Fn(&str) -> Option<TerminalScrollback>,
+    hovered_pill: Option<&str>,
+    pill_hits: &mut Vec<ScrollbackPillHit>,
+) -> PaperStyle {
     let view = ChromeView::new(camera.zoom, scale_factor);
     let mut style = ChromeStyle {
         bar_max_world: BAR_ROOM as f32,
@@ -229,10 +280,11 @@ pub fn describe_frame_chrome_with_scrollback(
     }
 
     // 2b. Per-terminal scrolled-back indicators (silent on live terminals).
+    let inv_sf = 1.0 / f64::from(view.safe_scale());
     for term in &described.terminals {
         if let Some(sb) = scrollback(&term.id) {
             if sb.viewing || sb.offset > 0 {
-                push_scrollback_indicator(
+                if let Some(world_rect) = push_scrollback_indicator(
                     shapes,
                     labels,
                     fonts,
@@ -245,8 +297,28 @@ pub fn describe_frame_chrome_with_scrollback(
                         visible_rows: term.rows.min(u32::from(u16::MAX)) as u16,
                         viewing: sb.viewing,
                         focused: term.focused,
+                        hovered: hovered_pill == Some(term.id.as_str()),
                     },
-                );
+                ) {
+                    let tl = camera.world_to_screen(
+                        Vec2::new(world_rect.min.x, world_rect.max.y),
+                        viewport,
+                    );
+                    let br = camera.world_to_screen(
+                        Vec2::new(world_rect.max.x, world_rect.min.y),
+                        viewport,
+                    );
+                    pill_hits.push(ScrollbackPillHit {
+                        terminal_id: term.id.clone(),
+                        world_rect,
+                        screen_rect: [
+                            f64::from(tl.x) * inv_sf,
+                            f64::from(tl.y) * inv_sf,
+                            f64::from(br.x) * inv_sf,
+                            f64::from(br.y) * inv_sf,
+                        ],
+                    });
+                }
             }
         }
     }
@@ -517,5 +589,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn describe_emits_scrollback_pill_hit_rect_in_logical_screen_px() {
+        let (metrics, mut atlas, family) = load_test_fonts();
+        let mut wall = make_wall(metrics);
+        wall.set_viewport(1200.0, 800.0, 2.0);
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        let _ = wall.run("wall.fit");
+        for step in 1..=30 {
+            let _ = wall.tick(1.0 / 30.0, f64::from(step) * 33.3);
+        }
+        let frame = wall.frame();
+        let sf = 2.0_f32;
+        let vp = (2400, 1600);
+        let cam = WallCamera::new(
+            Vec2::new(frame.camera.x as f32, frame.camera.y as f32),
+            frame.camera.zoom as f32 * sf,
+        );
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        let mut hits = Vec::new();
+        {
+            let mut fonts = ChromeFonts::new(metrics, &mut atlas, family);
+            describe_frame_chrome_with_scrollback_hits(
+                &frame,
+                &cam,
+                vp,
+                sf,
+                &mut fonts,
+                &mut shapes,
+                &mut labels,
+                |id| {
+                    (id == "t1").then_some(TerminalScrollback {
+                        offset: 25,
+                        max: 150,
+                        viewing: true,
+                    })
+                },
+                Some("t1"),
+                &mut hits,
+            );
+        }
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].terminal_id, "t1");
+        let [x0, y0, x1, y1] = hits[0].screen_rect;
+        assert!(x0 < x1 && y0 < y1, "screen_rect must be ordered: {:?}", hits[0].screen_rect);
+        assert!(x1 <= 1200.0 && y1 <= 800.0, "screen_rect must sit inside logical viewport");
+        assert!(hits[0].contains_screen(0.5 * (x0 + x1), 0.5 * (y0 + y1)));
+        assert!(!hits[0].contains_screen(x0 - 5.0, y0));
+        assert!(labels.iter().any(|l| l.text == "↑25 · live"));
     }
 }

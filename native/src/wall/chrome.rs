@@ -1277,6 +1277,8 @@ pub struct ScrollbackIndicatorDesc {
     pub viewing: bool,
     /// Whether this terminal holds keyboard focus.
     pub focused: bool,
+    /// Whether the pointer is currently hovering the jump-to-live badge.
+    pub hovered: bool,
 }
 
 /// Append a scrolled-back position thumb and compact `↑<offset>` badge inside
@@ -1343,7 +1345,13 @@ pub fn push_scrollback_indicator(
     }
 
     let badge_text = if desc.offset > 0 {
-        format!("↑{}", desc.offset)
+        if body_w_css >= 140.0 {
+            format!("↑{} · live", desc.offset)
+        } else {
+            format!("↑{}", desc.offset)
+        }
+    } else if body_w_css >= 160.0 {
+        "↑ history · live".to_string()
     } else {
         "↑ history".to_string()
     };
@@ -1375,12 +1383,18 @@ pub fn push_scrollback_indicator(
     );
     let z_pill = desc.z + 0.03;
 
-    // Exact `wall/AgentViewOverlay.jsx` `liveChip` colours (#1a3026 / #356b4f / #8ef0b8).
+    // Exact `wall/AgentViewOverlay.jsx` `liveChip` colours (#1a3026 / #356b4f / #8ef0b8),
+    // subtly lifted on pointer hover to signal the jump-to-live click action.
+    let (pill_fill, pill_border) = if desc.hovered {
+        (srgb_hex(0x234435, 0.96), srgb_hex(0x4ca074, 1.0))
+    } else {
+        (srgb_hex(0x1a3026, 0.94), srgb_hex(0x356b4f, 1.0))
+    };
     shapes.push(Shape::Rect(RectShape {
         rect: pill_rect,
         z: z_pill,
-        fill: Some(srgb_hex(0x1a3026, 0.94)),
-        stroke: Some(srgb_hex(0x356b4f, 1.0)),
+        fill: Some(pill_fill),
+        stroke: Some(pill_border),
         stroke_px: view.phys_px(1.0),
         dash: DashStyle::SOLID,
         corner_radius_px: view.phys_px(2.0),
@@ -2450,6 +2464,7 @@ mod tests {
                 visible_rows: 24,
                 viewing: false,
                 focused: true,
+                hovered: false,
             },
         );
         assert!(live_pill.is_none());
@@ -2466,12 +2481,13 @@ mod tests {
                 visible_rows: 24,
                 viewing: true,
                 focused: true,
+                hovered: false,
             },
         );
         assert!(sb_pill.is_some());
         assert_eq!(sb_s.len(), 2, "thumb + badge rect");
         assert_eq!(sb_l.len(), 1);
-        assert_eq!(sb_l[0].text, "↑42");
+        assert_eq!(sb_l[0].text, "↑42 · live");
     }
 
     #[test]

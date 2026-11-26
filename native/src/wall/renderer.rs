@@ -3872,6 +3872,7 @@ mod tests {
                     visible_rows: screen.rows,
                     viewing: true,
                     focused: true,
+                    hovered: false,
                 },
             )
         }
