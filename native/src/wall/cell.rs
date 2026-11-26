@@ -330,6 +330,28 @@ impl CellSelection {
     }
 }
 
+/// Expand a non-empty column span `[lo, hi)` on `row` so neither boundary cuts
+/// a 2-column wide character (`width == 2` head + `width == 0` tail) in half.
+///
+/// Mirrors terminal selection/underline rules (and `glyph_vt::Vt::text`): starting
+/// on a wide character's trailing cell widens `lo` left by 1; ending on a wide
+/// character's head cell widens `hi` right by 1 when its trailing cell is present.
+pub fn snap_row_span_to_wide(row: &[Cell], span: Range<u16>) -> Range<u16> {
+    let cols = row.len().min(usize::from(u16::MAX)) as u16;
+    let mut lo = span.start.min(cols);
+    let mut hi = span.end.min(cols);
+    if hi <= lo {
+        return 0..0;
+    }
+    if lo > 0 && row[lo as usize].width == 0 && row[lo as usize - 1].width == 2 {
+        lo -= 1;
+    }
+    if hi < cols && row[hi as usize - 1].width == 2 && row[hi as usize].width == 0 {
+        hi += 1;
+    }
+    lo..hi
+}
+
 /// Apply `selection`'s fill and optional text colour to a packed [`CellGpu`].
 pub fn apply_selection_to_cell(cell: &mut CellGpu, selection: &CellSelection) {
     let bg = if (selection.background >> 24) == 0 {
@@ -648,5 +670,35 @@ mod tests {
             dirty_row_ranges_with_selection(&edited, cols, 2, 1, Some(s4), Some(s4)),
             vec![0..1]
         );
+    }
+
+    #[test]
+    fn snap_row_span_to_wide_widens_split_wide_boundaries_and_preserves_clean_edges() {
+        // Row: [0:'a', 1:'漢'(w=2), 2:tail(w=0), 3:'b', 4:'🚀'(w=2), 5:tail(w=0), 6:'漢'(w=2, last col)]
+        let mut row = vec![Cell::BLANK; 7];
+        row[0] = Cell { content: 'a' as u32, width: 1, ..Cell::BLANK };
+        row[1] = Cell { content: '漢' as u32, width: 2, ..Cell::BLANK };
+        row[2] = Cell { content: 0, width: 0, ..Cell::BLANK };
+        row[3] = Cell { content: 'b' as u32, width: 1, ..Cell::BLANK };
+        row[4] = Cell { content: '🚀' as u32, width: 2, ..Cell::BLANK };
+        row[5] = Cell { content: 0, width: 0, ..Cell::BLANK };
+        row[6] = Cell { content: '漢' as u32, width: 2, ..Cell::BLANK };
+
+        // Empty stays empty.
+        assert_eq!(snap_row_span_to_wide(&row, 2..2), 0..0);
+        // Strictly narrow stays untouched.
+        assert_eq!(snap_row_span_to_wide(&row, 0..1), 0..1);
+        assert_eq!(snap_row_span_to_wide(&row, 3..4), 3..4);
+        // Ending on wide head (1..2) widens right to include tail (1..3).
+        assert_eq!(snap_row_span_to_wide(&row, 0..2), 0..3);
+        assert_eq!(snap_row_span_to_wide(&row, 1..2), 1..3);
+        // Starting on wide tail (2..4) widens left to include head (1..4).
+        assert_eq!(snap_row_span_to_wide(&row, 2..4), 1..4);
+        // Splitting wide cells on BOTH ends (2..5) widens both (1..6).
+        assert_eq!(snap_row_span_to_wide(&row, 2..5), 1..6);
+        // Already whole wide cell (1..3) stays exact.
+        assert_eq!(snap_row_span_to_wide(&row, 1..3), 1..3);
+        // Orphan wide cell in the last column (6..7) stays clamped within row length.
+        assert_eq!(snap_row_span_to_wide(&row, 6..7), 6..7);
     }
 }
