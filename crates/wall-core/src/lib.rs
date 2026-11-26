@@ -21,6 +21,7 @@ pub mod keymap;
 pub mod labels;
 pub mod layout;
 pub mod menu;
+pub mod model;
 pub mod mouse;
 pub mod scroll;
 pub mod selection;
