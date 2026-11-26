@@ -118,6 +118,12 @@ struct App {
     gfx: Option<Gfx>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
+    /// The socket `wallctl` reaches this wall by; None if it could not bind
+    /// (another wall holds the namespace) or the wall has no namespace.
+    control: Option<wall_control::Server>,
+    /// A frame `wallctl app.shot PATH` asked to keep, answered once it is written.
+    pending_shot: Option<(PathBuf, wall_control::Responder)>,
+    quit: bool,
     modifiers: ModifiersState,
     /// The pointer in logical pixels from the window's top-left.
     cursor: Point,
@@ -189,6 +195,20 @@ fn cursor_of(c: CursorIcon) -> winit::window::CursorIcon {
         CursorIcon::Resize(ResizeCursor::EwResize) => W::EwResize,
         CursorIcon::Resize(ResizeCursor::NsResize) => W::NsResize,
     }
+}
+
+/// A screen as text, a line a row, trailing blanks and blank rows dropped.
+fn screen_text(s: &Screen) -> String {
+    let mut out = String::new();
+    for r in 0..s.rows {
+        let line: String = s.row(r).iter().map(|c| if c.content == 0 { " ".into() } else { s.content_str(c).into_owned() }).collect();
+        let line = line.trim_end();
+        if !line.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Where the wall keeps its state between runs. A scratch daemon directory
@@ -286,6 +306,13 @@ impl App {
             // The loop may be gone at shutdown; nothing is left to wake.
             let _ = proxy.send_event(Wake);
         });
+        // The door for `wallctl`: verbs arrive on a socket beside termd's.
+        if let Some(ns) = &opts.namespace {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
+                Ok(server) => self.control = Some(server),
+                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
+            }
+        }
         let terms = match &opts.namespace {
             Some(ns) => {
                 let mut sessions = match Sessions::open(ns, wake) {
@@ -407,6 +434,58 @@ impl App {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Run the verb lines `wallctl` sent, and answer each.
+    fn serve_control(&mut self) {
+        let Some(server) = &self.control else { return };
+        let mut ran = false;
+        while let Some(request) = server.try_recv() {
+            let (line, responder) = request.into_parts();
+            // The window's own few verbs: what a script needs that the wall's
+            // rules cannot give (pixels, a terminal's text, quitting).
+            let mut words = line.split_whitespace();
+            match words.next() {
+                Some("app.shot") => {
+                    match words.next() {
+                        Some(path) => self.pending_shot = Some((PathBuf::from(path), responder)),
+                        None => {
+                            responder.send("ERR: usage: app.shot <path.png>");
+                        }
+                    }
+                    ran = true;
+                    continue;
+                }
+                Some("app.text") => {
+                    let reply = match (words.next(), &self.terms) {
+                        (Some(id), Some(terms)) => match terms.screen(id) {
+                            Some(s) => screen_text(s),
+                            None => format!("ERR: no terminal '{id}'"),
+                        },
+                        _ => "ERR: usage: app.text <terminal id>".to_string(),
+                    };
+                    responder.send(reply);
+                    continue;
+                }
+                Some("app.quit") => {
+                    responder.send("OK: quitting");
+                    self.quit = true;
+                    ran = true;
+                    continue;
+                }
+                _ => {}
+            }
+            let reply = match (&mut self.wall, &self.terms) {
+                (Some(wall), Some(terms)) => wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text,
+                _ => "ERR: the wall is not open yet".to_string(),
+            };
+            responder.send(reply);
+            ran = true;
+        }
+        if ran {
+            self.apply_effects();
+            self.redraw();
         }
     }
 
@@ -654,9 +733,10 @@ impl App {
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
         // draws the same frame once more offscreen and saves it.
-        if self.exit_after == Some(self.frames + 1) {
-            if let Ok(path) = std::env::var("GLYPH_WALL_SHOT") {
-                let path = PathBuf::from(path);
+        let asked = self.pending_shot.take();
+        let counted = (self.exit_after == Some(self.frames + 1)).then(|| std::env::var("GLYPH_WALL_SHOT").ok().map(PathBuf::from)).flatten();
+        if asked.is_some() || counted.is_some() {
+            for path in asked.iter().map(|(p, _)| p.clone()).chain(counted) {
                 super::renderer::render_wall_to_png_with_overlay(&self.ctx, &mut g.renderer, &camera, &wall_frame, viewport, 1, &path, |enc, color_view| {
                     #[cfg(feature = "egui-ui")]
                     if let Some(painted) = ui_painted.as_mut() {
@@ -677,6 +757,9 @@ impl App {
                         }
                     }
                 }
+            }
+            if let Some((path, responder)) = asked {
+                responder.send(format!("OK: wrote {}", path.display()));
             }
         }
         self.frames += 1;
@@ -798,6 +881,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _wake: Wake) {
+        self.serve_control();
         self.pump();
     }
 
@@ -871,6 +955,10 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.quit {
+            event_loop.exit();
+            return;
+        }
         match self.exit_after {
             Some(n) if self.frames >= n => event_loop.exit(),
             // A counted run draws without waiting to be asked.
@@ -906,6 +994,9 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         gfx: None,
         wall: None,
         terms: None,
+        control: None,
+        pending_shot: None,
+        quit: false,
         modifiers: ModifiersState::empty(),
         cursor: Point::new(0.0, 0.0),
         buttons: 0,
@@ -931,13 +1022,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
             for t in &described.terminals {
                 let Some(s) = terms.screen(&t.id) else { continue };
                 println!("--- terminal {} ({}x{}) at ({:.1}, {:.1}) z {:.1}{}", t.id, s.cols, s.rows, t.cell_origin.x, t.cell_origin.y, t.z, if t.focused { " focused" } else { "" });
-                for r in 0..s.rows {
-                    let line: String = s.row(r).iter().map(|c| if c.content == 0 { " ".into() } else { s.content_str(c).into_owned() }).collect();
-                    let line = line.trim_end();
-                    if !line.is_empty() {
-                        println!("{line}");
-                    }
-                }
+                print!("{}", screen_text(s));
             }
         }
     }

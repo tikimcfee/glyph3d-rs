@@ -33,6 +33,8 @@ wall-core = { path = "../crates/wall-core" }
 # the emulator that turns a terminal's bytes into a term-cells Screen.
 termd-client = { path = "../crates/termd-client" }
 glyph-vt = { path = "../crates/glyph-vt" }
+# The door a command line reaches the running wall by: `wallctl <verb ...>`.
+wall-control = { path = "../crates/wall-control" }
 # The wall's runtime Slug font encoder, sprites, clusters, and growable atlas.
 glyph-font = { path = "../crates/glyph-font" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
