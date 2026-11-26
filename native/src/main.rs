@@ -118,14 +118,12 @@ fn main() {
         }
         #[cfg(feature = "windowed")]
         CliCommand::Wall { emoji_sheet, pattern, frames } => {
-            let ctx = pollster::block_on(gpu::init(None));
-            let open: Box<dyn FnOnce(std::sync::Arc<dyn Fn() + Send + Sync>) -> Vec<Box<dyn wall::app::Terminal>>> = if pattern {
-                Box::new(|_wake| vec![Box::new(wall::app::StaticTerminal(wall::test_pattern::build_primary_screen())) as Box<dyn wall::app::Terminal>])
-            } else {
+            if !pattern {
                 eprintln!("error: --wall has no live terminals yet; run it with --wall-test-pattern");
                 std::process::exit(1);
-            };
-            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, exit_after: frames.map(u64::from), open });
+            }
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::app::run_test_pattern(ctx, emoji_sheet, frames.map(u64::from));
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {

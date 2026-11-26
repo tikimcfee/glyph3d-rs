@@ -793,6 +793,10 @@ impl WallRenderer {
         self.metrics
     }
 
+    pub fn atlas(&self) -> &Atlas {
+        &self.atlas
+    }
+
     /// Measure the unclipped world width of `text` drawn at `height` under `zoom`.
     pub fn measure_label_width(&self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
         measure_label_width(self.metrics, &self.atlas.trie, text, height.resolve_world(zoom))
@@ -1443,7 +1447,7 @@ pub fn render_wall_to_png(
     println!("wrote {}", path.display());
 }
 
-/// CLI driver for `--wall-test-pattern --screenshot OUT.png` (three overlapping terminals).
+/// CLI driver for `--wall-test-pattern --screenshot OUT.png` (three terminals + full D3 chrome).
 pub fn render_test_pattern_offscreen(
     ctx: &GpuContext,
     emoji_sheet: &Path,
@@ -1467,7 +1471,7 @@ pub fn render_test_pattern_offscreen(
             screen: &t.screen,
             position: t.position,
             z: t.z,
-            scale: 1.0,
+            scale: t.scale,
             focused: t.focused,
             panel_opacity: None,
             border_color: t.border_color,
@@ -1476,35 +1480,44 @@ pub fn render_test_pattern_offscreen(
 
     let pad = renderer.style().panel_padding;
     let metrics = renderer.metrics();
-    let bounds = placed
+    let infos: Vec<super::test_pattern::ChromeTerminalInfo<'_>> = placed
         .iter()
-        .map(|t| metrics.panel_rect(t.position, t.screen.cols, t.screen.rows, pad))
-        .reduce(|a, b| a.union(b))
-        .expect("test pattern has at least one terminal");
+        .map(|t| super::test_pattern::ChromeTerminalInfo {
+            id: t.id,
+            title: &t.title,
+            cols: t.screen.cols,
+            rows: t.screen.rows,
+            position: t.position,
+            z: t.z,
+            scale: t.scale,
+            focused: t.focused,
+        })
+        .collect();
 
-    let mut camera = WallCamera::frame_rect(
-        bounds,
-        (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT),
-        1.08,
-    );
+    let vp = (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
+    // Two-pass framing: first estimate zoom from rough bounds, then build chrome at that
+    // zoom and frame the exact union of terminals + group header + lasso + drop + map label.
+    let probe = super::test_pattern::build_test_pattern_chrome(metrics, &renderer.atlas().trie, pad, 20.0, &infos);
+    let mut camera = WallCamera::frame_rect(probe.chrome_bounds, vp, 1.08);
+    let fitted = super::test_pattern::build_test_pattern_chrome(metrics, &renderer.atlas().trie, pad, camera.zoom, &infos);
+    camera = WallCamera::frame_rect(fitted.chrome_bounds, vp, 1.08);
     if zoom_multiplier > 0.0 && zoom_multiplier.is_finite() {
         camera.zoom *= zoom_multiplier;
     }
-    let paper = PaperStyle::default();
-    let frame = WallFrame {
-        paper: Some(&paper),
-        terminals: &draws,
-        ..Default::default()
-    };
-    render_wall_to_png(
-        ctx,
-        &mut renderer,
-        &camera,
-        &frame,
-        (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT),
-        frames,
-        path,
+    let chrome = super::test_pattern::build_test_pattern_chrome(
+        metrics,
+        &renderer.atlas().trie,
+        pad,
+        camera.zoom,
+        &infos,
     );
+    let frame = WallFrame {
+        paper: Some(&chrome.paper),
+        terminals: &draws,
+        shapes: &chrome.shapes,
+        labels: &chrome.labels,
+    };
+    render_wall_to_png(ctx, &mut renderer, &camera, &frame, vp, frames, path);
 }
 
 #[cfg(test)]
@@ -2038,8 +2051,10 @@ mod tests {
 
         let ctx = crate::gpu::test_device::context();
         let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
-        let mut style = WallStyle::default();
-        style.clear_color = [0.0, 0.0, 0.0, 1.0];
+        let style = WallStyle {
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            ..WallStyle::default()
+        };
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
@@ -2126,8 +2141,10 @@ mod tests {
     fn gpu_terminal_scale_scales_panel_fills_ink_and_cursor() {
         let ctx = crate::gpu::test_device::context();
         let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
-        let mut style = WallStyle::default();
-        style.clear_color = [0.0, 0.0, 0.0, 1.0];
+        let style = WallStyle {
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            ..WallStyle::default()
+        };
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,

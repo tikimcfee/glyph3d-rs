@@ -60,6 +60,9 @@ impl Terminal for StaticTerminal {
     fn screen(&self) -> &Screen {
         &self.0
     }
+    fn title(&self) -> &str {
+        &self.0.title
+    }
 }
 
 /// What a reader thread sends the event loop: something arrived, look.
@@ -84,6 +87,8 @@ struct Placed {
     /// Top-left of cell (0, 0), world units, y up.
     position: Vec2,
     z: f32,
+    scale: f32,
+    border_color: Option<u32>,
 }
 
 /// What exists once there is a window.
@@ -110,6 +115,7 @@ struct App {
     panning: bool,
     frames: u64,
     exit_after: Option<u64>,
+    chrome_demo: bool,
 }
 
 impl App {
@@ -127,7 +133,9 @@ impl App {
     fn rect_of(&self, t: &Placed) -> WorldRect {
         let g = self.gfx.as_ref().expect("a terminal is placed only once the renderer exists");
         let s = t.term.screen();
-        g.renderer.metrics().panel_rect(t.position, s.cols, s.rows, g.renderer.style().panel_padding)
+        g.renderer
+            .metrics()
+            .terminal_panel_rect(t.position, s.cols, s.rows, g.renderer.style().panel_padding, t.scale)
     }
 
     /// The topmost terminal under a screen point.
@@ -194,12 +202,59 @@ impl App {
             // The loop may be gone at shutdown; nothing is left to wake.
             let _ = proxy.send_event(Wake);
         });
+        if self.chrome_demo {
+            let mut initial_focus = None;
+            for t in super::test_pattern::build_overlapping_test_pattern(metrics) {
+                if t.focused {
+                    initial_focus = Some(t.id);
+                }
+                self.terminals.push(Placed {
+                    id: t.id,
+                    term: Box::new(StaticTerminal(t.screen)),
+                    position: t.position,
+                    z: t.z,
+                    scale: t.scale,
+                    border_color: t.border_color,
+                });
+            }
+            self.focused = initial_focus;
+            let infos: Vec<super::test_pattern::ChromeTerminalInfo<'_>> = self
+                .terminals
+                .iter()
+                .map(|t| super::test_pattern::ChromeTerminalInfo {
+                    id: t.id,
+                    title: t.term.title(),
+                    cols: t.term.screen().cols,
+                    rows: t.term.screen().rows,
+                    position: t.position,
+                    z: t.z,
+                    scale: t.scale,
+                    focused: self.focused == Some(t.id),
+                })
+                .collect();
+            let vp = self.viewport();
+            let trie = &self.gfx.as_ref().expect("gfx initialized").renderer.atlas().trie;
+            let probe = super::test_pattern::build_test_pattern_chrome(metrics, trie, padding, 20.0, &infos);
+            let est = WallCamera::frame_rect(probe.chrome_bounds, vp, 1.08);
+            let fitted = super::test_pattern::build_test_pattern_chrome(metrics, trie, padding, est.zoom, &infos);
+            self.camera = WallCamera::frame_rect(fitted.chrome_bounds, vp, 1.08);
+            self.redraw();
+            return;
+        }
+
         let mut x = 0.0_f32;
         for (i, term) in (opts.open)(wake).into_iter().enumerate() {
             let (cols, rows) = (term.screen().cols, term.screen().rows);
             let position = Vec2::new(x, 0.0);
             x += metrics.grid_rect(position, cols, rows).width() + 2.0 * padding + GAP;
-            self.terminals.push(Placed { id: i as u64 + 1, term, position, z: i as f32 + 1.0 });
+            self.terminals.push(Placed {
+                id: i as u64 + 1,
+                term,
+                position,
+                z: i as f32 + 1.0,
+                scale: 1.0,
+                border_color: None,
+            });
         }
         if let Some(first) = self.terminals.first().map(|t| t.id) {
             self.focus(first);
@@ -247,14 +302,49 @@ impl App {
                 screen: t.term.screen(),
                 position: t.position,
                 z: t.z,
-                scale: 1.0,
+                scale: t.scale,
                 focused: self.focused == Some(t.id),
                 panel_opacity: None,
-                border_color: None,
+                border_color: t.border_color,
             })
             .collect();
+        let demo_chrome = self.chrome_demo.then(|| {
+            let infos: Vec<super::test_pattern::ChromeTerminalInfo<'_>> = self
+                .terminals
+                .iter()
+                .map(|t| super::test_pattern::ChromeTerminalInfo {
+                    id: t.id,
+                    title: t.term.title(),
+                    cols: t.term.screen().cols,
+                    rows: t.term.screen().rows,
+                    position: t.position,
+                    z: t.z,
+                    scale: t.scale,
+                    focused: self.focused == Some(t.id),
+                })
+                .collect();
+            super::test_pattern::build_test_pattern_chrome(
+                g.renderer.metrics(),
+                &g.renderer.atlas().trie,
+                g.renderer.style().panel_padding,
+                self.camera.zoom,
+                &infos,
+            )
+        });
         let paper = PaperStyle::default();
-        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, ..Default::default() };
+        let wall_frame = match &demo_chrome {
+            Some(c) => WallFrame {
+                paper: Some(&c.paper),
+                terminals: &draws,
+                shapes: &c.shapes,
+                labels: &c.labels,
+            },
+            None => WallFrame {
+                paper: Some(&paper),
+                terminals: &draws,
+                ..Default::default()
+            },
+        };
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
         g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
         self.ctx.queue.submit([encoder.finish()]);
@@ -368,6 +458,24 @@ impl ApplicationHandler<Wake> for App {
 
 /// Open the wall and run until its window closes.
 pub fn run(ctx: GpuContext, opts: WallOptions) {
+    run_inner(ctx, opts, false);
+}
+
+/// Open the wall window directly on the three-terminal + canvas-chrome test pattern
+/// (`--wall --wall-test-pattern`).
+pub fn run_test_pattern(ctx: GpuContext, emoji_sheet: PathBuf, exit_after: Option<u64>) {
+    run_inner(
+        ctx,
+        WallOptions {
+            emoji_sheet,
+            exit_after,
+            open: Box::new(|_| Vec::new()),
+        },
+        true,
+    );
+}
+
+fn run_inner(ctx: GpuContext, opts: WallOptions, chrome_demo: bool) {
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("event loop creation failed");
     let mut app = App {
         ctx,
@@ -382,6 +490,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         panning: false,
         frames: 0,
         exit_after: None,
+        chrome_demo,
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
