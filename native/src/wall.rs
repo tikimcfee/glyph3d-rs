@@ -19,4 +19,7 @@ pub use camera::WallCamera;
 pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph};
 pub use metrics::{CellMetrics, WorldRect, snap_cell_dimension};
 #[cfg(feature = "wgpu")]
-pub use renderer::{TerminalDraw, WallRenderer, WallStyle, WallTarget, render_test_pattern_offscreen};
+pub use renderer::{
+    TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallRenderer, WallStyle, WallTarget,
+    render_test_pattern_offscreen, render_wall_to_png,
+};

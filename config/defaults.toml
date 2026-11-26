@@ -396,7 +396,9 @@ wait_timeout_secs = 60
 # The wall canvas and terminal cell pass (2026-11-26, native/src/wall/).
 # Colours here are sRGB 0.0-1.0 (decoded with exact IEC sRGB in the shader).
 clear_color = [0.055, 0.063, 0.086, 1.0]          # #0e1016 canvas backdrop
-panel_opacity = 0.96
+# Opaque by default: linear-space blending on an sRGB render target amplifies
+# even 4% alpha of bright text behind a dark panel into visible ghosting.
+panel_opacity = 1.00
 panel_padding = 0.30                              # world units around the cell grid
 border_width_px = 1.5                             # hairline thickness in screen px
 border_focused_scale = 1.6                        # thickness multiplier when focused

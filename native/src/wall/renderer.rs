@@ -157,6 +157,19 @@ struct TerminalGpu {
     bind_group: wgpu::BindGroup,
 }
 
+/// Per-frame GPU upload counters returned by [`WallRenderer::prepare`] / [`WallRenderer::render`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UploadStats {
+    /// Terminals included in the draw list.
+    pub terminals_drawn: usize,
+    /// Terminals whose cell buffer received at least one row upload this frame.
+    pub terminals_uploaded: usize,
+    /// Total cell rows uploaded across all terminals this frame.
+    pub rows_uploaded: usize,
+    /// Total `queue.write_buffer` calls issued for cell buffers (coalesced dirty runs).
+    pub write_calls: usize,
+}
+
 /// Shared wgpu cell renderer for any number of live terminals.
 pub struct WallRenderer {
     atlas: Arc<Atlas>,
@@ -174,6 +187,7 @@ pub struct WallRenderer {
     cursor_pipeline: wgpu::RenderPipeline,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
+    draw_order: Vec<usize>,
 }
 
 const PREMUL_BLEND: wgpu::BlendState = wgpu::BlendState {
@@ -459,6 +473,7 @@ impl WallRenderer {
             cursor_pipeline,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
+            draw_order: Vec::new(),
         }
     }
 
@@ -474,11 +489,46 @@ impl WallRenderer {
         &mut self.style
     }
 
-    fn sync_terminal(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draw: &TerminalDraw<'_>) {
+    /// Release cached GPU buffers for a closed terminal.
+    pub fn remove_terminal(&mut self, id: u64) -> bool {
+        self.terminals.remove(&id).is_some()
+    }
+
+    /// Retain only cached terminal GPU entries matching `keep`, freeing all others.
+    pub fn retain_terminals(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.terminals.retain(|&id, _| keep(id));
+    }
+
+    /// Number of terminals currently cached on the GPU.
+    pub fn cached_terminal_count(&self) -> usize {
+        self.terminals.len()
+    }
+
+    fn sync_terminal(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draw: &TerminalDraw<'_>,
+        stats: &mut UploadStats,
+    ) {
         let screen = draw.screen;
         let cols = screen.cols;
         let rows = screen.rows;
         let cell_count = usize::from(cols) * usize::from(rows);
+        assert_eq!(
+            screen.cells.len(),
+            cell_count,
+            "terminal {}: screen.cells.len() ({}) != cols*rows ({cell_count})",
+            draw.id,
+            screen.cells.len()
+        );
+        assert_eq!(
+            screen.row_gen.len(),
+            usize::from(rows),
+            "terminal {}: screen.row_gen.len() ({}) != rows ({rows})",
+            draw.id,
+            screen.row_gen.len()
+        );
 
         let needs_alloc = match self.terminals.get(&draw.id) {
             Some(existing) => existing.cols != cols || existing.rows != rows,
@@ -571,9 +621,15 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
+            stats.terminals_uploaded += 1;
+            stats.rows_uploaded += usize::from(rows);
+            stats.write_calls += 1;
         } else if screen.generation != gpu.uploaded_gen {
             let dirty = dirty_row_ranges(&screen.row_gen, gpu.uploaded_gen);
             let cols_usize = usize::from(cols);
+            if !dirty.is_empty() {
+                stats.terminals_uploaded += 1;
+            }
             for range in dirty {
                 self.pack_scratch.clear();
                 self.pack_scratch.reserve(range.len() * cols_usize);
@@ -594,27 +650,29 @@ impl WallRenderer {
                     byte_offset,
                     bytemuck::cast_slice(&self.pack_scratch),
                 );
+                stats.rows_uploaded += range.len();
+                stats.write_calls += 1;
             }
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             gpu.uploaded_gen = screen.generation;
         }
     }
 
-    /// Upload any changed terminal rows and record the wall render pass into `encoder`.
-    pub fn render(
+    /// Upload frame uniforms and any dirty terminal rows, and sort `terminals`
+    /// back-to-front by `z`. Call before [`Self::record_into_pass`].
+    pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &WallTarget<'_>,
+        viewport: (u32, u32),
         camera: &WallCamera,
         terminals: &[TerminalDraw<'_>],
-    ) {
+    ) -> UploadStats {
         let (line_a, line_b) = fold_line_uniforms(&self.style);
         let sheet = &self.atlas.emoji.sheet;
         let frame = WallFrameUniform {
-            view_proj: camera.view_proj((target.width, target.height)).to_cols_array_2d(),
-            viewport: [target.width.max(1) as f32, target.height.max(1) as f32],
+            view_proj: camera.view_proj(viewport).to_cols_array_2d(),
+            viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32],
             cell_size: [self.metrics.cell_width, self.metrics.cell_height],
             line_a,
             line_b,
@@ -638,43 +696,36 @@ impl WallRenderer {
         };
         queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
+        let mut stats = UploadStats {
+            terminals_drawn: terminals.len(),
+            ..Default::default()
+        };
         for draw in terminals {
-            self.sync_terminal(device, queue, draw);
+            self.sync_terminal(device, queue, draw, &mut stats);
         }
 
         // Draw back-to-front by world z so translucent panels, antialiased edges,
         // and translucent cursors blend cleanly over farther terminals while the
         // reverse-Z depth buffer enforces hard 3D occlusion.
-        let mut order: Vec<usize> = (0..terminals.len()).collect();
-        order.sort_by(|&a, &b| terminals[a].z.total_cmp(&terminals[b].z));
+        self.draw_order.clear();
+        self.draw_order.extend(0..terminals.len());
+        self.draw_order
+            .sort_by(|&a, &b| terminals[a].z.total_cmp(&terminals[b].z));
+        stats
+    }
 
-        let clear = srgb_to_wgpu_clear_color(self.style.clear_color, self.color_format.is_srgb());
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("wall cells pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target.color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: target.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-
+    /// Record draw calls for the prepared `terminals` into an existing render pass.
+    /// The pass's colour attachment must match `color_format` and its depth
+    /// attachment must be [`WALL_DEPTH_FORMAT`] (reverse-Z, cleared to 0.0).
+    pub fn record_into_pass<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        terminals: &[TerminalDraw<'_>],
+    ) {
         pass.set_bind_group(0, &self.shared_bg, &[]);
         pass.set_index_buffer(self.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
 
-        for idx in order {
+        for &idx in &self.draw_order {
             let draw = &terminals[idx];
             let Some(gpu) = self.terminals.get(&draw.id) else {
                 continue;
@@ -702,6 +753,76 @@ impl WallRenderer {
                 pass.draw_indexed(0..6, 0, 0..1);
             }
         }
+    }
+
+    /// Upload any changed terminal rows, clear `target` to `style.clear_color`
+    /// and depth 0.0, and draw `terminals`.
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &WallTarget<'_>,
+        camera: &WallCamera,
+        terminals: &[TerminalDraw<'_>],
+    ) -> UploadStats {
+        let clear = srgb_to_wgpu_clear_color(self.style.clear_color, self.color_format.is_srgb());
+        self.render_pass_impl(device, queue, encoder, target, camera, terminals, Some(clear))
+    }
+
+    /// Upload any changed terminal rows and draw `terminals` over existing
+    /// colour and depth contents (`LoadOp::Load`), e.g. on top of grid paper.
+    pub fn render_over(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &WallTarget<'_>,
+        camera: &WallCamera,
+        terminals: &[TerminalDraw<'_>],
+    ) -> UploadStats {
+        self.render_pass_impl(device, queue, encoder, target, camera, terminals, None)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "internal pass helper shared by render and render_over")]
+    fn render_pass_impl(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &WallTarget<'_>,
+        camera: &WallCamera,
+        terminals: &[TerminalDraw<'_>],
+        clear: Option<wgpu::Color>,
+    ) -> UploadStats {
+        let stats = self.prepare(device, queue, (target.width, target.height), camera, terminals);
+        let (color_load, depth_load) = match clear {
+            Some(c) => (wgpu::LoadOp::Clear(c), wgpu::LoadOp::Clear(0.0)),
+            None => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("wall cells pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: color_load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: target.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: depth_load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        self.record_into_pass(&mut pass, terminals);
+        stats
     }
 }
 
@@ -816,7 +937,7 @@ pub fn render_wall_to_png(
     println!("wrote {}", path.display());
 }
 
-/// CLI driver for `--wall-test-pattern --screenshot OUT.png`.
+/// CLI driver for `--wall-test-pattern --screenshot OUT.png` (three overlapping terminals).
 pub fn render_test_pattern_offscreen(
     ctx: &GpuContext,
     emoji_sheet: &Path,
@@ -832,24 +953,32 @@ pub fn render_test_pattern_offscreen(
         wgpu::TextureFormat::Rgba8UnormSrgb,
         WallStyle::default(),
     );
-    let screen = super::test_pattern::build_primary_screen();
-    let origin = Vec2::ZERO;
-    let draw = TerminalDraw {
-        id: 1,
-        screen: &screen,
-        position: origin,
-        z: 0.0,
-        focused: true,
-        panel_opacity: None,
-        border_color: None,
-    };
-    let bounds = renderer
-        .metrics()
-        .panel_rect(origin, screen.cols, screen.rows, renderer.style().panel_padding);
+    let placed = super::test_pattern::build_overlapping_test_pattern(renderer.metrics());
+    let draws: Vec<TerminalDraw<'_>> = placed
+        .iter()
+        .map(|t| TerminalDraw {
+            id: t.id,
+            screen: &t.screen,
+            position: t.position,
+            z: t.z,
+            focused: t.focused,
+            panel_opacity: None,
+            border_color: t.border_color,
+        })
+        .collect();
+
+    let pad = renderer.style().panel_padding;
+    let metrics = renderer.metrics();
+    let bounds = placed
+        .iter()
+        .map(|t| metrics.panel_rect(t.position, t.screen.cols, t.screen.rows, pad))
+        .reduce(|a, b| a.union(b))
+        .expect("test pattern has at least one terminal");
+
     let mut camera = WallCamera::frame_rect(
         bounds,
         (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT),
-        1.12,
+        1.08,
     );
     if zoom_multiplier > 0.0 && zoom_multiplier.is_finite() {
         camera.zoom *= zoom_multiplier;
@@ -858,7 +987,7 @@ pub fn render_test_pattern_offscreen(
         ctx,
         &mut renderer,
         &camera,
-        &[draw],
+        &draws,
         crate::OFFSCREEN_WIDTH,
         crate::OFFSCREEN_HEIGHT,
         frames,
@@ -923,7 +1052,7 @@ mod tests {
             width,
             height,
         };
-        renderer.render(device, &ctx.queue, &mut encoder, &target, camera, terminals);
+        let _stats = renderer.render(device, &ctx.queue, &mut encoder, &target, camera, terminals);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -1016,5 +1145,106 @@ mod tests {
                 "expected uncrushed #1a1b26 (26,27,38) from nearer terminal (reverse_input={reverse_input}), got {got:?}"
             );
         }
+    }
+
+    /// Verifies generation-gated dirty-row uploads: first frame uploads all
+    /// rows, unchanged second frame uploads 0 bytes, editing rows {1,2} and {5}
+    /// uploads 3 rows in 2 coalesced writes, and GPU pixels reflect the edit.
+    #[test]
+    fn gpu_dirty_row_uploads_and_cursor_shapes() {
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let mut screen = Screen::new(12, 8);
+        screen.default_bg = rgb(0x10, 0x10, 0x10);
+        fn make_draw(screen: &Screen, focused: bool) -> TerminalDraw<'_> {
+            TerminalDraw {
+                id: 42,
+                screen,
+                position: Vec2::ZERO,
+                z: 0.0,
+                focused,
+                panel_opacity: Some(1.0),
+                border_color: None,
+            }
+        }
+        let cam = WallCamera::new(Vec2::new(3.0, -4.0), 32.0);
+        let vp = (320, 320);
+
+        // Frame 1: initial upload of all 8 rows in 1 write.
+        let s1 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 8, write_calls: 1 });
+        assert_eq!(renderer.cached_terminal_count(), 1);
+
+        // Frame 2: unchanged generation -> zero row uploads.
+        let s2 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 0, rows_uploaded: 0, write_calls: 0 });
+
+        // Frame 3: edit rows 1, 2 (contiguous) and row 5 (disjoint) -> 3 rows, 2 writes.
+        screen.row_mut(1)[0].bg = rgb(0x00, 0xd0, 0x40);
+        screen.touch_row(1);
+        screen.row_mut(2)[0].bg = rgb(0x00, 0xd0, 0x40);
+        screen.touch_row(2);
+        screen.row_mut(5)[0].bg = rgb(0xe0, 0x30, 0x30);
+        screen.touch_row(5);
+        let s3 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 2 });
+
+        // Verify all 4 cursor states render into expected cell regions (Block, Bar, Underline, Hollow).
+        let cell_w = renderer.metrics().cell_width;
+        let cell_h = renderer.metrics().cell_height;
+        let cell_cam = WallCamera::new(Vec2::new(cell_w * 0.5, -cell_h * 0.5), 64.0);
+        let mut cursor_screen = Screen::new(4, 2);
+        cursor_screen.default_bg = rgb(0x00, 0x00, 0x00);
+        cursor_screen.cursor = term_cells::Cursor {
+            col: 0,
+            row: 0,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+        let w = 128u32;
+        let h = 128u32;
+        let sample_g = |px: &[u8], sx: f32, sy: f32| -> u8 {
+            let x = (sx.round() as u32).min(w - 1);
+            let y = (sy.round() as u32).min(h - 1);
+            px[((y * w + x) * 4 + 1) as usize]
+        };
+        let center_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.5), (w, h));
+        let left_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.04, -cell_h * 0.5), (w, h));
+        let right_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.85, -cell_h * 0.5), (w, h));
+        let bottom_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.96), (w, h));
+        let top_mid_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.2), (w, h));
+
+        // 1. Focused Block: interior is lit green.
+        let px_block = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        assert!(sample_g(&px_block, center_px.x, center_px.y) > 80, "focused block interior should be lit");
+
+        // 2. Unfocused Hollow: border is lit green, interior center stays dark.
+        let px_hollow = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, false)], w, h);
+        assert!(sample_g(&px_hollow, left_px.x, left_px.y) > 80, "hollow cursor edge should be lit");
+        assert!(sample_g(&px_hollow, center_px.x, center_px.y) < 10, "hollow cursor centre must stay dark");
+
+        // 3. Focused Bar: left edge lit, right side dark.
+        cursor_screen.cursor.shape = CursorShape::Bar;
+        let px_bar = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        assert!(sample_g(&px_bar, left_px.x, left_px.y) > 100, "bar cursor left edge should be lit");
+        assert!(sample_g(&px_bar, right_px.x, right_px.y) < 10, "bar cursor right side must stay dark");
+
+        // 4. Focused Underline: bottom edge lit, upper interior dark.
+        cursor_screen.cursor.shape = CursorShape::Underline;
+        let px_ul = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        assert!(sample_g(&px_ul, bottom_px.x, bottom_px.y) > 100, "underline cursor bottom should be lit");
+        assert!(sample_g(&px_ul, top_mid_px.x, top_mid_px.y) < 10, "underline cursor top must stay dark");
+
+        assert!(renderer.remove_terminal(42));
+        assert_eq!(renderer.cached_terminal_count(), 0);
     }
 }

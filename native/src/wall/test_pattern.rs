@@ -276,3 +276,146 @@ pub fn build_primary_screen() -> Screen {
 
     s
 }
+
+/// One placed terminal in the three-terminal overlapping test pattern.
+pub struct TestPatternTerminal {
+    pub id: u64,
+    pub screen: Screen,
+    pub position: glam::Vec2,
+    pub z: f32,
+    pub focused: bool,
+    pub border_color: Option<u32>,
+}
+
+/// Build the three-terminal overlapping wall test pattern:
+/// - Terminal 1 (`z = 0.0`, back-left, unfocused): slate border, hollow cursor,
+///   background content overlapped on its lower-right by Terminals 2 and 3.
+/// - Terminal 2 (`z = 1.0`, middle-right, focused): amber accent border, bar
+///   cursor, overlaps Terminal 1 and is overlapped on its lower-left by Terminal 3.
+/// - Terminal 3 (`z = 2.0`, front, focused): full feature test pattern (palette,
+///   fills, all 5 underline styles, SGR 58, strike, overline, dim, wide + ZWJ
+///   emoji, block cursor, seamless gradient bar) covering both behind it.
+pub fn build_overlapping_test_pattern(metrics: super::metrics::CellMetrics) -> Vec<TestPatternTerminal> {
+    let cw = metrics.cell_width;
+    let ch = metrics.cell_height;
+
+    // Terminal 1: back-left, unfocused (hollow cursor + slate hairline border).
+    let mut back = Screen::new(46, 13);
+    back.default_fg = rgb(0xc8, 0xd3, 0xf5);
+    back.default_bg = rgb(0x13, 0x17, 0x24);
+    back.title = "back-unfocused".to_string();
+    let fg1 = back.default_fg;
+    let blue = rgb(0x82, 0xaa, 0xff);
+    let teal = rgb(0x4f, 0xd6, 0xbe);
+    let coral = rgb(0xff, 0x75, 0x7f);
+    write_run(&mut back, 0, 1, "Terminal 1 (z = 0.0, unfocused)", blue, 0, 0, 0);
+    write_run(&mut back, 2, 1, "Hollow cursor -> ", fg1, 0, 0, 0);
+    write_run(&mut back, 2, 18, "unfocused cell", teal, 0, 0, 0);
+    write_run(&mut back, 4, 1, "Overlapped below-right by z=1 and z=2:", fg1, 0, 0, attrs::DIM);
+    for r in 6..12u16 {
+        let bg = if r % 2 == 0 { rgb(0x22, 0x2c, 0x45) } else { rgb(0x2c, 0x1f, 0x38) };
+        write_run(
+            &mut back,
+            r,
+            1,
+            "BACKGROUND-TEXT-SHOULD-BE-OCCLUDED-BY-NEARER",
+            coral,
+            bg,
+            0,
+            0,
+        );
+    }
+    back.cursor = Cursor {
+        col: 18,
+        row: 2,
+        visible: true,
+        shape: CursorShape::Block,
+        blink: false,
+    };
+
+    // Terminal 2: middle-right, focused with Bar cursor & amber border override.
+    let mut mid = Screen::new(44, 13);
+    mid.default_fg = rgb(0xe2, 0xe8, 0xf0);
+    mid.default_bg = rgb(0x18, 0x1e, 0x29);
+    mid.title = "middle-bar-cursor".to_string();
+    let fg2 = mid.default_fg;
+    let amber = rgb(0xf0, 0xb4, 0x5a);
+    let mint = rgb(0x6e, 0xe7, 0xa0);
+    write_run(&mut mid, 0, 1, "Terminal 2 (z = 1.0, bar cursor)", amber, 0, 0, 0);
+    write_run(&mut mid, 2, 1, "Covers z=0; covered by z=2 front", fg2, 0, 0, 0);
+    write_run(&mut mid, 4, 1, "Bar cursor: ", fg2, 0, 0, 0);
+    write_run(&mut mid, 4, 13, "insert mode here", mint, 0, 0, 0);
+    write_run(
+        &mut mid,
+        6,
+        1,
+        "Mixed: ",
+        fg2,
+        0,
+        0,
+        0,
+    );
+    write_run(
+        &mut mid,
+        6,
+        8,
+        "dim+strike+curly",
+        rgb(0xf7, 0x76, 0x8e),
+        0,
+        amber,
+        attrs::DIM
+            | attrs::STRIKE
+            | (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT)
+            | attrs::UNDERLINE_COLOR,
+    );
+    for r in 8..12u16 {
+        write_run(
+            &mut mid,
+            r,
+            1,
+            "MIDDLE-LAYER-TEXT-OCCLUDED-BY-FRONT-TERM",
+            amber,
+            rgb(0x28, 0x24, 0x1c),
+            0,
+            0,
+        );
+    }
+    mid.cursor = Cursor {
+        col: 13,
+        row: 4,
+        visible: true,
+        shape: CursorShape::Bar,
+        blink: false,
+    };
+
+    // Terminal 3: front, focused, full primary showcase.
+    let front = build_primary_screen();
+
+    // Return in scrambled Z order [1.0, 2.0, 0.0] to exercise Z sorting + depth.
+    vec![
+        TestPatternTerminal {
+            id: 2,
+            screen: mid,
+            position: glam::Vec2::new(34.0 * cw, 5.0 * ch),
+            z: 1.0,
+            focused: true,
+            border_color: Some(rgb(0xf0, 0xb4, 0x5a)),
+        },
+        TestPatternTerminal {
+            id: 3,
+            screen: front,
+            position: glam::Vec2::new(10.0 * cw, -3.5 * ch),
+            z: 2.0,
+            focused: true,
+            border_color: None,
+        },
+        TestPatternTerminal {
+            id: 1,
+            screen: back,
+            position: glam::Vec2::new(0.0, 6.5 * ch),
+            z: 0.0,
+            focused: false,
+            border_color: None,
+        },
+    ]
+}
