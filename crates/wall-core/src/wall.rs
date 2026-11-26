@@ -262,6 +262,77 @@ impl TerminalAppeared {
     }
 }
 
+/// Plain-data summary of how one terminal's [`Screen`] changed on an emulator
+/// fill (mirrors `glyph_vt::FillDelta` without coupling `wall-core` to
+/// `glyph-vt`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenFillDelta<'a> {
+    /// Whether the terminal grid resized since the previous fill.
+    pub resized: bool,
+    /// Number of rows scrolled off row `0` since the previous fill.
+    pub scrolled_top: u32,
+    /// Whether scrolling was confined to margins (`DECSTBM` / `DECSLRM`) rather
+    /// than shifting the whole screen upward.
+    pub within_margins: bool,
+    /// Per-row half-open column ranges `(lo, hi)` rewritten in place (`lo >= hi`
+    /// or omitted trailing rows mean unchanged).
+    pub rewritten_cols: &'a [(u16, u16)],
+}
+
+/// Extract the last non-blank line from `screen`, trimmed at both ends, into
+/// `buf` (reusing `buf`'s capacity so unchanged screens do zero allocation).
+fn extract_preview_into(screen: &Screen, buf: &mut String) {
+    buf.clear();
+    for r in (0..screen.rows).rev() {
+        let row = screen.row(r);
+        let mut has_non_space = false;
+        for cell in row {
+            if cell.width == 0 || cell.content == 0 {
+                continue;
+            }
+            if cell.content < term_cells::CLUSTER_BASE {
+                if let Some(ch) = char::from_u32(cell.content) {
+                    if !ch.is_whitespace() {
+                        has_non_space = true;
+                        break;
+                    }
+                }
+            } else if !screen.content_str(cell).trim().is_empty() {
+                has_non_space = true;
+                break;
+            }
+        }
+        if !has_non_space {
+            continue;
+        }
+        for cell in row {
+            if cell.width == 0 {
+                continue;
+            }
+            if cell.content == 0 {
+                buf.push(' ');
+            } else {
+                buf.push_str(&screen.content_str(cell));
+            }
+        }
+        let trimmed = buf.trim();
+        let start = trimmed.as_ptr() as usize - buf.as_ptr() as usize;
+        let len = trimmed.len();
+        if start > 0 {
+            buf.drain(..start);
+        }
+        buf.truncate(len);
+        return;
+    }
+}
+
+/// Extract the last non-blank line from `screen` for sidebar/palette previews.
+pub fn preview_from_screen(screen: &Screen) -> String {
+    let mut buf = String::new();
+    extract_preview_into(screen, &mut buf);
+    buf
+}
+
 // ── Plain-data frame description (`WallFrame`) ───────────────────────────────
 
 /// Drafting-paper background and grid parameters for one frame.
@@ -441,6 +512,10 @@ struct WallCore {
     names: WallNames,
     selections: HashMap<String, TerminalSelection>,
     selection_text_cache: HashMap<String, String>,
+    /// Last `Screen::title` observed per terminal so unchanged fills never allocate
+    /// and an empty `Screen::title` never clobbers a title delivered by `Event::Title`.
+    last_screen_titles: HashMap<String, String>,
+    preview_scratch: String,
     pressed_keys: PressedKeys,
     termd: TermdStatus,
     bus: Option<GomuxSnapshot>,
@@ -1068,6 +1143,8 @@ impl WallCore {
             names: WallNames::new(None),
             selections: HashMap::new(),
             selection_text_cache: HashMap::new(),
+            last_screen_titles: HashMap::new(),
+            preview_scratch: String::new(),
             pressed_keys: PressedKeys::new(),
             termd: TermdStatus::new(opts.namespace),
             bus: None,
@@ -1654,6 +1731,7 @@ impl WallCore {
         self.sync_groups_to_store();
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
+        self.last_screen_titles.remove(id);
         self.model.deselect_one_raw(id);
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -1784,8 +1862,12 @@ impl WallCore {
     }
 
     fn terminal_resized(&mut self, id: &str, cols: u32, rows: u32) {
+        let prev = self.model.terminal(id).map(|t| (t.cols, t.rows));
         if !self.model.set_terminal_size_raw(id, cols, rows) {
             return;
+        }
+        if prev != Some((cols, rows)) {
+            self.clear_text_selection(id);
         }
         let in_fs = self.fullscreen.active() && self.fullscreen.has(&self.read_fs_view(), id);
         if in_fs {
@@ -1800,6 +1882,82 @@ impl WallCore {
         self.model.notify_changed();
     }
 
+    fn terminal_screen_filled(
+        &mut self,
+        id: &str,
+        screen: &Screen,
+        delta: ScreenFillDelta<'_>,
+    ) -> bool {
+        if self.model.terminal(id).is_none() {
+            return false;
+        }
+        let mut changed = false;
+
+        // 1. Maintain active text selection lifetime across scroll, rewrite, or resize.
+        if let Some(sel) = self.selections.get_mut(id) {
+            if sel.sync_after_fill(
+                screen,
+                delta.resized,
+                delta.scrolled_top,
+                delta.within_margins,
+                delta.rewritten_cols,
+            ) {
+                if sel.is_empty() {
+                    self.selection_text_cache.remove(id);
+                    self.model.set_terminal_has_selection(id, false);
+                } else {
+                    let text = sel.text(screen);
+                    self.selection_text_cache.insert(id.to_owned(), text);
+                    self.model.set_terminal_has_selection(id, true);
+                }
+                changed = true;
+            }
+        }
+
+        // 2. Refresh the last non-blank preview line when cells changed (or preview is still empty).
+        let cells_changed = delta.resized
+            || delta.scrolled_top > 0
+            || delta.within_margins
+            || delta.rewritten_cols.iter().any(|&(lo, hi)| lo < hi);
+        let cur_preview_empty = self
+            .model
+            .terminal(id)
+            .is_some_and(|t| t.preview.is_empty());
+        if cells_changed || cur_preview_empty {
+            extract_preview_into(screen, &mut self.preview_scratch);
+            let unchanged = self
+                .model
+                .terminal(id)
+                .is_some_and(|t| t.preview == self.preview_scratch);
+            if !unchanged {
+                let next = self.preview_scratch.clone();
+                changed |= self.model.set_terminal_preview(id, next);
+            }
+        }
+
+        // 3. Propagate `Screen::title` when the emulator's title changed (including an
+        //    adopted terminal's initial `Repaint` OSC title), without clobbering a title
+        //    delivered out-of-band by `Event::Title` when `screen.title` stays empty.
+        let prev_screen_title = self
+            .last_screen_titles
+            .get(id)
+            .map_or("", String::as_str);
+        if screen.title != prev_screen_title {
+            let next_title = screen.title.clone();
+            if let Some(slot) = self.last_screen_titles.get_mut(id) {
+                slot.clone_from(&next_title);
+            } else {
+                self.last_screen_titles.insert(id.to_owned(), next_title.clone());
+            }
+            changed |= self.model.set_terminal_title(id, next_title);
+        }
+
+        if changed {
+            self.model.notify_changed();
+        }
+        changed
+    }
+
     fn terminal_ended(&mut self, id: &str) {
         let prev_group = self.groups.group_of(id);
         let (existed, was_focused) = self.model.unmount_terminal_raw(id);
@@ -1808,6 +1966,7 @@ impl WallCore {
         }
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
+        self.last_screen_titles.remove(id);
         self.names.prune(|tid| self.model.terminal(tid).is_some());
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -4412,6 +4571,26 @@ impl Wall {
         self.router.context.model.set_terminal_preview(id, preview);
     }
 
+    /// Notify the wall that terminal `id`'s [`Screen`] was refilled by its emulator.
+    ///
+    /// Maintains text-selection lifetime ([`TerminalSelection::sync_after_fill`]),
+    /// refreshes the terminal's last non-blank preview line when cells changed, and
+    /// propagates `screen.title` when the emulator's title changed (covering adopted
+    /// terminals whose initial `Repaint` sets `Screen::title`).
+    ///
+    /// Returns `true` when any wall state changed (selection shifted/cleared,
+    /// preview changed, or title changed).
+    pub fn terminal_screen_filled(
+        &mut self,
+        id: &str,
+        screen: &Screen,
+        delta: ScreenFillDelta<'_>,
+    ) -> bool {
+        self.router
+            .context
+            .terminal_screen_filled(id, screen, delta)
+    }
+
     /// Notify the wall that terminal `id` ended or closed on the daemon.
     pub fn terminal_ended(&mut self, id: &str) {
         self.router.context.terminal_ended(id);
@@ -4419,14 +4598,17 @@ impl Wall {
     }
 
     /// Reconcile durable store entries against the daemon's live terminal list on connect.
-    /// Returns the forgotten terminal ids.
+    /// Call before adopting existing terminals with [`Self::terminal_appeared`] so dead
+    /// group members are pruned before surviving groups lay out. Returns the forgotten ids.
     pub fn set_live_terminals<S: AsRef<str>>(&mut self, live_ids: &[S]) -> Vec<String> {
         let gone = self.router.context.set_live_terminals(live_ids);
         self.sync_pointer_flags();
         gone
     }
 
-    /// Record whether the daemon connection is up.
+    /// Record whether the daemon connection is up. Independent of [`Self::set_live_terminals`]
+    /// and [`Self::terminal_appeared`]; calling `set_connected(true)` after adopting existing
+    /// terminals keeps `WallSnapshot::connected` false until adoption finishes.
     pub fn set_connected(&mut self, connected: bool) {
         self.router.context.model.set_connected(connected);
     }

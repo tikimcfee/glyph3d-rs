@@ -26,7 +26,7 @@ use wall_core::scroll::DeltaMode;
 use wall_core::selection::screen_from_lines;
 use wall_core::snap::{snap_step, snap_to, GridSpec};
 use wall_core::store::{FullscreenMode, Storage, WallStore};
-use wall_core::wall::{TerminalAppeared, Wall, WallFrame, WallOptions};
+use wall_core::wall::{ScreenFillDelta, TerminalAppeared, Wall, WallFrame, WallOptions};
 
 const MODS_NONE: Mods = Mods {
     shift: false,
@@ -1644,5 +1644,259 @@ fn disk_backed_wall_open_persists_across_instances() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Selection lifetime, preview & title from Vt::fill deltas ─────────────────
+
+#[test]
+fn selection_lifetime_across_vt_fill_scroll_rewrite_and_resize() {
+    use glyph_vt::{Theme, Vt};
+
+    let mut h = Harness::new();
+    let opts_cols: u16 = 30;
+    let opts_rows: u16 = 6;
+    let theme = Theme::default();
+    let mut vt = Vt::new(opts_cols, opts_rows, &theme);
+    let mut screen = Screen::new(opts_cols, opts_rows);
+
+    let t1 = "t1".to_owned();
+    h.wall
+        .terminal_appeared(TerminalAppeared::new(&t1, u32::from(opts_cols), u32::from(opts_rows)));
+    h.screens.insert(t1.clone(), Screen::new(opts_cols, opts_rows));
+    h.run_ok("wall.fit");
+    h.settle();
+
+    let pump_vt = |h: &mut Harness, vt: &mut Vt, screen: &mut Screen| -> bool {
+        if !vt.fill(screen) {
+            return false;
+        }
+        let d = vt.last_fill_delta();
+        let rw = d.rewritten_cols();
+        let rw_len = rw.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+        let changed = h.wall.terminal_screen_filled(
+            &t1,
+            screen,
+            ScreenFillDelta {
+                resized: d.resized,
+                scrolled_top: d.scrolled_top,
+                within_margins: d.within_margins(),
+                rewritten_cols: &rw[..rw_len],
+            },
+        );
+        h.screens.insert(t1.clone(), screen.clone());
+        h.pump();
+        changed
+    };
+
+    // Populate 6 rows; row 3 holds "alpha target omega".
+    vt.feed(b"line 0\r\nline 1\r\nline 2\r\nalpha target omega\r\nline 4\r\nline 5");
+    pump_vt(&mut h, &mut vt, &mut screen);
+
+    // Double-click "target" on row 3 (cols 6..12) via Wall pointer input.
+    h.now_ms += 1_000.0;
+    let target_pt = h.cell_world(&t1, 8, 3);
+    h.click_world(target_pt, MODS_NONE);
+    h.click_world(target_pt, MODS_NONE);
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "target");
+    let sel0 = h
+        .frame()
+        .terminals
+        .iter()
+        .find(|t| t.id == t1)
+        .and_then(|t| t.text_selection.clone())
+        .expect("selection active");
+    assert_eq!((sel0.r0, sel0.c0, sel0.r1, sel0.c1), (3, 6, 3, 12));
+
+    // 1. Unrelated output on the same row (cols 0..5, outside 6..12): selection survives.
+    vt.feed(b"\x1b[4;1HALPHA");
+    let changed_unrelated = pump_vt(&mut h, &mut vt, &mut screen);
+    assert!(
+        !changed_unrelated,
+        "unrelated edit with unchanged preview/title should report no wall state change"
+    );
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "target");
+    assert_eq!(
+        h.frame()
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .and_then(|t| t.text_selection.as_ref())
+            .map(|s| (s.r0, s.c0, s.r1, s.c1)),
+        Some((3, 6, 3, 12))
+    );
+
+    // 2. Whole-screen scroll by 2 lines: selection shifts row 3 -> row 1 and Cmd+C copies "target".
+    vt.feed(b"\x1b[6;1H\r\nline 6\r\nline 7");
+    assert!(pump_vt(&mut h, &mut vt, &mut screen));
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "target");
+    assert_eq!(
+        h.frame()
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .and_then(|t| t.text_selection.as_ref())
+            .map(|s| (s.r0, s.c0, s.r1, s.c1)),
+        Some((1, 6, 1, 12))
+    );
+    h.clipboard.clear();
+    h.key_press("c", "KeyC", MODS_META);
+    assert_eq!(h.clipboard, "target");
+
+    // 3. Rewriting a cell inside the selection (row 1, col 8: 'r' -> 'R') clears it.
+    vt.feed(b"\x1b[2;9HR");
+    assert!(pump_vt(&mut h, &mut vt, &mut screen));
+    assert!(h.wall.selection_text(&t1, &h.screens).is_empty());
+    assert!(
+        h.frame()
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .text_selection
+            .is_none()
+    );
+
+    // 4. Scrolling a selection past row 0 off the top clears it.
+    h.now_ms += 1_000.0;
+    let omega_pt = h.cell_world(&t1, 15, 1);
+    h.click_world(omega_pt, MODS_NONE);
+    h.click_world(omega_pt, MODS_NONE);
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "omega");
+    vt.feed(b"\x1b[6;1H\r\nline 8\r\nline 9");
+    assert!(pump_vt(&mut h, &mut vt, &mut screen));
+    assert!(h.wall.selection_text(&t1, &h.screens).is_empty());
+
+    // 5. Margin scroll (`DECSTBM` rows 4..6): row 0 survives, row 4 clears.
+    vt.feed(b"\x1b[1;1Hpinned header\x1b[5;1Hinside margin");
+    pump_vt(&mut h, &mut vt, &mut screen);
+    h.now_ms += 1_000.0;
+    let header_pt = h.cell_world(&t1, 2, 0);
+    h.click_world(header_pt, MODS_NONE);
+    h.click_world(header_pt, MODS_NONE);
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "pinned");
+    vt.feed(b"\x1b[4;6r\x1b[6;1H\n\x1b[r");
+    pump_vt(&mut h, &mut vt, &mut screen);
+    assert_eq!(h.wall.selection_text(&t1, &h.screens), "pinned");
+
+    // 6. Terminal resize via Vt::resize + fill delta clears active selection.
+    vt.resize(40, 8);
+    assert!(pump_vt(&mut h, &mut vt, &mut screen));
+    assert!(h.wall.selection_text(&t1, &h.screens).is_empty());
+    assert!(
+        h.frame()
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .text_selection
+            .is_none()
+    );
+}
+
+#[test]
+fn screen_fill_updates_preview_and_adopted_title_only_when_changed() {
+    use glyph_vt::{Theme, Vt};
+
+    let mut h = Harness::new();
+    let theme = Theme::default();
+    let mut vt = Vt::new(40, 6, &theme);
+    let mut screen = Screen::new(40, 6);
+
+    // Connect order as app.rs uses it: set_live_terminals -> adopted -> set_connected(true).
+    h.wall.set_live_terminals(&["t1"]);
+    h.wall.terminal_appeared(TerminalAppeared::adopted("t1", 40, 6));
+    assert!(!h.wall.snapshot().connected);
+    h.wall.set_connected(true);
+    assert!(h.wall.snapshot().connected);
+    assert_eq!(h.wall.name_of("t1"), "t1");
+    assert_eq!(h.wall.terminal("t1").expect("t1").preview, "");
+
+    // Adopted terminal's initial Repaint carries an OSC title and visible lines with trailing blanks.
+    vt.feed(b"\x1b]2;user@host: /srv/api\x07booting...\r\n  Listening on :8080   \r\n\r\n");
+    assert!(vt.fill(&mut screen));
+    let d = vt.last_fill_delta();
+    assert!(h.wall.terminal_screen_filled(
+        "t1",
+        &screen,
+        ScreenFillDelta {
+            resized: d.resized,
+            scrolled_top: d.scrolled_top,
+            within_margins: d.within_margins(),
+            rewritten_cols: d.rewritten_cols(),
+        },
+    ));
+
+    // Title bar shortened the OSC title; preview captured the last non-blank line trimmed.
+    assert_eq!(h.wall.name_of("t1"), "/srv/api");
+    assert_eq!(h.wall.terminal("t1").expect("t1").preview, "Listening on :8080");
+    assert_eq!(
+        h.wall.snapshot().terminals[0].preview,
+        "Listening on :8080"
+    );
+    assert_eq!(
+        h.frame()
+            .title_bars
+            .iter()
+            .find(|b| b.terminal_id == "t1")
+            .map(|b| b.text.as_str()),
+        Some("/srv/api")
+    );
+
+    // Drain effects and record model generation: a cursor-only move must NOT mark wall state changed.
+    let _ = h.wall.drain_effects();
+    let gen_before = h.wall.model().generation();
+    vt.feed(b"\x1b[1;1H");
+    assert!(vt.fill(&mut screen));
+    let d2 = vt.last_fill_delta();
+    let rw2 = d2.rewritten_cols();
+    let rw2_len = rw2.iter().rposition(|&(lo, hi)| lo < hi).map_or(0, |i| i + 1);
+    assert!(!h.wall.terminal_screen_filled(
+        "t1",
+        &screen,
+        ScreenFillDelta {
+            resized: d2.resized,
+            scrolled_top: d2.scrolled_top,
+            within_margins: d2.within_margins(),
+            rewritten_cols: &rw2[..rw2_len],
+        },
+    ));
+    assert_eq!(h.wall.model().generation(), gen_before);
+    assert!(h.wall.drain_effects().is_empty());
+
+    // A new bottom non-blank line updates preview; clearing OSC title reverts bar name to id.
+    vt.feed(b"\x1b[4;1Hready for traffic\x1b]2;\x07");
+    assert!(vt.fill(&mut screen));
+    let d3 = vt.last_fill_delta();
+    assert!(h.wall.terminal_screen_filled(
+        "t1",
+        &screen,
+        ScreenFillDelta {
+            resized: d3.resized,
+            scrolled_top: d3.scrolled_top,
+            within_margins: d3.within_margins(),
+            rewritten_cols: d3.rewritten_cols(),
+        },
+    ));
+    assert_eq!(h.wall.terminal("t1").expect("t1").preview, "ready for traffic");
+    assert_eq!(h.wall.name_of("t1"), "t1");
+
+    // An out-of-band Event::Title is not clobbered by subsequent fills whose Screen.title stays "".
+    h.wall.terminal_title("t1", "daemon-title");
+    assert_eq!(h.wall.name_of("t1"), "daemon-title");
+    vt.feed(b"\x1b[5;1Hnext line");
+    assert!(vt.fill(&mut screen));
+    let d4 = vt.last_fill_delta();
+    assert!(h.wall.terminal_screen_filled(
+        "t1",
+        &screen,
+        ScreenFillDelta {
+            resized: d4.resized,
+            scrolled_top: d4.scrolled_top,
+            within_margins: d4.within_margins(),
+            rewritten_cols: d4.rewritten_cols(),
+        },
+    ));
+    assert_eq!(h.wall.terminal("t1").expect("t1").preview, "next line");
+    assert_eq!(h.wall.name_of("t1"), "daemon-title");
 }
 

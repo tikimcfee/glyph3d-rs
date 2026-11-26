@@ -32,7 +32,7 @@ use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
 use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
-use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
+use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -533,16 +533,38 @@ impl App {
     fn pump(&mut self) {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
         let (changed, news) = sessions.pump();
-        let heard = !news.is_empty();
+        let mut heard = false;
         for n in news {
             match n {
-                News::Resized { id, cols, rows } => wall.terminal_resized(&id, u32::from(cols), u32::from(rows)),
-                News::Title { id, title } => wall.terminal_title(&id, title),
-                News::Modes { id, modes } => wall.terminal_modes(&id, modes),
-                News::Ended { id } => wall.terminal_ended(&id),
+                News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                    if let Some(screen) = sessions.screen(&id) {
+                        heard |= wall.terminal_screen_filled(
+                            &id,
+                            screen,
+                            ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
+                        );
+                    }
+                }
+                News::Resized { id, cols, rows } => {
+                    wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
+                    heard = true;
+                }
+                News::Title { id, title } => {
+                    wall.terminal_title(&id, title);
+                    heard = true;
+                }
+                News::Modes { id, modes } => {
+                    wall.terminal_modes(&id, modes);
+                    heard = true;
+                }
+                News::Ended { id } => {
+                    wall.terminal_ended(&id);
+                    heard = true;
+                }
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
+                    heard = true;
                 }
             }
         }
