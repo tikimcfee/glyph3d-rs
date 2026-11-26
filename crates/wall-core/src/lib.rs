@@ -13,6 +13,7 @@
 pub mod geom;
 pub mod input;
 
+pub mod camera;
 pub mod chord;
 pub mod config;
 pub mod dock;
@@ -22,6 +23,7 @@ pub mod layout;
 pub mod menu;
 pub mod mouse;
 pub mod scroll;
+pub mod selection;
 pub mod settings;
 pub mod snap;
 pub mod split;
