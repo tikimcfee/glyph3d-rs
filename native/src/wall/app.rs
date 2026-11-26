@@ -27,7 +27,9 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::metrics::WorldRect;
+use super::labels::{measure_label_width, Label, LabelHeight};
 use super::paper::PaperStyle;
+use super::shapes::{DashStyle, RectShape, Shape};
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 
 /// Physical pixels a wheel "line" is worth when a mouse reports lines.
@@ -36,6 +38,10 @@ const PX_PER_LINE: f32 = 53.0;
 const WHEEL_ZOOM_PER_PX: f32 = 0.0025;
 /// World units between terminals placed side by side.
 const GAP: f32 = 2.0;
+/// A title bar's height on screen, in physical pixels, and the most world
+/// height it takes when zoomed far out (the JS wall's TitleBar).
+const TITLE_BAR_PX: f32 = 22.0;
+const TITLE_BAR_MAX_WORLD: f32 = 2.0;
 
 /// A terminal as the window sees it.
 pub trait Terminal {
@@ -296,11 +302,67 @@ impl App {
             })
             .collect();
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
+        // A title bar above each terminal: a strip and its name, shrunk to
+        // fit. (The wall's own rules for names and map labels are
+        // wall-core's; this is the plain version until they drive it.)
+        let metrics = g.renderer.metrics();
+        let trie = &g.renderer.atlas().trie;
+        let padding = g.renderer.style().panel_padding;
+        // TITLE_BAR_PX is in logical pixels: a Retina display doubles it.
+        let bar_h = (TITLE_BAR_PX * g.window.scale_factor() as f32 / self.camera.zoom).min(TITLE_BAR_MAX_WORLD);
+        let mut shapes: Vec<Shape> = Vec::new();
+        let mut labels: Vec<Label<'_>> = Vec::new();
+        for t in &self.terminals {
+            let s = t.term.screen();
+            let panel = metrics.terminal_panel_rect(t.position, s.cols, s.rows, padding, t.scale);
+            let strip = WorldRect::new(Vec2::new(panel.min.x, panel.max.y), Vec2::new(panel.max.x, panel.max.y + bar_h));
+            let focused = self.focused == Some(t.id);
+            shapes.push(Shape::Rect(RectShape {
+                rect: strip,
+                z: t.z,
+                fill: Some(if focused { [0.13, 0.16, 0.22, 1.0] } else { [0.08, 0.09, 0.12, 1.0] }),
+                stroke: None,
+                stroke_px: 0.0,
+                dash: DashStyle::SOLID,
+                corner_radius_px: 0.0,
+            }));
+            let title = t.term.title();
+            let inset = bar_h * 0.45;
+            let room = (strip.width() - 2.0 * inset).max(0.0);
+            let natural = bar_h * 0.62;
+            let full = measure_label_width(metrics, trie, title, natural);
+            let text_h = if full > room && full > 1e-4 { natural * (room / full) } else { natural };
+            if text_h > 1e-4 && room > 1e-4 {
+                let color = if focused { [0.85, 0.88, 0.94, 1.0] } else { [0.55, 0.60, 0.68, 1.0] };
+                labels.push(Label::new(title, Vec2::new(strip.min.x + inset, strip.center().y + 0.5 * text_h), LabelHeight::World(text_h), color, t.z).with_clip(strip));
+            }
+        }
         let paper = PaperStyle::default();
-        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, ..Default::default() };
+        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.queue.present(frame);
+        // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
+        // draws the same frame once more offscreen and saves it.
+        if self.exit_after == Some(self.frames + 1) {
+            if let Ok(path) = std::env::var("GLYPH_WALL_SHOT") {
+                let path = std::path::PathBuf::from(path);
+                let viewport = (g.config.width, g.config.height);
+                super::renderer::render_wall_to_png(&self.ctx, &mut g.renderer, &self.camera, &wall_frame, viewport, 1, &path);
+                // The window's surface is BGRA; the PNG writer assumed RGBA.
+                if matches!(g.config.format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm) {
+                    if let Ok(img) = image::open(&path) {
+                        let mut rgba = img.to_rgba8();
+                        for px in rgba.pixels_mut() {
+                            px.0.swap(0, 2);
+                        }
+                        if let Err(e) = rgba.save(&path) {
+                            log::warn!("could not rewrite {}: {e}", path.display());
+                        }
+                    }
+                }
+            }
+        }
         self.frames += 1;
         // A counted run can type: GLYPH_WALL_PASTE is pasted into the
         // focused terminal a moment in, so a script sees a program answer.
