@@ -14,6 +14,7 @@ pub mod geom;
 pub mod input;
 
 pub mod agent_view;
+pub mod agent_views;
 pub mod bus;
 pub mod camera;
 pub mod chord;
