@@ -1,0 +1,10 @@
+[package]
+name = "term-cells"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal's screen as plain data: the seam between an emulator and a cell renderer (the wall)."
+
+[dependencies]
+
+[lints]
+workspace = true

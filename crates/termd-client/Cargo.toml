@@ -1,0 +1,10 @@
+[package]
+name = "termd-client"
+version = "0.1.0"
+edition = "2021"
+description = "A client for g3d-termd's socket protocol: frames, requests, and a reader thread that hands a host the terminals' bytes and events (the wall)."
+
+[dependencies]
+
+[lints]
+workspace = true

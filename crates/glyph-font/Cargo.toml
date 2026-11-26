@@ -1,0 +1,10 @@
+[package]
+name = "glyph-font"
+version = "0.1.0"
+edition = "2021"
+description = "Fonts loaded at run time and encoded to Slug curves in the engine's atlas format (the wall)."
+
+[dependencies]
+
+[lints]
+workspace = true

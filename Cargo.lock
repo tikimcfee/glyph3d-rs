@@ -1766,10 +1766,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-font"
+version = "0.1.0"
+
+[[package]]
 name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "glyph-vt"
+version = "0.1.0"
+dependencies = [
+ "term-cells",
 ]
 
 [[package]]
@@ -4016,6 +4027,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-cells"
+version = "0.1.0"
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4023,6 +4038,10 @@ checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "termd-client"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"
@@ -4473,6 +4492,10 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
+
+[[package]]
+name = "wall-core"
+version = "0.1.0"
 
 [[package]]
 name = "wasi"
