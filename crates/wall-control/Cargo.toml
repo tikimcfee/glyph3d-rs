@@ -1,0 +1,14 @@
+[package]
+name = "wall-control"
+version = "0.1.0"
+edition = "2021"
+description = "Unix-socket control server, client, and wallctl CLI for driving the native wall's command verbs."
+
+[[bin]]
+name = "wallctl"
+path = "src/bin/wallctl.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
