@@ -113,12 +113,20 @@ impl TextParser {
     pub fn parse(self, input: &str) -> Result<String, String> {
         match self {
             TextParser::Trim => Ok(input.trim().to_string()),
-            TextParser::ZoomKeys => Ok(parse_zoom_keys_knob(input)?.join(" ")),
+            TextParser::ZoomKeys => crate::chord::parse_zoom_keys(input).map(|keys| {
+                keys.into_iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
             TextParser::SelectionForeground => parse_selection_foreground_knob(input),
             TextParser::SelectionWordChars => {
                 Ok(input.chars().filter(|ch| !ch.is_whitespace()).collect())
             }
-            TextParser::MenuSizes => parse_menu_sizes_knob(input),
+            TextParser::MenuSizes => {
+                crate::menu::parse_sizes(input)?;
+                Ok(input.split_whitespace().collect::<Vec<_>>().join(" "))
+            }
         }
     }
 }
@@ -954,18 +962,6 @@ fn is_hex_color(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Private port of `chord.parseZoomKeys` so `settings.rs` stays independent of `chord.rs`
-/// while sibling modules are ported in parallel.
-fn parse_zoom_keys_knob(s: &str) -> Result<Vec<&str>, String> {
-    let keys: Vec<&str> = s.split_whitespace().collect();
-    for k in &keys {
-        if !matches!(*k, "ctrl" | "alt" | "meta" | "shift") {
-            return Err(format!("\"{k}\" is not a modifier (ctrl, alt, meta, shift)"));
-        }
-    }
-    Ok(keys)
-}
-
 fn parse_selection_foreground_knob(s: &str) -> Result<String, String> {
     let v = s.trim().to_lowercase();
     if v == "keep" || is_hex_color(&v) {
@@ -975,34 +971,6 @@ fn parse_selection_foreground_knob(s: &str) -> Result<String, String> {
             "a colour as #rrggbb, or keep (each cell keeps its own colour), not '{s}'"
         ))
     }
-}
-
-/// Private port of `contextMenu.parseSizes` + `menuSizes` whitespace normalization so
-/// `settings.rs` stays independent of `menu.rs` while sibling modules are ported in parallel.
-fn parse_menu_sizes_knob(s: &str) -> Result<String, String> {
-    let tokens: Vec<&str> = s.split_whitespace().collect();
-    for tok in &tokens {
-        let parts = tok.split_once('x').or_else(|| tok.split_once('×'));
-        let valid = match parts {
-            Some((cols, rows))
-                if !cols.is_empty()
-                    && !rows.is_empty()
-                    && cols.bytes().all(|b| b.is_ascii_digit())
-                    && rows.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                let c = cols.parse::<f64>().unwrap_or(0.0);
-                let r = rows.parse::<f64>().unwrap_or(0.0);
-                c >= 1.0 && r >= 1.0
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err(format!(
-                "sizes are COLSxROWS, space-separated (like \"80x24 120x36\"), not '{tok}'"
-            ));
-        }
-    }
-    Ok(tokens.join(" "))
 }
 
 /// Validate and coerce `value` against `def` (`wallSettings.checkKnob`).

@@ -13,7 +13,12 @@
 pub mod geom;
 pub mod input;
 
+<<<<<<< HEAD
 pub mod camera;
+=======
+pub mod agent_view;
+pub mod bus;
+>>>>>>> wall-core-config
 pub mod chord;
 pub mod commands;
 pub mod config;
