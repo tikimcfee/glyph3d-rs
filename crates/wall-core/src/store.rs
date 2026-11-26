@@ -211,7 +211,7 @@ pub struct WallSplit {
 pub struct WallGroup {
     pub name: String,
     pub layout: GroupLayout,
-    pub columns: u32,
+    pub columns: usize,
     pub gap: f64,
     #[serde(default, with = "serde_opt_point")]
     pub origin: Option<Point>,
@@ -220,15 +220,8 @@ pub struct WallGroup {
     pub split: Option<WallSplit>,
 }
 
-/// Edge docking or floating mode shared by the wall's panels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PanelSide {
-    Left,
-    Right,
-    #[default]
-    Float,
-}
+/// Edge docking or floating mode shared by the wall's panels (unified with [`crate::dock::DockSide`]).
+pub use crate::dock::DockSide as PanelSide;
 
 /// Persisted sidebar placement and folded group ids (`WallStore.SIDEBAR_DEFAULT`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -397,13 +390,8 @@ pub struct SavedCanvasPane {
     pub y: f64,
 }
 
-/// Orthographic camera pose saved when entering fullscreen.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CameraPose {
-    pub x: f64,
-    pub y: f64,
-    pub zoom: f64,
-}
+/// Orthographic camera pose saved when entering fullscreen (unified with [`crate::camera::CameraPose`]).
+pub use crate::camera::CameraPose;
 
 /// Whether fullscreen elevates a single pane or an entire group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

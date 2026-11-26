@@ -23,11 +23,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::geom::{Point, Rect};
-use crate::layout::{
-    self, Edges, Size as LayoutSize, TileOptions, BAR_ROOM,
-};
+use crate::layout::{self, Edges, Size, TileOptions, BAR_ROOM};
 use crate::split::{
-    self, Axis, BranchSide, Direction, Divider, DropZone, InsertSide, PaneMap, Size, SplitDir,
+    self, Axis, BranchSide, Direction, Divider, DropZone, InsertSide, PaneMap, SplitDir,
     SplitNode, SplitPath,
 };
 
@@ -71,42 +69,8 @@ impl fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
-/// How a group arranges its members (`'tile' | 'freeform' | 'split'`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GroupLayout {
-    /// Pack shown members row-major into `columns` columns separated by `gap`.
-    #[default]
-    Tile,
-    /// Leave each member at its own canvas coordinates; move together by header.
-    Freeform,
-    /// Partition one rectangle into binary panes re-wrapped to whole cells.
-    Split,
-}
-
-impl GroupLayout {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            GroupLayout::Tile => "tile",
-            GroupLayout::Freeform => "freeform",
-            GroupLayout::Split => "split",
-        }
-    }
-}
-
-impl FromStr for GroupLayout {
-    type Err = GroupError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "tile" => Ok(GroupLayout::Tile),
-            "freeform" => Ok(GroupLayout::Freeform),
-            "split" => Ok(GroupLayout::Split),
-            other => Err(GroupError::new(format!(
-                "a group's layout is 'tile', 'freeform' or 'split', not '{other}'"
-            ))),
-        }
-    }
-}
+/// How a group arranges its members (unified with [`crate::config::GroupLayout`]).
+pub use crate::config::GroupLayout;
 
 /// Direction along which [`Groups::can_split`] and [`Groups::insert_pane`] cut
 /// an existing pane (`'right' | 'down'`).
@@ -146,37 +110,11 @@ impl FromStr for SplitInsertDir {
     }
 }
 
-/// Split-specific state stored on a [`Group`] (`WallSplit` in `WallStore.js`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct GroupSplit {
-    /// Width of the split's rectangle in world units.
-    pub w: f64,
-    /// Height of the split's rectangle in world units (including title-bar room).
-    pub h: f64,
-    /// Whether panes reserve and display title bars (`splitBarRows` high).
-    pub bars: bool,
-    /// Binary tree of terminal leaves partitioning the split rectangle.
-    pub tree: SplitNode,
-}
+/// Split-specific state stored on a [`Group`] (unified with [`crate::store::WallSplit`]).
+pub use crate::store::WallSplit as GroupSplit;
 
-/// Durable data shape of a terminal group (`WallGroup` in `WallStore.js`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Group {
-    /// User-assigned group name (`""` falls back to `"group N"` in [`Groups::name_of`]).
-    pub name: String,
-    /// Active arrangement mode (`tile`, `freeform`, or `split`).
-    pub layout: GroupLayout,
-    /// Column count for `tile` layout (and row width when converting to `split`).
-    pub columns: usize,
-    /// World-unit spacing between tiled columns and rows.
-    pub gap: f64,
-    /// Top-left corner of the first tiled window or of the split's rectangle.
-    pub origin: Option<Point>,
-    /// Member terminal ids in tiling / reading order.
-    pub members: Vec<String>,
-    /// Split geometry and pane tree when `layout == GroupLayout::Split`, else `None`.
-    pub split: Option<GroupSplit>,
-}
+/// Durable data shape of a terminal group (unified with [`crate::store::WallGroup`]).
+pub use crate::store::WallGroup as Group;
 
 /// Group-related wall configuration knobs (`WALL_CONFIG` subset read by `WallGroups.js`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -195,6 +133,20 @@ pub struct GroupConfig {
     pub split_bar_rows: f64,
     /// Whether newly created splits show pane title bars (`splitBars`: `true`).
     pub split_bars: bool,
+}
+
+impl From<&crate::config::WallConfig> for GroupConfig {
+    fn from(cfg: &crate::config::WallConfig) -> GroupConfig {
+        GroupConfig {
+            group_layout: cfg.group_layout,
+            group_columns: cfg.group_columns.max(0.0) as usize,
+            group_gap: cfg.group_gap,
+            group_pad: cfg.group_pad,
+            split_gap: cfg.split_gap,
+            split_bar_rows: cfg.split_bar_rows,
+            split_bars: cfg.split_bars,
+        }
+    }
 }
 
 impl Default for GroupConfig {
@@ -1727,7 +1679,7 @@ impl Groups {
         let mut sizes = Vec::with_capacity(shown.len());
         for id in shown {
             let m = self.metrics_of(wall, id)?;
-            sizes.push(LayoutSize::new(m.w, m.h));
+            sizes.push(Size::new(m.w, m.h));
             metrics.push(m);
         }
         let origin = group.origin.or_else(|| self.origin_of(wall, shown))?;
@@ -2405,7 +2357,7 @@ mod tests {
         assert_eq!(g.origin, Some(Point::new(50.0, -40.0 + BAR_ROOM)));
 
         let places = layout::tile_layout(
-            &[LayoutSize::new(100.0, 50.0); 4],
+            &[Size::new(100.0, 50.0); 4],
             TileOptions::new(g.origin.unwrap(), 2, 2.0),
         )
         .unwrap()
@@ -2695,7 +2647,6 @@ mod tests {
             .contains("columns"));
         assert!(GroupLayout::from_str("grid")
             .unwrap_err()
-            .message()
             .contains("'tile', 'freeform' or 'split'"));
         assert!(groups
             .get("g-9")

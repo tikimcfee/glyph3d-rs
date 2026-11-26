@@ -19,13 +19,13 @@ use std::collections::BTreeMap;
 
 use crate::chord::chord_label;
 use crate::config::{GroupLayout, WallConfig};
-use crate::dock::{dock_layout, DockPanel, DockSide, DockState};
+use crate::dock::{dock_layout, DockPanel, DockState};
 use crate::geom::{Point, Rect};
 use crate::input::Platform;
 use crate::layout::{fit_rect, tile_layout, union_rect, GridSize, Size, TileOptions, BAR_ROOM};
 use crate::split;
 use crate::store::{
-    CameraPose, FullscreenMode, FullscreenState, PanelSide, SavedCanvasPane, WallGroup, WallStore,
+    CameraPose, FullscreenMode, FullscreenState, SavedCanvasPane, WallGroup, WallStore,
 };
 
 /// Smallest cell grid fullscreen ever makes (`MIN` in `wall/WallFullscreen.js`).
@@ -143,22 +143,15 @@ impl TextStep {
 
 /// Convert [`WallStore`]'s four panel states into a [`DockState`] for [`dock_layout`].
 pub fn dock_state_from_store(store: &WallStore) -> DockState {
-    const fn map_side(side: PanelSide) -> DockSide {
-        match side {
-            PanelSide::Left => DockSide::Left,
-            PanelSide::Right => DockSide::Right,
-            PanelSide::Float => DockSide::Float,
-        }
-    }
     let sb = store.sidebar();
     let st = store.status_window();
     let se = store.settings_panel();
     let he = store.help_panel();
     DockState {
-        sidebar: DockPanel::new(sb.open, map_side(sb.side)),
-        status_window: DockPanel::new(st.open, map_side(st.side)),
-        settings_panel: Some(DockPanel::new(se.open, map_side(se.side))),
-        help_panel: Some(DockPanel::new(he.open, map_side(he.side))),
+        sidebar: DockPanel::new(sb.open, sb.side),
+        status_window: DockPanel::new(st.open, st.side),
+        settings_panel: Some(DockPanel::new(se.open, se.side)),
+        help_panel: Some(DockPanel::new(he.open, he.side)),
     }
 }
 
@@ -1248,7 +1241,7 @@ impl WallFullscreen {
         };
         let f0 = frame_of(host, &shown[0])?;
 
-        let mut tree = to_split_tree(&split_spec.tree);
+        let mut tree = split_spec.tree.clone();
         for member in &group.members {
             if !shown.iter().any(|s| s == member) {
                 if let Some(pruned) = split::remove(&tree, member) {
@@ -1339,7 +1332,7 @@ impl WallFullscreen {
         let stride = ref_term.cell_stride;
         let pad = host.config().fullscreen_pad;
         let gap = group.gap;
-        let cols_count = (group.columns as usize).min(shown.len()).max(1);
+        let cols_count = group.columns.min(shown.len()).max(1);
         let rows_count = shown.len().div_ceil(cols_count);
 
         struct OrigPane {
@@ -1607,27 +1600,10 @@ fn js_round_i64(value: f64) -> i64 {
     rounded as i64
 }
 
-fn to_split_tree(node: &crate::split::SplitNode) -> split::SplitNode {
-    match node {
-        crate::split::SplitNode::Leaf { id } => split::SplitNode::Leaf { id: id.clone() },
-        crate::split::SplitNode::Branch { dir, ratio, a, b } => {
-            let split_dir = match dir {
-                crate::split::SplitDir::Row => split::SplitDir::Row,
-                crate::split::SplitDir::Col => split::SplitDir::Col,
-            };
-            split::SplitNode::Branch {
-                dir: split_dir,
-                ratio: *ratio,
-                a: Box::new(to_split_tree(a)),
-                b: Box::new(to_split_tree(b)),
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::PanelSide;
     use crate::layout::{z_stack_layout, ZStackOptions, FULLSCREEN_Z};
     use crate::store::{SidebarPatch, Storage, WallSplit};
     use std::cell::RefCell;
@@ -1784,7 +1760,7 @@ mod tests {
             } else {
                 0.0
             };
-            let tree = to_split_tree(&sp.tree);
+            let tree = sp.tree.clone();
             for (id, pr) in split::panes(&tree, sr, self.config.split_gap) {
                 let f = frame_of(self, &id).unwrap();
                 let cols = MIN_FULLSCREEN_SIZE.cols.max(

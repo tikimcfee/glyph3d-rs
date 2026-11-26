@@ -228,24 +228,8 @@ pub fn parse_sizes(input: &str) -> Result<Vec<CellSize>, String> {
     Ok(out)
 }
 
-/// Values accepted by `wall.config optionAsAlt`, in menu display order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum OptionAsAlt {
-    #[default]
-    Auto,
-    True,
-    False,
-}
-
-impl OptionAsAlt {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::True => "true",
-            Self::False => "false",
-        }
-    }
-}
+/// Values accepted by `wall.config optionAsAlt`, unified with [`crate::config::OptionAsAlt`].
+pub use crate::config::OptionAsAlt;
 
 const OPTION_AS_ALT_CHOICES: [(OptionAsAlt, &str); 3] = [
     (OptionAsAlt::Auto, "auto"),
@@ -253,25 +237,8 @@ const OPTION_AS_ALT_CHOICES: [(OptionAsAlt, &str); 3] = [
     (OptionAsAlt::False, "off"),
 ];
 
-/// Side of a terminal an Agent View attaches to (`AGENT_SIDES` in `wall/wallAgentView.js`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AgentSide {
-    Right,
-    Left,
-    Top,
-    Bottom,
-}
-
-impl AgentSide {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Right => "right",
-            Self::Left => "left",
-            Self::Top => "top",
-            Self::Bottom => "bottom",
-        }
-    }
-}
+/// Side of a terminal an Agent View attaches to (unified with [`crate::config::AgentSide`]).
+pub use crate::config::AgentSide;
 
 /// Offered Agent View sides in menu order.
 pub const AGENT_SIDES: [AgentSide; 4] = [
@@ -281,24 +248,8 @@ pub const AGENT_SIDES: [AgentSide; 4] = [
     AgentSide::Bottom,
 ];
 
-/// Group arrangement mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum GroupLayout {
-    #[default]
-    Tile,
-    Freeform,
-    Split,
-}
-
-impl GroupLayout {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tile => "tile",
-            Self::Freeform => "freeform",
-            Self::Split => "split",
-        }
-    }
-}
+/// Group arrangement mode (unified with [`crate::config::GroupLayout`]).
+pub use crate::config::GroupLayout;
 
 /// A terminal's attached Agent View state as exposed in `snapshot()`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

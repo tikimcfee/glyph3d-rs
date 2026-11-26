@@ -9,6 +9,8 @@
 //! eases and wheel glides step exponentially in log-zoom and snap cleanly onto
 //! their targets.
 
+use serde::{Deserialize, Serialize};
+
 use crate::geom::{Point, Rect};
 
 /// Exponential ease rate (`1/s`) for framing animations (`ease_to`).
@@ -50,7 +52,7 @@ impl Default for WheelZoomConfig {
 
 /// Orthographic camera pose: world-space centre `(x, y)` (y up) and `zoom` in
 /// screen pixels per world unit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraPose {
     pub x: f64,
     pub y: f64,
@@ -178,6 +180,21 @@ pub struct ScreenBox {
 }
 
 impl ScreenBox {
+    /// Construct from explicit edges (`left`, `top`, `right`, `bottom`).
+    pub const fn new(left: f64, top: f64, right: f64, bottom: f64) -> Self {
+        Self { left, top, right, bottom }
+    }
+
+    /// Construct from top-left corner and size (`width`, `height`), y down.
+    pub fn from_top_left(left: f64, top: f64, width: f64, height: f64) -> Self {
+        Self {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        }
+    }
+
     pub fn width(&self) -> f64 {
         self.right - self.left
     }
@@ -194,18 +211,6 @@ struct WheelGlide {
     ln_zoom: f64,
     client: Point,
     world: Point,
-}
-
-/// Private copy of `wallLayout.fitRect` so `camera.rs` stays independent of
-/// `layout.rs` while parallel work packages land.
-fn fit_rect(rect: Rect, view_w: f64, view_h: f64, margin: f64, max_zoom: f64) -> CameraPose {
-    let w = (rect.max_x - rect.min_x).max(1e-6);
-    let h = (rect.max_y - rect.min_y).max(1e-6);
-    CameraPose {
-        x: (rect.min_x + rect.max_x) * 0.5,
-        y: (rect.min_y + rect.max_y) * 0.5,
-        zoom: ((view_w / w).min(view_h / h) * margin).min(max_zoom),
-    }
 }
 
 /// Pure state machine for the wall's orthographic camera (`WallCamera.js`).
@@ -395,7 +400,7 @@ impl WallCamera {
     /// viewport with fill fraction `margin` (e.g. [`DEFAULT_FIT_MARGIN`]) and
     /// zoom ceiling `max_zoom` (`f64::INFINITY` for uncapped).
     pub fn fit_target(&self, rect: Rect, margin: f64, max_zoom: f64) -> CameraPose {
-        fit_rect(rect, self.bounds.width, self.bounds.height, margin, max_zoom)
+        crate::layout::fit_rect(rect, self.bounds.width, self.bounds.height, margin, max_zoom)
     }
 
     /// Begin easing exponentially toward `target`, cancelling any wheel glide.

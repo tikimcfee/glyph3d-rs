@@ -585,9 +585,7 @@ impl WallNames {
                 max_y: term.body_rect.max_y + bar_h,
                 ..term.body_rect
             };
-            let cam_box = frame.camera.to_screen_box(win_rect, frame.view_w, frame.view_h);
-            let screen_box =
-                ScreenBox::new(cam_box.left, cam_box.top, cam_box.right, cam_box.bottom);
+            let screen_box = frame.camera.to_screen_box(win_rect, frame.view_w, frame.view_h);
             if screen_box.right < 0.0
                 || screen_box.left > frame.view_w
                 || screen_box.bottom < 0.0

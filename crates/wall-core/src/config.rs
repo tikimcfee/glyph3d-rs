@@ -89,6 +89,16 @@ impl fmt::Display for GroupLayout {
     }
 }
 
+impl std::str::FromStr for GroupLayout {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        GroupLayout::parse(raw).ok_or_else(|| {
+            format!("a group's layout is 'tile', 'freeform' or 'split', not '{raw}'")
+        })
+    }
+}
+
 /// Whether macOS Option acts as Alt when encoding terminal keys (`keyEncoding.OPTION_AS_ALT`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +110,8 @@ pub enum OptionAsAlt {
 }
 
 impl OptionAsAlt {
+    pub const OPTIONS: &[&str] = &["auto", "true", "false"];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             OptionAsAlt::Auto => "auto",
@@ -108,12 +120,12 @@ impl OptionAsAlt {
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s {
-            "auto" => Some(OptionAsAlt::Auto),
-            "true" => Some(OptionAsAlt::True),
-            "false" => Some(OptionAsAlt::False),
-            _ => None,
+            "auto" => Ok(OptionAsAlt::Auto),
+            "true" => Ok(OptionAsAlt::True),
+            "false" => Ok(OptionAsAlt::False),
+            _ => Err(format!("optionAsAlt is auto, true, false, not '{s}'")),
         }
     }
 }
