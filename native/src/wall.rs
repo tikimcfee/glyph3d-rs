@@ -32,8 +32,9 @@ pub mod ui;
 
 pub use camera::WallCamera;
 pub use cell::{
-    CellGpu, dirty_row_ranges, pack_cell, pack_cell_resolved, pack_cell_style, resolve_cell_glyph,
-    resolve_str_glyphs,
+    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges,
+    dirty_row_ranges_with_selection, pack_cell, pack_cell_resolved, pack_cell_style,
+    resolve_cell_glyph, resolve_str_glyphs,
 };
 pub use glyphs::{EmojiSheetArchive, SparseEmojiSource};
 #[cfg(feature = "wgpu")]
