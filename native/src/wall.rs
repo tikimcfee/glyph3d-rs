@@ -35,6 +35,8 @@ pub mod shapes;
 pub mod test_pattern;
 #[cfg(feature = "egui-ui")]
 pub mod ui;
+#[cfg(feature = "windowed")]
+pub mod window;
 
 pub use camera::WallCamera;
 pub use cell::{

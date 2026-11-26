@@ -27,10 +27,10 @@ use glam::Vec2;
 use term_cells::Screen;
 use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
-use wall_core::layout::{ResizeCursor, Size};
+use wall_core::layout::Size;
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
-use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
+use wall_core::pointer::{Buttons, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
 use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
@@ -149,6 +149,7 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
+    win: super::window::WindowLifecycle,
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -182,25 +183,6 @@ fn button_of(b: MouseButton) -> Option<Button> {
     })
 }
 
-fn cursor_of(c: CursorIcon) -> winit::window::CursorIcon {
-    use winit::window::CursorIcon as W;
-    match c {
-        CursorIcon::Default => W::Default,
-        CursorIcon::Text => W::Text,
-        CursorIcon::Pointer => W::Pointer,
-        CursorIcon::Move => W::Move,
-        CursorIcon::Grab => W::Grab,
-        CursorIcon::Crosshair => W::Crosshair,
-        CursorIcon::Copy => W::Copy,
-        CursorIcon::ColResize => W::ColResize,
-        CursorIcon::RowResize => W::RowResize,
-        CursorIcon::Resize(ResizeCursor::NwseResize) => W::NwseResize,
-        CursorIcon::Resize(ResizeCursor::NeswResize) => W::NeswResize,
-        CursorIcon::Resize(ResizeCursor::EwResize) => W::EwResize,
-        CursorIcon::Resize(ResizeCursor::NsResize) => W::NsResize,
-    }
-}
-
 /// A screen as text, a line a row, trailing blanks and blank rows dropped.
 fn screen_text(s: &Screen) -> String {
     let mut out = String::new();
@@ -232,7 +214,7 @@ fn store_dir() -> PathBuf {
 
 impl App {
     fn scale_factor(&self) -> f64 {
-        self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor())
+        self.win.scale_factor()
     }
 
     fn now_ms(&self) -> f64 {
@@ -259,11 +241,14 @@ impl App {
     }
 
     fn open(&mut self, event_loop: &ActiveEventLoop) {
-        let window = Arc::new(
-            event_loop
-                .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
-                .expect("window creation failed"),
-        );
+        let opts = self.opts.take().expect("the window opens once");
+        self.exit_after = opts.exit_after;
+        let store = store_dir();
+        let (win_attrs, restore_fullscreen) = self.win.prepare_open(event_loop, &store, opts.namespace.as_deref());
+        let window = Arc::new(event_loop.create_window(win_attrs).expect("window creation failed"));
+        if restore_fullscreen {
+            window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
         let surface = self.ctx.instance.create_surface(window.clone()).expect("surface creation failed");
         let caps = surface.get_capabilities(&self.ctx.adapter);
         let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
@@ -282,15 +267,13 @@ impl App {
         surface.configure(&self.ctx.device, &config);
         let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
 
-        let opts = self.opts.take().expect("the window opens once");
-        self.exit_after = opts.exit_after;
         let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
-        renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
+        let base_style = WallStyle { panel_padding: PANEL_PAD / cell_scale, ..WallStyle::default() };
+        let sf = self.win.finish_open(&window, base_style, renderer.style_mut());
         #[cfg(feature = "egui-ui")]
         let ui = WallUi::new(&self.ctx.device, &window, format);
-        let sf = window.scale_factor();
 
         // The rules, at the renderer's cell size and the window's viewport.
         let namespace = opts.namespace.clone().unwrap_or_else(|| "pattern".to_string());
@@ -302,7 +285,7 @@ impl App {
             namespace: namespace.clone(),
             ..RulesOptions::default()
         };
-        let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
+        let mut wall = if opts.namespace.is_some() { Wall::open(store, namespace.clone(), rules) } else { Wall::in_memory(rules) };
 
         // The terminals.
         let proxy = self.proxy.clone();
@@ -439,9 +422,7 @@ impl App {
                 }
             }
             WallEffect::SetCursor { cursor } => {
-                if let Some(g) = &self.gfx {
-                    g.window.set_cursor(cursor_of(cursor));
-                }
+                self.win.set_cursor(self.gfx.as_ref().map(|g| g.window.as_ref()), cursor);
             }
             WallEffect::ConfigKnobChanged { key, value } => {
                 // The renderer's own knobs follow here as they are wired; the
@@ -585,17 +566,13 @@ impl App {
 
     fn resize(&mut self, width: u32, height: u32) {
         let Some(g) = &mut self.gfx else { return };
-        if width == 0 || height == 0 {
+        let Some(sync) = self.win.on_resize(&g.window, width, height, g.renderer.style_mut(), self.wall.as_mut()) else {
             return;
-        }
-        g.config.width = width;
-        g.config.height = height;
+        };
+        g.config.width = sync.physical_width;
+        g.config.height = sync.physical_height;
         g.surface.configure(&self.ctx.device, &g.config);
-        g.depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, width, height);
-        let sf = g.window.scale_factor();
-        if let Some(wall) = &mut self.wall {
-            wall.set_viewport(f64::from(width) / sf, f64::from(height) / sf, sf);
-        }
+        g.depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, sync.physical_width, sync.physical_height);
         self.apply_effects();
         self.redraw();
     }
@@ -617,7 +594,7 @@ impl App {
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = if to_surface {
+        let frame = if to_surface && !self.win.is_minimized_or_zero() {
             match g.surface.get_current_texture() {
                 Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
                 Cst::Lost | Cst::Outdated => {
@@ -640,7 +617,7 @@ impl App {
         if frame.is_none() && !need_offscreen {
             return;
         }
-        let sf = g.window.scale_factor() as f32;
+        let sf = self.win.scale_factor() as f32;
         // The wall's camera is in logical pixels per world unit; the
         // renderer's is in physical ones.
         let camera = WallCamera::new(Vec2::new(described.camera.x as f32, described.camera.y as f32), described.camera.zoom as f32 * sf);
@@ -649,15 +626,16 @@ impl App {
         let mut draws: Vec<TerminalDraw<'_>> = Vec::with_capacity(described.terminals.len());
         for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
             let Some(screen) = terms.screen(&t.id) else { continue };
+            let (focused, border_color) = self.win.terminal_draw_focus(t.focused, t.hovered);
             draws.push(TerminalDraw {
                 id: *render_id,
                 screen,
                 position: v2(t.cell_origin),
                 z: t.z as f32,
                 scale: g.cell_scale * t.scale as f32,
-                focused: t.focused,
+                focused,
                 panel_opacity: None,
-                border_color: t.hovered.then_some(term_cells::rgb(0x5a, 0x6b, 0x86)).filter(|_| !t.focused),
+                border_color,
                 selection: t.text_selection.as_ref().map(|sel| {
                     let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
                         .then(|| css_rgb_u32(&sel.foreground));
@@ -723,6 +701,9 @@ impl App {
                 }
             });
             panel_egui_keys = ui_frame.wants_keyboard;
+            if !ui_frame.wants_pointer {
+                self.win.restore_cursor(&g.window);
+            }
             if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
                 g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
             }
@@ -1089,11 +1070,33 @@ impl ApplicationHandler<Wake> for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => self.resize(size.width, size.height),
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Moved(_) => {
+                if let Some(g) = &self.gfx {
+                    self.win.on_moved(&g.window);
+                }
+            }
+            WindowEvent::Focused(focused) => {
+                let now_ms = self.now_ms();
+                self.win.on_focused(focused, self.wall.as_mut(), self.cursor, now_ms, &mut self.modifiers, &mut self.buttons);
+                self.apply_effects();
+                self.redraw();
+            }
+            WindowEvent::Resized(size) => {
+                self.resize(size.width, size.height);
+                #[cfg(target_os = "macos")]
+                if !self.win.is_minimized_or_zero() {
+                    self.draw(true);
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.win.set_scale_factor(scale_factor);
                 if let Some(g) = &self.gfx {
                     let size = g.window.inner_size();
                     self.resize(size.width, size.height);
+                    #[cfg(target_os = "macos")]
+                    if !self.win.is_minimized_or_zero() {
+                        self.draw(true);
+                    }
                 }
             }
             WindowEvent::RedrawRequested => self.draw(true),
@@ -1122,6 +1125,9 @@ impl ApplicationHandler<Wake> for App {
                     event_loop.exit();
                     return;
                 }
+                if self.win.handle_os_fullscreen_key(&event, self.modifiers, self.gfx.as_ref().map(|g| g.window.as_ref())) {
+                    return;
+                }
                 #[cfg(feature = "egui-ui")]
                 if event.state == ElementState::Pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F1) && !ui_outcome.consumed {
                     self.hud_open = !self.hud_open;
@@ -1137,6 +1143,10 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(g) = &self.gfx {
+            self.win.record_window_state(&g.window);
+        }
+        self.win.flush_save_now();
         // The egui layer, the surface and the window go while the event
         // loop's display connection is still alive (see `Gfx`).
         self.control = None;
@@ -1144,6 +1154,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.win.flush_save_if_due();
         if self.quit {
             event_loop.exit();
             return;
@@ -1159,6 +1170,11 @@ impl ApplicationHandler<Wake> for App {
         // tick/shot if macOS suppresses RedrawRequested while occluded.
         if self.pending_shot.is_some() {
             self.draw(false);
+        }
+        if self.win.is_minimized_or_zero() && self.exit_after.is_none() {
+            self.blink_repaint_at = None;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
         if self.animating {
             self.redraw();
@@ -1230,6 +1246,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
+        win: super::window::WindowLifecycle::new(),
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
