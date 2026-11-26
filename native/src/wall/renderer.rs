@@ -1846,6 +1846,7 @@ pub fn render_chrome_pattern_offscreen(
             focused: t.focused,
             panel_opacity: None,
             border_color: t.border_color,
+            selection: t.selection,
         })
         .collect();
 

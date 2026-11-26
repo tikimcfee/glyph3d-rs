@@ -1587,6 +1587,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: true,
             border_color: None,
+            selection: None,
         },
         TestPatternTerminal {
             id: 2,
@@ -1597,6 +1598,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: None,
+            selection: None,
         },
         // Middle-left: Idle Group B (T3 + T4)
         TestPatternTerminal {
@@ -1608,6 +1610,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: Some(rgb(0x4e, 0x59, 0x6f)),
+            selection: None,
         },
         TestPatternTerminal {
             id: 4,
@@ -1618,6 +1621,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: None,
+            selection: None,
         },
         // Bottom-left: Hovered Group C (T5)
         TestPatternTerminal {
@@ -1629,6 +1633,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: None,
+            selection: None,
         },
         // Bottom-centre: 3 small 0.35x terminals with Map Labels (T6, T7, T8)
         TestPatternTerminal {
@@ -1640,6 +1645,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 0.35,
             focused: false,
             border_color: None,
+            selection: None,
         },
         TestPatternTerminal {
             id: 7,
@@ -1650,6 +1656,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 0.35,
             focused: false,
             border_color: Some(mint),
+            selection: None,
         },
         TestPatternTerminal {
             id: 8,
@@ -1660,6 +1667,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 0.35,
             focused: false,
             border_color: None,
+            selection: None,
         },
         // Right zone: Fullscreen Veil demonstration (T9 behind veil at z=1, T10 in hole at z=25)
         TestPatternTerminal {
@@ -1671,6 +1679,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: None,
+            selection: None,
         },
         TestPatternTerminal {
             id: 10,
@@ -1681,6 +1690,7 @@ pub fn build_chrome_pattern_terminals(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: Some(mint),
+            selection: None,
         },
     ]
 }
