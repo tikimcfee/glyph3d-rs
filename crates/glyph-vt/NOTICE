@@ -59,7 +59,11 @@ Local changes to the vendored core (`src/term/`)
      Kitty keyboard `CSI > / < / = u`, `XTMODKEYS`, and `DECKPAM`/`DECKPNM`.
 4. Hot-path performance (`page.rs`, `screen.rs`, `stream.rs`, `parser.rs`, `terminal.rs`):
    - Added per-row `Row::dirty` + `Terminal::all_rows_dirty` so incremental
-     `Vt::fill` skips clean rows instead of re-resolving the whole grid.
+     `Vt::fill` skips clean rows instead of re-resolving the whole grid, plus
+     `Screen::pending_scroll`, `Terminal::resized_since_fill`, and
+     `Terminal::screen_switched_since_fill` so `Vt::fill` reports whole-screen
+     vs margin scroll counts and per-row in-place rewritten column spans for
+     terminal text-selection tracking.
    - Recycled evicted `Row` buffers in full-width `scroll_up` / `scroll_down`
      instead of dropping and reallocating `Vec<Cell>` on every linefeed.
    - Added `Stream::process` + `Terminal::print_ascii_slice` batched ground-state

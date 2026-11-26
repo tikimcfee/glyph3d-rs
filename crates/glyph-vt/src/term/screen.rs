@@ -60,6 +60,68 @@ pub struct SavedCursor {
 /// (`resize_reflow`) and sends nothing; neither does `clear_all`.
 pub type ScrollbackSink = Arc<dyn Fn(&Row) + Send + Sync>;
 
+/// Scroll activity accumulated on a [`Screen`] since the last `Vt::fill`.
+#[derive(Clone, Debug, Default)]
+pub struct PendingScroll {
+    /// Rows scrolled off row `0` (`scroll_top == 0 && full_width_margins()`,
+    /// excluding `CSI M` line deletions).
+    pub scrolled_top: u32,
+    /// True if at least one full-screen upward scroll (`0..rows`, full width,
+    /// not `CSI M`) occurred since the last fill.
+    pub saw_full_screen_up: bool,
+    /// True if any margin-bounded scroll (`DECSTBM` / `DECSLRM`), downward
+    /// scroll (`RI` / `CSI T` / `CSI L`), or `CSI M` line deletion occurred.
+    pub saw_margin_scroll: bool,
+    /// Per-row half-open column span `(lo, hi)` (`lo < hi`) of cells moved by
+    /// margin/downward/delete-line scrolls since the last fill.
+    pub margin_moved_cols: Vec<(u16, u16)>,
+}
+
+impl PendingScroll {
+    pub fn reset(&mut self) {
+        self.scrolled_top = 0;
+        self.saw_full_screen_up = false;
+        self.saw_margin_scroll = false;
+        self.margin_moved_cols.fill((0, 0));
+    }
+
+    pub fn record_margin_move(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+    ) {
+        if self.margin_moved_cols.len() != rows {
+            self.margin_moved_cols.resize(rows, (0, 0));
+        }
+        let full_hi = cols.min(u16::MAX as usize) as u16;
+        if self.saw_full_screen_up {
+            // Earlier in the same batch the whole screen scrolled up and now a
+            // sub-region or downward scroll moved rows non-uniformly: mark all
+            // rows moved in place.
+            self.margin_moved_cols.fill((0, full_hi));
+            self.saw_full_screen_up = false;
+        }
+        self.saw_margin_scroll = true;
+        let lo = left.min(cols).min(u16::MAX as usize) as u16;
+        let hi = (right.saturating_add(1)).min(cols).min(u16::MAX as usize) as u16;
+        if lo < hi && rows > 0 {
+            let end = bottom.min(rows - 1);
+            for slot in &mut self.margin_moved_cols[top.min(end)..=end] {
+                if slot.0 >= slot.1 {
+                    *slot = (lo, hi);
+                } else {
+                    slot.0 = slot.0.min(lo);
+                    slot.1 = slot.1.max(hi);
+                }
+            }
+        }
+    }
+}
+
 pub struct Screen {
     pub cols: usize,
     pub rows: usize,
@@ -88,6 +150,9 @@ pub struct Screen {
     /// previously printed cell, to append combining input.
     pub previous_char: Option<(usize, usize)>,
 
+    /// Scroll tracking accumulated between `Vt::fill` calls.
+    pub pending_scroll: PendingScroll,
+
     /// See [`ScrollbackSink`]; none by default.
     pub scrollback_sink: Option<ScrollbackSink>,
 }
@@ -111,6 +176,7 @@ impl Screen {
             left_margin: 0,
             right_margin: cols - 1,
             previous_char: None,
+            pending_scroll: PendingScroll::default(),
             scrollback_sink: None,
         }
     }
@@ -155,9 +221,65 @@ impl Screen {
     /// a scrollback screen, evicted rows go to history. Blank rows appear
     /// at the bottom carrying the pen's bg (`style`).
     pub fn scroll_up(&mut self, count: usize, style: &Style) {
+        self.scroll_up_inner(count, style, false);
+    }
+
+    /// Scroll up for `CSI M` (`DL`, delete lines): shifts `scroll_top..=scroll_bottom`
+    /// upward without counting as output scrolled off the top of the screen.
+    pub fn scroll_up_delete_lines(&mut self, count: usize, style: &Style) {
+        self.scroll_up_inner(count, style, true);
+    }
+
+    fn scroll_up_inner(&mut self, count: usize, style: &Style, is_delete_lines: bool) {
         let count = count.min(self.scroll_bottom.saturating_sub(self.scroll_top) + 1);
         if count == 0 {
             return;
+        }
+
+        if is_delete_lines {
+            self.pending_scroll.record_margin_move(
+                self.rows,
+                self.cols,
+                self.scroll_top,
+                self.scroll_bottom,
+                self.left_margin,
+                self.right_margin,
+            );
+        } else if self.scroll_top == 0
+            && self.scroll_bottom + 1 == self.rows
+            && self.full_width_margins()
+        {
+            self.pending_scroll.scrolled_top = self
+                .pending_scroll
+                .scrolled_top
+                .saturating_add(count as u32);
+            if self.pending_scroll.saw_margin_scroll {
+                self.pending_scroll.record_margin_move(
+                    self.rows,
+                    self.cols,
+                    0,
+                    self.rows.saturating_sub(1),
+                    0,
+                    self.cols.saturating_sub(1),
+                );
+            } else {
+                self.pending_scroll.saw_full_screen_up = true;
+            }
+        } else {
+            if self.scroll_top == 0 && self.full_width_margins() {
+                self.pending_scroll.scrolled_top = self
+                    .pending_scroll
+                    .scrolled_top
+                    .saturating_add(count as u32);
+            }
+            self.pending_scroll.record_margin_move(
+                self.rows,
+                self.cols,
+                self.scroll_top,
+                self.scroll_bottom,
+                self.left_margin,
+                self.right_margin,
+            );
         }
 
         if self.full_width_margins() {
@@ -238,6 +360,14 @@ impl Screen {
         if count == 0 {
             return;
         }
+        self.pending_scroll.record_margin_move(
+            self.rows,
+            self.cols,
+            self.scroll_top,
+            self.scroll_bottom,
+            self.left_margin,
+            self.right_margin,
+        );
 
         if self.full_width_margins() {
             for _ in 0..count {
