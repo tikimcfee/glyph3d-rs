@@ -490,9 +490,9 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     let raw_fg = unpack_rgba8(cell.fg).rgb;
     var fg_rgb = raw_fg;
     var cell_style = style;
+    let cell_bg_rgba = unpack_rgba8(cell.bg);
+    let cell_bg = select(unpack_rgba8(term.default_bg).rgb, cell_bg_rgba.rgb, cell_bg_rgba.a > 0.0);
     if under_cursor {
-        let cell_bg_rgba = unpack_rgba8(cell.bg);
-        let cell_bg = select(unpack_rgba8(term.default_bg).rgb, cell_bg_rgba.rgb, cell_bg_rgba.a > 0.0);
         let cursor_rgb = resolved_cursor_color().rgb;
         let diff = abs(cell_bg - cursor_rgb);
         // Ghostty cursor-text default: draw the glyph over a solid block cursor in the
@@ -501,8 +501,24 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
         fg_rgb = select(cell_bg, raw_fg, max(diff.x, max(diff.y, diff.z)) < 0.05);
         cell_style = cell_style & (~STYLE_DIM);
     }
-    let fg_srgb = vec4<f32>(fg_rgb, 1.0);
-    let decor_srgb = select(fg_srgb.rgb, unpack_rgba8(cell.ul).rgb, (cell_style & STYLE_UNDERLINE_COLOR) != 0u);
+    var decor_srgb = select(fg_rgb, unpack_rgba8(cell.ul).rgb, (cell_style & STYLE_UNDERLINE_COLOR) != 0u);
+    var fg_alpha = 1.0;
+    if (cell_style & STYLE_DIM) != 0u && frame.target_is_srgb != 0u && mode != 1u {
+        // The JS wall (WebGL2 sRGB canvas, docs/architecture/rendering.md "Colour")
+        // blends SGR 2 dim ink and lines in gamma/sRGB space (uDimAlpha = 0.5).
+        // Linear blending alpha = 0.5 into an *_Srgb target lands ~0.75 in sRGB on
+        // dark panels and washes out dim-inverse text. Mix toward cell_bg in sRGB
+        // here so both light-on-dark and dark-on-light dim match the browser wall.
+        let dim = clamp(frame.dim_alpha, 0.0, 1.0);
+        if dim <= 0.0 {
+            fg_alpha = 0.0;
+        } else {
+            fg_rgb = mix(cell_bg, fg_rgb, dim);
+            decor_srgb = mix(cell_bg, decor_srgb, dim);
+            cell_style = cell_style & (~STYLE_DIM);
+        }
+    }
+    let fg_srgb = vec4<f32>(fg_rgb, fg_alpha);
 
     out.clip = clip;
     out.glyph_uv = c;

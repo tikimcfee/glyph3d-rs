@@ -3247,4 +3247,130 @@ mod tests {
         assert_eq!(count_cell(&px_clear, 3, 1, is_sel_bg), 0, "cleared selection must restore original background");
         assert!(count_cell(&px_clear, 3, 1, is_orig_fg) > 40, "cleared selection must restore original fg");
     }
+
+    /// Colour parity with the JS browser wall: `Theme::default()` carries `#cccccc` fg,
+    /// `#0a0a1e` panel bg, `#6ee7a0` cursor, and `terminalPalette.js`'s 16 ANSI colours
+    /// (`bold_is_bright = false`), and SGR 2 (`DIM`) blends in sRGB space toward `cell_bg`
+    /// on an `Rgba8UnormSrgb` target so both dark-panel dim and dim-inverse match WebGL.
+    #[test]
+    fn js_wall_theme_and_srgb_dim_match_browser_wall() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Col 0: plain '█' (#cccccc on #0a0a1e)
+        // Col 1: dim '█' (sRGB 50% mix of #cccccc and #0a0a1e -> #6b6b75)
+        // Col 2: dim inverse 'M' (#0a0a1e on #cccccc fill -> sRGB 50% mix #6b6b75 on #cccccc)
+        // Col 3: ANSI blue '█' (#1a1ae6)
+        // Col 4: bold ANSI red '█' (bold_is_bright=false -> still #b31a1a, not #ff4d4d)
+        // Col 5: empty panel cell (#0a0a1e)
+        // Col 6: cursor cell 'M' (focused solid block #6ee7a0 with #0a0a1e glyph ink)
+        let stream = "\x1b[H\x1b[2J█\x1b[2m█\x1b[0;2;7mM\x1b[0;34m█\x1b[0;1;31m█\x1b[0m M\x1b[1;7H";
+        let screen = super::super::replay::replay_screen(stream.as_bytes(), 8, 1);
+        assert_eq!(screen.default_fg, term_cells::rgb(0xcc, 0xcc, 0xcc));
+        assert_eq!(screen.default_bg, term_cells::rgb(0x0a, 0x0a, 0x1e));
+        assert_eq!(screen.cursor_color, term_cells::rgb(0x6e, 0xe7, 0xa0));
+        assert_eq!(screen.cursor.col, 6);
+
+        let w = 640u32;
+        let h = 160u32;
+        let m = renderer.metrics();
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.05);
+        let draw = TerminalDraw {
+            id: 1,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: None,
+            border_color: None,
+            selection: None,
+        };
+        let px = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[draw], ..Default::default() },
+            w,
+            h,
+        );
+
+        let cell_center_rgb = |col: u16| -> [u8; 3] {
+            let world = Vec2::new((f32::from(col) + 0.5) * m.cell_width, -0.5 * m.cell_height);
+            let sp = cam.world_to_screen(world, (w, h));
+            let x = (sp.x.round() as u32).min(w - 1);
+            let y = (sp.y.round() as u32).min(h - 1);
+            let idx = ((y * w + x) * 4) as usize;
+            [px[idx], px[idx + 1], px[idx + 2]]
+        };
+        let count_cell = |col: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(f32::from(col) * m.cell_width, 0.0), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(f32::from(col + 1) * m.cell_width, -m.cell_height), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        let close = |actual: [u8; 3], expected: [u8; 3]| -> bool {
+            actual[0].abs_diff(expected[0]) <= 2
+                && actual[1].abs_diff(expected[1]) <= 2
+                && actual[2].abs_diff(expected[2]) <= 2
+        };
+
+        let plain = cell_center_rgb(0);
+        let dim = cell_center_rgb(1);
+        let blue = cell_center_rgb(3);
+        let bold_red = cell_center_rgb(4);
+        let panel = cell_center_rgb(5);
+
+        assert!(close(plain, [0xcc, 0xcc, 0xcc]), "default fg must be #cccccc, got {plain:?}");
+        assert!(
+            close(dim, [0x6b, 0x6b, 0x75]),
+            "sRGB 50% dim of #cccccc on #0a0a1e must be #6b6b75 (not linear #969697), got {dim:?}"
+        );
+        assert!(close(blue, [0x1a, 0x1a, 0xe6]), "ANSI blue must be #1a1ae6, got {blue:?}");
+        assert!(
+            close(bold_red, [0xb3, 0x1a, 0x1a]),
+            "bold ANSI red with bold_is_bright=false must stay #b31a1a, got {bold_red:?}"
+        );
+        assert!(close(panel, [0x0a, 0x0a, 0x1e]), "panel bg must be #0a0a1e, got {panel:?}");
+
+        // Col 2: dim inverse 'M' -> #cccccc fill + #6b6b75 ink (not washed-out linear #969697).
+        let dim_inv_fill = count_cell(2, |c| {
+            c[0].abs_diff(0xcc) <= 2 && c[1].abs_diff(0xcc) <= 2 && c[2].abs_diff(0xcc) <= 2
+        });
+        let dim_inv_ink = count_cell(2, |c| {
+            c[0].abs_diff(0x6b) <= 3 && c[1].abs_diff(0x6b) <= 3 && c[2].abs_diff(0x75) <= 3
+        });
+        assert!(dim_inv_fill > 200, "dim inverse fill must be #cccccc ({dim_inv_fill} px)");
+        assert!(dim_inv_ink > 80, "dim inverse ink must be #6b6b75 ({dim_inv_ink} px)");
+
+        // Col 6: focused block cursor uses Theme::default().cursor (#6ee7a0) with #0a0a1e ink.
+        let cursor_fill = count_cell(6, |c| {
+            c[0].abs_diff(0x6e) <= 3 && c[1].abs_diff(0xe7) <= 3 && c[2].abs_diff(0xa0) <= 3
+        });
+        let cursor_ink = count_cell(6, |c| {
+            c[0].abs_diff(0x0a) <= 3 && c[1].abs_diff(0x0a) <= 3 && c[2].abs_diff(0x1e) <= 3
+        });
+        assert!(cursor_fill > 200, "focused block cursor must be #6ee7a0 ({cursor_fill} px)");
+        assert!(cursor_ink > 80, "glyph over focused cursor must be #0a0a1e ({cursor_ink} px)");
+    }
 }
