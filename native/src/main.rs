@@ -152,13 +152,34 @@ fn main() {
             wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
         }
         #[cfg(feature = "wgpu")]
-        CliCommand::WallReplay { file, cols, rows, .. } => {
-            eprintln!(
-                "error: --wall-replay {} ({cols}x{rows}) is not built yet: crates/glyph-vt has not landed \
-                 (expected Vt::new / feed / fill per out/WALL-PLAN-2026-11-26.md section B)",
-                file.display()
+        CliCommand::WallReplay {
+            file,
+            cols,
+            rows,
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-replay requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let bytes = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("error: --wall-replay '{}': {e}", file.display());
+                std::process::exit(1);
+            });
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_replay_offscreen(
+                &ctx,
+                &bytes,
+                cols,
+                rows,
+                &emoji_sheet,
+                &path,
+                frames,
+                zoom,
             );
-            std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {

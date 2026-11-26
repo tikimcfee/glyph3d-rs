@@ -4,7 +4,7 @@
 //! wgpu and the engine's Slug glyph atlas, without putting terminals in the
 //! static `GlyphField` arena and without depending on `winit`.
 //!
-//! Pure CPU modules (`metrics`, `cell`, `camera`, `test_pattern`) compile
+//! Pure CPU modules (`metrics`, `cell`, `camera`, `replay`, `test_pattern`) compile
 //! under `--no-default-features`; the GPU renderer (`renderer`) is gated on
 //! the `wgpu` feature.
 
@@ -17,6 +17,7 @@ pub mod keys;
 pub mod metrics;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
+pub mod replay;
 #[cfg(feature = "windowed")]
 pub mod session;
 pub mod test_pattern;
@@ -29,3 +30,5 @@ pub use renderer::{
     TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallRenderer, WallStyle, WallTarget,
     render_test_pattern_offscreen, render_wall_to_png,
 };
+#[cfg(feature = "wgpu")]
+pub use replay::render_replay_offscreen;
