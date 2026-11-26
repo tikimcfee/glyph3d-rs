@@ -1,0 +1,41 @@
+[?1049l[!p[?7h[?9l[?1000l[?1002l[?1003l[?1005l[?1006l[?1015l[?1016l[?1004l[?2004l[=0;1u[H[2J[3g[9GH[17GH[25GH[33GH[41GH[49GH[57GH[65GH[73GH[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0m]2;
+[?1006;1000h[?1002h[?1049h[>4;2m[?1h=[?2004h[?1004h[1;24r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[24;1H"native/src/wall/replay.rs" 116L, 3418B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c[1;1H[38;5;130m  1 [m[35m//! Offscreen terminal byte-stream replay (`--wall-replay FILE --screenshot  [m[2;1H[38;5;130m    [m[35mOUT.png`).[m[2;15H[K[3;1H[38;5;130m  2 [m[35m//![m[3;8H[K[4;1H[38;5;130m  3 [m[35m//! Feeds a recorded stream of raw terminal bytes (such as a `g3d-termd` subb[m[5;1H[38;5;130m    [m[35mscriber[m
+[38;5;130m  4 [m[35m//! capture containing `REPAINT` + `OUTPUT` frames) through [`glyph_vt::Vt`]][m[7;1H[38;5;130m    [m[35m at a fixed[m
+[38;5;130m  5 [m[35m//! `(cols, rows)` grid size and renders the resulting [`term_cells::Screen``[m[9;1H[38;5;130m    [m[35m] through[m
+[38;5;130m  6 [m[35m//! [`super::renderer::render_wall_to_png`].[m
+[38;5;130m  7 
+  8 [m[35m#[cfg(feature = [m[31m"wgpu"[m[35m)][m
+[38;5;130m  9 use[m [35mstd[m[35m::[m[35mpath[m[35m::[mPath;
+[38;5;130m 10 [m[35m#[cfg(feature = [m[31m"wgpu"[m[35m)][m
+[38;5;130m 11 use[m [35mstd[m[35m::[m[35msync[m[35m::[mArc;
+[38;5;130m 12 
+ 13 [m[35m#[cfg(feature = [m[31m"wgpu"[m[35m)][m
+[38;5;130m 14 use[m [35mglam[m[35m::[mVec2;
+[38;5;130m 15 use[m [35mglyph_vt[m[35m::[m{Theme, Vt};
+[38;5;130m 16 use[m [35mterm_cells[m[35m::[mScreen;
+[38;5;130m 17 
+ 18 [m[35m#[cfg(feature = [m[31m"wgpu"[m[35m)][m
+[38;5;130m 19 use[m [35mcrate[m[35m::[m[35matlas[m[35m::[mAtlas;[24;63H1,1[11CTop[1;5H[?25h[?4m[?12$p

@@ -43,7 +43,7 @@ pub enum CliCommand {
         frames: u32,
         zoom: f32,
     },
-    /// Replay a recorded terminal byte stream on the wall renderer (pending crates/glyph-vt).
+    /// Replay a recorded terminal byte stream on the wall renderer offscreen.
     WallReplay {
         file: PathBuf,
         cols: u16,
