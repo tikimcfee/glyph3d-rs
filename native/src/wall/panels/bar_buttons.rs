@@ -1044,6 +1044,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         }];
         let frame = WallFrame {
             terminals: &draws,

@@ -35,6 +35,7 @@ pub mod families;
 pub mod metrics;
 pub mod raster;
 pub mod sprites;
+pub mod system;
 
 pub use atlas::{Face, FamilyId, FontAtlas, FontError, ResolvedCell, Slot, SlotInfo, SlotKind};
 pub use buffer::{
@@ -52,8 +53,12 @@ pub use encode::{
     EncodedGlyph, OutlineCollector, PackedCurve,
 };
 pub use families::{
-    cousine_family_spec, default_font_chain, monaspace_family_spec, FaceSpec, FontSource, FontSpec,
-    Variation, DEFAULT_FONT_FAMILY, MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
+    bundled_family_spec, cousine_family_spec, default_font_chain, fallback_font_chain,
+    monaspace_family_spec, FaceSpec, FontSource, FontSpec, Variation, DEFAULT_FONT_FAMILY,
+    MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
+};
+pub use system::{
+    normalize_family_key, resolve_family_chain, resolve_family_spec, system_font_dirs,
 };
 pub use metrics::{
     compute_cell_metrics, compute_sprite_metrics, derive_char_size, snap_cell_dimension, CharSize,
