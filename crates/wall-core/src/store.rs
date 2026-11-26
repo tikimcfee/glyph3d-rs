@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentSide, GroupLayout};
 use crate::geom::Point;
+use crate::split::{self, SplitNode};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -193,59 +194,6 @@ mod serde_opt_point {
         deserializer: D,
     ) -> Result<Option<Point>, D::Error> {
         Option::<StoredPoint>::deserialize(deserializer).map(|opt| opt.map(Point::from))
-    }
-}
-
-/// Axis along which a split branch divides its rectangle (`splitTree.js`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SplitDir {
-    Row,
-    Col,
-}
-
-/// Binary split tree stored inside [`WallSplit`] (`splitTree.SplitNode`).
-///
-/// Defined here so `store.rs` compiles and collapses departed panes independently while
-/// `split.rs` is ported on its own branch.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SplitNode {
-    Leaf {
-        id: String,
-    },
-    Branch {
-        dir: SplitDir,
-        ratio: f64,
-        a: Box<SplitNode>,
-        b: Box<SplitNode>,
-    },
-}
-
-/// Remove leaf `target_id` from `node`, handing its room to its sibling (`splitTree.remove`).
-fn remove_pane(node: &SplitNode, target_id: &str) -> Option<SplitNode> {
-    match node {
-        SplitNode::Leaf { id } => {
-            if id == target_id {
-                None
-            } else {
-                Some(node.clone())
-            }
-        }
-        SplitNode::Branch { dir, ratio, a, b } => {
-            let next_a = remove_pane(a, target_id);
-            let next_b = remove_pane(b, target_id);
-            match (next_a, next_b) {
-                (None, other) => other,
-                (other, None) => other,
-                (Some(na), Some(nb)) => Some(SplitNode::Branch {
-                    dir: *dir,
-                    ratio: *ratio,
-                    a: Box::new(na),
-                    b: Box::new(nb),
-                }),
-            }
-        }
     }
 }
 
@@ -955,7 +903,7 @@ impl WallStore {
         group.members.retain(|m| !ids.contains(&m.as_str()));
         if let Some(ref mut split) = group.split {
             for &id in ids {
-                if let Some(next_tree) = remove_pane(&split.tree, id) {
+                if let Some(next_tree) = split::remove(&split.tree, id) {
                     split.tree = next_tree;
                 }
             }
@@ -1238,6 +1186,7 @@ fn parse_help_panel(raw: Option<&serde_json::Value>) -> HelpPanelState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::split::SplitDir;
 
     struct ScratchDir(PathBuf);
 
@@ -1576,6 +1525,17 @@ mod tests {
         );
 
         let mut reloaded = WallStore::open(&dir.0, "rs-wall");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(reloaded.path().unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["groups"]["g-1"]["split"]["tree"],
+            serde_json::json!({
+                "dir": "row",
+                "ratio": 0.5,
+                "a": { "id": "t1" },
+                "b": { "id": "t2" },
+            })
+        );
         assert_eq!(reloaded.attached("t1"), Some("helper@workstation"));
         assert_eq!(reloaded.attached_to("helper@workstation"), vec!["t1"]);
         assert_eq!(

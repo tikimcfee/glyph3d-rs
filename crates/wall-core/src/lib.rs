@@ -13,6 +13,8 @@
 pub mod geom;
 pub mod input;
 
+pub mod agent_view;
+pub mod bus;
 pub mod chord;
 pub mod config;
 pub mod dock;

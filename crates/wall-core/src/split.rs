@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::geom::{Point, Rect};
 
 /// Share of a pane's width or height from an edge within which a pointer drop
@@ -62,7 +64,8 @@ impl Size {
 }
 
 /// How a split branch cuts its rectangle (`'row' | 'col'`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SplitDir {
     /// Side by side: `a` sits left of `b`.
     Row,
@@ -162,7 +165,8 @@ pub struct Divider {
 }
 
 /// Binary tree of split panes (`SplitLeaf | SplitBranch`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum SplitNode {
     /// One terminal occupying its pane.
     Leaf { id: String },
