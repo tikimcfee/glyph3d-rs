@@ -253,7 +253,7 @@ impl App {
             })
             .collect();
         let paper = PaperStyle::default();
-        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws };
+        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, ..Default::default() };
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
         g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
         self.ctx.queue.submit([encoder.finish()]);

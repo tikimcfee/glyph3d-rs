@@ -18,6 +18,7 @@ pub mod metrics;
 pub mod paper;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
+pub mod shapes;
 pub mod test_pattern;
 
 pub use camera::WallCamera;
@@ -29,6 +30,7 @@ pub use renderer::{
     TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallFrame, WallRenderer, WallStyle, WallTarget,
     render_test_pattern_offscreen, render_wall_to_png,
 };
+pub use shapes::{DashStyle, DotShape, LeaderShape, LineShape, PolygonShape, RectShape, Shape};
 
 /// Convert a 24-bit `0xRRGGBB` sRGB hex colour and `alpha` into normalized sRGB RGBA (`0.0..=1.0`).
 pub const fn srgb_hex(hex: u32, alpha: f32) -> [f32; 4] {

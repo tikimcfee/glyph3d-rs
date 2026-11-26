@@ -6,6 +6,7 @@
 //! buffers so unchanged terminals upload zero bytes.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use super::camera::WallCamera;
 use super::cell::{CellGpu, dirty_row_ranges, pack_cell};
 use super::metrics::CellMetrics;
 use super::paper::{PaperStyle, WallPaperUniform, build_paper_uniform};
+use super::shapes::{Shape, ShapeFrameUniform, ShapeGpu, expand_shape};
 
 /// Depth texture format expected by [`WallRenderer`] (reverse-Z, clear 0.0).
 pub const WALL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -110,6 +112,9 @@ pub struct WallFrame<'a> {
     pub paper: Option<&'a PaperStyle>,
     /// Live or static terminals to draw (sorted internally back-to-front by `z`).
     pub terminals: &'a [TerminalDraw<'a>],
+    /// World-space 2D chrome shapes (group frames, title bar strips, selection outlines,
+    /// lassos, drop outlines, map label pills and leaders), interleaved by `z`.
+    pub shapes: &'a [Shape],
 }
 
 /// Shared per-frame uniform block (`WallFrameUniform` in `wall_cells.wgsl`, 224 B).
@@ -181,6 +186,12 @@ pub struct UploadStats {
     pub write_calls: usize,
 }
 
+enum DrawRun {
+    ShapesOpaque(Range<u32>),
+    ShapesBlend(Range<u32>),
+    Terminal(usize),
+}
+
 /// Shared wgpu cell renderer for any number of live terminals.
 pub struct WallRenderer {
     atlas: Arc<Atlas>,
@@ -192,6 +203,13 @@ pub struct WallRenderer {
     paper_bg: wgpu::BindGroup,
     paper_pipeline: wgpu::RenderPipeline,
     draw_paper: bool,
+    shape_frame_buf: wgpu::Buffer,
+    shapes_bgl: wgpu::BindGroupLayout,
+    shapes_buf: wgpu::Buffer,
+    shapes_cap: usize,
+    shapes_bg: wgpu::BindGroup,
+    shape_opaque_pipeline: wgpu::RenderPipeline,
+    shape_blend_pipeline: wgpu::RenderPipeline,
     frame_buf: wgpu::Buffer,
     quad_index_buf: wgpu::Buffer,
     shared_bg: wgpu::BindGroup,
@@ -202,7 +220,8 @@ pub struct WallRenderer {
     cursor_pipeline: wgpu::RenderPipeline,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
-    draw_order: Vec<usize>,
+    shape_scratch: Vec<ShapeGpu>,
+    draw_runs: Vec<DrawRun>,
 }
 
 const PREMUL_BLEND: wgpu::BlendState = wgpu::BlendState {
@@ -355,6 +374,107 @@ impl WallRenderer {
             multiview_mask: None,
             cache: None,
         });
+
+        let shape_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wall shape frame uniform"),
+            size: std::mem::size_of::<ShapeFrameUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shapes_cap = 64usize;
+        let shapes_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wall shapes instances"),
+            size: (shapes_cap * std::mem::size_of::<ShapeGpu>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shapes_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("wall shapes bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shapes_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wall shapes bg"),
+            layout: &shapes_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: shape_frame_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: shapes_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wall_shapes.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_shapes.wgsl").into()),
+        });
+        let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("wall shapes pl"),
+            bind_group_layouts: &[Some(&shapes_bgl)],
+            immediate_size: 0,
+        });
+        let make_shape_pipeline = |label: &str, depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&shape_pl),
+                vertex: wgpu::VertexState {
+                    module: &shape_shader,
+                    entry_point: Some("vs_shape"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shape_shader,
+                    entry_point: Some("fs_shape"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(PREMUL_BLEND),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: WALL_DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let shape_opaque_pipeline = make_shape_pipeline("wall shape opaque pipeline", true);
+        let shape_blend_pipeline = make_shape_pipeline("wall shape blend pipeline", false);
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -554,6 +674,13 @@ impl WallRenderer {
             paper_bg,
             paper_pipeline,
             draw_paper: false,
+            shape_frame_buf,
+            shapes_bgl,
+            shapes_buf,
+            shapes_cap,
+            shapes_bg,
+            shape_opaque_pipeline,
+            shape_blend_pipeline,
             frame_buf,
             quad_index_buf,
             shared_bg,
@@ -564,7 +691,8 @@ impl WallRenderer {
             cursor_pipeline,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
-            draw_order: Vec::new(),
+            shape_scratch: Vec::new(),
+            draw_runs: Vec::new(),
         }
     }
 
@@ -772,9 +900,11 @@ impl WallRenderer {
 
         let (line_a, line_b) = fold_line_uniforms(&self.style);
         let sheet = &self.atlas.emoji.sheet;
+        let view_proj = camera.view_proj(viewport).to_cols_array_2d();
+        let viewport_f = [viewport.0.max(1) as f32, viewport.1.max(1) as f32];
         let frame_uniform = WallFrameUniform {
-            view_proj: camera.view_proj(viewport).to_cols_array_2d(),
-            viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32],
+            view_proj,
+            viewport: viewport_f,
             cell_size: [self.metrics.cell_width, self.metrics.cell_height],
             line_a,
             line_b,
@@ -807,13 +937,99 @@ impl WallRenderer {
             self.sync_terminal(device, queue, draw, &mut stats);
         }
 
-        // Draw back-to-front by world z so translucent panels, antialiased edges,
-        // and translucent cursors blend cleanly over farther terminals while the
-        // reverse-Z depth buffer enforces hard 3D occlusion.
-        self.draw_order.clear();
-        self.draw_order.extend(0..terminals.len());
-        self.draw_order
-            .sort_by(|&a, &b| terminals[a].z.total_cmp(&terminals[b].z));
+        // Expand shapes and interleave with terminals back-to-front by world z.
+        // Equal-z tier tie-break: opaque shape (0) -> terminal (1) -> blend shape (2).
+        #[derive(Clone, Copy)]
+        enum Pending {
+            Shape { opaque: bool, raw_idx: usize },
+            Terminal(usize),
+        }
+        let mut raw_shapes: Vec<ShapeGpu> = Vec::new();
+        let mut pending: Vec<(f32, u8, Pending)> =
+            Vec::with_capacity(terminals.len() + frame.shapes.len());
+        for shape in frame.shapes {
+            expand_shape(shape, camera.zoom, |opaque, gpu| {
+                let raw_idx = raw_shapes.len();
+                let z = gpu.z;
+                raw_shapes.push(gpu);
+                pending.push((z, if opaque { 0 } else { 2 }, Pending::Shape { opaque, raw_idx }));
+            });
+        }
+        for (i, draw) in terminals.iter().enumerate() {
+            pending.push((draw.z, 1, Pending::Terminal(i)));
+        }
+        pending.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        self.shape_scratch.clear();
+        self.shape_scratch.reserve(raw_shapes.len());
+        self.draw_runs.clear();
+        for (_, _, item) in pending {
+            match item {
+                Pending::Shape { opaque, raw_idx } => {
+                    let gpu_idx = self.shape_scratch.len() as u32;
+                    self.shape_scratch.push(raw_shapes[raw_idx]);
+                    if opaque {
+                        if let Some(DrawRun::ShapesOpaque(r)) = self.draw_runs.last_mut() {
+                            if r.end == gpu_idx {
+                                r.end = gpu_idx + 1;
+                                continue;
+                            }
+                        }
+                        self.draw_runs.push(DrawRun::ShapesOpaque(gpu_idx..gpu_idx + 1));
+                    } else {
+                        if let Some(DrawRun::ShapesBlend(r)) = self.draw_runs.last_mut() {
+                            if r.end == gpu_idx {
+                                r.end = gpu_idx + 1;
+                                continue;
+                            }
+                        }
+                        self.draw_runs.push(DrawRun::ShapesBlend(gpu_idx..gpu_idx + 1));
+                    }
+                }
+                Pending::Terminal(idx) => {
+                    self.draw_runs.push(DrawRun::Terminal(idx));
+                }
+            }
+        }
+
+        if !self.shape_scratch.is_empty() {
+            let shape_frame = ShapeFrameUniform {
+                view_proj,
+                viewport: viewport_f,
+                target_is_srgb: u32::from(target_is_srgb),
+                _pad0: 0,
+            };
+            queue.write_buffer(&self.shape_frame_buf, 0, bytemuck::bytes_of(&shape_frame));
+            if self.shape_scratch.len() > self.shapes_cap {
+                let new_cap = self.shape_scratch.len().next_power_of_two().max(64);
+                self.shapes_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("wall shapes instances"),
+                    size: (new_cap * std::mem::size_of::<ShapeGpu>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.shapes_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("wall shapes bg"),
+                    layout: &self.shapes_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.shape_frame_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.shapes_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                self.shapes_cap = new_cap;
+            }
+            queue.write_buffer(
+                &self.shapes_buf,
+                0,
+                bytemuck::cast_slice(&self.shape_scratch),
+            );
+        }
         stats
     }
 
@@ -831,40 +1047,54 @@ impl WallRenderer {
             pass.draw(0..3, 0..1);
         }
 
-        let terminals = frame.terminals;
-        if terminals.is_empty() {
+        if self.draw_runs.is_empty() {
             return;
         }
 
-        pass.set_bind_group(0, &self.shared_bg, &[]);
         pass.set_index_buffer(self.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
 
-        for &idx in &self.draw_order {
-            let draw = &terminals[idx];
-            let Some(gpu) = self.terminals.get(&draw.id) else {
-                continue;
-            };
-            let cell_count = u32::from(gpu.cols) * u32::from(gpu.rows);
-            pass.set_bind_group(1, &gpu.bind_group, &[]);
-
-            pass.set_pipeline(&self.panel_pipeline);
-            pass.draw_indexed(0..6, 0, 0..1);
-
-            if cell_count > 0 {
-                if gpu.has_any_bg {
-                    pass.set_pipeline(&self.fill_pipeline);
-                    pass.draw_indexed(0..6, 0, 0..cell_count);
+        let terminals = frame.terminals;
+        for run in &self.draw_runs {
+            match run {
+                DrawRun::ShapesOpaque(range) => {
+                    pass.set_pipeline(&self.shape_opaque_pipeline);
+                    pass.set_bind_group(0, &self.shapes_bg, &[]);
+                    pass.draw_indexed(0..6, 0, range.clone());
                 }
-                pass.set_pipeline(&self.ink_pipeline);
-                pass.draw_indexed(0..6, 0, 0..cell_count);
-            }
+                DrawRun::ShapesBlend(range) => {
+                    pass.set_pipeline(&self.shape_blend_pipeline);
+                    pass.set_bind_group(0, &self.shapes_bg, &[]);
+                    pass.draw_indexed(0..6, 0, range.clone());
+                }
+                DrawRun::Terminal(idx) => {
+                    let draw = &terminals[*idx];
+                    let Some(gpu) = self.terminals.get(&draw.id) else {
+                        continue;
+                    };
+                    let cell_count = u32::from(gpu.cols) * u32::from(gpu.rows);
+                    pass.set_bind_group(0, &self.shared_bg, &[]);
+                    pass.set_bind_group(1, &gpu.bind_group, &[]);
 
-            if draw.screen.cursor.visible
-                && draw.screen.cursor.col < draw.screen.cols
-                && draw.screen.cursor.row < draw.screen.rows
-            {
-                pass.set_pipeline(&self.cursor_pipeline);
-                pass.draw_indexed(0..6, 0, 0..1);
+                    pass.set_pipeline(&self.panel_pipeline);
+                    pass.draw_indexed(0..6, 0, 0..1);
+
+                    if cell_count > 0 {
+                        if gpu.has_any_bg {
+                            pass.set_pipeline(&self.fill_pipeline);
+                            pass.draw_indexed(0..6, 0, 0..cell_count);
+                        }
+                        pass.set_pipeline(&self.ink_pipeline);
+                        pass.draw_indexed(0..6, 0, 0..cell_count);
+                    }
+
+                    if draw.screen.cursor.visible
+                        && draw.screen.cursor.col < draw.screen.cols
+                        && draw.screen.cursor.row < draw.screen.rows
+                    {
+                        pass.set_pipeline(&self.cursor_pipeline);
+                        pass.draw_indexed(0..6, 0, 0..1);
+                    }
+                }
             }
         }
     }
@@ -1106,6 +1336,7 @@ pub fn render_test_pattern_offscreen(
     let frame = WallFrame {
         paper: Some(&paper),
         terminals: &draws,
+        ..Default::default()
     };
     render_wall_to_png(
         ctx,
@@ -1258,7 +1489,7 @@ mod tests {
                 border_color: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
-            let frame = WallFrame { paper: None, terminals: &list };
+            let frame = WallFrame { terminals: &list, ..Default::default() };
             let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
             let center_idx = ((h / 2) * w + (w / 2)) as usize * 4;
             let got = [px[center_idx], px[center_idx + 1], px[center_idx + 2]];
@@ -1308,7 +1539,7 @@ mod tests {
             &ctx.queue,
             vp,
             &cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+            &WallFrame { terminals: &[make_draw(&screen, true)], ..Default::default() },
         );
         assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 8, write_calls: 1 });
         assert_eq!(renderer.cached_terminal_count(), 1);
@@ -1319,7 +1550,7 @@ mod tests {
             &ctx.queue,
             vp,
             &cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+            &WallFrame { terminals: &[make_draw(&screen, true)], ..Default::default() },
         );
         assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 0, rows_uploaded: 0, write_calls: 0 });
 
@@ -1335,7 +1566,7 @@ mod tests {
             &ctx.queue,
             vp,
             &cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+            &WallFrame { terminals: &[make_draw(&screen, true)], ..Default::default() },
         );
         assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 2 });
 
@@ -1370,7 +1601,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cell_cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            &WallFrame { terminals: &[make_draw(&cursor_screen, true)], ..Default::default() },
             w,
             h,
         );
@@ -1381,7 +1612,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cell_cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, false)] },
+            &WallFrame { terminals: &[make_draw(&cursor_screen, false)], ..Default::default() },
             w,
             h,
         );
@@ -1394,7 +1625,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cell_cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            &WallFrame { terminals: &[make_draw(&cursor_screen, true)], ..Default::default() },
             w,
             h,
         );
@@ -1407,7 +1638,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cell_cam,
-            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            &WallFrame { terminals: &[make_draw(&cursor_screen, true)], ..Default::default() },
             w,
             h,
         );
@@ -1458,7 +1689,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cam_both,
-            &WallFrame { paper: Some(&paper), terminals: &[] },
+            &WallFrame { paper: Some(&paper), ..Default::default() },
             w,
             h,
         );
@@ -1484,7 +1715,7 @@ mod tests {
             &ctx,
             &mut renderer,
             &cam_major,
-            &WallFrame { paper: Some(&paper), terminals: &[] },
+            &WallFrame { paper: Some(&paper), ..Default::default() },
             w,
             h,
         );
@@ -1498,5 +1729,141 @@ mod tests {
             on_hidden_minor[0].abs_diff(0x07) <= 1 && on_hidden_minor[1].abs_diff(0x08) <= 1 && on_hidden_minor[2].abs_diff(0x0b) <= 1,
             "minor line must hard-switch off to #07080b (never fade), got {on_hidden_minor:?}"
         );
+    }
+
+    /// Verifies world-space shapes: opaque rect behind a terminal is occluded,
+    /// dashed rect in front alternates dash/gap over the terminal, polygon fills
+    /// and strokes cleanly, and leader draws both its line and anchor dot.
+    #[test]
+    fn gpu_shapes_rect_dashed_polygon_leader_and_z_order() {
+        use super::super::metrics::WorldRect;
+        use super::super::shapes::{DashStyle, LeaderShape, PolygonShape, RectShape};
+
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let mut term = Screen::new(6, 4);
+        term.default_bg = rgb(0x10, 0x30, 0x80);
+        let draw = TerminalDraw {
+            id: 7,
+            screen: &term,
+            position: Vec2::new(-1.5, 2.0),
+            z: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+        };
+
+        let shapes = vec![
+            // Opaque yellow backdrop BEHIND terminal (z = 0.0) -> hidden behind terminal, visible outside it.
+            Shape::Rect(RectShape {
+                rect: WorldRect::new(Vec2::new(-5.0, -4.0), Vec2::new(5.0, 4.0)),
+                z: 0.0,
+                fill: Some([0.9, 0.8, 0.1, 1.0]),
+                stroke: None,
+                stroke_px: 0.0,
+                dash: DashStyle::SOLID,
+                corner_radius_px: 0.0,
+            }),
+            // Translucent dashed red rect IN FRONT of terminal (z = 5.0).
+            Shape::Rect(RectShape {
+                rect: WorldRect::new(Vec2::new(-2.0, -2.0), Vec2::new(2.0, 2.0)),
+                z: 5.0,
+                fill: Some([0.9, 0.1, 0.1, 0.2]),
+                stroke: Some([1.0, 0.1, 0.1, 1.0]),
+                stroke_px: 4.0,
+                dash: DashStyle::new(16.0, 16.0),
+                corner_radius_px: 0.0,
+            }),
+            // Leader line + dot on the right side (z = 5.0).
+            Shape::Leader(LeaderShape {
+                from: Vec2::new(6.0, 0.0),
+                to: Vec2::new(9.0, 0.0),
+                z: 5.0,
+                color: [0.1, 0.95, 0.4, 1.0],
+                width_px: 3.0,
+                dot_radius_px: 5.0,
+                dash: DashStyle::SOLID,
+            }),
+            // Closed polygon on the left side (z = 5.0).
+            Shape::Polygon(PolygonShape {
+                points: vec![
+                    Vec2::new(-9.0, -2.0),
+                    Vec2::new(-6.0, -2.0),
+                    Vec2::new(-6.0, 2.0),
+                    Vec2::new(-9.0, 2.0),
+                ],
+                z: 5.0,
+                fill: Some([0.2, 0.6, 1.0, 0.8]),
+                stroke: [1.0, 1.0, 1.0, 1.0],
+                stroke_px: 2.0,
+                dash: DashStyle::SOLID,
+            }),
+        ];
+
+        let w = 400u32;
+        let h = 200u32;
+        let cam = WallCamera::new(Vec2::ZERO, 18.0);
+        let px = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame {
+                paper: None,
+                terminals: &[draw],
+                shapes: &shapes,
+            },
+            w,
+            h,
+        );
+        let sample = |world: Vec2| -> [u8; 3] {
+            let s = cam.world_to_screen(world, (w, h));
+            let x = (s.x.round() as u32).min(w - 1);
+            let y = (s.y.round() as u32).min(h - 1);
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        // Backdrop outside terminal is bright yellow.
+        let outside_backdrop = sample(Vec2::new(4.0, 3.0));
+        assert!(outside_backdrop[0] > 200 && outside_backdrop[1] > 180 && outside_backdrop[2] < 50,
+            "backdrop outside terminal should be yellow, got {outside_backdrop:?}");
+        // Inside terminal + translucent red overlay: blue terminal shows through (NOT yellow backdrop!).
+        let inside_term = sample(Vec2::new(0.0, 0.0));
+        assert!(inside_term[2] > 90 && inside_term[0] > 60 && inside_term[1] < 60,
+            "translucent red tint should blend over blue terminal, got {inside_term:?}");
+
+        // Along the top border of the dashed red rect (y = 2.0, 1px inside), we must see BOTH
+        // bright red dash pixels AND non-red gap pixels!
+        let top_left = cam.world_to_screen(Vec2::new(-2.0, 2.0), (w, h));
+        let top_right = cam.world_to_screen(Vec2::new(2.0, 2.0), (w, h));
+        let y_row = (top_left.y.round() as u32 + 1).min(h - 1);
+        let (mut dashes, mut gaps) = (0usize, 0usize);
+        for x in (top_left.x.round() as u32 + 4)..(top_right.x.round() as u32 - 4) {
+            let i = ((y_row * w + x) * 4) as usize;
+            if px[i] > 230 && px[i + 2] < 45 {
+                dashes += 1;
+            } else {
+                gaps += 1;
+            }
+        }
+        assert!(dashes > 10 && gaps > 10, "dashed border must show both dashes ({dashes}) and gaps ({gaps})");
+
+        // Leader midpoint and anchor dot are bright green.
+        let leader_mid = sample(Vec2::new(7.5, 0.0));
+        let leader_dot = sample(Vec2::new(9.0, 0.0));
+        assert!(leader_mid[1] > 200, "leader line should be green, got {leader_mid:?}");
+        assert!(leader_dot[1] > 200, "leader dot should be green, got {leader_dot:?}");
+
+        // Polygon interior is blue.
+        let poly_mid = sample(Vec2::new(-7.5, 0.0));
+        assert!(poly_mid[2] > 180, "polygon fill should be blue, got {poly_mid:?}");
     }
 }

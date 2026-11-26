@@ -42,7 +42,7 @@ fn all_wgsl_shaders_parse_and_validate() {
         // (glyph_scene/regions.rs). library_faces.wgsl (2026-10-10, the page
         // faces' compute pass) and library_regions.wgsl's compute half were
         // retired 2026-10-26: the host composes both now.
-        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_regions.wgsl", "mesh.wgsl", "quad_field.wgsl", "wall_cells.wgsl", "wall_paper.wgsl"],
+        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_regions.wgsl", "mesh.wgsl", "quad_field.wgsl", "wall_cells.wgsl", "wall_paper.wgsl", "wall_shapes.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 
@@ -81,6 +81,12 @@ fn all_wgsl_shaders_parse_and_validate() {
                     }
                     if name == "WallPaperUniform" {
                         assert_eq!(span, 80, "WallPaperUniform WGSL struct size must match wall::paper WallPaperUniform (80 B)");
+                    }
+                    if name == "ShapeFrameUniform" {
+                        assert_eq!(span, 80, "ShapeFrameUniform WGSL struct size must match wall::shapes ShapeFrameUniform (80 B)");
+                    }
+                    if name == "ShapeGpu" {
+                        assert_eq!(span, 80, "ShapeGpu WGSL struct size must match wall::shapes ShapeGpu (80 B)");
                     }
                 }
             }
