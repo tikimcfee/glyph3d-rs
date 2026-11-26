@@ -11,6 +11,7 @@
 //! while the wall's own menu is open, while handing right-clicks on the focused
 //! mouse-reporting terminal's body to that program unless Shift bypasses capture.
 
+use crate::chord::{chord_label, copy_label, paste_label};
 use crate::geom::Point;
 use crate::input::{Button, Mods, Platform};
 
@@ -435,37 +436,6 @@ impl MenuItem {
     /// Whether this item is a visual section separator.
     pub const fn is_sep(&self) -> bool {
         matches!(self, Self::Sep { .. })
-    }
-}
-
-// Private stand-ins for `wall/chord.js` until `crate::chord` lands.
-fn copy_label(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Mac => "⌘C",
-        Platform::Other => "Ctrl+Shift+C",
-    }
-}
-
-fn paste_label(platform: Platform) -> &'static str {
-    match platform {
-        Platform::Mac => "⌘V",
-        Platform::Other => "Ctrl+Shift+V",
-    }
-}
-
-fn chord_label(platform: Platform, keys: &[&str], shift: bool) -> String {
-    match platform {
-        Platform::Mac => {
-            let mod_str = if shift { "⌘⇧" } else { "⌘" };
-            keys.iter()
-                .map(|k| format!("{mod_str}{k}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-        Platform::Other => {
-            let shift_str = if shift { "Shift+" } else { "" };
-            format!("Ctrl+Alt+{shift_str}{}", keys.join(" "))
-        }
     }
 }
 

@@ -18,7 +18,11 @@ pub mod chord;
 pub mod commands;
 pub mod config;
 pub mod dock;
+<<<<<<< HEAD
 pub mod groups;
+=======
+pub mod fullscreen;
+>>>>>>> wall-core-menu
 pub mod keymap;
 pub mod labels;
 pub mod layout;
