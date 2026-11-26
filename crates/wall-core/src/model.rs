@@ -27,25 +27,20 @@ use std::sync::{Arc, Mutex};
 
 use crate::camera::{CameraPose, WallCamera};
 use crate::config::{CopyOnSelect, GroupLayout, WallConfig};
-use crate::dock::{dock_layout, DockPanel, DockSide, DockState};
+use crate::dock::dock_layout;
 use crate::geom::{Point, Rect};
 use crate::layout::{
     cycle, free_flow_slot, hit_test, lasso_touches, pad_rect, reading_order, tile_layout,
-    union_rect, z_stack_layout, Hit, HitPart, HitTarget, ReadingItem, Size as LayoutSize,
-    TileOptions, ZStackOptions, BAR_ROOM, DEFAULT_FIT_MARGIN,
+    union_rect, z_stack_layout, Hit, HitPart, HitTarget, ReadingItem, Size, TileOptions,
+    ZStackOptions, BAR_ROOM, DEFAULT_FIT_MARGIN,
 };
 use crate::menu::MenuTarget;
 use crate::settings::{KnobInput, KnobValue};
 use crate::snap::{snap_step, snap_to, GridSpec};
-use crate::split::{
-    self, Direction, Divider, InsertSide, PaneMap, Size as SplitSize, SplitDir, SplitNode,
-};
-// The store keeps the split tree in split.rs's own types (one definition).
-use crate::split::{SplitDir as StoreSplitDir, SplitNode as StoreSplitNode};
+use crate::split::{self, Direction, Divider, InsertSide, PaneMap, SplitDir};
 use crate::store::{
-    HelpPanelPatch, HelpPanelState, PanelSide, SettingsPanelPatch, SettingsPanelState,
-    SidebarPatch, SidebarState, 
-    StatusWindowPatch, StatusWindowState, Storage, WallGroup, WallSplit, WallStore,
+    HelpPanelPatch, HelpPanelState, SettingsPanelPatch, SettingsPanelState, SidebarPatch,
+    SidebarState, StatusWindowPatch, StatusWindowState, Storage, WallGroup, WallSplit, WallStore,
 };
 
 /// Screen-space half-width of the border resize grab band in pixels (`EDGE_GRAB_PX`).
@@ -370,44 +365,6 @@ fn group_numeral(gid: &str) -> u64 {
     gid.strip_prefix("g-")
         .and_then(|digits| digits.parse::<u64>().ok())
         .unwrap_or(0)
-}
-
-const fn to_dock_side(side: PanelSide) -> DockSide {
-    match side {
-        PanelSide::Left => DockSide::Left,
-        PanelSide::Right => DockSide::Right,
-        PanelSide::Float => DockSide::Float,
-    }
-}
-
-fn split_from_store(node: &StoreSplitNode) -> SplitNode {
-    match node {
-        StoreSplitNode::Leaf { id } => SplitNode::leaf(id.clone()),
-        StoreSplitNode::Branch { dir, ratio, a, b } => SplitNode::branch(
-            match dir {
-                StoreSplitDir::Row => SplitDir::Row,
-                StoreSplitDir::Col => SplitDir::Col,
-            },
-            *ratio,
-            split_from_store(a),
-            split_from_store(b),
-        ),
-    }
-}
-
-fn split_to_store(node: &SplitNode) -> StoreSplitNode {
-    match node {
-        SplitNode::Leaf { id } => StoreSplitNode::Leaf { id: id.clone() },
-        SplitNode::Branch { dir, ratio, a, b } => StoreSplitNode::Branch {
-            dir: match dir {
-                SplitDir::Row => StoreSplitDir::Row,
-                SplitDir::Col => StoreSplitDir::Col,
-            },
-            ratio: *ratio,
-            a: Box::new(split_to_store(a)),
-            b: Box::new(split_to_store(b)),
-        },
-    }
 }
 
 /// Extract the last non-blank line from visible screen lines for `TerminalSnapshot::preview`.
@@ -1007,16 +964,7 @@ impl WallModel {
                 .expect("keep_flow checked flow is Some")
                 .origin
         } else {
-            let sidebar = self.store.sidebar();
-            let status = self.store.status_window();
-            let settings = self.store.settings_panel();
-            let help = self.store.help_panel();
-            let docked = dock_layout(&DockState {
-                sidebar: DockPanel::new(sidebar.open, to_dock_side(sidebar.side)),
-                status_window: DockPanel::new(status.open, to_dock_side(status.side)),
-                settings_panel: Some(DockPanel::new(settings.open, to_dock_side(settings.side))),
-                help_panel: Some(DockPanel::new(help.open, to_dock_side(help.side))),
-            });
+            let docked = dock_layout(&crate::fullscreen::dock_state_from_store(&self.store));
             let (view_w, _) = self.camera.view();
             let dx_px = if view_w > docked.edges.left + docked.edges.right {
                 (docked.edges.left - docked.edges.right) * 0.5
@@ -1971,7 +1919,7 @@ impl WallModel {
             WallGroup {
                 name: name.trim().to_owned(),
                 layout: chosen_layout,
-                columns: chosen_cols,
+                columns: chosen_cols as usize,
                 gap: chosen_gap,
                 origin,
                 members,
@@ -2016,13 +1964,13 @@ impl WallModel {
                 continue;
             }
             if let Some(ref mut split_state) = group.split {
-                let mut tree = split_from_store(&split_state.tree);
+                let mut tree = split_state.tree.clone();
                 for id in &leaving {
                     if let Some(collapsed) = split::remove(&tree, id) {
                         tree = collapsed;
                     }
                 }
-                split_state.tree = split_to_store(&tree);
+                split_state.tree = tree;
             }
             self.store.set_group(&gid, group);
             self.relayout_group(&gid);
@@ -2122,10 +2070,9 @@ impl WallModel {
             return Err("a split needs its rect".to_owned());
         };
         let sr = Rect::from_top_left(origin.x, origin.y, split_state.w, split_state.h);
-        let tree = split_from_store(&split_state.tree);
         let min_pane = self.min_pane_size(split_state.bars);
         let next_ratio = split::ratio_for(
-            &tree,
+            &split_state.tree,
             sr,
             self.config.split_gap,
             path,
@@ -2133,21 +2080,22 @@ impl WallModel {
             |_| min_pane,
         )
         .map_err(|e| e.to_string())?;
-        let updated = split::set_ratio(&tree, path, next_ratio).map_err(|e| e.to_string())?;
-        split_state.tree = split_to_store(&updated);
+        let updated =
+            split::set_ratio(&split_state.tree, path, next_ratio).map_err(|e| e.to_string())?;
+        split_state.tree = updated;
         self.store.set_group(gid, group);
         self.relayout_group(gid);
         self.emit_change();
         Ok(())
     }
 
-    fn min_pane_size(&self, bars: bool) -> SplitSize {
+    fn min_pane_size(&self, bars: bool) -> Size {
         let room = if bars {
             self.config.split_bar_rows * self.geometry.stride.y
         } else {
             0.0
         };
-        SplitSize::new(
+        Size::new(
             f64::from(MIN_PANE_COLS) * self.geometry.stride.x + 2.0 * self.geometry.padding.x,
             f64::from(MIN_PANE_ROWS) * self.geometry.stride.y
                 + 2.0 * self.geometry.padding.y
@@ -2180,7 +2128,7 @@ impl WallModel {
         Ok(WallGroup {
             name: name.to_owned(),
             layout: GroupLayout::Split,
-            columns,
+            columns: columns as usize,
             gap,
             origin: Some(Point::new(bounds.min_x, bounds.max_y + room)),
             members: members.to_vec(),
@@ -2188,7 +2136,7 @@ impl WallModel {
                 w: bounds.width(),
                 h: bounds.height() + room,
                 bars,
-                tree: split_to_store(&tree),
+                tree,
             }),
         })
     }
@@ -2226,9 +2174,8 @@ impl WallModel {
             .split
             .clone()
             .expect("split group carries WallSplit");
-        let base_tree = split_from_store(&split_state.tree);
         let next_tree = split::insert(
-            &base_tree,
+            &split_state.tree,
             at,
             id,
             axis.split_dir(),
@@ -2244,7 +2191,7 @@ impl WallModel {
         }
 
         let next_members = split::leaves(&next_tree);
-        split_state.tree = split_to_store(&next_tree);
+        split_state.tree = next_tree;
         let next_group = WallGroup {
             members: next_members,
             split: Some(split_state),
@@ -2282,16 +2229,16 @@ impl WallModel {
                     .origin
                     .or_else(|| self.origin_of_members(&shown))
                     .unwrap_or_default();
-                let sizes: Vec<LayoutSize> = shown
+                let sizes: Vec<Size> = shown
                     .iter()
                     .filter_map(|id| {
                         self.terminal_rect(id)
-                            .map(|r| LayoutSize::new(r.width(), r.height()))
+                            .map(|r| Size::new(r.width(), r.height()))
                     })
                     .collect();
                 let Ok(tiled) = tile_layout(
                     &sizes,
-                    TileOptions::new(origin, group.columns.max(1) as usize, group.gap.max(0.0)),
+                    TileOptions::new(origin, group.columns.max(1), group.gap.max(0.0)),
                 ) else {
                     return;
                 };
@@ -2316,8 +2263,7 @@ impl WallModel {
                 };
                 let split_rect =
                     Rect::from_top_left(origin.x, origin.y, split_state.w, split_state.h);
-                let tree = split_from_store(&split_state.tree);
-                let pane_rects = split::panes(&tree, split_rect, self.config.split_gap);
+                let pane_rects = split::panes(&split_state.tree, split_rect, self.config.split_gap);
 
                 let mut resizes: Vec<(String, u32, u32)> = Vec::new();
                 for (id, pr) in &pane_rects {
@@ -2435,8 +2381,7 @@ impl WallModel {
         let origin = group.origin?;
         let sp = group.split.as_ref()?;
         let split_rect = Rect::from_top_left(origin.x, origin.y, sp.w, sp.h);
-        let tree = split_from_store(&sp.tree);
-        split::divider_at(&tree, split_rect, self.config.split_gap, point, tol)
+        split::divider_at(&sp.tree, split_rect, self.config.split_gap, point, tol)
     }
 
     // ── knobs, panels, context menu, notices, clipboard, snapshot ───────────
@@ -2609,7 +2554,7 @@ impl WallModel {
                     name,
                     named: !g.name.is_empty(),
                     layout: g.layout,
-                    columns: g.columns,
+                    columns: g.columns as u32,
                     gap: g.gap,
                     bars: g.split.as_ref().map(|s| s.bars),
                     members: g
@@ -2644,6 +2589,7 @@ impl WallModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::PanelSide;
     use crate::menu::TerminalPart;
 
     fn make_wall_with_storage(storage: MemoryStorage, scope: &str) -> WallModel {

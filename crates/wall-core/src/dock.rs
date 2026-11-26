@@ -6,6 +6,8 @@
 //! in a fixed priority order: sidebar first, then the `termd` status window,
 //! then settings, then help. Closed or floating panels consume no edge width.
 
+use serde::{Deserialize, Serialize};
+
 /// Width of each panel when docked to a viewport edge, in CSS pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DockWidths {
@@ -27,12 +29,32 @@ pub const DOCK_WIDTHS: DockWidths = DockWidths {
 pub const TOPBAR_EDGE_GAP: f64 = 12.0;
 
 /// Where a panel is placed: stuck to the left or right edge, or floating freely.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DockSide {
     Left,
     Right,
     #[default]
     Float,
+}
+
+impl DockSide {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DockSide::Left => "left",
+            DockSide::Right => "right",
+            DockSide::Float => "float",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "left" => Some(DockSide::Left),
+            "right" => Some(DockSide::Right),
+            "float" => Some(DockSide::Float),
+            _ => None,
+        }
+    }
 }
 
 /// Whether one chrome panel is open and which side it occupies.

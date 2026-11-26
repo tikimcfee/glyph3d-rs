@@ -50,18 +50,8 @@ impl fmt::Display for SplitError {
 
 impl std::error::Error for SplitError {}
 
-/// A 2D extent in world units (`{ w, h }` in JS).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Size {
-    pub w: f64,
-    pub h: f64,
-}
-
-impl Size {
-    pub const fn new(w: f64, h: f64) -> Size {
-        Size { w, h }
-    }
-}
+/// A 2D extent in world units (`{ w, h }` in JS; unified with [`crate::layout::Size`]).
+pub use crate::layout::Size;
 
 /// How a split branch cuts its rectangle (`'row' | 'col'`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
