@@ -17,6 +17,8 @@ pub mod glyphs;
 pub mod keys;
 pub mod labels;
 pub mod metrics;
+#[cfg(feature = "egui-ui")]
+pub mod panels;
 pub mod paper;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
