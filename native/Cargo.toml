@@ -37,6 +37,8 @@ glyph-vt = { path = "../crates/glyph-vt" }
 # The door a command line reaches the running wall by: `wallctl <verb ...>`.
 wall-control = { path = "../crates/wall-control" }
 term-session = { path = "../crates/term-session" }
+# The wall's live gomuxai fleet, session list, and transcript streams (`agent` CLI).
+agent-feed = { path = "../crates/agent-feed" }
 # The wall's runtime Slug font encoder, sprites, clusters, and growable atlas.
 glyph-font = { path = "../crates/glyph-font" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
