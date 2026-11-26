@@ -515,6 +515,8 @@ struct WallCore {
     /// Last `Screen::title` observed per terminal so unchanged fills never allocate
     /// and an empty `Screen::title` never clobbers a title delivered by `Event::Title`.
     last_screen_titles: HashMap<String, String>,
+    /// Per-terminal Agent View stick-to-bottom pin state (`wall.agent.follow`, defaults to `true`).
+    agent_stick_bottom: HashMap<String, bool>,
     preview_scratch: String,
     pressed_keys: PressedKeys,
     termd: TermdStatus,
@@ -1144,6 +1146,7 @@ impl WallCore {
             selections: HashMap::new(),
             selection_text_cache: HashMap::new(),
             last_screen_titles: HashMap::new(),
+            agent_stick_bottom: HashMap::new(),
             preview_scratch: String::new(),
             pressed_keys: PressedKeys::new(),
             termd: TermdStatus::new(opts.namespace),
@@ -1732,6 +1735,7 @@ impl WallCore {
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
         self.last_screen_titles.remove(id);
+        self.agent_stick_bottom.remove(id);
         self.model.deselect_one_raw(id);
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -1967,6 +1971,7 @@ impl WallCore {
         self.selections.remove(id);
         self.selection_text_cache.remove(id);
         self.last_screen_titles.remove(id);
+        self.agent_stick_bottom.remove(id);
         self.names.prune(|tid| self.model.terminal(tid).is_some());
         if self.fullscreen.active() {
             let owned = id.to_owned();
@@ -2686,6 +2691,13 @@ impl WallApi for WallCore {
 
     fn show(&mut self, id: &str) -> Result<(), String> {
         self.show_terminal(id);
+        Ok(())
+    }
+
+    fn focus(&mut self, id: &str) -> Result<(), String> {
+        if !self.focus(Some(id), false) {
+            return Err(format!("no terminal '{id}'"));
+        }
         Ok(())
     }
 
@@ -3424,12 +3436,19 @@ impl WallApi for WallCore {
     }
 
     fn agent_jump(&mut self, id: &str, target: &str) -> Result<AgentJumpResult, String> {
+        if self.model.terminal(id).is_some_and(|t| t.modes.alt_screen) {
+            let msg = format!(
+                "{} is on the alternate screen — primary scrollback jump is unavailable while a full-screen TUI is active",
+                self.model.name_of(id)
+            );
+            self.model.notify(msg.clone(), self.now_ms);
+            return Err(msg);
+        }
         if target == "live" {
-            self.model.push_effect(WallEffect::ScrollTerminal {
+            self.model.push_effect(WallEffect::ScrollTerminalLive {
                 id: id.to_owned(),
-                lines: 0,
-                cell: Point::new(0.0, 0.0),
             });
+            self.model.notify_changed();
             return Ok(AgentJumpResult {
                 live: true,
                 event_id: String::new(),
@@ -3441,6 +3460,37 @@ impl WallApi for WallCore {
 
     fn agent_load_earlier(&mut self, _id: &str) -> Result<AgentEarlierResult, String> {
         Ok(AgentEarlierResult { loaded: 0 })
+    }
+
+    fn palette_open(&self) -> bool {
+        self.palette_open
+    }
+
+    fn set_palette_open(&mut self, open: bool) {
+        if self.palette_open != open {
+            self.palette_open = open;
+            self.model.notify_changed();
+        }
+    }
+
+    fn agent_set_stick_bottom(&mut self, id: &str, mode: &str) -> Result<bool, String> {
+        if self.model.terminal(id).is_none() {
+            return Err(format!("no terminal '{id}'"));
+        }
+        let cur = self.agent_stick_bottom.get(id).copied().unwrap_or(true);
+        let next = match mode {
+            "off" => false,
+            "toggle" => !cur,
+            "on" | "tail" => true,
+            other => {
+                return Err(format!(
+                    "agent follow takes tail|on|off|toggle, not '{other}'"
+                ));
+            }
+        };
+        self.agent_stick_bottom.insert(id.to_owned(), next);
+        self.model.notify_changed();
+        Ok(next)
     }
 
     fn relay_endpoint(&self) -> Option<(String, u16)> {
@@ -3493,8 +3543,8 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
     router.register(
         "terminal.scroll",
         RegisterMeta {
-            description: "Scroll a terminal's scrollback view by N lines at cell (x, y)",
-            usage: "<id> <lines> [cell_x cell_y]",
+            description: "Scroll a terminal's scrollback view (+ = up into history, - = down toward live, or `live`)",
+            usage: "<id> <lines | live> [cell_x cell_y]",
             returns: "",
         },
         |args, core, _meta| {
@@ -3504,9 +3554,18 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
             if core.model.terminal(id).is_none() {
                 return Ok(CommandReply::err(format!("no terminal '{id}'")));
             }
+            if args.get(1).map(String::as_str) == Some("live") {
+                core.model
+                    .push_effect(WallEffect::ScrollTerminalLive { id: id.clone() });
+                core.model.notify_changed();
+                return Ok(CommandReply::ok(
+                    format!("terminal '{id}' scroll live"),
+                    Some(json!({ "id": id, "live": true, "offset": 0 })),
+                ));
+            }
             let lines: i32 = match args.get(1).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
-                None => return Ok(CommandReply::err("lines must be an integer")),
+                None => return Ok(CommandReply::err("lines must be an integer or 'live'")),
             };
             let cx: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let cy: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -4703,6 +4762,61 @@ impl Wall {
 
     pub fn termd(&self) -> &TermdStatus {
         &self.router.context.termd
+    }
+
+    /// Host platform conventions configured on this wall (`Platform::Mac` or `Platform::Other`).
+    pub fn platform(&self) -> Platform {
+        self.router.context.platform
+    }
+
+    /// Latest gomuxai agent bus snapshot set via [`Self::set_bus_snapshot`], if any.
+    pub fn bus_snapshot(&self) -> Option<&GomuxSnapshot> {
+        self.router.context.bus.as_ref()
+    }
+
+    /// Diagnostic reason paired with [`Self::bus_snapshot`] when gomuxai is unavailable.
+    pub fn bus_reason(&self) -> &str {
+        &self.router.context.bus_reason
+    }
+
+    /// Projected [`crate::sidebar::BusSnapshot`] ready for the sidebar and command palette panels.
+    pub fn sidebar_bus_snapshot(&self) -> crate::sidebar::BusSnapshot {
+        let Some(snap) = self.router.context.bus.as_ref() else {
+            return crate::sidebar::BusSnapshot {
+                host: String::new(),
+                reason: self.router.context.bus_reason.clone(),
+                agents: Vec::new(),
+            };
+        };
+        crate::sidebar::BusSnapshot {
+            host: snap.host.clone().unwrap_or_default(),
+            reason: self.router.context.bus_reason.clone(),
+            agents: snap
+                .agents
+                .iter()
+                .map(|a| crate::sidebar::BusAgentInput {
+                    name: a.name.clone(),
+                    host: a.host.clone().unwrap_or_default(),
+                    live: a.live,
+                    status: a.status.clone().unwrap_or_default(),
+                    end_reason: a.end_reason.clone().unwrap_or_default(),
+                    attached: a.attached,
+                    detail: a.detail.clone().unwrap_or_default(),
+                    cwd: a.cwd.clone().unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether terminal `id`'s Agent View scroll list is currently pinned to its live tail
+    /// (`wall.agent.follow`; defaults to `true`).
+    pub fn agent_stick_bottom(&self, id: &str) -> bool {
+        self.router
+            .context
+            .agent_stick_bottom
+            .get(id)
+            .copied()
+            .unwrap_or(true)
     }
 
     pub fn cursor(&self) -> CursorIcon {

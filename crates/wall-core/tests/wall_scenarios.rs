@@ -83,6 +83,7 @@ struct Harness {
     pasted: Vec<(String, String)>,
     mouse_events: Vec<(String, TerminalMouseEvent)>,
     scrolls: Vec<(String, i32)>,
+    scroll_lives: Vec<String>,
     resizes: Vec<(String, u32, u32)>,
     kills: Vec<String>,
     cursors: Vec<CursorIcon>,
@@ -119,6 +120,7 @@ impl Harness {
             pasted: Vec::new(),
             mouse_events: Vec::new(),
             scrolls: Vec::new(),
+            scroll_lives: Vec::new(),
             resizes: Vec::new(),
             kills: Vec::new(),
             cursors: Vec::new(),
@@ -166,6 +168,9 @@ impl Harness {
                     }
                     WallEffect::ScrollTerminal { id, lines, .. } => {
                         self.scrolls.push((id, lines));
+                    }
+                    WallEffect::ScrollTerminalLive { id } => {
+                        self.scroll_lives.push(id);
                     }
                     WallEffect::WriteClipboard { text } => {
                         self.clipboard = text;
@@ -1898,5 +1903,236 @@ fn screen_fill_updates_preview_and_adopted_title_only_when_changed() {
     ));
     assert_eq!(h.wall.terminal("t1").expect("t1").preview, "next line");
     assert_eq!(h.wall.name_of("t1"), "daemon-title");
+}
+
+// ── Panel/smoke findings (a)-(e) ─────────────────────────────────────────────
+
+#[test]
+fn verbs_palette_focus_without_framing_and_agent_follow() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // (a1) wall.palette toggle|open|close
+    assert!(!h.wall.palette_open());
+    assert!(!h.frame().palette_open);
+    h.run_ok("wall.palette toggle");
+    assert!(h.wall.palette_open());
+    assert!(h.frame().palette_open);
+    h.run_ok("wall.palette open");
+    assert!(h.wall.palette_open());
+    h.run_ok("wall.palette close");
+    assert!(!h.wall.palette_open());
+    assert!(h.wall.run("wall.palette sideways").is_err());
+
+    // (a2) wall.focus <id> focuses & raises without moving or easing the camera.
+    assert_eq!(h.wall.focused_id(), Some(t2.as_str()));
+    let cam_before = h.wall.camera().pose();
+    h.run_ok(&format!("wall.focus {t1}"));
+    assert_eq!(h.wall.focused_id(), Some(t1.as_str()));
+    assert_eq!(
+        h.wall.camera().pose(),
+        cam_before,
+        "wall.focus must not move the camera"
+    );
+    assert!(
+        h.wall.camera().target().is_none(),
+        "wall.focus must not start a camera ease (unlike wall.reveal)"
+    );
+    assert!(
+        h.wall.terminal(&t1).expect("t1").z > h.wall.terminal(&t2).expect("t2").z,
+        "wall.focus must still raise the focused terminal"
+    );
+
+    // (a3) wall.agent.follow <id> [tail|on|off|toggle]
+    assert!(h.wall.agent_stick_bottom(&t1));
+    h.run_ok(&format!("wall.agent.follow {t1} off"));
+    assert!(!h.wall.agent_stick_bottom(&t1));
+    h.run_ok(&format!("wall.agent.follow {t1}"));
+    assert!(h.wall.agent_stick_bottom(&t1));
+    h.run_ok(&format!("wall.agent.follow {t1} toggle"));
+    assert!(!h.wall.agent_stick_bottom(&t1));
+    h.run_ok(&format!("wall.agent.follow {t1} on"));
+    assert!(h.wall.agent_stick_bottom(&t1));
+    assert!(h.wall.run(format!("wall.agent.follow {t1} bogus")).is_err());
+}
+
+#[test]
+fn accessors_expose_bus_snapshot_and_platform() {
+    use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+
+    let mut mac = Harness::with_platform(Platform::Mac);
+    assert_eq!(mac.wall.platform(), Platform::Mac);
+    assert!(mac.wall.bus_snapshot().is_none());
+
+    let linux = Harness::with_platform(Platform::Other);
+    assert_eq!(linux.wall.platform(), Platform::Other);
+
+    let snap = GomuxSnapshot {
+        gen: 7,
+        host: Some("laptop-2".to_owned()),
+        dirs: vec!["/tmp/gomux".to_owned()],
+        agents: vec![GomuxAgent {
+            name: "wall-lead".to_owned(),
+            host: Some("laptop-2".to_owned()),
+            live: true,
+            status: Some("processing".to_owned()),
+            attached: Some(true),
+            detail: Some("integrating".to_owned()),
+            cwd: Some("/Users/lugo/localdev/glyph3d-rs".to_owned()),
+            ..GomuxAgent::default()
+        }],
+    };
+    mac.wall.set_bus_snapshot(Some(snap.clone()), "");
+    assert_eq!(mac.wall.bus_snapshot(), Some(&snap));
+    assert_eq!(mac.wall.bus_reason(), "");
+
+    let projected = mac.wall.sidebar_bus_snapshot();
+    assert_eq!(projected.host, "laptop-2");
+    assert_eq!(projected.agents.len(), 1);
+    assert_eq!(projected.agents[0].name, "wall-lead");
+    assert_eq!(projected.agents[0].status, "processing");
+    assert!(projected.agents[0].live);
+}
+
+#[test]
+fn wheel_over_unfocused_terminal_covering_focused_pans_and_scroll_sign_matches_js() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok("wall.snap off");
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // Focus t1 so it is active, then verify scroll sign:
+    // negative DOM delta_y (scroll up) emits POSITIVE lines (+ = up into scrollback history),
+    // positive DOM delta_y (scroll down) emits NEGATIVE lines (- = down toward live).
+    h.run_ok(&format!("wall.focus {t1}"));
+    let t1_center = rect_center(h.wall.terminal_rect(&t1).expect("t1 rect"));
+    let t1_screen = h.screen_pt(t1_center);
+
+    h.scrolls.clear();
+    h.now_ms += 400.0;
+    h.wall.wheel(&WheelEvent {
+        x: t1_screen.x,
+        y: t1_screen.y,
+        delta_x: 0.0,
+        delta_y: -120.0,
+        delta_mode: DeltaMode::Pixel,
+        mods: MODS_NONE,
+        time_ms: h.now_ms,
+    });
+    h.settle();
+    assert!(
+        !h.scrolls.is_empty() && h.scrolls.iter().all(|(id, lines)| id == &t1 && *lines > 0),
+        "wheel up (delta_y < 0) must emit positive lines (+ = up into history), got {:?}",
+        h.scrolls
+    );
+
+    h.scrolls.clear();
+    h.now_ms += 400.0;
+    h.wall.wheel(&WheelEvent {
+        x: t1_screen.x,
+        y: t1_screen.y,
+        delta_x: 0.0,
+        delta_y: 120.0,
+        delta_mode: DeltaMode::Pixel,
+        mods: MODS_NONE,
+        time_ms: h.now_ms,
+    });
+    h.settle();
+    assert!(
+        !h.scrolls.is_empty() && h.scrolls.iter().all(|(id, lines)| id == &t1 && *lines < 0),
+        "wheel down (delta_y > 0) must emit negative lines (- = down toward live), got {:?}",
+        h.scrolls
+    );
+
+    // Exact occlusion repro: drag unfocused t2's title bar directly over focused t1 so t2 rises
+    // above t1 while t1 remains focused.
+    let bar2 = h
+        .frame()
+        .title_bars
+        .into_iter()
+        .find(|b| b.terminal_id == t2)
+        .expect("t2 title bar");
+    let r1 = h.wall.terminal_rect(&t1).expect("t1 rect");
+    let r2 = h.wall.terminal_rect(&t2).expect("t2 rect");
+    let drag_from = rect_center(bar2.rect);
+    let drag_to = Point::new(
+        drag_from.x + (r1.min_x - r2.min_x),
+        drag_from.y + (r1.max_y - r2.max_y),
+    );
+    h.drag_world(drag_from, drag_to, MODS_NONE);
+
+    assert_eq!(
+        h.wall.focused_id(),
+        Some(t1.as_str()),
+        "dragging t2's title bar must keep t1 focused"
+    );
+    assert!(
+        h.wall.terminal(&t2).expect("t2").z > h.wall.terminal(&t1).expect("t1").z,
+        "dragged t2 must sit above focused t1"
+    );
+
+    // Wheel over t1's center (now covered by unfocused t2): must pan canvas, NOT scroll t1.
+    let covered_screen = h.screen_pt(rect_center(h.wall.terminal_rect(&t1).expect("t1")));
+    let cam_before = h.wall.camera().pose();
+    h.scrolls.clear();
+    h.now_ms += 400.0;
+    h.wall.wheel(&WheelEvent {
+        x: covered_screen.x,
+        y: covered_screen.y,
+        delta_x: 0.0,
+        delta_y: -120.0,
+        delta_mode: DeltaMode::Pixel,
+        mods: MODS_NONE,
+        time_ms: h.now_ms,
+    });
+    h.settle();
+    assert!(
+        h.scrolls.is_empty(),
+        "wheel over unfocused t2 covering focused t1 must NOT scroll hidden t1, got {:?}",
+        h.scrolls
+    );
+    assert_ne!(
+        h.wall.camera().pose(),
+        cam_before,
+        "wheel over unfocused covering terminal must pan the canvas"
+    );
+}
+
+#[test]
+fn agent_jump_live_and_terminal_scroll_live_emit_scroll_live_effect() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+
+    // `wall.agent.jump <id> live` emits ScrollTerminalLive (not a no-op 0-line delta).
+    h.scrolls.clear();
+    h.scroll_lives.clear();
+    h.run_ok(&format!("wall.agent.jump {t1} live"));
+    assert!(h.scrolls.is_empty(), "jump live must not emit zero-line delta");
+    assert_eq!(h.scroll_lives, vec![t1.clone()]);
+
+    // `terminal.scroll <id> live` also emits ScrollTerminalLive.
+    h.scroll_lives.clear();
+    h.run_ok(&format!("terminal.scroll {t1} live"));
+    assert_eq!(h.scroll_lives, vec![t1.clone()]);
+
+    // While on alternate screen, `wall.agent.jump <id> live` refuses cleanly.
+    h.scroll_lives.clear();
+    h.wall.terminal_modes(
+        &t1,
+        Modes {
+            alt_screen: true,
+            ..Default::default()
+        },
+    );
+    let reply = h.wall.run(format!("wall.agent.jump {t1} live"));
+    assert!(reply.is_err(), "jump live should refuse on alternate screen");
+    assert!(reply.text.contains("alternate screen"));
+    h.pump();
+    assert!(h.scroll_lives.is_empty());
 }
 

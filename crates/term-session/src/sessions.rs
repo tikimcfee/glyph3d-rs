@@ -469,6 +469,18 @@ impl Sessions {
         }
     }
 
+    /// Returns terminal `id`'s scrollback view immediately to live (`View::Live`, offset 0).
+    /// No-op while the terminal is ended or showing the alternate screen.
+    pub fn scroll_live(&mut self, id: &str) {
+        let Some(tracked) = self.live.get(id) else {
+            return;
+        };
+        if tracked.session.is_ended() || tracked.session.modes().alt_screen {
+            return;
+        }
+        tracked.session.send_view(View::Live);
+    }
+
     /// Requests `g3d-termd` to send a fresh `REPAINT` for terminal `id`.
     pub fn repaint(&mut self, id: &str) {
         let Some(tracked) = self.live.get(id) else {

@@ -671,6 +671,8 @@ pub trait WallApi {
 
     fn hide(&mut self, id: &str) -> Result<(), String>;
     fn show(&mut self, id: &str) -> Result<(), String>;
+    /// Focus terminal `id` without moving or easing the camera (`wall.focus`).
+    fn focus(&mut self, id: &str) -> Result<(), String>;
     fn focus_and_frame(&mut self, id: &str) -> Result<(), String>;
     fn spawn(&mut self, at: Option<Point>) -> Result<String, String>;
     fn fit_all(&mut self) -> Result<(), String>;
@@ -735,9 +737,15 @@ pub trait WallApi {
     fn group_move_pane(&mut self, id: &str, dir: &str) -> Result<Option<String>, String>;
     fn step_focus_history(&mut self, dir: i32) -> Result<Option<String>, String>;
 
-    // ── Panels, status & context menu ────────────────────────────────────
+    // ── Panels, palette, status & context menu ───────────────────────────
     fn panel(&self, kind: PanelKind) -> PanelPlacement;
     fn set_panel(&mut self, kind: PanelKind, patch: PanelPatch);
+    /// Whether the command palette overlay is currently open (`wall.palette`).
+    fn palette_open(&self) -> bool {
+        false
+    }
+    /// Open or close the command palette overlay (`wall.palette`).
+    fn set_palette_open(&mut self, _open: bool) {}
     fn termd_state(&self) -> String;
     fn termd_dismiss_lost(&mut self) -> bool;
 
@@ -787,6 +795,11 @@ pub trait WallApi {
     fn agent_show_full_body(&mut self, id: &str, event_id: &str) -> Result<(), String>;
     fn agent_jump(&mut self, id: &str, target: &str) -> Result<AgentJumpResult, String>;
     fn agent_load_earlier(&mut self, id: &str) -> Result<AgentEarlierResult, String>;
+    /// Pin/unpin terminal `id`'s Agent View scroll list to the live tail (`wall.agent.follow`).
+    /// `mode` is `"tail"`, `"on"`, `"off"`, or `"toggle"`; returns the resulting `stick_bottom`.
+    fn agent_set_stick_bottom(&mut self, _id: &str, mode: &str) -> Result<bool, String> {
+        Ok(mode != "off")
+    }
 
     /// Active `(host, port)` of the WebSocket relay bridge, or `None` when not running.
     fn relay_endpoint(&self) -> Option<(String, u16)>;
@@ -1018,6 +1031,20 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
                 format!("showed {}", args.join(", ")),
                 Some(json!({ "ids": args })),
             ))
+        },
+    );
+
+    reg(
+        router,
+        "wall.focus",
+        "<id>",
+        "Focus a terminal without moving the camera",
+        |args, wall| {
+            let first_slice = &args[..args.len().min(1)];
+            let ids = terminal_ids(wall, first_slice, 1)?;
+            let id = &ids[0];
+            wall.focus(id)?;
+            Ok(CommandReply::ok(format!("focused {id}"), Some(json!({ "id": id }))))
         },
     );
 
@@ -2369,6 +2396,31 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
 
     reg(
         router,
+        "wall.palette",
+        "[toggle|open|close]",
+        "Open, close or toggle the command palette",
+        |args, wall| {
+            let how = args.first().map_or("toggle", String::as_str);
+            let next = match how {
+                "toggle" => !wall.palette_open(),
+                "open" | "on" => true,
+                "close" | "off" => false,
+                other => {
+                    return Err(format!(
+                        "palette takes toggle|open|close, not '{other}'"
+                    ));
+                }
+            };
+            wall.set_palette_open(next);
+            Ok(CommandReply::ok(
+                if next { "palette open" } else { "palette closed" },
+                Some(json!({ "open": next })),
+            ))
+        },
+    );
+
+    reg(
+        router,
         "wall.agent.earlier",
         "<id>",
         "Load an earlier window of transcript events into a terminal's Agent View",
@@ -2380,6 +2432,30 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
             Ok(CommandReply::ok(
                 format!("loaded {} earlier event(s) on {id}", r.loaded),
                 Some(json!(r)),
+            ))
+        },
+    );
+
+    reg(
+        router,
+        "wall.agent.follow",
+        "<id> [tail|on|off|toggle]",
+        "Pin or unpin a terminal's Agent View to its live tail (clearing unread when pinned)",
+        |args, wall| {
+            let first_slice = &args[..args.len().min(1)];
+            let ids = terminal_ids(wall, first_slice, 1)?;
+            let id = &ids[0];
+            let mode = args.get(1).map_or("tail", String::as_str);
+            if !matches!(mode, "tail" | "on" | "off" | "toggle") {
+                return Err(format!(
+                    "agent follow takes tail|on|off|toggle, not '{mode}'"
+                ));
+            }
+            let stick_bottom = wall.agent_set_stick_bottom(id, mode)?;
+            let state = if stick_bottom { "following tail" } else { "unpinned" };
+            Ok(CommandReply::ok(
+                format!("{id} agent view {state}"),
+                Some(json!({ "id": id, "stickBottom": stick_bottom })),
             ))
         },
     );
@@ -2471,6 +2547,8 @@ mod tests {
         notices: Vec<String>,
         fullscreen: FullscreenStatus,
         panels: BTreeMap<String, PanelPlacement>,
+        palette_open: bool,
+        agent_stick_bottom: BTreeMap<String, bool>,
         termd_state: String,
         termd_lost: bool,
         view: (f64, f64),
@@ -2508,6 +2586,8 @@ mod tests {
                 notices: Vec::new(),
                 fullscreen: FullscreenStatus::default(),
                 panels: BTreeMap::new(),
+                palette_open: false,
+                agent_stick_bottom: BTreeMap::new(),
                 termd_state: "ok".to_string(),
                 termd_lost: false,
                 view: (800.0, 600.0),
@@ -2603,6 +2683,11 @@ mod tests {
             if let Some(t) = self.terms.get_mut(id) {
                 t.hidden = false;
             }
+            Ok(())
+        }
+
+        fn focus(&mut self, id: &str) -> Result<(), String> {
+            self.focused_id = Some(id.to_string());
             Ok(())
         }
 
@@ -3199,6 +3284,25 @@ mod tests {
             Ok(AgentEarlierResult { loaded: 1 })
         }
 
+        fn palette_open(&self) -> bool {
+            self.palette_open
+        }
+
+        fn set_palette_open(&mut self, open: bool) {
+            self.palette_open = open;
+        }
+
+        fn agent_set_stick_bottom(&mut self, id: &str, mode: &str) -> Result<bool, String> {
+            let cur = self.agent_stick_bottom.get(id).copied().unwrap_or(true);
+            let next = match mode {
+                "off" => false,
+                "toggle" => !cur,
+                _ => true,
+            };
+            self.agent_stick_bottom.insert(id.to_string(), next);
+            Ok(next)
+        }
+
         fn relay_endpoint(&self) -> Option<(String, u16)> {
             self.relay.clone()
         }
@@ -3219,7 +3323,8 @@ mod tests {
     fn registers_all_54_wall_verbs_plus_call_and_help_and_feeds_help_sections() {
         let r = wall_router();
         let cmds = r.list_commands();
-        assert_eq!(cmds.len(), 56);
+        // 54 JS wall.* verbs + wall.focus + wall.palette + wall.agent.follow + call + help.
+        assert_eq!(cmds.len(), 59);
 
         let help_verbs: Vec<HelpVerb<'_>> = cmds
             .iter()

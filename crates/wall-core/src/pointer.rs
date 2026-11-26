@@ -2225,7 +2225,15 @@ impl WallPointer {
                 if host.is_shown(&focused_owned) {
                     if let Some(rect) = host.terminal_rect(&focused_owned) {
                         let world = host.to_world(event.x, event.y);
-                        if rect.contains(world) {
+                        // Require the topmost hit at `world` to be the focused terminal so an
+                        // unfocused terminal raised over it pans the canvas instead of scrolling
+                        // the occluded focused terminal underneath.
+                        if rect.contains(world)
+                            && matches!(
+                                host.hit(world),
+                                Some(CanvasHit::Terminal { ref id, .. }) if id == &focused_owned
+                            )
+                        {
                             hit_focused = Some(focused_owned);
                         }
                     }

@@ -484,6 +484,7 @@ impl App {
                     WallEffect::SendMouse { id, event } => sessions.mouse(&id, &event),
                     // wall-core emits +lines for up-into-history; Sessions::scroll takes negative for up.
                     WallEffect::ScrollTerminal { id, lines, cell } => sessions.scroll(&id, lines.saturating_neg(), cell.x, cell.y),
+                    WallEffect::ScrollTerminalLive { id } => sessions.scroll_live(&id),
                     WallEffect::RefreshTerminal { id } => sessions.repaint(&id),
                     _ => {}
                 }
