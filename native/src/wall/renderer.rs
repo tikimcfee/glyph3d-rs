@@ -1202,6 +1202,40 @@ impl WallRenderer {
         }
     }
 
+    /// Load a bundled or installed system font family by name with `line_height_scale` at run
+    /// time, dropping the previous atlas and GPU textures, rebuilding the shared bind group,
+    /// re-measuring cell & line metrics, and forcing every cached terminal to re-pack.
+    ///
+    /// On error (e.g. a family name that is not installed), leaves the current family, atlas,
+    /// metrics, and bind group completely untouched.
+    pub fn reload_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        family_name: &str,
+        line_height_scale: f64,
+    ) -> Result<bool, glyph_font::FontError> {
+        let changed = self
+            .glyphs
+            .reload_family(device, queue, family_name, line_height_scale)?;
+        if !changed {
+            return Ok(false);
+        }
+        self.metrics = self.glyphs.cell_metrics();
+        self.glyphs.apply_line_metrics(&mut self.style);
+        self.shared_bg = make_shared_bg(
+            device,
+            &self.shared_bgl,
+            &self.frame_buf,
+            &self.glyphs,
+            &self.emoji_sampler,
+        );
+        for gpu in self.terminals.values_mut() {
+            gpu.force_repack = true;
+        }
+        Ok(true)
+    }
+
     /// Measure the unclipped world width of `text` drawn at `height` under `zoom`.
     pub fn measure_label_width(&mut self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
         self.glyphs.measure_label_width(text, height.resolve_world(zoom))

@@ -381,12 +381,59 @@ impl App {
         });
         self.wall = Some(wall);
         self.terms = Some(terms);
+        self.sync_font_and_text_knobs(None);
         self.apply_effects();
         if let Some(wall) = &mut self.wall {
             wall.run("wall.fit");
         }
         self.apply_effects();
         self.redraw();
+    }
+
+    /// Apply font family, size, line-height, and text-style knobs from `wall.config()` to the
+    /// renderer and cell geometry, re-wrapping terminals to preserve panel footprints.
+    fn sync_font_and_text_knobs(&mut self, changed_key: Option<&str>) {
+        let (Some(g), Some(wall)) = (&mut self.gfx, &mut self.wall) else { return };
+        let cfg = wall.config();
+        let family = cfg.font_family.clone();
+        let font_size = cfg.font_size;
+        let line_height = cfg.line_height;
+        g.renderer.style_mut().line_thickness_scale = cfg.line_thickness as f32;
+        g.renderer.style_mut().underline_raise = cfg.underline_raise as f32;
+        g.renderer.style_mut().curly_amplitude = cfg.curly_amplitude as f32;
+        g.renderer.style_mut().dim_alpha = cfg.dim_alpha as f32;
+
+        let font_changed = matches!(changed_key, None | Some("fontFamily" | "fontSize" | "lineHeight"));
+        if !font_changed {
+            return;
+        }
+        if matches!(changed_key, None | Some("fontFamily")) {
+            if let Err(err) = g.renderer.reload_font(&self.ctx.device, &self.ctx.queue, &family, line_height) {
+                let kept = g.renderer.glyphs().active_family_name().to_string();
+                log::warn!("wall font '{family}': {err}; keeping '{kept}'");
+                wall.notify(&format!("font '{family}' is not installed — keeping {kept}"));
+                return;
+            }
+        } else if changed_key == Some("lineHeight") {
+            let active = g.renderer.glyphs().active_family_name().to_string();
+            if let Err(err) = g.renderer.reload_font(&self.ctx.device, &self.ctx.queue, &active, line_height) {
+                log::warn!("wall lineHeight {line_height} reload failed: {err}");
+                return;
+            }
+        }
+        let metrics = g.renderer.metrics();
+        let size_factor = (font_size / wall_core::config::FONT_SIZE_DEFAULT).max(0.1) as f32;
+        let active_lh = g.renderer.glyphs().line_height_scale() as f32;
+        let base_cell_h = (metrics.cell_height / active_lh.max(0.1)).max(1e-4);
+        g.cell_scale = (WORLD_CELL_HEIGHT * size_factor) / base_cell_h;
+        g.renderer.style_mut().panel_padding = PANEL_PAD / g.cell_scale;
+        let geom = CellGeometry::with_padding(
+            f64::from(metrics.cell_width * g.cell_scale),
+            f64::from(metrics.cell_height * g.cell_scale),
+            f64::from(PANEL_PAD),
+            f64::from(PANEL_PAD),
+        );
+        wall.set_geometry_preserving_panels(geom);
     }
 
     /// Carry out what the wall asked for, until it asks for nothing more.
@@ -446,6 +493,12 @@ impl App {
                 }
                 return;
             }
+            WallEffect::ConfigKnobChanged { key, value } => {
+                log::debug!("wall knob {key} is now {value:?}");
+                self.sync_font_and_text_knobs(Some(&key));
+                self.redraw();
+                return;
+            }
             other => other,
         };
         let (Some(wall), Some(terms)) = (&mut self.wall, &mut self.terms) else { return };
@@ -458,14 +511,6 @@ impl App {
             WallEffect::SetCursor { cursor } => {
                 if let Some(g) = &self.gfx {
                     g.window.set_cursor(cursor_of(cursor));
-                }
-            }
-            WallEffect::ConfigKnobChanged { key, value } => {
-                // The renderer's own knobs follow here as they are wired; the
-                // rules have already taken the value.
-                log::debug!("wall knob {key} is now {value:?}");
-                if let Some(g) = &self.gfx {
-                    g.window.request_redraw();
                 }
             }
             other => {

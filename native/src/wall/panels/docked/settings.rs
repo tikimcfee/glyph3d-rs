@@ -1105,19 +1105,19 @@ mod tests {
         assert_eq!(state.query, "snap crossing");
         assert_eq!(out, vec!["wall.config snap false"]);
 
-        // Clear and search "fontFamily", then press Enter to step from default `monaspace-neon` to `monaspace-argon`.
+        // Clear and search "groupLayout", then press Enter to step from default `tile` to `freeform`.
         state.query.clear();
         let (out_enum, _) = run_frame(
             &ctx,
             vec![
-                egui::Event::Text("fontFamily".to_string()),
+                egui::Event::Text("groupLayout".to_string()),
                 key_press(egui::Key::Enter),
             ],
             (1280.0, 800.0),
             &mut state,
             &input,
         );
-        assert_eq!(out_enum, vec!["wall.config fontFamily monaspace-argon"]);
+        assert_eq!(out_enum, vec!["wall.config groupLayout freeform"]);
 
         // ArrowDown navigation across matching knobs ("major" matches gridMajorEvery, gridMinPx, gridMajorColor).
         state.query.clear();

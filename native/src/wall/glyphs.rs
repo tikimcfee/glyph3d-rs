@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glyph_font::EmojiSource;
 #[cfg(feature = "wgpu")]
 use glyph_font::{
-    default_font_chain, FamilyId, FontAtlas, FontError, LineMetrics, ResolvedCell, TextureBacking,
-    TextureDirty, CURVE_INITIAL_ROWS, MAP_INITIAL_ROWS, MONASPACE_NEON_FAMILY, TEXTURE_WIDTH,
-    U32S_PER_TEXEL,
+    default_font_chain, normalize_family_key, resolve_family_chain, FamilyId, FontAtlas, FontError,
+    LineMetrics, ResolvedCell, TextureBacking, TextureDirty, CURVE_INITIAL_ROWS, MAP_INITIAL_ROWS,
+    MONASPACE_NEON_FAMILY, TEXTURE_WIDTH, U32S_PER_TEXEL,
 };
 #[cfg(feature = "wgpu")]
 use term_cells::{Cell, Screen};
@@ -791,8 +791,13 @@ fn create_emoji_texture(
 /// textures — a complete drop-in for `wall_cells.wgsl` group 0 bindings 1, 2, and 3.
 #[cfg(feature = "wgpu")]
 pub struct GlyphSource {
+    fonts_dir: PathBuf,
+    curve_rows_cfg: u32,
+    map_rows_cfg: u32,
     atlas: FontAtlas,
     active_family: FamilyId,
+    active_family_name: String,
+    line_height_scale: f64,
     curves_tex: wgpu::Texture,
     curves_view: wgpu::TextureView,
     glyphmap_tex: wgpu::Texture,
@@ -879,8 +884,13 @@ impl GlyphSource {
         );
 
         Ok(Self {
+            fonts_dir: fonts_dir.to_path_buf(),
+            curve_rows_cfg: curve_rows,
+            map_rows_cfg: map_rows,
             atlas,
             active_family,
+            active_family_name: MONASPACE_NEON_FAMILY.to_string(),
+            line_height_scale: 1.0,
             curves_tex,
             curves_view,
             glyphmap_tex,
@@ -906,6 +916,73 @@ impl GlyphSource {
         self.active_family
     }
 
+    /// Name of the currently loaded font family (bundled id or system family name).
+    #[inline]
+    pub fn active_family_name(&self) -> &str {
+        &self.active_family_name
+    }
+
+    /// Currently active vertical line-height multiplier (`1.0` default).
+    #[inline]
+    pub fn line_height_scale(&self) -> f64 {
+        self.line_height_scale
+    }
+
+    /// Load `family_name` (bundled id or installed system font name on macOS/Linux) with
+    /// `line_height_scale` into a fresh [`FontAtlas`] and fresh GPU `curves`/`glyphmap`
+    /// textures, dropping the previous atlas and textures immediately (zero leak).
+    ///
+    /// Returns `Ok(false)` if the requested family and line height are already active,
+    /// `Ok(true)` if reloaded (callers must rebuild bind groups over `glyphmap_view`/`curves_view`
+    /// and repack terminals), or `Err(FontError)` if the family is not installed (leaving the
+    /// current atlas and textures untouched).
+    pub fn reload_family(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        family_name: &str,
+        line_height_scale: f64,
+    ) -> Result<bool, FontError> {
+        let scale = if line_height_scale.is_finite() && line_height_scale > 0.0 {
+            line_height_scale
+        } else {
+            1.0
+        };
+        if normalize_family_key(family_name) == normalize_family_key(&self.active_family_name)
+            && (scale - self.line_height_scale).abs() <= 1e-6
+        {
+            return Ok(false);
+        }
+
+        let specs = resolve_family_chain(&self.fonts_dir, family_name, scale)?;
+        let mut new_atlas =
+            FontAtlas::load_with_initial_rows(&specs, self.curve_rows_cfg, self.map_rows_cfg)?;
+        let emoji_dyn: Arc<dyn EmojiSource> = self.emoji.source.clone();
+        new_atlas.set_emoji_source(Some(emoji_dyn));
+        let _ = new_atlas.take_dirty();
+
+        let (curves_tex, curves_view) =
+            create_and_upload_full(device, queue, "wall slug curves", new_atlas.curve_texture());
+        let (glyphmap_tex, glyphmap_view) = create_and_upload_full(
+            device,
+            queue,
+            "wall slug glyphmap",
+            new_atlas.glyphmap_texture(),
+        );
+
+        let active_family = new_atlas.default_family();
+        // Drop the previous FontAtlas and GPU textures in place — no old atlas retained.
+        self.atlas = new_atlas;
+        self.active_family = active_family;
+        self.active_family_name = family_name.trim().to_owned();
+        self.line_height_scale = scale;
+        self.curves_tex = curves_tex;
+        self.curves_view = curves_view;
+        self.glyphmap_tex = glyphmap_tex;
+        self.glyphmap_view = glyphmap_view;
+        Ok(true)
+    }
+
     /// Look up a family handle by id (`"monaspace-neon"`, `"cousine"`, `"monaspace-argon"`).
     pub fn family_id(&self, name: &str) -> Option<FamilyId> {
         self.atlas.family_id(name)
@@ -916,6 +993,7 @@ impl GlyphSource {
     pub fn set_family(&mut self, name: &str) -> Option<FamilyId> {
         let id = self.atlas.family_id(name)?;
         self.active_family = id;
+        self.active_family_name = name.to_string();
         Some(id)
     }
 
@@ -928,6 +1006,9 @@ impl GlyphSource {
             self.atlas.family_count()
         );
         self.active_family = family;
+        if let Some(Some(id)) = self.atlas.family_ids().get(family.0) {
+            self.active_family_name = (*id).to_string();
+        }
     }
 
     /// Resolve `(slot, span_cols)` for `cell` in the active font family.
@@ -967,9 +1048,10 @@ impl GlyphSource {
     /// Snapped world-space [`CellMetrics`] for `family`.
     pub fn cell_metrics_for(&self, family: FamilyId) -> CellMetrics {
         let m = self.atlas.family_metrics(family);
-        let raw_width = (f64::from(m.advance_fu) * f64::from(CELL_HEIGHT_WORLD)
+        let cell_height = CELL_HEIGHT_WORLD * self.line_height_scale as f32;
+        let raw_width = (f64::from(m.advance_fu) * f64::from(cell_height)
             / m.extents.em_height()) as f32;
-        CellMetrics::snapped(raw_width, CELL_HEIGHT_WORLD)
+        CellMetrics::snapped(raw_width, cell_height)
     }
 
     /// Normalised `[0, 1]` cell-space underline/strikethrough metrics for the active family.
@@ -1758,5 +1840,108 @@ mod tests {
             glyphs.sync(&ctx.device, &ctx.queue),
             GlyphSyncStats::default()
         );
+    }
+
+    #[test]
+    fn gpu_reload_family_swaps_atlas_without_leak_scales_line_height_and_keeps_old_on_missing() {
+        let ctx = crate::gpu::test_device::context();
+        let mut glyphs = GlyphSource::new(&ctx.device, &ctx.queue, &crate::default_emoji_sheet());
+        let base_metrics = glyphs.cell_metrics();
+        assert_eq!(glyphs.active_family_name(), MONASPACE_NEON_FAMILY);
+
+        // Encode some glyphs in the initial family so the atlas is non-empty.
+        let screen = Screen::new(4, 1);
+        for ch in ['A', 'g', '─', '🚀'] {
+            glyphs.resolve_cell(
+                &screen,
+                &Cell {
+                    content: ch as u32,
+                    fg: rgb(0xff, 0xff, 0xff),
+                    bg: 0,
+                    ul: 0,
+                    attrs: 0,
+                    width: if ch == '🚀' { 2 } else { 1 },
+                    _pad: 0,
+                },
+            );
+        }
+        let _ = glyphs.sync(&ctx.device, &ctx.queue);
+        let initial_slots = glyphs.atlas().slot_count();
+        assert!(initial_slots >= 4);
+
+        // No-op reload when family & line height match.
+        assert!(!glyphs
+            .reload_family(&ctx.device, &ctx.queue, MONASPACE_NEON_FAMILY, 1.0)
+            .unwrap());
+
+        // Switch across families (including a macOS system font when present) + line height.
+        let targets: &[(&str, f64)] = if cfg!(target_os = "macos") {
+            &[("Menlo", 1.0), ("monaspace-argon", 1.35), ("cousine", 1.0)]
+        } else {
+            &[("monaspace-argon", 1.35), ("cousine", 1.0)]
+        };
+        for &(fam, lh) in targets {
+            let changed = glyphs
+                .reload_family(&ctx.device, &ctx.queue, fam, lh)
+                .unwrap_or_else(|e| panic!("reload {fam} ({lh}x) failed: {e}"));
+            assert!(changed, "expected reload for {fam} ({lh}x)");
+            // Fresh atlas starts clean (only slot 0 allocated before resolving cells) — no leak.
+            assert_eq!(glyphs.atlas().slot_count(), 1);
+            assert!((glyphs.line_height_scale() - lh).abs() < 1e-6);
+            let m = glyphs.cell_metrics();
+            assert!(
+                (m.cell_height - base_metrics.cell_height * lh as f32).abs() < 1e-4,
+                "cell_height {} should scale by {lh}x from {}",
+                m.cell_height,
+                base_metrics.cell_height
+            );
+            // Resolve ASCII + box sprite + emoji in the newly loaded family and verify GPU matches.
+            let g_a = glyphs.resolve_cell(
+                &screen,
+                &Cell {
+                    content: 'A' as u32,
+                    fg: rgb(0xff, 0xff, 0xff),
+                    bg: 0,
+                    ul: 0,
+                    attrs: attrs::BOLD,
+                    width: 1,
+                    _pad: 0,
+                },
+            );
+            let g_box = glyphs.resolve_cell(
+                &screen,
+                &Cell {
+                    content: '╭' as u32,
+                    fg: rgb(0xff, 0xff, 0xff),
+                    bg: 0,
+                    ul: 0,
+                    attrs: 0,
+                    width: 1,
+                    _pad: 0,
+                },
+            );
+            assert!(g_a.slot > 0 && g_box.slot > 0);
+            let _ = glyphs.sync(&ctx.device, &ctx.queue);
+            assert_gpu_matches_atlas(&ctx.device, &ctx.queue, &glyphs);
+        }
+
+        // Missing family returns FamilyNotFound and leaves active family, metrics, and atlas intact.
+        let before_name = glyphs.active_family_name().to_string();
+        let before_metrics = glyphs.cell_metrics();
+        let before_slots = glyphs.atlas().slot_count();
+        let err = glyphs
+            .reload_family(&ctx.device, &ctx.queue, "NoSuchFontFamilyXYZ", 1.0)
+            .unwrap_err();
+        assert!(
+            matches!(err, glyph_font::FontError::FamilyNotFound(_)),
+            "expected FamilyNotFound, got {err:?}"
+        );
+        assert_eq!(glyphs.active_family_name(), before_name);
+        assert_eq!(glyphs.cell_metrics().cell_width, before_metrics.cell_width);
+        assert_eq!(
+            glyphs.cell_metrics().cell_height,
+            before_metrics.cell_height
+        );
+        assert_eq!(glyphs.atlas().slot_count(), before_slots);
     }
 }
