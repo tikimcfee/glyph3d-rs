@@ -26,6 +26,13 @@ pub enum CliCommand {
     },
     /// Render execution plan (windowed or offscreen).
     Render(RenderPlan),
+    /// Render the wall cell renderer test pattern offscreen.
+    WallTestPattern {
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
 }
 
 /// Mode for GPU information inspection.
@@ -138,6 +145,14 @@ impl Cli {
         }
 
         let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
+        if self.wall_test_pattern {
+            return CliCommand::WallTestPattern {
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
         let choice = if self.demo {
             SceneChoice::Demo
         } else if let Some(session) = &self.agent_session {

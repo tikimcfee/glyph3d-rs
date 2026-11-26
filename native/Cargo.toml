@@ -23,6 +23,9 @@ glyph-field-derived = { path = "../crates/glyph-field-derived", default-features
 # the CPU into the group table, whose changed rows are uploaded
 # (glyph_scene/nodes.rs; a GPU compute pass until 2026-10-26).
 glyph-scene-graph = { path = "../crates/glyph-scene-graph" }
+# The wall's plain terminal screen data seam (2026-11-26): the cell renderer
+# in native/src/wall/ reads Screen/Cell here without depending on any emulator.
+term-cells = { path = "../crates/term-cells" }
 # The window (`windowed/`), behind the `windowed` feature (2026-10-26): a
 # host that brings its own window links the library without it.
 winit = { version = "0.30", optional = true }

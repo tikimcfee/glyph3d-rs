@@ -86,7 +86,7 @@ fn main() {
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
         #[cfg(not(feature = "wgpu"))]
-        CliCommand::GpuInfo(_) | CliCommand::Render(_) => {
+        CliCommand::GpuInfo(_) | CliCommand::Render(_) | CliCommand::WallTestPattern { .. } => {
             eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
             std::process::exit(1);
         }
@@ -111,6 +111,20 @@ fn main() {
         } => {
             let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallTestPattern {
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-test-pattern requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {

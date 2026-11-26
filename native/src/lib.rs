@@ -32,6 +32,7 @@ pub mod seam;
 pub mod spatial_scene;
 pub mod text;
 pub mod views;
+pub mod wall;
 #[cfg(feature = "windowed")]
 pub mod windowed;
 
