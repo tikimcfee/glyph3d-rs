@@ -12,6 +12,7 @@
 pub mod app;
 pub mod camera;
 pub mod cell;
+pub mod glyphs;
 #[cfg(feature = "windowed")]
 pub mod keys;
 pub mod metrics;
@@ -23,6 +24,9 @@ pub mod test_pattern;
 
 pub use camera::WallCamera;
 pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph};
+pub use glyphs::AtlasEmojiSource;
+#[cfg(feature = "wgpu")]
+pub use glyphs::{GlyphSource, GlyphSyncStats};
 pub use metrics::{CellMetrics, WorldRect, snap_cell_dimension};
 #[cfg(feature = "wgpu")]
 pub use renderer::{
