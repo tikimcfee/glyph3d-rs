@@ -869,10 +869,152 @@ pub fn render_test_pattern_offscreen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use term_cells::rgb;
 
     #[test]
     fn uniform_sizes_match_wgsl() {
         assert_eq!(std::mem::size_of::<WallFrameUniform>(), 224);
         assert_eq!(std::mem::size_of::<TerminalUniform>(), 48);
+    }
+
+    fn render_rgba_bytes(
+        ctx: &GpuContext,
+        renderer: &mut WallRenderer,
+        camera: &WallCamera,
+        terminals: &[TerminalDraw<'_>],
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let device = &ctx.device;
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("wall test target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: renderer.color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let color_view = texture.create_view(&Default::default());
+        let depth_view = crate::scene::create_depth(device, WALL_DEPTH_FORMAT, width, height);
+
+        let unpadded_bpr = width * 4;
+        let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wall test readback"),
+            size: u64::from(padded_bpr * height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wall test frame"),
+        });
+        let target = WallTarget {
+            color_view: &color_view,
+            depth_view: &depth_view,
+            width,
+            height,
+        };
+        renderer.render(device, &ctx.queue, &mut encoder, &target, camera, terminals);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        ctx.queue.submit([encoder.finish()]);
+
+        let slice = readback.slice(..);
+        glyph_field::map_read(
+            device,
+            &slice,
+            crate::config::settings().gpu.wait_limit(),
+            "wall test readback",
+        );
+        let data = slice.get_mapped_range().expect("wall test readback mapped");
+        let mut pixels = Vec::with_capacity((unpadded_bpr * height) as usize);
+        for row in 0..height {
+            let start = (row * padded_bpr) as usize;
+            pixels.extend_from_slice(&data[start..start + unpadded_bpr as usize]);
+        }
+        drop(data);
+        readback.unmap();
+        pixels
+    }
+
+    /// Verifies both Risk 4 (exact IEC sRGB round-trip on dark #1a1b26 without
+    /// pow(2.2) crush) and reverse-Z depth occlusion (nearer terminal covers
+    /// farther terminal regardless of input slice order).
+    #[test]
+    fn gpu_dark_srgb_round_trip_and_depth_occlusion() {
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let mut far_screen = Screen::new(10, 4);
+        far_screen.default_bg = rgb(0xc8, 0x20, 0x20);
+        let mut near_screen = Screen::new(10, 4);
+        near_screen.default_bg = rgb(0x1a, 0x1b, 0x26);
+
+        let w = 256u32;
+        let h = 128u32;
+        let cam = WallCamera::new(Vec2::new(2.5, -2.0), 24.0);
+
+        // Pass near BEFORE far AND far BEFORE near: in both orders, near (z=5) must cover far (z=0).
+        for reverse_input in [false, true] {
+            let far = TerminalDraw {
+                id: 1,
+                screen: &far_screen,
+                position: Vec2::new(0.0, 0.0),
+                z: 0.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+            };
+            let near = TerminalDraw {
+                id: 2,
+                screen: &near_screen,
+                position: Vec2::new(0.0, 0.0),
+                z: 5.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+            };
+            let list = if reverse_input { [near, far] } else { [far, near] };
+            let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &list, w, h);
+            let center_idx = ((h / 2) * w + (w / 2)) as usize * 4;
+            let got = [px[center_idx], px[center_idx + 1], px[center_idx + 2]];
+            assert!(
+                got[0].abs_diff(0x1a) <= 1
+                    && got[1].abs_diff(0x1b) <= 1
+                    && got[2].abs_diff(0x26) <= 1,
+                "expected uncrushed #1a1b26 (26,27,38) from nearer terminal (reverse_input={reverse_input}), got {got:?}"
+            );
+        }
     }
 }

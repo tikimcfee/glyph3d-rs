@@ -84,6 +84,12 @@ impl WallCamera {
         )
     }
 
+    /// Reverse-Z NDC depth for world `z` (`z_min` → 0.0, `z_max` → 1.0).
+    pub fn ndc_depth(&self, z: f32) -> f32 {
+        let z_span = (self.z_max - self.z_min).max(1e-3);
+        (z - self.z_min) / z_span
+    }
+
     /// Project a world XY point into physical screen pixels (origin top-left, +Y down).
     pub fn world_to_screen(&self, world: Vec2, viewport: (u32, u32)) -> Vec2 {
         let vp_w = viewport.0.max(1) as f32;
@@ -119,5 +125,128 @@ impl WallCamera {
             anchor.x - (screen.x - vp_w * 0.5) / new_zoom,
             anchor.y + (screen.y - vp_h * 0.5) / new_zoom,
         );
+    }
+
+    /// Pan the canvas so world content shifts by `delta_px` physical screen pixels
+    /// (+X right, +Y down).
+    pub fn pan_by_screen_delta(&mut self, delta_px: Vec2) {
+        self.center.x -= delta_px.x / self.zoom;
+        self.center.y += delta_px.y / self.zoom;
+    }
+
+    /// World-space rectangle visible inside `viewport` (for 2D frustum culling).
+    pub fn visible_world_rect(&self, viewport: (u32, u32)) -> WorldRect {
+        let half_w = viewport.0.max(1) as f32 / (2.0 * self.zoom);
+        let half_h = viewport.1.max(1) as f32 / (2.0 * self.zoom);
+        WorldRect::new(
+            Vec2::new(self.center.x - half_w, self.center.y - half_h),
+            Vec2::new(self.center.x + half_w, self.center.y + half_h),
+        )
+    }
+
+    /// On-screen height in physical pixels of a cell `cell_height_world` tall.
+    pub fn cell_height_px(&self, cell_height_world: f32) -> f32 {
+        self.zoom * cell_height_world
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_and_screen_conversions_round_trip() {
+        let vp = (1600, 1000);
+        let cam = WallCamera::new(Vec2::new(-42.5, 19.25), 31.5);
+        for world in [
+            Vec2::ZERO,
+            cam.center,
+            Vec2::new(-100.0, 55.0),
+            Vec2::new(12.34, -78.9),
+        ] {
+            let screen = cam.world_to_screen(world, vp);
+            let back = cam.screen_to_world(screen, vp);
+            assert!(
+                (back - world).length() < 1e-4,
+                "world->screen->world drift: {world:?} -> {screen:?} -> {back:?}"
+            );
+        }
+        assert_eq!(cam.world_to_screen(cam.center, vp), Vec2::new(800.0, 500.0));
+    }
+
+    #[test]
+    fn view_proj_agrees_with_world_to_screen_and_reverse_z_depth() {
+        let vp = (1280, 720);
+        let cam = WallCamera::new(Vec2::new(15.0, -8.0), 20.0);
+        let m = cam.view_proj(vp);
+
+        let world = Vec2::new(27.5, -2.25);
+        let clip = m * Vec4::new(world.x, world.y, 0.0, 1.0);
+        assert_eq!(clip.w, 1.0, "orthographic clip.w is 1");
+        let expected_px = cam.world_to_screen(world, vp);
+        let from_ndc = Vec2::new(
+            (clip.x * 0.5 + 0.5) * vp.0 as f32,
+            (0.5 - clip.y * 0.5) * vp.1 as f32,
+        );
+        assert!(
+            (from_ndc - expected_px).length() < 1e-4,
+            "matrix {from_ndc:?} != world_to_screen {expected_px:?}"
+        );
+
+        // Reverse-Z: nearer (larger world z) maps to larger NDC depth inside [0, 1].
+        let d_min = (m * Vec4::new(0.0, 0.0, cam.z_min, 1.0)).z;
+        let d_far = (m * Vec4::new(0.0, 0.0, -5.0, 1.0)).z;
+        let d_near = (m * Vec4::new(0.0, 0.0, 12.0, 1.0)).z;
+        let d_max = (m * Vec4::new(0.0, 0.0, cam.z_max, 1.0)).z;
+        assert!((d_min - 0.0).abs() < 1e-6);
+        assert!((d_max - 1.0).abs() < 1e-6);
+        assert!(d_near > d_far, "nearer z=12 ({d_near}) must beat farther z=-5 ({d_far})");
+        assert!((d_near - cam.ndc_depth(12.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_about_screen_point_holds_world_anchor_fixed() {
+        let vp = (1600, 1000);
+        let mut cam = WallCamera::new(Vec2::new(10.0, -5.0), 24.0);
+        let cursor = Vec2::new(1234.0, 275.0);
+        let anchor_before = cam.screen_to_world(cursor, vp);
+
+        cam.zoom_about_screen_point(cursor, 2.5, vp);
+        assert!((cam.zoom - 60.0).abs() < 1e-4);
+        let anchor_after = cam.screen_to_world(cursor, vp);
+        assert!(
+            (anchor_after - anchor_before).length() < 1e-4,
+            "zoom-in moved anchor: {anchor_before:?} -> {anchor_after:?}"
+        );
+        let screen_after = cam.world_to_screen(anchor_before, vp);
+        assert!((screen_after - cursor).length() < 1e-3);
+
+        cam.zoom_about_screen_point(cursor, 0.2, vp);
+        assert!((cam.zoom - 12.0).abs() < 1e-4);
+        assert!((cam.screen_to_world(cursor, vp) - anchor_before).length() < 1e-4);
+
+        // Extreme factor clamps cleanly without losing the anchor.
+        cam.zoom_about_screen_point(cursor, 10_000.0, vp);
+        assert_eq!(cam.zoom, MAX_ZOOM);
+        assert!((cam.screen_to_world(cursor, vp) - anchor_before).length() < 1e-3);
+    }
+
+    #[test]
+    fn pan_and_frame_rect_behave_as_expected() {
+        let vp = (1000, 600);
+        let mut cam = WallCamera::new(Vec2::new(5.0, 5.0), 25.0);
+        let world_pt = Vec2::new(9.0, 2.0);
+        let before = cam.world_to_screen(world_pt, vp);
+        let drag = Vec2::new(75.0, -40.0);
+        cam.pan_by_screen_delta(drag);
+        let after = cam.world_to_screen(world_pt, vp);
+        assert!(((after - before) - drag).length() < 1e-4);
+
+        let rect = WorldRect::new(Vec2::new(-10.0, -20.0), Vec2::new(30.0, 4.0));
+        let framed = WallCamera::frame_rect(rect, vp, 1.2);
+        let visible = framed.visible_world_rect(vp);
+        assert!(visible.contains(rect.min));
+        assert!(visible.contains(rect.max));
+        assert!((framed.center - rect.center()).length() < 1e-4);
     }
 }
