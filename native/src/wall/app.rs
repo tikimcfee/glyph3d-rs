@@ -27,7 +27,8 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::metrics::WorldRect;
-use super::renderer::{TerminalDraw, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
+use super::paper::PaperStyle;
+use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 
 /// Physical pixels a wheel "line" is worth when a mouse reports lines.
 const PX_PER_LINE: f32 = 53.0;
@@ -95,6 +96,9 @@ struct Placed {
     /// Top-left of cell (0, 0), world units, y up.
     position: Vec2,
     z: f32,
+    /// 1.0 draws the terminal at the atlas's cell size.
+    scale: f32,
+    border_color: Option<u32>,
 }
 
 /// What exists once there is a window.
@@ -140,7 +144,7 @@ impl App {
     fn rect_of(&self, t: &Placed) -> WorldRect {
         let g = self.gfx.as_ref().expect("a terminal is placed only once the renderer exists");
         let s = t.term.screen();
-        g.renderer.metrics().panel_rect(t.position, s.cols, s.rows, g.renderer.style().panel_padding)
+        g.renderer.metrics().terminal_panel_rect(t.position, s.cols, s.rows, g.renderer.style().panel_padding, t.scale)
     }
 
     /// The topmost terminal under a screen point.
@@ -228,7 +232,7 @@ impl App {
         let top = self.terminals.iter().map(|t| t.z).fold(0.0_f32, f32::max);
         self.next_id += 1;
         let id = self.next_id;
-        self.terminals.push(Placed { id, term, position: Vec2::new(x, 0.0), z: top + 1.0 });
+        self.terminals.push(Placed { id, term, position: Vec2::new(x, 0.0), z: top + 1.0, scale: 1.0, border_color: None });
         id
     }
 
@@ -285,13 +289,16 @@ impl App {
                 screen: t.term.screen(),
                 position: t.position,
                 z: t.z,
+                scale: t.scale,
                 focused: self.focused == Some(t.id),
                 panel_opacity: None,
-                border_color: None,
+                border_color: t.border_color,
             })
             .collect();
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
-        g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &draws);
+        let paper = PaperStyle::default();
+        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, ..Default::default() };
+        g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.queue.present(frame);
         self.frames += 1;

@@ -476,6 +476,22 @@ pub struct WallSettings {
     pub curly_amplitude: f32,
     /// SGR 2 dim ink/line opacity multiplier (0..1).
     pub dim_alpha: f32,
+    /// Whether the drafting-paper grid is drawn over the canvas background.
+    pub paper_show: bool,
+    /// Drafting-paper canvas background colour (sRGB 0..1 RGBA).
+    pub paper_background: [f32; 4],
+    /// Minor grid line colour (sRGB 0..1 RGBA).
+    pub paper_minor_color: [f32; 4],
+    /// Major grid line colour (sRGB 0..1 RGBA).
+    pub paper_major_color: [f32; 4],
+    /// World units between adjacent minor grid lines.
+    pub paper_minor_spacing: f32,
+    /// Every Nth minor line is promoted to a major line.
+    pub paper_major_every: u32,
+    /// Grid line width in physical screen pixels.
+    pub paper_line_px: f32,
+    /// Minimum on-screen spacing in pixels below which a grid level hard-switches off.
+    pub paper_min_px: f32,
 }
 
 impl Settings {

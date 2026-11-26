@@ -82,6 +82,10 @@ struct TerminalUniform {
     cursor_row: u32,
     cursor_flags: u32,
     border_override: u32,
+    scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct CellGpu {
@@ -89,6 +93,15 @@ struct CellGpu {
     fg: u32,
     bg: u32,
     ul: u32,
+};
+
+struct LabelGlyphGpu {
+    rect: vec4<f32>,
+    uv_clip: vec4<f32>,
+    z: f32,
+    glyph_id: u32,
+    fg_rgba: u32,
+    span_cols: u32,
 };
 
 @group(0) @binding(0) var<uniform> frame: WallFrameUniform;
@@ -99,6 +112,7 @@ struct CellGpu {
 
 @group(1) @binding(0) var<uniform> term: TerminalUniform;
 @group(1) @binding(1) var<storage, read> cells: array<CellGpu>;
+@group(1) @binding(2) var<storage, read> label_glyphs: array<LabelGlyphGpu>;
 
 fn quad_corner(vi: u32) -> vec2<f32> {
     var corners = array<vec2<f32>, 4>(
@@ -265,9 +279,10 @@ struct PanelVsOut {
 @vertex
 fn vs_panel(@builtin(vertex_index) vi: u32) -> PanelVsOut {
     let c = quad_corner(vi);
-    let pad = frame.panel_padding;
-    let grid_w = f32(term.cols) * frame.cell_size.x;
-    let grid_h = f32(term.rows) * frame.cell_size.y;
+    let cell_size = frame.cell_size * term.scale;
+    let pad = frame.panel_padding * term.scale;
+    let grid_w = f32(term.cols) * cell_size.x;
+    let grid_h = f32(term.rows) * cell_size.y;
     let x0 = term.origin.x - pad;
     let x1 = term.origin.x + grid_w + pad;
     let y0 = term.origin.y - grid_h - pad;
@@ -340,14 +355,15 @@ fn vs_fill(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let col = ii % term.cols;
     let row = ii / term.cols;
     let c = quad_corner(vi);
+    let cell_size = frame.cell_size * term.scale;
     let x = select(
-        term.origin.x + f32(col) * frame.cell_size.x,
-        term.origin.x + f32(col + 1u) * frame.cell_size.x,
+        term.origin.x + f32(col) * cell_size.x,
+        term.origin.x + f32(col + 1u) * cell_size.x,
         c.x > 0.5,
     );
     let y = select(
-        term.origin.y - f32(row + 1u) * frame.cell_size.y,
-        term.origin.y - f32(row) * frame.cell_size.y,
+        term.origin.y - f32(row + 1u) * cell_size.y,
+        term.origin.y - f32(row) * cell_size.y,
         c.y > 0.5,
     );
     let z = term.z + Z_OFFSET_FILL;
@@ -367,7 +383,7 @@ fn fs_fill(in: FillVsOut) -> @location(0) vec4<f32> {
 struct InkVsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) glyph_uv: vec2<f32>,
-    @location(1) @interpolate(flat) fg_srgb: vec3<f32>,
+    @location(1) @interpolate(flat) fg_srgb: vec4<f32>,
     @location(2) @interpolate(flat) decor_srgb: vec3<f32>,
     @location(3) @interpolate(flat) curve_start: u32,
     @location(4) @interpolate(flat) curve_count: u32,
@@ -426,14 +442,15 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     let col = ii % term.cols;
     let row = ii / term.cols;
     let c = quad_corner(vi);
-    let span_w = f32(span_cols) * frame.cell_size.x;
-    let quad_w = select(span_w, max(span_w, frame.cell_size.y), mode == 1u);
+    let cell_size = frame.cell_size * term.scale;
+    let span_w = f32(span_cols) * cell_size.x;
+    let quad_w = select(span_w, max(span_w, cell_size.y), mode == 1u);
 
-    let x0 = term.origin.x + f32(col) * frame.cell_size.x;
-    let exact_span_right = term.origin.x + f32(col + span_cols) * frame.cell_size.x;
+    let x0 = term.origin.x + f32(col) * cell_size.x;
+    let exact_span_right = term.origin.x + f32(col + span_cols) * cell_size.x;
     let x1 = select(x0 + quad_w, exact_span_right, quad_w == span_w);
-    let y0 = term.origin.y - f32(row + 1u) * frame.cell_size.y;
-    let y1 = term.origin.y - f32(row) * frame.cell_size.y;
+    let y0 = term.origin.y - f32(row + 1u) * cell_size.y;
+    let y1 = term.origin.y - f32(row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
     let y = select(y0, y1, c.y > 0.5);
     let z = term.z + Z_OFFSET_INK;
@@ -454,8 +471,8 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
             * vec2<f32>(frame.emoji_cell);
     }
 
-    let fg_srgb = unpack_rgba8(cell.fg).rgb;
-    let decor_srgb = select(fg_srgb, unpack_rgba8(cell.ul).rgb, (style & STYLE_UNDERLINE_COLOR) != 0u);
+    let fg_srgb = vec4<f32>(unpack_rgba8(cell.fg).rgb, 1.0);
+    let decor_srgb = select(fg_srgb.rgb, unpack_rgba8(cell.ul).rgb, (style & STYLE_UNDERLINE_COLOR) != 0u);
 
     out.clip = clip;
     out.glyph_uv = c;
@@ -467,10 +484,94 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     out.glyph_arg = glyph_arg;
     out.style = style;
     out.cell_info = vec4<f32>(
-        quad_w / max(frame.cell_size.x, 1e-6),
-        frame.cell_size.x / max(frame.cell_size.y, 1e-6),
+        quad_w / max(cell_size.x, 1e-6),
+        cell_size.x / max(cell_size.y, 1e-6),
         f32(span_cols),
-        quad_w / max(frame.cell_size.y, 1e-6),
+        quad_w / max(cell_size.y, 1e-6),
+    );
+    out.emoji_cell_xy = emoji_cell_xy;
+    out.emoji_layer = emoji_layer;
+    out.foot_p0 = foot_c0.xyw * foot_scale;
+    out.foot_pu = foot_cu.xyw * foot_scale;
+    out.foot_pv = foot_cv.xyw * foot_scale;
+    return out;
+}
+
+// Non-terminal text labels (title bars, group headers, map labels) routed through
+// the exact same Slug/emoji/greek fragment shader (fs_ink).
+@vertex
+fn vs_label(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> InkVsOut {
+    var out: InkVsOut;
+    let g = label_glyphs[ii];
+    if g.glyph_id == 0u {
+        out.clip = OFFSCREEN;
+        return out;
+    }
+
+    let info = textureLoad(
+        glyphmap,
+        vec2<i32>(i32(g.glyph_id % TEX_W), i32(g.glyph_id / TEX_W)),
+        0,
+    );
+    let curve_start = info.x;
+    let curve_count = info.y;
+    var mode = info.z;
+    let glyph_arg = info.w;
+    if mode == 1u && glyph_arg == NO_CELL {
+        mode = 2u;
+    }
+    let has_ink = mode == 1u || (mode != 2u && curve_count > 0u);
+    if !has_ink {
+        out.clip = OFFSCREEN;
+        return out;
+    }
+
+    let c = quad_corner(vi);
+    let uv = vec2<f32>(
+        mix(g.uv_clip.x, g.uv_clip.z, c.x),
+        mix(g.uv_clip.y, g.uv_clip.w, c.y),
+    );
+    let x0 = g.rect.x;
+    let y0 = g.rect.y;
+    let x1 = g.rect.z;
+    let y1 = g.rect.w;
+    let x = mix(x0, x1, uv.x);
+    let y = mix(y0, y1, uv.y);
+
+    let clip = frame.view_proj * vec4<f32>(x, y, g.z, 1.0);
+    let foot_cu = frame.view_proj * vec4<f32>(x1 - x0, 0.0, 0.0, 0.0);
+    let foot_cv = frame.view_proj * vec4<f32>(0.0, y1 - y0, 0.0, 0.0);
+    let foot_c0 = clip - uv.x * foot_cu - uv.y * foot_cv;
+    let foot_scale = vec3<f32>(frame.viewport.x * 0.5, -frame.viewport.y * 0.5, 1.0);
+
+    var emoji_cell_xy = vec2<f32>(0.0);
+    var emoji_layer = 0u;
+    if mode == 1u {
+        let per_layer = frame.emoji_cols * frame.emoji_rows;
+        emoji_layer = glyph_arg / per_layer;
+        let rem = glyph_arg % per_layer;
+        emoji_cell_xy = vec2<f32>(f32(rem % frame.emoji_cols), f32(rem / frame.emoji_cols))
+            * vec2<f32>(frame.emoji_cell);
+    }
+
+    let quad_w = max(x1 - x0, 1e-6);
+    let quad_h = max(y1 - y0, 1e-6);
+    let fg_srgb = unpack_rgba8(g.fg_rgba);
+
+    out.clip = clip;
+    out.glyph_uv = uv;
+    out.fg_srgb = fg_srgb;
+    out.decor_srgb = fg_srgb.rgb;
+    out.curve_start = curve_start;
+    out.curve_count = curve_count;
+    out.mode = mode;
+    out.glyph_arg = glyph_arg;
+    out.style = 0u;
+    out.cell_info = vec4<f32>(
+        f32(max(g.span_cols, 1u)),
+        quad_w / (f32(max(g.span_cols, 1u)) * quad_h),
+        f32(max(g.span_cols, 1u)),
+        quad_w / quad_h,
     );
     out.emoji_cell_xy = emoji_cell_xy;
     out.emoji_layer = emoji_layer;
@@ -485,7 +586,7 @@ fn fs_ink(in: InkVsOut) -> @location(0) vec4<f32> {
     let j = foot_jacobian(in.foot_p0, in.foot_pu, in.foot_pv, in.glyph_uv);
     let fw = max(abs(j[0]) + abs(j[1]), vec2<f32>(1e-6));
 
-    let fg = srgb_to_output(in.fg_srgb);
+    let fg = srgb_to_output(in.fg_srgb.rgb);
     var ink = fg;
     var cov = 0.0;
 
@@ -612,7 +713,7 @@ fn fs_ink(in: InkVsOut) -> @location(0) vec4<f32> {
     pre = ink * cov + pre * (1.0 - cov);
     alpha = cov + alpha * (1.0 - cov);
 
-    let keep = select(1.0, frame.dim_alpha, (in.style & STYLE_DIM) != 0u);
+    let keep = in.fg_srgb.a * select(1.0, frame.dim_alpha, (in.style & STYLE_DIM) != 0u);
     alpha *= keep;
     if alpha <= 0.0 {
         discard;
@@ -639,10 +740,11 @@ fn vs_cursor(@builtin(vertex_index) vi: u32) -> CursorVsOut {
     }
     let span_cols = max((term.cursor_flags >> 4u) & 3u, 1u);
     let c = quad_corner(vi);
-    let x0 = term.origin.x + f32(term.cursor_col) * frame.cell_size.x;
-    let x1 = term.origin.x + f32(term.cursor_col + span_cols) * frame.cell_size.x;
-    let y0 = term.origin.y - f32(term.cursor_row + 1u) * frame.cell_size.y;
-    let y1 = term.origin.y - f32(term.cursor_row) * frame.cell_size.y;
+    let cell_size = frame.cell_size * term.scale;
+    let x0 = term.origin.x + f32(term.cursor_col) * cell_size.x;
+    let x1 = term.origin.x + f32(term.cursor_col + span_cols) * cell_size.x;
+    let y0 = term.origin.y - f32(term.cursor_row + 1u) * cell_size.y;
+    let y1 = term.origin.y - f32(term.cursor_row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
     let y = select(y0, y1, c.y > 0.5);
     let z = term.z + Z_OFFSET_CURSOR;
