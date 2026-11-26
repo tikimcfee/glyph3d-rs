@@ -9,9 +9,12 @@
 // The settings panel and the status window arrived with a shared kit of
 // their own (docked.rs); they are re-exported here under their plain names.
 pub mod docked;
+// The right-click menu and the help panel, with their own kit (menus.rs).
+pub mod menus;
 pub mod palette;
 pub mod sidebar;
 pub use docked::{settings, status};
+pub use menus::{context_menu, help};
 
 use std::path::Path;
 
