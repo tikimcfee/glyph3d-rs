@@ -3,6 +3,9 @@
 
 use ttf_parser::Face;
 
+use crate::encode::{compute_bbox, OutlineCollector};
+use crate::sprites::SpriteMetrics;
+
 /// Multiplier of cell height for the line pitch (1.0 = contiguous rows).
 pub const LINE_PITCH: f32 = 1.0;
 
@@ -146,6 +149,8 @@ pub struct FamilyMetrics {
     pub aspect: f32,
     /// Underline and strikethrough placement in cell units (`None` if the font lacks `post` metrics).
     pub lines: Option<LineMetrics>,
+    /// Cell aspect and box-drawing line weights for generating this family's cell sprites.
+    pub sprites: SpriteMetrics,
 }
 
 impl FamilyMetrics {
@@ -159,19 +164,21 @@ impl FamilyMetrics {
             .map(|adv| adv as i32)
             .unwrap_or_else(|| ((upem as f64) * 0.6).round() as i32);
         let em = extents.em_height();
-        let aspect = if em > 0.0 {
-            (advance_fu as f64 / em) as f32
+        let aspect_f64 = if em > 0.0 {
+            advance_fu as f64 / em
         } else {
             0.6
         };
-        let lines = RawLineMetrics::from_face(face)
-            .and_then(|raw| LineMetrics::compute(raw, extents));
+        let raw_lines = RawLineMetrics::from_face(face);
+        let lines = raw_lines.and_then(|raw| LineMetrics::compute(raw, extents));
+        let sprites = compute_sprite_metrics(face, advance_fu, extents, raw_lines);
         Self {
             upem,
             advance_fu,
             extents,
-            aspect,
+            aspect: aspect_f64 as f32,
             lines,
+            sprites,
         }
     }
 
@@ -185,6 +192,56 @@ impl FamilyMetrics {
     /// `computeCellMetrics` in `core/cellMetrics.js`.
     pub fn world_cell_metrics(&self, font_size_px: f32, world_scale: f32) -> WorldCellMetrics {
         compute_cell_metrics(self.char_size(font_size_px), world_scale)
+    }
+}
+
+/// Measure a horizontal box-drawing glyph's stroke thickness (`max_y - min_y` of its control hull),
+/// matching `FontChain.spriteMetrics()`.
+fn box_stroke_thickness_fu(face: &Face<'_>, ch: char) -> f64 {
+    let Some(gid) = face.glyph_index(ch) else {
+        return 0.0;
+    };
+    let mut collector = OutlineCollector::new(1.0);
+    if face.outline_glyph(gid, &mut collector).is_none() {
+        return 0.0;
+    }
+    let (curves, _) = collector.into_curves();
+    if curves.is_empty() {
+        return 0.0;
+    }
+    let bbox = compute_bbox(&curves);
+    (bbox.max_y - bbox.min_y).max(0.0)
+}
+
+/// Compute `SpriteMetrics` from the family's primary font (`FontChain.spriteMetrics()`):
+/// light is the thickness of `─` (else `post.underlineThickness`, else 5% of em);
+/// heavy is the thickness of `━` (else twice light).
+pub fn compute_sprite_metrics(
+    face: &Face<'_>,
+    advance_fu: i32,
+    extents: FontExtents,
+    raw_lines: Option<RawLineMetrics>,
+) -> SpriteMetrics {
+    let em = extents.em_height().max(1.0);
+    let aspect = (advance_fu as f64 / em).max(0.1);
+    let light_from_box = box_stroke_thickness_fu(face, '─');
+    let light_fu = if light_from_box > 0.0 {
+        light_from_box
+    } else if let Some(ul) = raw_lines.filter(|r| r.underline_thickness_fu > 0) {
+        ul.underline_thickness_fu as f64
+    } else {
+        em * 0.05
+    };
+    let heavy_from_box = box_stroke_thickness_fu(face, '━');
+    let heavy_fu = if heavy_from_box > 0.0 {
+        heavy_from_box
+    } else {
+        2.0 * light_fu
+    };
+    SpriteMetrics {
+        aspect,
+        light: light_fu / em,
+        heavy: heavy_fu / em,
     }
 }
 

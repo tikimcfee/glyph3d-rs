@@ -10,6 +10,9 @@ pub const DEFAULT_FONT_FAMILY: &str = "cousine";
 /// Monaspace Neon family identifier.
 pub const MONASPACE_NEON_FAMILY: &str = "monaspace-neon";
 
+/// Monaspace Argon family identifier.
+pub const MONASPACE_ARGON_FAMILY: &str = "monaspace-argon";
+
 /// One variable-font axis coordinate (`tag` is a 4-byte OpenType axis tag like `*b"wght"`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Variation {
@@ -196,6 +199,7 @@ pub fn cousine_family_spec(fonts_dir: &Path) -> FontSpec {
 /// 2. MesloLGS NF Mono (fallback)
 /// 3. DejaVu Sans (fallback)
 /// 4. Monaspace Neon (family `"monaspace-neon"`, variable font with four instances)
+/// 5. Monaspace Argon (family `"monaspace-argon"`, variable font with four instances)
 ///
 /// Matches the ordering rule of `fonts/families.js::fontChain()`: default family first,
 /// fallbacks next (so their indices are stable), then every additional family.
@@ -214,6 +218,11 @@ pub fn default_font_chain(fonts_dir: &Path) -> Vec<FontSpec> {
             MONASPACE_NEON_FAMILY,
             "Monaspace Neon",
             fonts_dir.join("MonaspaceNeonVar.ttf"),
+        ),
+        monaspace_family_spec(
+            MONASPACE_ARGON_FAMILY,
+            "Monaspace Argon",
+            fonts_dir.join("MonaspaceArgonVar.ttf"),
         ),
     ]
 }

@@ -1,25 +1,34 @@
 //! Runtime font chain and growable Slug atlas.
 //!
 //! Combines `FontChain` routing (families, bold/italic/bold-italic faces, variable-font
-//! instances, shared fallback fonts) with on-demand Slug curve encoding into a growable
-//! [`SlugBuffer`].
+//! instances, shared fallback fonts, cell-generated terminal sprites, and combining-mark
+//! composite clusters) with on-demand Slug curve encoding into a growable [`SlugBuffer`].
 //!
-//! A [`Slot`] is a plain `u32` (slot 0 = blank). Other glyph sources (cell sprites,
-//! combining-mark clusters, colour emoji) can allocate slots from the same atlas via
-//! [`FontAtlas::allocate_slot`] and write their curves or glyph-map entries directly into
-//! its buffer without colliding with font glyph slots.
+//! A [`Slot`] is a plain `u32` (slot 0 = blank). Cell sprites route before any font into
+//! glyph-map mode `3` (`GLYPH_MODE_SPRITE`). Other external glyph sources (such as colour
+//! emoji bitmaps) can allocate slots from the same atlas via [`FontAtlas::allocate_slot`] and
+//! write their curves or glyph-map entries directly into its buffer without colliding.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ttf_parser::{Face as TtfFace, GlyphId, Tag};
+use icu_normalizer::{ComposingNormalizer, DecomposingNormalizer};
+use ttf_parser::{Face as TtfFace, GlyphId, Rect, Tag};
 
 use crate::buffer::{DirtyUpdate, SlugBuffer, TextureBacking};
-use crate::constants::{BLANK_SLOT, GLYPH_MODE_OUTLINE};
-use crate::encode::{encode_glyph, PackedCurve};
+use crate::constants::{BLANK_SLOT, GLYPH_MODE_OUTLINE, GLYPH_MODE_SPRITE};
+use crate::encode::{
+    encode_composite_part_curves, encode_glyph, extract_raw_curves, CompositePart, Curve,
+    PackedCurve,
+};
 use crate::families::{FaceSpec, FontSource, FontSpec, Variation};
 use crate::metrics::{FamilyMetrics, FontExtents};
+use crate::sprites::{encode_sprite, is_sprite_codepoint, SpriteMetrics};
+
+/// Vertical gap between a base glyph's ink and a mark placed above or below it, in ems
+/// (matches `MARK_GAP = 1 / 16` in `FontChain.js` and HarfBuzz's fallback mark positioning).
+const MARK_GAP_EM: f64 = 1.0 / 16.0;
 
 /// Dense atlas slot id. Slot `0` ([`BLANK_SLOT`]) is reserved for the blank/missing cell.
 pub type Slot = u32;
@@ -124,10 +133,26 @@ pub struct SlotInfo {
     pub glyph_name: Option<String>,
 }
 
+/// Classification of any allocated [`Slot`] in a [`FontAtlas`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotKind<'a> {
+    /// Slot 0 (blank / missing cell).
+    Blank,
+    /// Single font glyph outline (mode 0).
+    Font(SlotInfo),
+    /// Generated cell sprite (mode 3), owned by `family`.
+    Sprite { family: FamilyId, codepoint: u32 },
+    /// Composite cluster outline (mode 0) built from a base and placed combining marks.
+    Composite { parts: &'a [CompositePart] },
+    /// Slot allocated by an external source via [`FontAtlas::allocate_slot`].
+    External,
+}
+
 struct LoadedFont {
     name: String,
     bytes: Arc<[u8]>,
     variations: Vec<Variation>,
+    upem: u16,
     extents: FontExtents,
     /// Unicode scalar -> non-zero glyph id. Shared via `Arc` across variable instances of one file.
     cmap: Arc<HashMap<u32, u16>>,
@@ -152,10 +177,18 @@ pub struct FontAtlas {
     next_slot: Slot,
     /// `(font_index, gid) -> Slot` for font-backed outline slots.
     slot_by_glyph: HashMap<(usize, u16), Slot>,
+    /// `(family_idx, codepoint) -> Slot` for generated cell sprite slots (mode 3).
+    sprite_by_key: HashMap<(usize, u32), Slot>,
+    /// `parts -> Slot` deduplication for composite clusters.
+    composite_by_parts: HashMap<Vec<CompositePart>, Slot>,
     /// `(family_idx, face_bits, codepoint) -> Slot` fast cache (including `BLANK_SLOT` misses).
     lookup_cache: HashMap<(usize, u8, u32), Slot>,
-    /// Optional metadata per font-backed slot.
+    /// `(family_idx, face_bits, cluster_text) -> Slot` fast cache for multi-codepoint clusters.
+    cluster_cache: HashMap<(usize, u8, String), Slot>,
+    /// Per-slot provenance tables.
     slot_sources: HashMap<Slot, (usize, u16)>,
+    sprite_sources: HashMap<Slot, (usize, u32)>,
+    composite_sources: HashMap<Slot, Vec<CompositePart>>,
 }
 
 impl FontAtlas {
@@ -183,7 +216,7 @@ impl FontAtlas {
         // Pass 1: load every listed font so its index equals its position in `specs`.
         for spec in specs {
             let bytes = load_source(&spec.name, &spec.source)?;
-            let loaded = build_loaded_font(
+            let mut loaded = build_loaded_font(
                 spec.name.clone(),
                 bytes,
                 spec.variations.clone(),
@@ -192,7 +225,6 @@ impl FontAtlas {
                 None,
             )?;
             let idx = fonts.len();
-            let mut loaded = loaded;
             loaded.faces[0] = Some(idx);
             fonts.push(loaded);
         }
@@ -210,7 +242,7 @@ impl FontAtlas {
                     continue;
                 };
                 let face_name = format!("{}{}", spec.name, suffix);
-                let loaded = load_face_spec(
+                let mut loaded = load_face_spec(
                     &face_name,
                     face_spec,
                     spec.include_line_gap,
@@ -218,7 +250,6 @@ impl FontAtlas {
                     &fonts[upright_idx],
                 )?;
                 let idx = fonts.len();
-                let mut loaded = loaded;
                 loaded.faces[0] = Some(idx);
                 fonts.push(loaded);
                 fonts[upright_idx].faces[face_kind.as_index()] = Some(idx);
@@ -232,24 +263,25 @@ impl FontAtlas {
             .filter_map(|(i, s)| s.family.is_none().then_some(i))
             .collect();
 
-        let make_family = |primary: usize, id: Option<String>, fonts: &[LoadedFont]| -> Result<Family, FontError> {
-            let mut route = Vec::with_capacity(1 + fallbacks.len());
-            route.push(primary);
-            for &fb in &fallbacks {
-                if fb != primary {
-                    route.push(fb);
+        let make_family =
+            |primary: usize, id: Option<String>, fonts: &[LoadedFont]| -> Result<Family, FontError> {
+                let mut route = Vec::with_capacity(1 + fallbacks.len());
+                route.push(primary);
+                for &fb in &fallbacks {
+                    if fb != primary {
+                        route.push(fb);
+                    }
                 }
-            }
-            let font = &fonts[primary];
-            let face = parse_and_vary(&font.name, &font.bytes, &font.variations)?;
-            let include_gap = specs[primary].include_line_gap;
-            let metrics = FamilyMetrics::from_face(&face, include_gap);
-            Ok(Family {
-                id,
-                route,
-                metrics,
-            })
-        };
+                let font = &fonts[primary];
+                let face = parse_and_vary(&font.name, &font.bytes, &font.variations)?;
+                let include_gap = specs[primary].include_line_gap;
+                let metrics = FamilyMetrics::from_face(&face, include_gap);
+                Ok(Family {
+                    id,
+                    route,
+                    metrics,
+                })
+            };
 
         let mut families = Vec::new();
         families.push(make_family(0, specs[0].family.clone(), &fonts)?);
@@ -269,12 +301,17 @@ impl FontAtlas {
             buffer: SlugBuffer::with_initial_rows(curve_rows, map_rows),
             next_slot: 1,
             slot_by_glyph: HashMap::new(),
+            sprite_by_key: HashMap::new(),
+            composite_by_parts: HashMap::new(),
             lookup_cache: HashMap::new(),
+            cluster_cache: HashMap::new(),
             slot_sources: HashMap::new(),
+            sprite_sources: HashMap::new(),
+            composite_sources: HashMap::new(),
         })
     }
 
-    /// Look up a family handle by its string id (e.g. `"cousine"`, `"monaspace-neon"`).
+    /// Look up a family handle by its string id (e.g. `"cousine"`, `"monaspace-neon"`, `"monaspace-argon"`).
     pub fn family_id(&self, id: &str) -> Option<FamilyId> {
         self.families
             .iter()
@@ -305,16 +342,24 @@ impl FontAtlas {
         self.fonts.len()
     }
 
-    /// Cell and line metrics for `family`. Panics if `family` is out of range.
+    /// Cell, line, and sprite metrics for `family`. Panics if `family` is out of range.
     pub fn family_metrics(&self, family: FamilyId) -> FamilyMetrics {
         self.families[family.0].metrics
     }
 
+    /// Sprite geometry (cell aspect and light/heavy box-drawing weights) for `family`.
+    pub fn sprite_metrics(&self, family: FamilyId) -> SpriteMetrics {
+        self.families[family.0].metrics.sprites
+    }
+
     /// Look up (and encode on first use) the atlas [`Slot`] for `(family, face, codepoint)`.
     ///
-    /// - Routes through `family`'s primary font first, then the shared fallbacks.
-    /// - For non-regular faces, uses that font's matching face (falling back from `BoldItalic` to
-    ///   `Italic` then `Bold`, then upright if absent or uncovered). Fallback fonts stay upright.
+    /// - Cell sprite codepoints (`is_sprite_codepoint`) route to a per-family sprite slot in
+    ///   glyph-map mode `3` (`GLYPH_MODE_SPRITE`) BEFORE any font (ignoring `face`).
+    /// - All other codepoints route through `family`'s primary font first, then the shared
+    ///   fallbacks. For non-regular faces, uses that font's matching face (falling back from
+    ///   `BoldItalic` to `Italic` then `Bold`, then upright if absent or uncovered). Fallback
+    ///   fonts stay upright.
     /// - Returns [`BLANK_SLOT`] (`0`) when no font in the family's route covers `codepoint`.
     pub fn glyph(&mut self, family: FamilyId, face: Face, codepoint: char) -> Slot {
         self.glyph_u32(family, face, codepoint as u32)
@@ -328,10 +373,13 @@ impl FontAtlas {
             return slot;
         }
 
-        let resolved = self.resolve_font_glyph(fam_idx, face, codepoint);
-        let slot = match resolved {
-            None => BLANK_SLOT,
-            Some((font_idx, gid)) => self.ensure_font_glyph(font_idx, gid),
+        let slot = if is_sprite_codepoint(codepoint) {
+            self.ensure_sprite(fam_idx, codepoint)
+        } else {
+            match self.resolve_font_glyph(fam_idx, face, codepoint) {
+                None => BLANK_SLOT,
+                Some((font_idx, gid)) => self.ensure_font_glyph(font_idx, gid),
+            }
         };
         self.lookup_cache.insert(key, slot);
         slot
@@ -346,17 +394,297 @@ impl FontAtlas {
         }
     }
 
-    /// Resolve `(family, face, codepoint)` to `(font_index, gid)` without encoding or allocating.
-    fn resolve_font_glyph(&self, fam_idx: usize, face: Face, codepoint: u32) -> Option<(usize, u16)> {
-        let family = self.families.get(fam_idx)?;
-        let mut upright = None;
-        for &font_idx in &family.route {
-            if let Some(&gid) = self.fonts[font_idx].cmap.get(&codepoint) {
-                upright = Some((font_idx, gid));
-                break;
+    /// Look up (and encode on first use) a grapheme cluster — a base and its combining marks
+    /// (e.g. `"e\u{0301}"`, `"x\u{0301}"`, `"q\u{0308}\u{0304}"`) or an emoji/variation sequence.
+    ///
+    /// Mirrors `FontChain.lookupCluster` and `slugData.encodeComposite`:
+    /// 1. Variation selectors (`U+FE00..=FE0F`, `U+E0100..=E01EF`) and joiners (`U+200C`,
+    ///    `U+200D`) are stripped.
+    /// 2. The remainder is NFC-normalised (`icu_normalizer`). If it composes to a single scalar
+    ///    covered by a sprite or font in `family`'s route, returns that single glyph's slot in
+    ///    `face`. If uncovered, NFD decomposition is tried so a decomposed base + marks can still
+    ///    be drawn as a composite.
+    /// 3. For a multi-scalar cluster whose base is a sprite or astral emoji (`>= U+1F000`) or
+    ///    uncovered, draws the base alone (`glyph(family, face, base)`).
+    /// 4. Otherwise builds a composite slot from the base (in `face` where available) and each
+    ///    combining mark (from the base's font if covered, else from `family`'s fallback fonts;
+    ///    uncovered marks are dropped). Marks are placed by ink bounding box (`MARK_GAP_EM = 1/16`
+    ///    above/below the accumulated ink stack, centred horizontally over the base's ink).
+    pub fn cluster(&mut self, family: FamilyId, face: Face, text: &str) -> Slot {
+        let fam_idx = family.0;
+        if fam_idx >= self.families.len() {
+            return BLANK_SLOT;
+        }
+        let cache_key = (fam_idx, face as u8, text.to_owned());
+        if let Some(&slot) = self.cluster_cache.get(&cache_key) {
+            return slot;
+        }
+
+        let slot = self.resolve_cluster_uncached(family, face, text);
+        self.cluster_cache.insert(cache_key, slot);
+        slot
+    }
+
+    fn resolve_cluster_uncached(&mut self, family: FamilyId, face: Face, text: &str) -> Slot {
+        let fam_idx = family.0;
+        let stripped: String = text.chars().filter(|&ch| !is_ignorable_cluster_char(ch)).collect();
+        if stripped.is_empty() {
+            return BLANK_SLOT;
+        }
+
+        let nfc = ComposingNormalizer::new_nfc().normalize(&stripped);
+        let mut working = nfc.into_owned();
+        let mut chars = working.chars();
+        let Some(mut base) = chars.next() else {
+            return BLANK_SLOT;
+        };
+
+        if chars.next().is_none() {
+            // Single scalar after NFC: use the precomposed glyph/sprite if covered.
+            let cp = base as u32;
+            if is_sprite_codepoint(cp) || self.route_upright(fam_idx, cp).is_some() {
+                return self.glyph(family, face, base);
+            }
+            // No font has the precomposed scalar; try NFD so it can still compose from parts.
+            let nfd = DecomposingNormalizer::new_nfd().normalize(&working);
+            if nfd.as_ref() == working.as_str() {
+                return self.glyph(family, face, base);
+            }
+            working = nfd.into_owned();
+            let Some(new_base) = working.chars().next() else {
+                return BLANK_SLOT;
+            };
+            base = new_base;
+        }
+
+        let base_cp = base as u32;
+        let Some(upright_idx) = self.route_upright(fam_idx, base_cp) else {
+            return self.glyph(family, face, base);
+        };
+        if is_sprite_codepoint(base_cp) || base_cp >= 0x1F000 {
+            return self.glyph(family, face, base);
+        }
+
+        // Choose the face font for the base if available and covering `base`.
+        let base_font_idx = if face != Face::Regular {
+            self.face_font(upright_idx, face)
+                .filter(|&fi| self.fonts[fi].cmap.contains_key(&base_cp))
+                .unwrap_or(upright_idx)
+        } else {
+            upright_idx
+        };
+        let Some(&base_gid) = self.fonts[base_font_idx].cmap.get(&base_cp) else {
+            return self.glyph(family, face, base);
+        };
+
+        let base_face_parsed = parse_and_vary(
+            &self.fonts[base_font_idx].name,
+            &self.fonts[base_font_idx].bytes,
+            &self.fonts[base_font_idx].variations,
+        )
+        .expect("already-validated font bytes must re-parse");
+        let base_adv = base_face_parsed
+            .glyph_hor_advance(GlyphId(base_gid))
+            .map(|a| a as i32)
+            .filter(|&a| a > 0)
+            .unwrap_or(self.families[fam_idx].metrics.advance_fu);
+        let base_upem = self.fonts[base_font_idx].upem as f64;
+
+        struct DraftPart {
+            font_index: usize,
+            glyph_id: u16,
+            offset_x_fu: i32,
+            offset_y_fu: i32,
+            units_per_cell: i32,
+            raw_curves: Vec<Curve>,
+            ink_rect: Option<Rect>,
+        }
+
+        let (base_curves, base_rect, _) = extract_raw_curves(
+            &base_face_parsed,
+            GlyphId(base_gid),
+            self.fonts[base_font_idx].extents,
+        );
+        let mut drafts = vec![DraftPart {
+            font_index: base_font_idx,
+            glyph_id: base_gid,
+            offset_x_fu: 0,
+            offset_y_fu: 0,
+            units_per_cell: base_adv,
+            raw_curves: base_curves,
+            ink_rect: base_rect,
+        }];
+
+        for mark_ch in working.chars().skip(1) {
+            let mark_cp = mark_ch as u32;
+            let resolved_mark = if let Some(&gid) = self.fonts[base_font_idx].cmap.get(&mark_cp) {
+                Some((base_font_idx, gid, base_adv))
+            } else if let Some(other_idx) = self.route_upright(fam_idx, mark_cp) {
+                if other_idx != upright_idx {
+                    self.fonts[other_idx].cmap.get(&mark_cp).map(|&gid| {
+                        let other_upem = self.fonts[other_idx].upem as f64;
+                        let units = ((base_adv as f64) * other_upem / base_upem).round() as i32;
+                        (other_idx, gid, units.max(1))
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let Some((m_font_idx, m_gid, m_units)) = resolved_mark else {
+                continue; // uncovered mark is dropped; base still draws
+            };
+
+            let (m_curves, m_rect, _) = if m_font_idx == base_font_idx {
+                extract_raw_curves(
+                    &base_face_parsed,
+                    GlyphId(m_gid),
+                    self.fonts[m_font_idx].extents,
+                )
+            } else {
+                let mf = parse_and_vary(
+                    &self.fonts[m_font_idx].name,
+                    &self.fonts[m_font_idx].bytes,
+                    &self.fonts[m_font_idx].variations,
+                )
+                .expect("already-validated font bytes must re-parse");
+                extract_raw_curves(&mf, GlyphId(m_gid), self.fonts[m_font_idx].extents)
+            };
+
+            drafts.push(DraftPart {
+                font_index: m_font_idx,
+                glyph_id: m_gid,
+                offset_x_fu: 0,
+                offset_y_fu: 0,
+                units_per_cell: m_units,
+                raw_curves: m_curves,
+                ink_rect: m_rect,
+            });
+        }
+
+        // Only the base survived: share the lone base glyph's slot.
+        if drafts.len() == 1 {
+            return self.ensure_font_glyph(base_font_idx, base_gid);
+        }
+
+        // Place marks relative to the base's ink (FontChain._placeMarks).
+        #[derive(Clone, Copy)]
+        struct CellInk {
+            x0: f64,
+            x1: f64,
+            y0: f64,
+            y1: f64,
+            em: f64,
+            baseline: f64,
+            gap: f64,
+        }
+
+        let to_cell_ink = |d: &DraftPart, fonts: &[LoadedFont]| -> Option<CellInk> {
+            let rect = d.ink_rect?;
+            if rect.x_max <= rect.x_min || rect.y_max <= rect.y_min || d.units_per_cell <= 0 {
+                return None;
+            }
+            let font = &fonts[d.font_index];
+            let ext = font.extents;
+            let em = ext.em_height();
+            if em <= 0.0 {
+                return None;
+            }
+            let units = d.units_per_cell as f64;
+            Some(CellInk {
+                x0: (d.offset_x_fu as f64 + rect.x_min as f64) / units,
+                x1: (d.offset_x_fu as f64 + rect.x_max as f64) / units,
+                y0: (d.offset_y_fu as f64 + rect.y_min as f64 - ext.descender) / em,
+                y1: (d.offset_y_fu as f64 + rect.y_max as f64 - ext.descender) / em,
+                em,
+                baseline: -ext.descender / em,
+                gap: MARK_GAP_EM * (font.upem as f64) / em,
+            })
+        };
+
+        let mut acc_box = to_cell_ink(&drafts[0], &self.fonts);
+        let mid = acc_box.map_or(0.0, |b| (b.y0 + b.y1) * 0.5);
+
+        for d in drafts.iter_mut().skip(1) {
+            let Some(mut m) = to_cell_ink(d, &self.fonts) else {
+                continue;
+            };
+            let base_center = acc_box.map_or(0.5, |b| (b.x0 + b.x1) * 0.5);
+            let dx = base_center - (m.x0 + m.x1) * 0.5;
+            let mut dy = 0.0_f64;
+            if let Some(b) = acc_box {
+                if m.y0 >= mid && m.y0 > m.baseline {
+                    // Mark above: foot sits `gap` clear of what's under it (lower halfway if floating higher).
+                    dy = b.y1 + m.gap - m.y0;
+                    if dy < 0.0 {
+                        dy *= 0.5;
+                    }
+                } else if m.y1 <= m.baseline + m.gap * 0.25 {
+                    // Mark below: cedilla/ogonek touches; detached mark hangs `gap` below. Never raised.
+                    let attached = m.y1 >= m.baseline - m.gap * 0.25;
+                    dy = (b.y0 - if attached { 0.0 } else { m.gap } - m.y1).min(0.0);
+                }
+            }
+            d.offset_x_fu += (dx * d.units_per_cell as f64).round() as i32;
+            d.offset_y_fu += (dy * m.em).round() as i32;
+            m.y0 += dy;
+            m.y1 += dy;
+            if let Some(ref mut b) = acc_box {
+                b.y0 = b.y0.min(m.y0);
+                b.y1 = b.y1.max(m.y1);
             }
         }
-        let (upright_idx, upright_gid) = upright?;
+
+        let parts: Vec<CompositePart> = drafts
+            .iter()
+            .map(|d| CompositePart {
+                font_index: d.font_index,
+                glyph_id: d.glyph_id,
+                offset_x_fu: d.offset_x_fu,
+                offset_y_fu: d.offset_y_fu,
+                units_per_cell: d.units_per_cell,
+            })
+            .collect();
+
+        if let Some(&existing) = self.composite_by_parts.get(&parts) {
+            return existing;
+        }
+
+        let mut packed = Vec::new();
+        for d in &drafts {
+            encode_composite_part_curves(
+                &d.raw_curves,
+                d.offset_x_fu,
+                d.offset_y_fu,
+                d.units_per_cell,
+                self.fonts[d.font_index].extents,
+                &mut packed,
+            );
+        }
+
+        let slot = self.allocate_slot();
+        self.buffer
+            .write_outline_slot(slot, &packed, GLYPH_MODE_OUTLINE, 0);
+        self.composite_by_parts.insert(parts.clone(), slot);
+        self.composite_sources.insert(slot, parts);
+        slot
+    }
+
+    fn route_upright(&self, fam_idx: usize, codepoint: u32) -> Option<usize> {
+        let family = self.families.get(fam_idx)?;
+        family
+            .route
+            .iter()
+            .copied()
+            .find(|&fi| self.fonts[fi].cmap.contains_key(&codepoint))
+    }
+
+    /// Resolve `(family, face, codepoint)` to `(font_index, gid)` without encoding or allocating.
+    fn resolve_font_glyph(&self, fam_idx: usize, face: Face, codepoint: u32) -> Option<(usize, u16)> {
+        let upright_idx = self.route_upright(fam_idx, codepoint)?;
+        let upright_gid = *self.fonts[upright_idx].cmap.get(&codepoint)?;
 
         if face != Face::Regular {
             if let Some(face_idx) = self.face_font(upright_idx, face) {
@@ -379,6 +707,22 @@ impl FontAtlas {
         None
     }
 
+    fn ensure_sprite(&mut self, fam_idx: usize, codepoint: u32) -> Slot {
+        if let Some(&slot) = self.sprite_by_key.get(&(fam_idx, codepoint)) {
+            return slot;
+        }
+        let metrics = self.families[fam_idx].metrics.sprites;
+        let Some((curves, alpha)) = encode_sprite(codepoint, metrics) else {
+            return BLANK_SLOT;
+        };
+        let slot = self.allocate_slot();
+        self.buffer
+            .write_outline_slot(slot, &curves, GLYPH_MODE_SPRITE, alpha as u32);
+        self.sprite_by_key.insert((fam_idx, codepoint), slot);
+        self.sprite_sources.insert(slot, (fam_idx, codepoint));
+        slot
+    }
+
     fn ensure_font_glyph(&mut self, font_idx: usize, gid: u16) -> Slot {
         if let Some(&slot) = self.slot_by_glyph.get(&(font_idx, gid)) {
             return slot;
@@ -395,13 +739,12 @@ impl FontAtlas {
         slot
     }
 
-    // ── Extensibility for external glyph sources (sprites, clusters, emoji) ──
+    // ── Extensibility for external glyph sources (emoji, etc.) ──────────────
 
     /// Allocate the next unused [`Slot`] id (`>= 1`).
     ///
-    /// External glyph sources (cell sprites, combining-mark clusters, colour emoji) use this
-    /// to claim slots from the same id space and then populate them with
-    /// [`Self::insert_outline_slot`] or [`Self::insert_map_entry`].
+    /// External glyph sources (e.g. colour emoji) use this to claim slots from the same id space
+    /// and populate them with [`Self::insert_outline_slot`] or [`Self::insert_map_entry`].
     pub fn allocate_slot(&mut self) -> Slot {
         let slot = self.next_slot;
         self.next_slot += 1;
@@ -466,7 +809,50 @@ impl FontAtlas {
         self.buffer.slot_curves(slot)
     }
 
-    /// Inspect which font and per-font glyph id produced `slot` (`None` for blank or external slots).
+    /// Returns true if `slot` is a generated cell sprite (mode 3).
+    pub fn is_sprite_slot(&self, slot: Slot) -> bool {
+        self.sprite_sources.contains_key(&slot)
+    }
+
+    /// Returns `(family, codepoint)` if `slot` is a generated cell sprite.
+    pub fn sprite_info(&self, slot: Slot) -> Option<(FamilyId, u32)> {
+        self.sprite_sources
+            .get(&slot)
+            .map(|&(fam, cp)| (FamilyId(fam), cp))
+    }
+
+    /// Returns true if `slot` is a composite cluster slot (base + combining marks).
+    pub fn is_composite_slot(&self, slot: Slot) -> bool {
+        self.composite_sources.contains_key(&slot)
+    }
+
+    /// Returns the placed parts of a composite cluster slot, or `None` for other slots.
+    pub fn composite_parts(&self, slot: Slot) -> Option<&[CompositePart]> {
+        self.composite_sources.get(&slot).map(Vec::as_slice)
+    }
+
+    /// Classify any allocated slot (blank, font glyph, cell sprite, composite cluster, or external).
+    pub fn slot_kind(&self, slot: Slot) -> SlotKind<'_> {
+        if slot == BLANK_SLOT {
+            return SlotKind::Blank;
+        }
+        if let Some(info) = self.describe_slot(slot) {
+            return SlotKind::Font(info);
+        }
+        if let Some(&(fam, cp)) = self.sprite_sources.get(&slot) {
+            return SlotKind::Sprite {
+                family: FamilyId(fam),
+                codepoint: cp,
+            };
+        }
+        if let Some(parts) = self.composite_sources.get(&slot) {
+            return SlotKind::Composite { parts };
+        }
+        SlotKind::External
+    }
+
+    /// Inspect which font and per-font glyph id produced `slot` (`None` for blank, sprite,
+    /// composite, or external slots).
     pub fn describe_slot(&self, slot: Slot) -> Option<SlotInfo> {
         let &(font_idx, gid) = self.slot_sources.get(&slot)?;
         let font = &self.fonts[font_idx];
@@ -479,6 +865,11 @@ impl FontAtlas {
             glyph_id: gid,
             glyph_name,
         })
+    }
+
+    /// Human-readable name of a loaded font index (e.g. for describing composite parts).
+    pub fn font_name(&self, font_index: usize) -> Option<&str> {
+        self.fonts.get(font_index).map(|f| f.name.as_str())
     }
 
     /// Check whether two loaded font indices share the same underlying font byte buffer
@@ -495,6 +886,16 @@ impl FontAtlas {
     pub fn instance_of(&self, font_index: usize) -> Option<usize> {
         self.fonts.get(font_index).and_then(|f| f.instance_of)
     }
+}
+
+/// Variation selectors and joiners ignored when normalizing a cluster (matches `IGNORABLE` in
+/// `FontChain.js`).
+#[inline]
+fn is_ignorable_cluster_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x200C | 0x200D | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF
+    )
 }
 
 fn load_source(name: &str, source: &FontSource) -> Result<Arc<[u8]>, FontError> {
@@ -553,6 +954,7 @@ fn build_loaded_font(
     instance_of: Option<usize>,
 ) -> Result<LoadedFont, FontError> {
     let face = parse_and_vary(&name, &bytes, &variations)?;
+    let upem = face.units_per_em();
     let extents = FontExtents::from_face(&face, include_line_gap);
     let cmap = match shared_cmap {
         Some(existing) => existing,
@@ -562,6 +964,7 @@ fn build_loaded_font(
         name,
         bytes,
         variations,
+        upem,
         extents,
         cmap,
         instance_of,

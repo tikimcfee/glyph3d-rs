@@ -5,6 +5,7 @@ edition = "2021"
 description = "Fonts loaded at run time and encoded to Slug curves in the engine's atlas format (the wall)."
 
 [dependencies]
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 ttf-parser = "0.25"
 
 [lints]

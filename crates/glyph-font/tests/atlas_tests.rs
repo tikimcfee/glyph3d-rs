@@ -14,8 +14,9 @@ use glyph_font::encode::{encode_glyph, encode_raw_curves, reverse_curves, Curve,
 use glyph_font::metrics::{compute_cell_metrics, derive_char_size, snap_cell_dimension, FontExtents};
 use glyph_font::raster::{measure_ink, rasterize_glyph};
 use glyph_font::{
-    default_font_chain, texel_range_to_rects, Face, FaceSpec, FontAtlas, FontError, FontSource,
-    FontSpec, TexelRect, Variation, DEFAULT_FONT_FAMILY, MONASPACE_NEON_FAMILY,
+    default_font_chain, is_sprite_codepoint, texel_range_to_rects, Face, FaceSpec, FontAtlas,
+    FontError, FontSource, FontSpec, TexelRect, Variation, DEFAULT_FONT_FAMILY,
+    MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
 };
 use ttf_parser::{Face as TtfFace, OutlineBuilder};
 
@@ -199,13 +200,15 @@ fn oracle_cousine_matches_baked_atlas() {
         assert_eq!(ext.line_gap as i32, baked.fonts[idx].line_gap, "{file} line_gap");
     }
 
-    // Build test character set: all printable ASCII + accented letters + box-drawing.
+    // Build test character set: all printable ASCII + accented letters (routed through FontAtlas
+    // to Cousine outlines) + box-drawing/blocks (which FontAtlas now routes to mode-3 cell sprites,
+    // while Cousine's own outline in `encode_glyph` still matches the baked oracle verbatim).
     let mut chars: Vec<char> = (0x20u8..=0x7Eu8).map(char::from).collect();
     chars.extend(['é', 'è', 'ê', 'ë', 'ñ', 'ü', 'ö', 'ä', 'à', 'ç', 'Å', 'É', 'Ö', 'ß']);
-    chars.extend([
+    let sprite_chars = [
         '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼',
         '═', '║', '╔', '╗', '╚', '╝', '█', '▀', '▄', '░', '▒', '▓',
-    ]);
+    ];
 
     let mut exact_glyphs = 0usize;
     let mut count_mismatches = Vec::new();
@@ -213,6 +216,7 @@ fn oracle_cousine_matches_baked_atlas() {
     let mut max_u16_diff = 0u32;
 
     for ch in chars {
+        assert!(!is_sprite_codepoint(ch as u32));
         let baked_slot = baked.lookup_slot(ch);
         assert_ne!(baked_slot, 0, "expected '{ch}' (U+{:04X}) in baked atlas", ch as u32);
         let baked_entry = baked.map_entry(baked_slot);
@@ -278,6 +282,13 @@ fn oracle_cousine_matches_baked_atlas() {
                 ch as u32, ch, glyph_max_diff, first_diff
             ));
         }
+    }
+
+    // Verify box-drawing/blocks route to mode-3 cell sprites in FontAtlas.
+    for ch in sprite_chars {
+        let rt_slot = atlas.glyph(cousine_fam, Face::Regular, ch);
+        assert!(atlas.is_sprite_slot(rt_slot), "'{ch}' must route to a cell sprite");
+        assert_eq!(atlas.map_entry(rt_slot)[2], GLYPH_MODE_SPRITE);
     }
 
     eprintln!(
@@ -514,6 +525,29 @@ fn variable_font_monaspace_neon_weights_slant_ink_and_winding() {
     let c_l_reg = measure_ink(&atlas.slot_curves(cl_reg), 80, 80);
     let c_l_it = measure_ink(&atlas.slot_curves(cl_it), 80, 80);
     assert!(c_l_it.lean > c_l_reg.lean + 0.04);
+
+    // Monaspace Argon: four distinct slots sharing bytes, Bold inks more, Italic leans right.
+    let argon = atlas.family_id(MONASPACE_ARGON_FAMILY).expect("monaspace-argon family");
+    let ah_reg = atlas.glyph(argon, Face::Regular, 'H');
+    let ah_bold = atlas.glyph(argon, Face::Bold, 'H');
+    let ah_it = atlas.glyph(argon, Face::Italic, 'H');
+    let ah_bi = atlas.glyph(argon, Face::BoldItalic, 'H');
+    assert_eq!(std::collections::HashSet::from([ah_reg, ah_bold, ah_it, ah_bi]).len(), 4);
+    let ah_reg_info = atlas.describe_slot(ah_reg).unwrap();
+    let ah_bold_info = atlas.describe_slot(ah_bold).unwrap();
+    assert_eq!(ah_reg_info.font_name, "Monaspace Argon");
+    assert_eq!(ah_bold_info.font_name, "Monaspace Argon Bold");
+    assert!(atlas.shares_font_bytes(ah_reg_info.font_index, ah_bold_info.font_index));
+    assert!(
+        measure_ink(&atlas.slot_curves(ah_bold), 80, 80).mean_coverage
+            > measure_ink(&atlas.slot_curves(ah_reg), 80, 80).mean_coverage * 1.12
+    );
+    let al_reg = atlas.glyph(argon, Face::Regular, 'l');
+    let al_it = atlas.glyph(argon, Face::Italic, 'l');
+    assert!(
+        measure_ink(&atlas.slot_curves(al_it), 80, 80).lean
+            > measure_ink(&atlas.slot_curves(al_reg), 80, 80).lean + 0.04
+    );
 }
 
 #[test]
@@ -647,19 +681,28 @@ fn fallback_routing_missing_glyphs_and_external_slots() {
     let a_neon = atlas.glyph(neon, Face::Regular, 'A');
     assert_ne!(a_cousine, a_neon);
 
-    // A DejaVu-only symbol (Braille '⣿' U+28FF) routes to the SAME shared fallback slot in both
-    // families, and stays upright even when Bold or Italic is requested.
-    let braille_c = atlas.glyph(cousine, Face::Regular, '⣿');
-    let braille_n = atlas.glyph(neon, Face::Regular, '⣿');
-    assert_ne!(braille_c, BLANK_SLOT);
-    assert_eq!(braille_c, braille_n, "fallback glyphs must be shared across families");
+    // A Meslo fallback symbol ('☃' U+2603) routes to the SAME shared fallback slot in
+    // both families, and stays upright even when Bold or Italic is requested.
+    let snow_c = atlas.glyph(cousine, Face::Regular, '☃');
+    let snow_n = atlas.glyph(neon, Face::Regular, '☃');
+    assert_ne!(snow_c, BLANK_SLOT);
+    assert_eq!(snow_c, snow_n, "fallback glyphs must be shared across families");
     assert_eq!(
-        atlas.describe_slot(braille_c).expect("braille info").font_name,
-        "DejaVu Sans"
+        atlas.describe_slot(snow_c).expect("snowman info").font_name,
+        "MesloLGS NF Mono"
     );
-    assert_eq!(atlas.glyph(cousine, Face::Bold, '⣿'), braille_c);
-    assert_eq!(atlas.glyph(cousine, Face::Italic, '⣿'), braille_c);
-    assert_eq!(atlas.glyph(neon, Face::BoldItalic, '⣿'), braille_c);
+    assert_eq!(atlas.glyph(cousine, Face::Bold, '☃'), snow_c);
+    assert_eq!(atlas.glyph(cousine, Face::Italic, '☃'), snow_c);
+    assert_eq!(atlas.glyph(neon, Face::BoldItalic, '☃'), snow_c);
+
+    // A DejaVu-only symbol (Arabic 'ش' U+0634) falls all the way through to DejaVu Sans
+    // and is also shared across families and stays upright across faces.
+    let dv_c = atlas.glyph(cousine, Face::Regular, 'ش');
+    let dv_n = atlas.glyph(neon, Face::Regular, 'ش');
+    assert_ne!(dv_c, BLANK_SLOT);
+    assert_eq!(dv_c, dv_n);
+    assert_eq!(atlas.describe_slot(dv_c).expect("dejavu info").font_name, "DejaVu Sans");
+    assert_eq!(atlas.glyph(cousine, Face::Bold, 'ش'), dv_c);
 
     // Space allocates a real slot with 0 curves and stays stable.
     let space1 = atlas.glyph(cousine, Face::Regular, ' ');
