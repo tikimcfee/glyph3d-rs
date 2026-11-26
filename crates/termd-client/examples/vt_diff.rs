@@ -26,6 +26,7 @@ const FORBIDDEN_NAMESPACES: [&str; 4] = ["wall", "agents", "default", "rs-wall"]
 
 struct Config {
     termd_dir: PathBuf,
+    termd_bin: Option<PathBuf>,
     ns: String,
     tmux_label: String,
     verbose: bool,
@@ -39,6 +40,7 @@ fn parse_args() -> Config {
     let mut termd_dir = std::env::var_os("G3D_TERMD_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/g3d-vt-{pid}")));
+    let mut termd_bin = std::env::var_os("G3D_TERMD_BIN").map(PathBuf::from);
     let mut ns = "probe".to_owned();
     let mut tmux_label = format!("vt-diff-{pid}");
     let mut verbose = false;
@@ -49,6 +51,9 @@ fn parse_args() -> Config {
         match arg.as_str() {
             "--termd-dir" => {
                 termd_dir = PathBuf::from(args.next().expect("--termd-dir requires path"));
+            }
+            "--termd-bin" => {
+                termd_bin = Some(PathBuf::from(args.next().expect("--termd-bin requires path")));
             }
             "--ns" => {
                 ns = args.next().expect("--ns requires namespace");
@@ -77,6 +82,7 @@ fn parse_args() -> Config {
 
     Config {
         termd_dir,
+        termd_bin,
         ns,
         tmux_label,
         verbose,
@@ -85,7 +91,11 @@ fn parse_args() -> Config {
     }
 }
 
-fn locate_termd_bin() -> PathBuf {
+fn locate_termd_bin(override_bin: Option<&Path>) -> PathBuf {
+    if let Some(p) = override_bin {
+        assert!(p.is_file(), "--termd-bin {} does not exist", p.display());
+        return p.to_path_buf();
+    }
     let local = PathBuf::from("/Users/lugo/.local/bin/g3d-termd");
     if local.is_file() {
         return local;
@@ -103,7 +113,7 @@ struct ScratchHarness {
 
 impl ScratchHarness {
     fn new(cfg: &Config) -> Self {
-        let bin = locate_termd_bin();
+        let bin = locate_termd_bin(cfg.termd_bin.as_deref());
         let owns_dir = !cfg.termd_dir.exists();
         if owns_dir {
             std::fs::DirBuilder::new()

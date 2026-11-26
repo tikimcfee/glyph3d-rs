@@ -40,4 +40,8 @@ fi
 if [[ "${VT_DIFF_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build --release -p termd-client --example vt_diff
 fi
-"$ROOT/target/release/examples/vt_diff" --termd-dir "$D" --ns "$NS" --tmux-label "vt-diff-$$" "$@"
+EXTRA_ARGS=()
+if [[ -n "${G3D_TERMD_BIN:-}" ]]; then
+    EXTRA_ARGS+=(--termd-bin "$G3D_TERMD_BIN")
+fi
+"$ROOT/target/release/examples/vt_diff" --termd-dir "$D" --ns "$NS" --tmux-label "vt-diff-$$" "${EXTRA_ARGS[@]}" "$@"
