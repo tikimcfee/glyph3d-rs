@@ -1,6 +1,7 @@
 //! Scripted window-level input verbs (`app.move`, `app.down`, `app.up`, `app.click`,
-//! `app.dblclick`, `app.drag`, `app.wheel`, `app.pinch`, `app.key`, `app.type`, and
-//! `app.where`) for driving a live `--wall` window over `wallctl`.
+//! `app.dblclick`, `app.drag`, `app.wheel`, `app.pinch`, `app.key`, `app.type`, `app.ime`,
+//! `app.focus`, `app.clipboard`, and `app.where`) for driving a live `--wall` window over
+//! `wallctl`.
 //!
 //! Coordinates are logical pixels from the window's top-left `(0, 0)`, matching
 //! `App::cursor` and `Wall`'s viewport coordinate space.
@@ -59,21 +60,71 @@ pub enum ScriptCommand {
     },
     /// `app.pinch <x> <y> <factor>`
     Pinch { x: f64, y: f64, factor: f64 },
-    /// `app.key <chord>` (e.g. `cmd+d`, `cmd+shift+d`, `shift+Tab`, `Enter`, `Escape`).
+    /// `app.key [--down|--up|--repeat] [--key <logical>] [--text <typed>] <chord>`
     Key(ScriptKey),
     /// `app.type <text>`
     Type(String),
+    /// `app.ime preedit <text> | commit <text> | disable`
+    Ime(ScriptIme),
+    /// `app.focus on|off`
+    Focus(bool),
+    /// `app.clipboard [clear | set <text>]`
+    Clipboard(ScriptClipboard),
     /// `app.where`
     Where,
 }
 
-/// Physical key, logical key, typed text, and modifiers for one synthesized keystroke.
+/// Phase of a scripted keystroke (`app.key`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScriptKeyPhase {
+    /// Press followed immediately by release (default).
+    #[default]
+    Tap,
+    /// Press only (`--down`).
+    Down,
+    /// Release only (`--up`).
+    Up,
+    /// Repeated press (`--repeat`, `KeyEvent.repeat = true`).
+    Repeat,
+}
+
+/// Physical key, logical key, typed text, modifiers, and phase for one synthesized keystroke.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptKey {
     pub physical: PhysicalKey,
     pub logical: Key,
     pub text: Option<String>,
     pub mods: ModifiersState,
+    pub phase: ScriptKeyPhase,
+}
+
+/// Scripted IME composition event (`app.ime`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptIme {
+    Preedit(String),
+    Commit(String),
+    Disable,
+}
+
+/// Scripted clipboard inspection or memory-clipboard mutation (`app.clipboard`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptClipboard {
+    Get,
+    Clear,
+    Set(String),
+}
+
+/// Modifier flag corresponding to a physical modifier key, if `physical` is one.
+pub fn modifier_bit_of_physical(physical: PhysicalKey) -> Option<ModifiersState> {
+    match physical {
+        PhysicalKey::Code(KeyCode::ShiftLeft | KeyCode::ShiftRight) => Some(ModifiersState::SHIFT),
+        PhysicalKey::Code(KeyCode::ControlLeft | KeyCode::ControlRight) => {
+            Some(ModifiersState::CONTROL)
+        }
+        PhysicalKey::Code(KeyCode::AltLeft | KeyCode::AltRight) => Some(ModifiersState::ALT),
+        PhysicalKey::Code(KeyCode::SuperLeft | KeyCode::SuperRight) => Some(ModifiersState::SUPER),
+        _ => None,
+    }
 }
 
 /// Check whether `line` targets one of the scripted `app.*` verbs handled by this module.
@@ -95,6 +146,9 @@ pub fn parse_script_line(line: &str) -> Option<Result<ScriptCommand, String>> {
         "app.pinch" => Some(parse_pinch(args)),
         "app.key" => Some(parse_key_verb(args)),
         "app.type" => Some(parse_type_verb(args)),
+        "app.ime" => Some(parse_ime_verb(args)),
+        "app.focus" => Some(parse_focus_verb(args)),
+        "app.clipboard" => Some(parse_clipboard_verb(args)),
         "app.where" => {
             if !args.is_empty() {
                 Some(Err("usage: app.where".to_string()))
@@ -313,10 +367,119 @@ fn parse_pinch(args: &[String]) -> Result<ScriptCommand, String> {
 }
 
 fn parse_key_verb(args: &[String]) -> Result<ScriptCommand, String> {
-    if args.len() != 1 {
-        return Err("usage: app.key <chord>".to_string());
+    const USAGE: &str =
+        "app.key [--down|--up|--repeat] [--key <logical>] [--text <typed>|--no-text] <chord>";
+    if args.is_empty() {
+        return Err(format!("usage: {USAGE}"));
     }
-    parse_key_chord(&args[0]).map(ScriptCommand::Key)
+    let mut phase = ScriptKeyPhase::Tap;
+    let mut phase_set = false;
+    let mut key_override: Option<String> = None;
+    let mut text_override: Option<Option<String>> = None;
+    let mut chord_spec: Option<&str> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--down" => {
+                if phase_set {
+                    return Err("conflicting phase flags in app.key".to_string());
+                }
+                phase = ScriptKeyPhase::Down;
+                phase_set = true;
+            }
+            "--up" => {
+                if phase_set {
+                    return Err("conflicting phase flags in app.key".to_string());
+                }
+                phase = ScriptKeyPhase::Up;
+                phase_set = true;
+            }
+            "--repeat" => {
+                if phase_set {
+                    return Err("conflicting phase flags in app.key".to_string());
+                }
+                phase = ScriptKeyPhase::Repeat;
+                phase_set = true;
+            }
+            "--key" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --key (usage: {USAGE})"));
+                };
+                key_override = Some(val.clone());
+            }
+            "--text" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --text (usage: {USAGE})"));
+                };
+                text_override = Some((!val.is_empty()).then(|| val.clone()));
+            }
+            "--no-text" => {
+                text_override = Some(None);
+            }
+            tok => {
+                if chord_spec.is_some() {
+                    return Err(format!("unexpected argument '{tok}' (usage: {USAGE})"));
+                }
+                chord_spec = Some(tok);
+            }
+        }
+        i += 1;
+    }
+
+    let Some(spec) = chord_spec else {
+        return Err(format!("usage: {USAGE}"));
+    };
+    let mut parsed = parse_key_chord(spec)?;
+    parsed.phase = phase;
+    if let Some(raw_key) = key_override {
+        parsed.logical = parse_logical_key_override(&raw_key);
+        if text_override.is_none() {
+            parsed.text = match &parsed.logical {
+                Key::Named(NamedKey::Space) => Some(" ".to_string()),
+                Key::Character(s) if !s.is_empty() && !s.chars().any(char::is_control) => {
+                    Some(s.to_string())
+                }
+                _ => None,
+            };
+        }
+    }
+    if let Some(explicit_text) = text_override {
+        parsed.text = explicit_text;
+    }
+    Ok(ScriptCommand::Key(parsed))
+}
+
+fn parse_logical_key_override(raw: &str) -> Key {
+    match raw {
+        " " | "Space" => Key::Named(NamedKey::Space),
+        "Dead" => Key::Dead(None),
+        "Unidentified" => Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
+        "Enter" => Key::Named(NamedKey::Enter),
+        "Tab" => Key::Named(NamedKey::Tab),
+        "Escape" => Key::Named(NamedKey::Escape),
+        "Backspace" => Key::Named(NamedKey::Backspace),
+        "Delete" => Key::Named(NamedKey::Delete),
+        "Insert" => Key::Named(NamedKey::Insert),
+        "Home" => Key::Named(NamedKey::Home),
+        "End" => Key::Named(NamedKey::End),
+        "PageUp" => Key::Named(NamedKey::PageUp),
+        "PageDown" => Key::Named(NamedKey::PageDown),
+        "ArrowUp" => Key::Named(NamedKey::ArrowUp),
+        "ArrowDown" => Key::Named(NamedKey::ArrowDown),
+        "ArrowLeft" => Key::Named(NamedKey::ArrowLeft),
+        "ArrowRight" => Key::Named(NamedKey::ArrowRight),
+        "Clear" => Key::Named(NamedKey::Clear),
+        "Shift" => Key::Named(NamedKey::Shift),
+        "Control" => Key::Named(NamedKey::Control),
+        "Alt" => Key::Named(NamedKey::Alt),
+        "Meta" | "Super" => Key::Named(NamedKey::Super),
+        "CapsLock" => Key::Named(NamedKey::CapsLock),
+        "NumLock" => Key::Named(NamedKey::NumLock),
+        other => Key::Character(SmolStr::new(other)),
+    }
 }
 
 fn parse_type_verb(args: &[String]) -> Result<ScriptCommand, String> {
@@ -324,6 +487,48 @@ fn parse_type_verb(args: &[String]) -> Result<ScriptCommand, String> {
         return Err("usage: app.type <text>".to_string());
     }
     Ok(ScriptCommand::Type(args.join(" ")))
+}
+
+fn parse_ime_verb(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.ime preedit [text] | commit <text> | disable";
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err(format!("usage: {USAGE}"));
+    };
+    match sub {
+        "preedit" => Ok(ScriptCommand::Ime(ScriptIme::Preedit(args[1..].join(" ")))),
+        "commit" => {
+            if args.len() < 2 {
+                return Err(format!("usage: {USAGE}"));
+            }
+            Ok(ScriptCommand::Ime(ScriptIme::Commit(args[1..].join(" "))))
+        }
+        "disable" if args.len() == 1 => Ok(ScriptCommand::Ime(ScriptIme::Disable)),
+        _ => Err(format!("usage: {USAGE}")),
+    }
+}
+
+fn parse_focus_verb(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.focus on|off";
+    if args.len() != 1 {
+        return Err(format!("usage: {USAGE}"));
+    }
+    match args[0].to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Ok(ScriptCommand::Focus(true)),
+        "off" | "false" | "0" => Ok(ScriptCommand::Focus(false)),
+        _ => Err(format!("usage: {USAGE}")),
+    }
+}
+
+fn parse_clipboard_verb(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.clipboard [clear | set <text>]";
+    match args.first().map(String::as_str) {
+        None => Ok(ScriptCommand::Clipboard(ScriptClipboard::Get)),
+        Some("clear") if args.len() == 1 => Ok(ScriptCommand::Clipboard(ScriptClipboard::Clear)),
+        Some("set") if args.len() >= 2 => {
+            Ok(ScriptCommand::Clipboard(ScriptClipboard::Set(args[1..].join(" "))))
+        }
+        _ => Err(format!("usage: {USAGE}")),
+    }
 }
 
 /// Parse a chord specification such as `cmd+d`, `cmd+shift+d`, `shift+Tab`, `Enter`,
@@ -363,6 +568,7 @@ pub fn parse_key_chord(spec: &str) -> Result<ScriptKey, String> {
         logical,
         text,
         mods,
+        phase: ScriptKeyPhase::Tap,
     })
 }
 
@@ -491,6 +697,150 @@ fn resolve_key_token(
         "f10" => Ok((KeyCode::F10, Key::Named(NamedKey::F10), None, false)),
         "f11" => Ok((KeyCode::F11, Key::Named(NamedKey::F11), None, false)),
         "f12" => Ok((KeyCode::F12, Key::Named(NamedKey::F12), None, false)),
+        "f13" => Ok((KeyCode::F13, Key::Named(NamedKey::F13), None, false)),
+        "f14" => Ok((KeyCode::F14, Key::Named(NamedKey::F14), None, false)),
+        "f15" => Ok((KeyCode::F15, Key::Named(NamedKey::F15), None, false)),
+        "f16" => Ok((KeyCode::F16, Key::Named(NamedKey::F16), None, false)),
+        "f17" => Ok((KeyCode::F17, Key::Named(NamedKey::F17), None, false)),
+        "f18" => Ok((KeyCode::F18, Key::Named(NamedKey::F18), None, false)),
+        "f19" => Ok((KeyCode::F19, Key::Named(NamedKey::F19), None, false)),
+        "f20" => Ok((KeyCode::F20, Key::Named(NamedKey::F20), None, false)),
+        "numlock" => Ok((KeyCode::NumLock, Key::Named(NamedKey::NumLock), None, false)),
+        "numpadenter" | "kp_enter" => Ok((
+            KeyCode::NumpadEnter,
+            Key::Named(NamedKey::Enter),
+            None,
+            false,
+        )),
+        "numpad0" => Ok((
+            KeyCode::Numpad0,
+            Key::Character(SmolStr::new("0")),
+            (!mods.super_key()).then(|| "0".to_string()),
+            false,
+        )),
+        "numpad1" => Ok((
+            KeyCode::Numpad1,
+            Key::Character(SmolStr::new("1")),
+            (!mods.super_key()).then(|| "1".to_string()),
+            false,
+        )),
+        "numpad2" => Ok((
+            KeyCode::Numpad2,
+            Key::Character(SmolStr::new("2")),
+            (!mods.super_key()).then(|| "2".to_string()),
+            false,
+        )),
+        "numpad3" => Ok((
+            KeyCode::Numpad3,
+            Key::Character(SmolStr::new("3")),
+            (!mods.super_key()).then(|| "3".to_string()),
+            false,
+        )),
+        "numpad4" => Ok((
+            KeyCode::Numpad4,
+            Key::Character(SmolStr::new("4")),
+            (!mods.super_key()).then(|| "4".to_string()),
+            false,
+        )),
+        "numpad5" => Ok((
+            KeyCode::Numpad5,
+            Key::Character(SmolStr::new("5")),
+            (!mods.super_key()).then(|| "5".to_string()),
+            false,
+        )),
+        "numpad6" => Ok((
+            KeyCode::Numpad6,
+            Key::Character(SmolStr::new("6")),
+            (!mods.super_key()).then(|| "6".to_string()),
+            false,
+        )),
+        "numpad7" => Ok((
+            KeyCode::Numpad7,
+            Key::Character(SmolStr::new("7")),
+            (!mods.super_key()).then(|| "7".to_string()),
+            false,
+        )),
+        "numpad8" => Ok((
+            KeyCode::Numpad8,
+            Key::Character(SmolStr::new("8")),
+            (!mods.super_key()).then(|| "8".to_string()),
+            false,
+        )),
+        "numpad9" => Ok((
+            KeyCode::Numpad9,
+            Key::Character(SmolStr::new("9")),
+            (!mods.super_key()).then(|| "9".to_string()),
+            false,
+        )),
+        "numpadadd" => Ok((
+            KeyCode::NumpadAdd,
+            Key::Character(SmolStr::new("+")),
+            (!mods.super_key()).then(|| "+".to_string()),
+            false,
+        )),
+        "numpadsubtract" => Ok((
+            KeyCode::NumpadSubtract,
+            Key::Character(SmolStr::new("-")),
+            (!mods.super_key()).then(|| "-".to_string()),
+            false,
+        )),
+        "numpadmultiply" => Ok((
+            KeyCode::NumpadMultiply,
+            Key::Character(SmolStr::new("*")),
+            (!mods.super_key()).then(|| "*".to_string()),
+            false,
+        )),
+        "numpaddivide" => Ok((
+            KeyCode::NumpadDivide,
+            Key::Character(SmolStr::new("/")),
+            (!mods.super_key()).then(|| "/".to_string()),
+            false,
+        )),
+        "numpaddecimal" => Ok((
+            KeyCode::NumpadDecimal,
+            Key::Character(SmolStr::new(".")),
+            (!mods.super_key()).then(|| ".".to_string()),
+            false,
+        )),
+        "numpadequal" => Ok((
+            KeyCode::NumpadEqual,
+            Key::Character(SmolStr::new("=")),
+            (!mods.super_key()).then(|| "=".to_string()),
+            false,
+        )),
+        "shift" | "shiftleft" => Ok((KeyCode::ShiftLeft, Key::Named(NamedKey::Shift), None, false)),
+        "shiftright" => Ok((KeyCode::ShiftRight, Key::Named(NamedKey::Shift), None, false)),
+        "ctrl" | "control" | "controlleft" => Ok((
+            KeyCode::ControlLeft,
+            Key::Named(NamedKey::Control),
+            None,
+            false,
+        )),
+        "controlright" => Ok((
+            KeyCode::ControlRight,
+            Key::Named(NamedKey::Control),
+            None,
+            false,
+        )),
+        "alt" | "opt" | "option" | "altleft" => {
+            Ok((KeyCode::AltLeft, Key::Named(NamedKey::Alt), None, false))
+        }
+        "altright" => Ok((KeyCode::AltRight, Key::Named(NamedKey::Alt), None, false)),
+        "cmd" | "command" | "meta" | "super" | "metaleft" | "superleft" => {
+            Ok((KeyCode::SuperLeft, Key::Named(NamedKey::Super), None, false))
+        }
+        "metaright" | "superright" => Ok((
+            KeyCode::SuperRight,
+            Key::Named(NamedKey::Super),
+            None,
+            false,
+        )),
+        "capslock" => Ok((
+            KeyCode::CapsLock,
+            Key::Named(NamedKey::CapsLock),
+            None,
+            false,
+        )),
         "contextmenu" | "menu" => Ok((
             KeyCode::ContextMenu,
             Key::Named(NamedKey::ContextMenu),
@@ -535,18 +885,21 @@ pub fn keys_for_typed_text(text: &str) -> Vec<ScriptKey> {
                 logical: Key::Named(NamedKey::Enter),
                 text: None,
                 mods: ModifiersState::empty(),
+                phase: ScriptKeyPhase::Tap,
             }),
             '\t' => out.push(ScriptKey {
                 physical: PhysicalKey::Code(KeyCode::Tab),
                 logical: Key::Named(NamedKey::Tab),
                 text: None,
                 mods: ModifiersState::empty(),
+                phase: ScriptKeyPhase::Tap,
             }),
             ' ' => out.push(ScriptKey {
                 physical: PhysicalKey::Code(KeyCode::Space),
                 logical: Key::Named(NamedKey::Space),
                 text: Some(" ".to_string()),
                 mods: ModifiersState::empty(),
+                phase: ScriptKeyPhase::Tap,
             }),
             c if c.is_ascii_alphabetic() => {
                 let is_upper = c.is_ascii_uppercase();
@@ -560,6 +913,7 @@ pub fn keys_for_typed_text(text: &str) -> Vec<ScriptKey> {
                     } else {
                         ModifiersState::empty()
                     },
+                    phase: ScriptKeyPhase::Tap,
                 });
             }
             c if c.is_ascii_digit() => {
@@ -569,6 +923,7 @@ pub fn keys_for_typed_text(text: &str) -> Vec<ScriptKey> {
                     logical: Key::Character(SmolStr::new(&s)),
                     text: Some(s),
                     mods: ModifiersState::empty(),
+                    phase: ScriptKeyPhase::Tap,
                 });
             }
             c => {
@@ -583,6 +938,7 @@ pub fn keys_for_typed_text(text: &str) -> Vec<ScriptKey> {
                         } else {
                             ModifiersState::empty()
                         },
+                        phase: ScriptKeyPhase::Tap,
                     });
                 } else {
                     out.push(ScriptKey {
@@ -590,6 +946,7 @@ pub fn keys_for_typed_text(text: &str) -> Vec<ScriptKey> {
                         logical: Key::Character(SmolStr::new(&s)),
                         text: Some(s),
                         mods: ModifiersState::empty(),
+                        phase: ScriptKeyPhase::Tap,
                     });
                 }
             }
@@ -751,6 +1108,20 @@ pub fn format_where(described: &WallFrame, cursor: Point) -> String {
     lines.push(format!("focused {focused}"));
     lines.push(format!("selection {selection_str}"));
     lines.push(format!("menu {menu_str}"));
+    lines.push(format!(
+        "panels sidebar={} status={} settings={} help={} palette={} grid={}",
+        described.panels.sidebar.open,
+        described.panels.status_window.open,
+        described.panels.settings_panel.open,
+        described.panels.help_panel.open,
+        described.palette_open,
+        described.paper.grid_show,
+    ));
+    let fs_str = match &described.fullscreen_backdrop {
+        None => "none".to_string(),
+        Some(fb) => format!("{:?}:{}", fb.mode, fb.target).to_ascii_lowercase(),
+    };
+    lines.push(format!("fullscreen {fs_str}"));
 
     for t in &described.terminals {
         let sb = cam.to_screen_box(t.body_rect, vw, vh);
@@ -758,8 +1129,13 @@ pub fn format_where(described: &WallFrame, cursor: Point) -> String {
             None => "none".to_string(),
             Some(sel) => format!("{}:{}..{}:{}", sel.r0, sel.c0, sel.r1, sel.c1),
         };
+        let hold_str = if t.close_hold_progress.is_some() {
+            "active"
+        } else {
+            "none"
+        };
         lines.push(format!(
-            "terminal {} cols={} rows={} focused={} selected={} z={:.2} rect={:.2},{:.2},{:.2},{:.2} world={:.4},{:.4},{:.4},{:.4} text_sel={text_sel}",
+            "terminal {} cols={} rows={} focused={} selected={} z={:.2} rect={:.2},{:.2},{:.2},{:.2} world={:.4},{:.4},{:.4},{:.4} text_sel={text_sel} close_hold={hold_str}",
             t.id,
             t.cols,
             t.rows,
@@ -986,7 +1362,78 @@ mod tests {
         let report = format_where(&wall.frame(), Point::new(800.0, 500.0));
         assert!(report.contains("viewport w=1600.00 h=1000.00 scale=2.00"));
         assert!(report.contains("focused t1"));
+        assert!(report.contains("panels sidebar=false status=false settings=false help=false palette=false"));
+        assert!(report.contains("fullscreen none"));
         assert!(report.contains("terminal t1 cols=100 rows=30 focused=true"));
+        assert!(report.contains("close_hold=none"));
         assert!(report.contains("titlebar t1 rect="));
+    }
+
+    #[test]
+    fn parses_extended_key_flags_ime_focus_clipboard_and_numpad_modifiers() {
+        let opt_b = match parse_script_line("app.key --key ∫ --text ∫ alt+KeyB")
+            .unwrap()
+            .unwrap()
+        {
+            ScriptCommand::Key(k) => k,
+            other => panic!("expected Key, got {other:?}"),
+        };
+        assert_eq!(opt_b.physical, PhysicalKey::Code(KeyCode::KeyB));
+        assert_eq!(opt_b.logical, Key::Character(SmolStr::new("∫")));
+        assert_eq!(opt_b.text.as_deref(), Some("∫"));
+        assert_eq!(opt_b.mods, ModifiersState::ALT);
+        assert_eq!(opt_b.phase, ScriptKeyPhase::Tap);
+
+        let dead = match parse_script_line("app.key --key Dead --no-text alt+KeyE")
+            .unwrap()
+            .unwrap()
+        {
+            ScriptCommand::Key(k) => k,
+            other => panic!("expected Key, got {other:?}"),
+        };
+        assert_eq!(dead.logical, Key::Dead(None));
+        assert_eq!(dead.text, None);
+
+        let down_cmd = match parse_script_line("app.key --down cmd").unwrap().unwrap() {
+            ScriptCommand::Key(k) => k,
+            other => panic!("expected Key, got {other:?}"),
+        };
+        assert_eq!(down_cmd.physical, PhysicalKey::Code(KeyCode::SuperLeft));
+        assert_eq!(down_cmd.phase, ScriptKeyPhase::Down);
+
+        let rep_kp = match parse_script_line("app.key --repeat NumpadEnter")
+            .unwrap()
+            .unwrap()
+        {
+            ScriptCommand::Key(k) => k,
+            other => panic!("expected Key, got {other:?}"),
+        };
+        assert_eq!(rep_kp.physical, PhysicalKey::Code(KeyCode::NumpadEnter));
+        assert_eq!(rep_kp.phase, ScriptKeyPhase::Repeat);
+
+        assert_eq!(
+            parse_script_line("app.ime preedit ´").unwrap().unwrap(),
+            ScriptCommand::Ime(ScriptIme::Preedit("´".to_string()))
+        );
+        assert_eq!(
+            parse_script_line("app.ime commit é").unwrap().unwrap(),
+            ScriptCommand::Ime(ScriptIme::Commit("é".to_string()))
+        );
+        assert_eq!(
+            parse_script_line("app.focus off").unwrap().unwrap(),
+            ScriptCommand::Focus(false)
+        );
+        assert_eq!(
+            parse_script_line("app.clipboard").unwrap().unwrap(),
+            ScriptCommand::Clipboard(ScriptClipboard::Get)
+        );
+        assert_eq!(
+            parse_script_line("app.clipboard clear").unwrap().unwrap(),
+            ScriptCommand::Clipboard(ScriptClipboard::Clear)
+        );
+        assert_eq!(
+            parse_script_line("app.clipboard set hello world").unwrap().unwrap(),
+            ScriptCommand::Clipboard(ScriptClipboard::Set("hello world".to_string()))
+        );
     }
 }
