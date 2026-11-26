@@ -73,6 +73,8 @@ pub struct WallOptions {
     /// The termd namespace whose terminals the wall shows. None: no daemon,
     /// one fixed test screen instead.
     pub namespace: Option<String>,
+    /// Extra termd namespaces to attach alongside `namespace` (off by default).
+    pub extra_namespaces: Vec<String>,
     /// Draw this many frames, one after another, then exit (`--frames`): how
     /// a script checks the window came up and drew.
     pub exit_after: Option<u64>,
@@ -486,7 +488,7 @@ impl App {
         // The terminals.
         let terms = match &opts.namespace {
             Some(ns) => {
-                let mut sessions = match Sessions::open(ns, wake) {
+                let mut sessions = match Sessions::open_with_extra(ns, &opts.extra_namespaces, wake) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("error: the wall could not reach its terminals: {e}");
@@ -501,7 +503,11 @@ impl App {
                 for id in &ids {
                     match sessions.adopt(id) {
                         Ok((cols, rows)) => {
-                            wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                            let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                            if let Some(title) = sessions.default_title_for(id) {
+                                appeared = appeared.with_title(title);
+                            }
+                            wall.terminal_appeared(appeared);
                         }
                         Err(e) => log::error!("{e}"),
                     }
@@ -839,7 +845,11 @@ impl App {
             for id in &live_ids {
                 match sessions.adopt(id) {
                     Ok((cols, rows)) => {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                        let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                        if let Some(title) = sessions.default_title_for(id) {
+                            appeared = appeared.with_title(title);
+                        }
+                        wall.terminal_appeared(appeared);
                     }
                     Err(e) => log::error!("{e}"),
                 }
@@ -851,7 +861,11 @@ impl App {
         for id in sessions.take_external_appeared() {
             match sessions.adopt(&id) {
                 Ok((cols, rows)) => {
-                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                    if let Some(title) = sessions.default_title_for(&id) {
+                        appeared = appeared.with_title(title);
+                    }
+                    wall.terminal_appeared(appeared);
                     heard = true;
                 }
                 Err(e) => log::error!("{e}"),

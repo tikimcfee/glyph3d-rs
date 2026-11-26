@@ -1643,3 +1643,290 @@ fn part1_scroll_state_pipelined_bell_and_osc8_links() {
         "OSC 8 hyperlinks should survive g3d-termd REPAINT on re-adopt"
     );
 }
+
+#[test]
+fn part2_extra_namespaces_lossy_flow_detach_on_kill_and_isolation() {
+    use term_session::{wall_id_for_extra, News, Sessions};
+
+    // Pure scratch daemons ONLY:
+    // - `primary`: scratch namespace `probe`
+    // - `extra_probe2`: scratch namespace `probe2` in the same scratch dir
+    // - `extra_agents`: separate scratch `G3D_TERMD_DIR` playing the role of `"agents"`
+    let primary = ScratchDaemon::new("ns-prim");
+    let probe2_target = Target::namespace_in(&primary.dir, "probe2");
+    let scratch_agents = ScratchDaemon::new("ns-ag");
+
+    assert_eq!(wall_id_for_extra("agents", "agent-planner"), "gx-planner");
+    assert_eq!(wall_id_for_extra("probe2", "worker1"), "probe2/worker1");
+
+    let wake = Arc::new(WakeSignal::default());
+
+    // Pre-populate `probe2` (`worker1` + `t1` colliding name) and `scratch_agents` (`agent-planner`),
+    // while also testing a third extra namespace `probe_late` that is NOT running yet at open time!
+    let probe2_hub = SessionHub::open_with(&probe2_target, HubOptions::default(), wake.waker())
+        .expect("start scratch probe2 daemon");
+    let agents_hub =
+        SessionHub::open_with(&scratch_agents.target(), HubOptions::default(), wake.waker())
+            .expect("start scratch agents daemon");
+    let late_target = Target::namespace_in(&primary.dir, "probe_late");
+
+    let p2_ready = primary.dir.join("p2-ready");
+    let _p2_sess = probe2_hub
+        .spawn(&SpawnOptions {
+            id: "worker1".into(),
+            argv: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf 'PROBE2_WORKER>'; printf r > \"$1\"; exec cat".into(),
+                "sh".into(),
+                p2_ready.to_string_lossy().into_owned(),
+            ]),
+            cols: 64,
+            rows: 12,
+            env_base: Some(base_env()),
+            ..SpawnOptions::shell("worker1", 64, 12)
+        })
+        .expect("spawn probe2/worker1");
+    drop(_p2_sess); // release initial owner so Sessions takes Role::Own cleanly
+
+    let ag_ready = scratch_agents.dir.join("ag-ready");
+    let _ag_sess = agents_hub
+        .spawn(&SpawnOptions {
+            id: "agent-planner".into(),
+            argv: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf 'AGENT_PLANNER>'; printf r > \"$1\"; exec cat".into(),
+                "sh".into(),
+                ag_ready.to_string_lossy().into_owned(),
+            ]),
+            cols: 70,
+            rows: 16,
+            env_base: Some(base_env()),
+            ..SpawnOptions::shell("agent-planner", 70, 16)
+        })
+        .expect("spawn agent-planner");
+    drop(_ag_sess);
+
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            p2_ready.exists() && ag_ready.exists()
+        }),
+        "scratch extra-namespace programs did not signal ready"
+    );
+
+    // Open `Sessions` with primary + 3 extra targets (`probe2`, `"agents"` on `scratch_agents`, and
+    // not-yet-running `probe_late` — verifying `probe_late` is NOT auto-started!).
+    let mut sessions = Sessions::open_targets(
+        &primary.target(),
+        &[
+            ("probe2".into(), probe2_target.clone()),
+            ("agents".into(), scratch_agents.target()),
+            ("probe_late".into(), late_target.clone()),
+        ],
+        wake.waker(),
+    )
+    .expect("open multi-namespace Sessions");
+
+    assert!(
+        !primary.dir.join("termd-probe_late.sock").exists(),
+        "opening with an absent extra namespace must NOT auto-start its daemon"
+    );
+
+    // Spawn `t1` in primary namespace (`Sessions::spawn` must always target primary).
+    let (prim_id, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'PRIMARY_T1'; exec sleep 60".into(),
+            ]),
+            60,
+            10,
+        )
+        .expect("spawn primary t1");
+    assert_eq!(prim_id, "t1");
+    assert_eq!(
+        sessions
+            .hub()
+            .list()
+            .expect("primary list")
+            .into_iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec!["t1".to_string()],
+        "Sessions::spawn must create terminals in the primary namespace only"
+    );
+
+    // `list()` includes primary `t1`, `probe2/worker1`, and `gx-planner` (`agents` -> `agent-planner`).
+    let all_ids = sessions.list().expect("list across namespaces");
+    assert_eq!(
+        all_ids,
+        vec![
+            "gx-planner".to_string(),
+            "probe2/worker1".to_string(),
+            "t1".to_string(),
+        ]
+    );
+
+    assert_eq!(sessions.adopt("probe2/worker1").expect("adopt probe2/worker1"), (64, 12));
+    assert_eq!(sessions.adopt("gx-planner").expect("adopt gx-planner"), (70, 16));
+    assert_eq!(
+        sessions.default_title_for("gx-planner").as_deref(),
+        Some("planner"),
+        "gomuxai gx-<name> sessions default to <name> when OSC title is unset"
+    );
+
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions
+                .text("t1", 0, 0, 60, 9)
+                .unwrap_or_default()
+                .contains("PRIMARY_T1")
+                && sessions
+                    .text("probe2/worker1", 0, 0, 64, 11)
+                    .unwrap_or_default()
+                    .contains("PROBE2_WORKER>")
+                && sessions
+                    .text("gx-planner", 0, 0, 70, 15)
+                    .unwrap_or_default()
+                    .contains("AGENT_PLANNER>")
+        }),
+        "initial screens across primary and extra namespaces did not converge"
+    );
+
+    // Verify on the daemon status document that extra-namespace subscriptions use
+    // `role: "own"` AND `flow: "lossy"` (never blocking an agent's PTY!).
+    let ag_status = agents_hub.status().expect("agents status");
+    let sub_json = &ag_status["terminals"][0]["subscribers"][0];
+    assert_eq!(sub_json["role"].as_str(), Some("own"));
+    assert_eq!(
+        sub_json["flow"].as_str(),
+        Some("lossy"),
+        "extra-namespace subscription must use flow=lossy: {sub_json}"
+    );
+
+    // Verify typing (`paste`) and `resize` work on extra-namespace terminals.
+    sessions.paste("gx-planner", "hello-agent");
+    sessions.resize("gx-planner", 88, 22);
+    let mut saw_gx_resized = false;
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let (_, news) = sessions.pump();
+            if news.contains(&News::Resized {
+                id: "gx-planner".into(),
+                cols: 88,
+                rows: 22,
+            }) {
+                saw_gx_resized = true;
+            }
+            saw_gx_resized
+                && sessions
+                    .text("gx-planner", 0, 0, 88, 21)
+                    .unwrap_or_default()
+                    .contains("AGENT_PLANNER>hello-agent")
+        }),
+        "typing and resize on gx-planner did not take effect"
+    );
+
+    // Verify `Sessions::kill("gx-planner")` DETACHES on the wall (`News::Ended` emitted, suppressed
+    // from `list()` and `take_external_appeared()`) WITHOUT killing `agent-planner` in `agents`!
+    seen = wake.current();
+    sessions.kill("gx-planner");
+    let mut saw_gx_ended = false;
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            let (_, news) = sessions.pump();
+            if news.contains(&News::Ended {
+                id: "gx-planner".into(),
+            }) {
+                saw_gx_ended = true;
+            }
+            saw_gx_ended && sessions.screen("gx-planner").is_none()
+        }),
+        "kill on extra-namespace terminal must emit News::Ended and unmount locally"
+    );
+    // Wait past one `status_follow` interval (500 ms) to prove `gx-planner` stays detached/suppressed
+    // AND `agent-planner` is still alive in `scratch_agents`!
+    std::thread::sleep(Duration::from_millis(650));
+    let _ = sessions.pump();
+    assert!(
+        !sessions.take_external_appeared().contains(&"gx-planner".to_string()),
+        "detached extra-namespace terminal must not auto-reappear from status_follow"
+    );
+    let still_alive = agents_hub.list().expect("agents list after detach");
+    assert_eq!(
+        still_alive.len(),
+        1,
+        "detaching gx-planner on the wall must NOT kill agent-planner in its daemon"
+    );
+    assert_eq!(still_alive[0].id, "agent-planner");
+
+    // Start `probe_late` dynamically after `Sessions` opened -> passive watcher discovers it!
+    let late_hub = SessionHub::open_with(&late_target, HubOptions::default(), wake.waker())
+        .expect("start probe_late daemon dynamically");
+    let _late_sess = late_hub
+        .spawn(&SpawnOptions {
+            id: "late1".into(),
+            argv: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'LATE_HELLO'; exec sleep 60".into(),
+            ]),
+            cols: 50,
+            rows: 8,
+            env_base: Some(base_env()),
+            ..SpawnOptions::shell("late1", 50, 8)
+        })
+        .expect("spawn late1");
+    drop(_late_sess);
+
+    let mut late_appeared = false;
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            if sessions
+                .take_external_appeared()
+                .contains(&"probe_late/late1".to_string())
+            {
+                late_appeared = true;
+            }
+            late_appeared
+        }),
+        "passive watcher did not discover late-started extra namespace probe_late/late1"
+    );
+
+    // Stopping `probe2` unmounts `probe2/worker1` (`News::Ended`) WITHOUT emitting
+    // `News::Disconnected` or disturbing primary `t1`!
+    seen = wake.current();
+    probe2_hub.stop().expect("stop probe2");
+    let mut saw_p2_ended = false;
+    let mut saw_primary_disconnected = false;
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let (_, news) = sessions.pump();
+            for n in news {
+                match n {
+                    News::Ended { id } if id == "probe2/worker1" => saw_p2_ended = true,
+                    News::Disconnected { .. } => saw_primary_disconnected = true,
+                    _ => {}
+                }
+            }
+            saw_p2_ended
+        }),
+        "stopping probe2 did not emit News::Ended for probe2/worker1"
+    );
+    assert!(
+        !saw_primary_disconnected,
+        "stopping an extra namespace must NOT emit News::Disconnected for the primary wall"
+    );
+    assert!(
+        sessions.screen("t1").is_some(),
+        "primary terminal t1 must stay live when extra namespace probe2 stops"
+    );
+
+    // Clean up extra scratch daemons explicitly created inside `primary.dir`.
+    let _ = late_hub.stop();
+}
