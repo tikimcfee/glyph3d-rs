@@ -219,10 +219,11 @@ pub fn build_primary_screen() -> Screen {
     c = write_run(&mut s, 10, c, "  ", fg, 0, 0, 0);
     write_run(&mut s, 10, c, "dim faint text", fg, 0, 0, attrs::DIM);
 
-    // Row 12: wide emoji + cluster emoji + fill under/beside wide emoji (verify fill never covers ink)
+    // Row 12: wide emoji + cluster emoji + adjacent cell fill (proves fill never covers ink)
     c = 1;
     c = write_run(&mut s, 12, c, "Emoji: ", fg, 0, 0, 0);
     c = write_run(&mut s, 12, c, "🚀", fg, rgb(0x28, 0x34, 0x57), 0, 0);
+    c = write_run(&mut s, 12, c, "X", dark, green, 0, 0);
     c = write_run(&mut s, 12, c, " rocket  ", fg, 0, 0, 0);
     c = write_run(&mut s, 12, c, "🐀", fg, rgb(0x3b, 0x2a, 0x45), 0, 0);
     c = write_run(&mut s, 12, c, " rat  ", fg, 0, 0, 0);
