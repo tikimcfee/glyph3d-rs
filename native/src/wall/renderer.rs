@@ -5,6 +5,7 @@
 //! textures (`curves`, `glyphmap`, `emoji`) and caches per-terminal GPU cell
 //! buffers so unchanged terminals upload zero bytes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
@@ -441,6 +442,29 @@ fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
     flags
 }
 
+/// Load a wall WGSL shader from `GLYPH_WALL_SHADER_DIR/<file>` when set (dev loop),
+/// falling back to the compile-time `include_str!` source.
+fn load_wall_wgsl(file: &str, embedded: &'static str) -> Cow<'static, str> {
+    if let Ok(dir) = std::env::var("GLYPH_WALL_SHADER_DIR") {
+        if !dir.is_empty() {
+            let path = Path::new(&dir).join(file);
+            match std::fs::read_to_string(&path) {
+                Ok(src) => {
+                    log::info!("wall shader: loaded {} from disk", path.display());
+                    return Cow::Owned(src);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "GLYPH_WALL_SHADER_DIR: could not read {}: {e}; using embedded shader",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    Cow::Borrowed(embedded)
+}
+
 fn make_shared_bg(
     device: &wgpu::Device,
     shared_bgl: &wgpu::BindGroupLayout,
@@ -519,7 +543,10 @@ impl WallRenderer {
         });
         let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_paper.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_paper.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_paper.wgsl",
+                include_str!("../shaders/wall_paper.wgsl"),
+            )),
         });
         let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall paper pl"),
@@ -616,7 +643,10 @@ impl WallRenderer {
         });
         let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_shapes.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_shapes.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_shapes.wgsl",
+                include_str!("../shaders/wall_shapes.wgsl"),
+            )),
         });
         let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall shapes pl"),
@@ -773,7 +803,10 @@ impl WallRenderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_cells.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_cells.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_cells.wgsl",
+                include_str!("../shaders/wall_cells.wgsl"),
+            )),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
