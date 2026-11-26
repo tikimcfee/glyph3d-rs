@@ -150,6 +150,7 @@ struct App {
     hud_open: bool,
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
+    blink_repaint_at: Option<Instant>,
 }
 
 /// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
@@ -729,6 +730,7 @@ impl App {
             min_px: described.paper.grid.grid_min_px as f32 * sf,
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
+        self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
         let stats = g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &camera, &wall_frame);
         let _ = stats;
@@ -1016,15 +1018,28 @@ impl ApplicationHandler<Wake> for App {
         if self.animating {
             self.redraw();
         }
+        let now = Instant::now();
+        let mut next_repaint: Option<Instant> = None;
         #[cfg(feature = "egui-ui")]
-        if let Some(at) = self.ui_repaint_at {
-            if Instant::now() >= at {
+        if let Some(deadline) = self.ui_repaint_at {
+            if now >= deadline {
                 self.ui_repaint_at = None;
                 self.redraw();
             } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-                return;
+                next_repaint = Some(deadline);
             }
+        }
+        if let Some(deadline) = self.blink_repaint_at {
+            if now >= deadline {
+                self.blink_repaint_at = None;
+                self.redraw();
+            } else {
+                next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
+            }
+        }
+        if let Some(deadline) = next_repaint {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            return;
         }
         event_loop.set_control_flow(ControlFlow::Wait);
     }
@@ -1058,6 +1073,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         hud_open: std::env::var("GLYPH_WALL_HUD").is_ok_and(|v| !v.is_empty() && v != "0"),
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
+        blink_repaint_at: None,
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
