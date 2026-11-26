@@ -3,9 +3,11 @@
 //! coverage.
 //!
 //! Run modes (`--help` has every flag; `cargo glyph run` builds first):
-//!   (no arguments, on a terminal) / `--launcher`
-//!                    the terminal launcher (`launcher/`): pick a scene and
-//!                    its options, Enter starts the renderer on them.
+//!   (no arguments) / `--wall`
+//!                    the wall (`wall/`): the infinite canvas of live
+//!                    terminals in `g3d-termd` (default namespace `rs-wall`).
+//!   `--launcher`     the terminal launcher (`launcher/`): pick the wall or a
+//!                    scene and its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
 //!                    `--field-mode derived`, the one field mode since
 //!                    2026-10-31).
