@@ -142,6 +142,8 @@ struct App {
     #[cfg(feature = "egui-ui")]
     hud_open: bool,
     #[cfg(feature = "egui-ui")]
+    panels: super::mount::Panels,
+    #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
 }
 
@@ -474,6 +476,27 @@ impl App {
                     ran = true;
                     continue;
                 }
+                Some("app.palette") => {
+                    let reply = match &mut self.wall {
+                        Some(wall) => {
+                            let next = match words.next() {
+                                Some("open") => true,
+                                Some("close") => false,
+                                Some("toggle") | None => !wall.palette_open(),
+                                Some(other) => {
+                                    responder.send(format!("ERR: takes toggle|open|close, not '{other}'"));
+                                    continue;
+                                }
+                            };
+                            wall.set_palette_open(next);
+                            format!("OK: palette {}", if next { "open" } else { "closed" })
+                        }
+                        None => "ERR: the wall is not open yet".to_string(),
+                    };
+                    responder.send(reply);
+                    ran = true;
+                    continue;
+                }
                 _ => {}
             }
             let reply = match (&mut self.wall, &self.terms) {
@@ -695,7 +718,11 @@ impl App {
         let _ = stats;
 
         #[cfg(feature = "egui-ui")]
-        let mut ui_painted = if self.hud_open || g.ui.is_active() {
+        let mut panel_verbs: Vec<String> = Vec::new();
+        #[cfg(feature = "egui-ui")]
+        let mut panel_egui_keys = false;
+        #[cfg(feature = "egui-ui")]
+        let mut ui_painted = if self.hud_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
             let hud_terms: Vec<HudTerminalInfo<'_>> = described
                 .terminals
                 .iter()
@@ -707,11 +734,17 @@ impl App {
                 .collect();
             let hud_input = DebugHudInput { camera_zoom: camera.zoom, camera_center: camera.center, viewport, stats, terminals: &hud_terms };
             let hud_open = &mut self.hud_open;
+            let panels = &mut self.panels;
+            let wall_ref = self.wall.as_ref();
             let mut ui_frame = g.ui.run(&g.window, viewport, |ctx| {
+                if let Some(w) = wall_ref {
+                    panel_verbs = panels.show(ctx, w, &described);
+                }
                 if *hud_open {
                     show_debug_hud(ctx, hud_open, &hud_input);
                 }
             });
+            panel_egui_keys = ui_frame.wants_keyboard;
             if let Some(painted) = ui_frame.painted.as_mut() {
                 g.ui.paint(&self.ctx.device, &self.ctx.queue, &mut encoder, &view, painted);
             }
@@ -760,6 +793,24 @@ impl App {
             }
             if let Some((path, responder)) = asked {
                 responder.send(format!("OK: wrote {}", path.display()));
+            }
+        }
+        #[cfg(feature = "egui-ui")]
+        {
+            let mut changed = false;
+            if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                changed |= self.panels.sync_after_pass(wall, panel_egui_keys);
+                if !panel_verbs.is_empty() {
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    for verb in &panel_verbs {
+                        let reply = wall.run_with_screens(verb.as_str(), &lookup);
+                        self.panels.record_verb_reply(verb, &reply.text);
+                    }
+                    changed = true;
+                }
+            }
+            if changed {
+                self.apply_effects();
             }
         }
         self.frames += 1;
@@ -829,6 +880,19 @@ impl App {
             return;
         }
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+        #[cfg(feature = "egui-ui")]
+        if key.pressed && key.code == "Escape" && !key.mods.ctrl && !key.mods.alt && !key.mods.meta {
+            if self.panels.close_open_on_escape(wall) {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            if self.hud_open {
+                self.hud_open = false;
+                self.redraw();
+                return;
+            }
+        }
         let lookup = screen_lookup(|id| terms.screen(id));
         let _decision = wall.key(&key, &lookup);
         self.apply_effects();
@@ -887,16 +951,25 @@ impl ApplicationHandler<Wake> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         #[cfg(feature = "egui-ui")]
-        let ui_outcome = match &mut self.gfx {
-            Some(g) => g.ui.on_window_event(&g.window, &event),
-            None => UiEventOutcome::default(),
+        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        #[cfg(feature = "egui-ui")]
+        let feed_ui = !matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+            || panels_want_keys
+            || self.gfx.as_ref().is_some_and(|g| g.ui.context().egui_wants_keyboard_input());
+        #[cfg(feature = "egui-ui")]
+        let ui_outcome = match (&mut self.gfx, feed_ui) {
+            (Some(g), true) => g.ui.on_window_event(&g.window, &event),
+            _ => UiEventOutcome::default(),
         };
         #[cfg(feature = "egui-ui")]
         if ui_outcome.repaint {
             self.redraw();
         }
         #[cfg(feature = "egui-ui")]
-        let (ui_pointer, ui_keys) = (ui_outcome.consumed || ui_outcome.wants_pointer, ui_outcome.consumed || ui_outcome.wants_keyboard);
+        let (ui_pointer, ui_keys) = (
+            ui_outcome.consumed || ui_outcome.wants_pointer,
+            ui_outcome.consumed || ui_outcome.wants_keyboard || panels_want_keys,
+        );
         #[cfg(not(feature = "egui-ui"))]
         let (ui_pointer, ui_keys) = (false, false);
 
@@ -940,6 +1013,11 @@ impl ApplicationHandler<Wake> for App {
                 self.redraw();
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
+                #[cfg(feature = "egui-ui")]
+                if event.state == ElementState::Pressed && self.modifiers.super_key() && !self.modifiers.control_key() && !self.modifiers.alt_key() && event.physical_key == PhysicalKey::Code(KeyCode::KeyQ) {
+                    event_loop.exit();
+                    return;
+                }
                 #[cfg(feature = "egui-ui")]
                 if event.state == ElementState::Pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F1) && !ui_outcome.consumed {
                     self.hud_open = !self.hud_open;
@@ -1009,6 +1087,8 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         exit_after: None,
         #[cfg(feature = "egui-ui")]
         hud_open: std::env::var("GLYPH_WALL_HUD").is_ok_and(|v| !v.is_empty() && v != "0"),
+        #[cfg(feature = "egui-ui")]
+        panels: super::mount::Panels::new(),
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
     };
