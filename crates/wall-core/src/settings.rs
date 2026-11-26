@@ -40,7 +40,7 @@ pub const SECTIONS: &[SettingsSection] = &[
     SettingsSection {
         id: "text",
         title: "Text",
-        subtitle: "font family · bold · underline · strikethrough · overline · dim",
+        subtitle: "font family · size · line height · bold · underline · dim",
     },
     SettingsSection {
         id: "groups",
@@ -97,6 +97,8 @@ impl KnobType {
 pub enum TextParser {
     /// Trim leading and trailing whitespace (used when `KnobDef.parse` is absent).
     Trim,
+    /// Trim whitespace and require a non-empty value (e.g. a font family name).
+    NonEmptyTrim,
     /// Space-separated modifier names (`ctrl`, `alt`, `meta`, `shift`).
     ZoomKeys,
     /// `#rrggbb` hex colour (lowercased) or `"keep"`.
@@ -113,6 +115,14 @@ impl TextParser {
     pub fn parse(self, input: &str) -> Result<String, String> {
         match self {
             TextParser::Trim => Ok(input.trim().to_string()),
+            TextParser::NonEmptyTrim => {
+                let s = input.trim();
+                if s.is_empty() {
+                    Err("cannot be empty".to_string())
+                } else {
+                    Ok(s.to_string())
+                }
+            }
             TextParser::ZoomKeys => crate::chord::parse_zoom_keys(input).map(|keys| {
                 keys.into_iter()
                     .map(|k| k.as_str())
@@ -185,7 +195,6 @@ impl KnobDef {
 
 pub(crate) const RENDER_LOOP_OPTIONS: &[&str] = &["demand", "always"];
 pub(crate) const AGENT_SIDE_OPTIONS: &[&str] = &["right", "left", "top", "bottom"];
-pub(crate) const FONT_FAMILY_OPTIONS: &[&str] = &["cousine", "monaspace-neon", "monaspace-argon"];
 pub(crate) const GROUP_LAYOUT_OPTIONS: &[&str] = &["tile", "freeform", "split"];
 pub(crate) const OPTION_AS_ALT_OPTIONS: &[&str] = &["auto", "true", "false"];
 pub(crate) const COPY_ON_SELECT_OPTIONS: &[&str] = &["true", "clipboard", "false"];
@@ -452,8 +461,42 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Font family",
-            kind: KnobKind::Enum { options: FONT_FAMILY_OPTIONS },
-            description: "The font every terminal's text is drawn in, with its regular, bold, italic and bold-italic faces. Changing it redraws every terminal at once: each keeps its columns and rows, and its size on the canvas follows the family's cell. Symbols a family lacks come from the fallback fonts; box drawing, blocks and braille are drawn to the cell in every family.",
+            kind: KnobKind::Text {
+                parser: TextParser::NonEmptyTrim,
+            },
+            description: "The font every terminal's text is drawn in (bundled: monaspace-neon, monaspace-argon, cousine; or any installed system monospace family such as Menlo or SF Mono). Changing it loads the family live, re-measures the cell, and re-wraps each terminal to keep its panel size.",
+        },
+    ),
+    (
+        "fontSize",
+        KnobDef {
+            section: "text",
+            label: "Font size",
+            kind: KnobKind::Number {
+                min: Some(6.0),
+                above: None,
+                max: Some(72.0),
+                step: Some(0.5),
+                whole: false,
+                unit: Some("pt"),
+            },
+            description: "The base font size for every terminal (14 pt default). Changing it scales the cell and re-wraps each terminal's grid to keep its panel size.",
+        },
+    ),
+    (
+        "lineHeight",
+        KnobDef {
+            section: "text",
+            label: "Line height",
+            kind: KnobKind::Number {
+                min: Some(0.8),
+                above: None,
+                max: Some(2.5),
+                step: Some(0.05),
+                whole: false,
+                unit: Some("×"),
+            },
+            description: "Vertical cell pitch multiplier (1.0 = natural font height; higher adds leading between rows without stretching glyphs) and re-wraps rows to keep each panel's height.",
         },
     ),
     (
@@ -1316,9 +1359,23 @@ mod tests {
             check_config("fontFamily", "cousine").unwrap(),
             KnobValue::Text("cousine".to_string())
         );
-        assert!(check_config("fontFamily", "helvetica")
+        assert_eq!(
+            check_config("fontFamily", "  Menlo ").unwrap(),
+            KnobValue::Text("Menlo".to_string())
+        );
+        assert!(check_config("fontFamily", "   ")
             .unwrap_err()
-            .contains("fontFamily is cousine, monaspace-neon, monaspace-argon, not 'helvetica'"));
+            .contains("fontFamily: cannot be empty"));
+        assert_eq!(
+            check_config("fontSize", "18").unwrap(),
+            KnobValue::Number(18.0)
+        );
+        assert!(check_config("fontSize", "2").is_err());
+        assert_eq!(
+            check_config("lineHeight", "1.25").unwrap(),
+            KnobValue::Number(1.25)
+        );
+        assert!(check_config("lineHeight", "0.2").is_err());
         assert_eq!(check_config("boldIsBright", "on").unwrap(), KnobValue::Bool(true));
         assert!(check_config("nope", "1")
             .unwrap_err()
@@ -1403,7 +1460,16 @@ mod tests {
                 "selectionForeground",
             ]
         );
-        assert_eq!(keys("font"), vec!["fontFamily", "lineThickness", "underlineRaise"]);
+        assert_eq!(
+            keys("font"),
+            vec![
+                "fontFamily",
+                "fontSize",
+                "lineHeight",
+                "lineThickness",
+                "underlineRaise",
+            ]
+        );
         assert_eq!(sections("font family"), vec!["text"]);
 
         let expected_groups: Vec<&str> = KNOBS
