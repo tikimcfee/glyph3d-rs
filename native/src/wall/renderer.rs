@@ -12,16 +12,18 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
+use glyph_font::FamilyId;
 use term_cells::{CursorShape, Screen};
 use wgpu::util::DeviceExt;
 
-use crate::atlas::{Atlas, AtlasGpu};
+use crate::atlas::{Atlas, EmojiTexture};
 use crate::config::WallSettings;
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
-use super::cell::{CellGpu, dirty_row_ranges, pack_cell};
-use super::labels::{Label, LabelGlyphGpu, LabelHeight, measure_label_width, pack_label_glyphs};
+use super::cell::{CellGpu, dirty_row_ranges, pack_cell_resolved};
+use super::glyphs::GlyphSource;
+use super::labels::{Label, LabelGlyphGpu, LabelHeight, pack_label_glyphs};
 use super::metrics::{CellMetrics, sanitize_scale};
 use super::paper::{PaperStyle, WallPaperUniform, build_paper_uniform};
 use super::shapes::{Shape, ShapeFrameUniform, ShapeGpu, expand_shape};
@@ -177,6 +179,7 @@ struct TerminalGpu {
     cols: u16,
     rows: u16,
     uploaded_gen: u64,
+    force_repack: bool,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
     uniform_buf: wgpu::Buffer,
@@ -207,7 +210,8 @@ enum DrawRun {
 /// Shared wgpu cell renderer for any number of live terminals.
 pub struct WallRenderer {
     atlas: Arc<Atlas>,
-    _atlas_gpu: AtlasGpu,
+    glyphs: GlyphSource,
+    _emoji_gpu: EmojiTexture,
     metrics: CellMetrics,
     style: WallStyle,
     color_format: wgpu::TextureFormat,
@@ -224,6 +228,9 @@ pub struct WallRenderer {
     shape_blend_pipeline: wgpu::RenderPipeline,
     frame_buf: wgpu::Buffer,
     quad_index_buf: wgpu::Buffer,
+    shared_bgl: wgpu::BindGroupLayout,
+    emoji_view: wgpu::TextureView,
+    emoji_sampler: wgpu::Sampler,
     shared_bg: wgpu::BindGroup,
     term_bgl: wgpu::BindGroupLayout,
     labels_bgl: wgpu::BindGroupLayout,
@@ -309,6 +316,42 @@ fn pack_cursor_flags(screen: &Screen) -> u32 {
     visible | (shape << 1) | (span_cols << 4)
 }
 
+fn make_shared_bg(
+    device: &wgpu::Device,
+    shared_bgl: &wgpu::BindGroupLayout,
+    frame_buf: &wgpu::Buffer,
+    glyphs: &GlyphSource,
+    emoji_view: &wgpu::TextureView,
+    emoji_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("wall shared bg"),
+        layout: shared_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: frame_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(glyphs.glyphmap_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(glyphs.curves_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(emoji_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(emoji_sampler),
+            },
+        ],
+    })
+}
+
 impl WallRenderer {
     /// Build a `WallRenderer` on `device`/`queue` targeting `color_format` + [`WALL_DEPTH_FORMAT`].
     pub fn new(
@@ -316,10 +359,12 @@ impl WallRenderer {
         queue: &wgpu::Queue,
         atlas: Arc<Atlas>,
         color_format: wgpu::TextureFormat,
-        style: WallStyle,
+        mut style: WallStyle,
     ) -> Self {
-        let atlas_gpu = AtlasGpu::upload(device, queue, &atlas);
-        let metrics = CellMetrics::from_primary(atlas.metrics);
+        let glyphs = GlyphSource::new(device, queue, Arc::clone(&atlas));
+        let emoji_gpu = EmojiTexture::upload(device, queue, &atlas.emoji);
+        let metrics = glyphs.cell_metrics();
+        glyphs.apply_line_metrics(&mut style);
 
         let paper_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall paper uniform"),
@@ -506,9 +551,7 @@ impl WallRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let glyphmap_view = atlas_gpu.glyphmap.create_view(&Default::default());
-        let curves_view = atlas_gpu.curves.create_view(&Default::default());
-        let emoji_view = atlas_gpu.emoji.texture.create_view(&wgpu::TextureViewDescriptor {
+        let emoji_view = emoji_gpu.texture.create_view(&wgpu::TextureViewDescriptor {
             label: Some("wall emoji sheet view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -575,32 +618,14 @@ impl WallRenderer {
             ],
         });
 
-        let shared_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wall shared bg"),
-            layout: &shared_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: frame_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&glyphmap_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&curves_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&emoji_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&emoji_sampler),
-                },
-            ],
-        });
+        let shared_bg = make_shared_bg(
+            device,
+            &shared_bgl,
+            &frame_buf,
+            &glyphs,
+            &emoji_view,
+            &emoji_sampler,
+        );
 
         let term_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("wall terminal bgl"),
@@ -753,7 +778,8 @@ impl WallRenderer {
 
         Self {
             atlas,
-            _atlas_gpu: atlas_gpu,
+            glyphs,
+            _emoji_gpu: emoji_gpu,
             metrics,
             style,
             color_format,
@@ -770,6 +796,9 @@ impl WallRenderer {
             shape_blend_pipeline,
             frame_buf,
             quad_index_buf,
+            shared_bgl,
+            emoji_view,
+            emoji_sampler,
             shared_bg,
             term_bgl,
             labels_bgl,
@@ -797,9 +826,50 @@ impl WallRenderer {
         &self.atlas
     }
 
+    /// Underlying runtime [`GlyphSource`] (active font family, Slug atlas, GPU textures).
+    pub fn glyphs(&self) -> &GlyphSource {
+        &self.glyphs
+    }
+
+    /// Mutable access to the runtime [`GlyphSource`].
+    pub fn glyphs_mut(&mut self) -> &mut GlyphSource {
+        &mut self.glyphs
+    }
+
+    /// Active font family used by all terminals and canvas labels (default: Monaspace Neon).
+    pub fn font_family(&self) -> FamilyId {
+        self.glyphs.family()
+    }
+
+    /// Select the active font family by id (`"monaspace-neon"`, `"cousine"`, `"monaspace-argon"`).
+    ///
+    /// Updates [`Self::metrics`] and [`WallStyle`] line metrics to match the new family and
+    /// marks every cached terminal for full re-pack on the next [`Self::prepare`].
+    pub fn set_font_family(&mut self, name: &str) -> bool {
+        let Some(id) = self.glyphs.family_id(name) else {
+            return false;
+        };
+        self.set_font_family_id(id);
+        true
+    }
+
+    /// Select the active font family by [`FamilyId`], updating cell/line metrics and
+    /// forcing cached terminals to re-pack against the new family's slots.
+    pub fn set_font_family_id(&mut self, family: FamilyId) {
+        if self.glyphs.family() == family {
+            return;
+        }
+        self.glyphs.set_family_id(family);
+        self.metrics = self.glyphs.cell_metrics();
+        self.glyphs.apply_line_metrics(&mut self.style);
+        for gpu in self.terminals.values_mut() {
+            gpu.force_repack = true;
+        }
+    }
+
     /// Measure the unclipped world width of `text` drawn at `height` under `zoom`.
-    pub fn measure_label_width(&self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
-        measure_label_width(self.metrics, &self.atlas.trie, text, height.resolve_world(zoom))
+    pub fn measure_label_width(&mut self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
+        self.glyphs.measure_label_width(text, height.resolve_world(zoom))
     }
 
     pub fn style(&self) -> &WallStyle {
@@ -890,6 +960,7 @@ impl WallRenderer {
                     cols,
                     rows,
                     uploaded_gen: 0,
+                    force_repack: false,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
                     uniform_buf,
@@ -928,14 +999,14 @@ impl WallRenderer {
             return;
         }
 
-        let upload_all = needs_alloc || screen.generation < gpu.uploaded_gen;
+        let upload_all = needs_alloc || gpu.force_repack || screen.generation < gpu.uploaded_gen;
         if upload_all {
             self.pack_scratch.clear();
             self.pack_scratch.reserve(cell_count);
             for r in 0..usize::from(rows) {
                 let mut any_bg = false;
                 for cell in screen.row(r as u16) {
-                    let packed = pack_cell(&self.atlas.trie, screen, cell);
+                    let packed = pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
                     if (packed.bg >> 24) != 0 {
                         any_bg = true;
                     }
@@ -946,6 +1017,7 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
+            gpu.force_repack = false;
             stats.terminals_uploaded += 1;
             stats.rows_uploaded += usize::from(rows);
             stats.write_calls += 1;
@@ -961,7 +1033,7 @@ impl WallRenderer {
                 for r in range.clone() {
                     let mut any_bg = false;
                     for cell in screen.row(r as u16) {
-                        let packed = pack_cell(&self.atlas.trie, screen, cell);
+                        let packed = pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
                         if (packed.bg >> 24) != 0 {
                             any_bg = true;
                         }
@@ -1066,13 +1138,27 @@ impl WallRenderer {
         for (i, draw) in terminals.iter().enumerate() {
             pending.push((draw.z, 1, Pending::Terminal(i)));
         }
+        let label_family = self.glyphs.family();
         for label in frame.labels {
-            pack_label_glyphs(self.metrics, &self.atlas.trie, label, camera.zoom, |gpu| {
+            pack_label_glyphs(self.metrics, self.glyphs.atlas_mut(), label_family, label, camera.zoom, |gpu| {
                 let raw_idx = raw_labels.len();
                 let z = gpu.z;
                 raw_labels.push(gpu);
                 pending.push((z, 3, Pending::Label(raw_idx)));
             });
+        }
+        // Flush any newly encoded cell or label glyphs to the GPU textures and rebuild
+        // the shared bind group if either backing texture grew.
+        let glyph_sync = self.glyphs.sync(device, queue);
+        if glyph_sync.rebound {
+            self.shared_bg = make_shared_bg(
+                device,
+                &self.shared_bgl,
+                &self.frame_buf,
+                &self.glyphs,
+                &self.emoji_view,
+                &self.emoji_sampler,
+            );
         }
         pending.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
@@ -1512,18 +1598,34 @@ pub fn render_test_pattern_offscreen(
         .collect();
 
     let vp = (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
+    let family = renderer.font_family();
     // Two-pass framing: first estimate zoom from rough bounds, then build chrome at that
     // zoom and frame the exact union of terminals + group header + lasso + drop + map label.
-    let probe = super::test_pattern::build_test_pattern_chrome(metrics, &renderer.atlas().trie, pad, 20.0, &infos);
+    let probe = super::test_pattern::build_test_pattern_chrome(
+        metrics,
+        renderer.glyphs_mut().atlas_mut(),
+        family,
+        pad,
+        20.0,
+        &infos,
+    );
     let mut camera = WallCamera::frame_rect(probe.chrome_bounds, vp, 1.08);
-    let fitted = super::test_pattern::build_test_pattern_chrome(metrics, &renderer.atlas().trie, pad, camera.zoom, &infos);
+    let fitted = super::test_pattern::build_test_pattern_chrome(
+        metrics,
+        renderer.glyphs_mut().atlas_mut(),
+        family,
+        pad,
+        camera.zoom,
+        &infos,
+    );
     camera = WallCamera::frame_rect(fitted.chrome_bounds, vp, 1.08);
     if zoom_multiplier > 0.0 && zoom_multiplier.is_finite() {
         camera.zoom *= zoom_multiplier;
     }
     let chrome = super::test_pattern::build_test_pattern_chrome(
         metrics,
-        &renderer.atlas().trie,
+        renderer.glyphs_mut().atlas_mut(),
+        family,
         pad,
         camera.zoom,
         &infos,
@@ -1782,7 +1884,7 @@ mod tests {
             px[((y * w + x) * 4 + 1) as usize]
         };
         let center_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.5), (w, h));
-        let left_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.04, -cell_h * 0.5), (w, h));
+        let left_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.02, -cell_h * 0.5), (w, h));
         let right_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.85, -cell_h * 0.5), (w, h));
         let bottom_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.96), (w, h));
         let top_mid_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.2), (w, h));
@@ -2226,5 +2328,136 @@ mod tests {
         // Green focused block cursor sits at scaled cell (1, 1).
         let cursor_half = sample(m_half.cell_rect(origin, 1, 1, 1).center());
         assert!(cursor_half[1] > 120, "0.5x focused block cursor should light green, got {cursor_half:?}");
+    }
+
+    /// Verifies runtime font faces (regular/bold/italic/bold-italic draw distinct
+    /// pixels), cell sprites render, and switching font family updates cell/line
+    /// metrics and re-packs cached terminals.
+    #[test]
+    fn gpu_runtime_faces_and_family_switching() {
+        use glyph_font::{DEFAULT_FONT_FAMILY, MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY};
+        use term_cells::attrs;
+
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let style = WallStyle {
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            ..WallStyle::default()
+        };
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            Arc::clone(&atlas),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            style,
+        );
+
+        let neon_metrics = renderer.metrics();
+        assert_eq!(
+            renderer.font_family(),
+            renderer.glyphs().family_id(MONASPACE_NEON_FAMILY).expect("neon")
+        );
+
+        let render_char = |renderer: &mut WallRenderer, ch: char, cell_attrs: u16| -> Vec<u8> {
+            let mut s = Screen::new(2, 1);
+            s.default_bg = rgb(0x00, 0x00, 0x00);
+            s.row_mut(0)[0] = term_cells::Cell {
+                content: ch as u32,
+                fg: rgb(0xff, 0xff, 0xff),
+                bg: 0,
+                ul: 0,
+                attrs: cell_attrs,
+                width: 1,
+                _pad: 0,
+            };
+            s.touch_row(0);
+            let m = renderer.metrics();
+            let cam = WallCamera::new(Vec2::new(m.cell_width * 0.5, -m.cell_height * 0.5), 64.0);
+            let draw = TerminalDraw {
+                id: 500 + u64::from(cell_attrs),
+                screen: &s,
+                position: Vec2::ZERO,
+                z: 1.0,
+                scale: 1.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+            };
+            render_rgba_bytes(
+                &ctx,
+                renderer,
+                &cam,
+                &WallFrame { terminals: &[draw], ..Default::default() },
+                64,
+                96,
+            )
+        };
+
+        let px_reg = render_char(&mut renderer, 'R', 0);
+        let px_bold = render_char(&mut renderer, 'R', attrs::BOLD);
+        let px_ital = render_char(&mut renderer, 'R', attrs::ITALIC);
+        let px_bi = render_char(&mut renderer, 'R', attrs::BOLD | attrs::ITALIC);
+        let lit = |px: &[u8]| px.chunks_exact(4).filter(|p| p[0] > 80).count();
+        assert!(lit(&px_reg) > 50, "regular glyph should draw");
+        assert!(lit(&px_bold) > lit(&px_reg), "bold should have more lit ink pixels than regular");
+        assert_ne!(px_reg, px_ital, "italic face must differ from regular");
+        assert_ne!(px_bold, px_bi, "bold-italic face must differ from bold");
+
+        // Switch family to Cousine: metrics match baked Cousine and cached terminal re-packs.
+        let mut static_screen = Screen::new(4, 1);
+        static_screen.row_mut(0)[0] = term_cells::Cell {
+            content: 'M' as u32,
+            fg: rgb(0xff, 0xff, 0xff),
+            bg: 0,
+            ul: 0,
+            attrs: 0,
+            width: 1,
+            _pad: 0,
+        };
+        let draw_cached = TerminalDraw {
+            id: 777,
+            screen: &static_screen,
+            position: Vec2::ZERO,
+            z: 1.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+        };
+        let cam = WallCamera::new(Vec2::new(1.0, -0.5), 48.0);
+        let s_before = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (128, 128),
+            &cam,
+            &WallFrame { terminals: &[draw_cached], ..Default::default() },
+        );
+        assert_eq!(s_before.rows_uploaded, 1);
+
+        assert!(renderer.set_font_family(DEFAULT_FONT_FAMILY));
+        assert_eq!(renderer.metrics(), CellMetrics::from_primary(atlas.metrics));
+        assert_ne!(renderer.metrics().cell_width, neon_metrics.cell_width);
+
+        // Even with static_screen.generation == 0 unchanged, family switch forces re-pack.
+        let draw_cached2 = TerminalDraw {
+            id: 777,
+            screen: &static_screen,
+            position: Vec2::ZERO,
+            z: 1.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+        };
+        let s_after = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (128, 128),
+            &cam,
+            &WallFrame { terminals: &[draw_cached2], ..Default::default() },
+        );
+        assert_eq!(s_after.rows_uploaded, 1, "family switch must repack cached terminals");
+        assert!(renderer.set_font_family(MONASPACE_ARGON_FAMILY));
+        assert!(!renderer.set_font_family("nonexistent-family"));
     }
 }

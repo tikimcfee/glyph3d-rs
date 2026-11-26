@@ -9,8 +9,7 @@ use std::borrow::Cow;
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
-
-use crate::atlas::TrieTable;
+use glyph_font::{FamilyId, FontAtlas};
 
 use super::cell::{GLYPH_ID_MASK, resolve_str_glyphs};
 use super::metrics::{CellMetrics, WorldRect};
@@ -136,7 +135,8 @@ pub fn pack_srgb_rgba8(color: [f32; 4]) -> u32 {
 /// Measure the unclipped world width of `text` drawn at `height_world`.
 pub fn measure_label_width(
     metrics: CellMetrics,
-    trie: &TrieTable,
+    atlas: &mut FontAtlas,
+    family: FamilyId,
     text: &str,
     height_world: f32,
 ) -> f32 {
@@ -146,7 +146,7 @@ pub fn measure_label_width(
     let aspect = metrics.cell_width / metrics.cell_height.max(1e-6);
     let cell_w = height_world * aspect;
     let mut cols = 0u32;
-    resolve_str_glyphs(trie, text, |_gid, span| {
+    resolve_str_glyphs(atlas, family, text, |_gid, span| {
         cols += u32::from(span);
     });
     cols as f32 * cell_w
@@ -156,7 +156,8 @@ pub fn measure_label_width(
 /// each visible non-blank glyph.
 pub fn pack_label_glyphs(
     metrics: CellMetrics,
-    trie: &TrieTable,
+    atlas: &mut FontAtlas,
+    family: FamilyId,
     label: &Label<'_>,
     zoom: f32,
     mut emit: impl FnMut(LabelGlyphGpu),
@@ -180,7 +181,7 @@ pub fn pack_label_glyphs(
     }
 
     let mut col = 0u32;
-    resolve_str_glyphs(trie, &label.text, |gid, span| {
+    resolve_str_glyphs(atlas, family, &label.text, |gid, span| {
         let span_u32 = u32::from(span);
         let x0 = label.position.x + col as f32 * cell_w;
         let x1 = label.position.x + (col + span_u32) as f32 * cell_w;
@@ -245,8 +246,15 @@ mod tests {
 
     #[test]
     fn pack_label_glyphs_clips_partially_and_drops_outside_glyphs() {
-        let trie = crate::atlas::default_trie();
-        let metrics = CellMetrics::from_primary(trie.metrics);
+        let specs = glyph_font::default_font_chain(&crate::wall::glyphs::default_fonts_dir());
+        let mut atlas = FontAtlas::load(&specs).expect("load default font chain");
+        let family = atlas
+            .family_id(glyph_font::MONASPACE_NEON_FAMILY)
+            .unwrap_or_else(|| atlas.default_family());
+        let fm = atlas.family_metrics(family);
+        let raw_w = (f64::from(fm.advance_fu) * f64::from(crate::text::CELL_HEIGHT_WORLD)
+            / fm.extents.em_height()) as f32;
+        let metrics = CellMetrics::snapped(raw_w, crate::text::CELL_HEIGHT_WORLD);
         let cw = metrics.cell_width;
         // 4 characters "ABCD" at height 1.0 -> x spans [0, 4*cw], y spans [-1, 0].
         // Clip at x = [0.5*cw, 2.5*cw]: A is right-half clipped [0.5, 1.0], B is full [0, 1],
@@ -254,13 +262,13 @@ mod tests {
         let label = Label::new("ABCD", Vec2::ZERO, LabelHeight::World(1.0), [1.0; 4], 3.0)
             .with_clip(WorldRect::new(Vec2::new(0.5 * cw, -1.0), Vec2::new(2.5 * cw, 0.0)));
         let mut out = Vec::new();
-        pack_label_glyphs(metrics, &trie, &label, 20.0, |g| out.push(g));
+        pack_label_glyphs(metrics, &mut atlas, family, &label, 20.0, |g| out.push(g));
         assert_eq!(out.len(), 3, "D should be clipped out");
         assert!((out[0].uv_clip[0] - 0.5).abs() < 1e-4 && (out[0].uv_clip[2] - 1.0).abs() < 1e-4);
         assert_eq!(out[1].uv_clip, [0.0, 0.0, 1.0, 1.0]);
         assert!((out[2].uv_clip[0] - 0.0).abs() < 1e-4 && (out[2].uv_clip[2] - 0.5).abs() < 1e-4);
 
-        let full_w = measure_label_width(metrics, &trie, "ABCD", 1.0);
+        let full_w = measure_label_width(metrics, &mut atlas, family, "ABCD", 1.0);
         assert!((full_w - 4.0 * cw).abs() < 1e-5);
     }
 }

@@ -31,7 +31,7 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::metrics::WorldRect;
-use super::labels::{measure_label_width, Label, LabelHeight};
+use super::labels::{Label, LabelHeight};
 use super::paper::PaperStyle;
 use super::shapes::{DashStyle, RectShape, Shape};
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
@@ -331,7 +331,6 @@ impl App {
         // fit. (The wall's own rules for names and map labels are
         // wall-core's; this is the plain version until they drive it.)
         let metrics = g.renderer.metrics();
-        let trie = &g.renderer.atlas().trie;
         let padding = g.renderer.style().panel_padding;
         // TITLE_BAR_PX is in logical pixels: a Retina display doubles it.
         let bar_h = (TITLE_BAR_PX * g.window.scale_factor() as f32 / self.camera.zoom).min(TITLE_BAR_MAX_WORLD);
@@ -355,7 +354,7 @@ impl App {
             let inset = bar_h * 0.45;
             let room = (strip.width() - 2.0 * inset).max(0.0);
             let natural = bar_h * 0.62;
-            let full = measure_label_width(metrics, trie, title, natural);
+            let full = g.renderer.measure_label_width(title, LabelHeight::World(natural), self.camera.zoom);
             let text_h = if full > room && full > 1e-4 { natural * (room / full) } else { natural };
             if text_h > 1e-4 && room > 1e-4 {
                 let color = if focused { [0.85, 0.88, 0.94, 1.0] } else { [0.55, 0.60, 0.68, 1.0] };
