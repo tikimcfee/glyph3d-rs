@@ -1823,6 +1823,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "naga",
+ "objc2-foundation 0.2.2",
  "pollster",
  "ratatui",
  "rayon",

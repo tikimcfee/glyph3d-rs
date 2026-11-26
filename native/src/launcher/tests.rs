@@ -57,6 +57,12 @@ fn untouched_controls_show_the_cli_defaults() {
 #[test]
 fn focus_skips_controls_the_target_does_not_use() {
     let mut l = Launcher::defaults();
+    l.target = Target::Wall;
+    l.focus = Control::Target;
+    l.focus_next(1);
+    assert_eq!(l.focus, Control::WallNamespace, "wall target offers its namespace");
+    l.focus_next(1);
+    assert_eq!(l.focus, Control::Target, "wall skips glyph-scene layout and LOD controls");
     l.target = Target::File;
     l.focus = Control::Target;
     l.focus_next(1);
@@ -148,6 +154,10 @@ fn scene_keys_become_the_target_and_only_it_is_written() {
     let repo = l.launch_config(Path::new("/cwd"));
     assert_eq!(repo.load_repo, Some(PathBuf::from("/r")));
     assert_eq!((repo.render_file, repo.focus_file.as_deref()), (None, Some("alpha")));
+
+    l.target = Target::Wall;
+    let wall = l.launch_config(Path::new("/cwd"));
+    assert_eq!((wall.wall, wall.load_repo, wall.render_file, wall.focus_file), (Some(true), None, None, None));
 
     l.target = Target::File;
     let file = l.launch_config(Path::new("/cwd"));
@@ -300,4 +310,37 @@ fn the_written_file_builds_the_plan_the_flags_build() {
         "--no-greeking",
     ]);
     assert_eq!(from_file, from_flags);
+}
+
+#[test]
+fn launcher_wanted_only_on_explicit_flag_and_wall_target_launches_wall() {
+    let bare = Cli::command().try_get_matches_from(["glyph3d-native"]).unwrap();
+    assert!(!super::wanted(&bare), "a bare run opens the wall, not the launcher");
+    let explicit = Cli::command().try_get_matches_from(["glyph3d-native", "--launcher"]).unwrap();
+    assert!(super::wanted(&explicit), "--launcher still opens the launcher");
+
+    let mut l = Launcher::defaults();
+    assert_eq!(l.target, Target::Repo, "--launcher keeps Repo as its initial selection");
+    l.target = Target::Wall;
+    assert_eq!(l.wall_ns, "rs-wall");
+
+    let parse_action = |argv: &[&str]| {
+        let cli: Cli = parse_cli_from(Cli::command().try_get_matches_from(argv).unwrap()).unwrap();
+        format!("{:?}", cli.action())
+    };
+
+    // Default Wall target writes `wall = true` and builds the exact same Wall command as `--wall`.
+    let tmp = std::env::temp_dir().join(format!("test_launcher_wall_{}.toml", std::process::id()));
+    std::fs::write(&tmp, l.launch_config(Path::new("/cwd")).to_toml_string()).unwrap();
+    assert_eq!(
+        parse_action(&["glyph3d-native", "--launch-config", tmp.to_str().unwrap()]),
+        parse_action(&["glyph3d-native", "--wall"]),
+    );
+
+    // Editing the namespace rides through the written config file into `CliCommand::Wall`.
+    l.wall_ns = "scratch-ns".into();
+    std::fs::write(&tmp, l.launch_config(Path::new("/cwd")).to_toml_string()).unwrap();
+    let reopened = Launcher::open(Some(tmp.clone()));
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!((reopened.target, reopened.wall_ns.as_str()), (Target::Wall, "scratch-ns"));
 }

@@ -119,6 +119,8 @@ fn main() {
         }
         #[cfg(feature = "windowed")]
         CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
+            #[cfg(target_os = "macos")]
+            set_macos_process_name(WALL_MACOS_APP_NAME);
             let ctx = pollster::block_on(gpu::init(None));
             // The test pattern needs no daemon: one fixed screen.
             let namespace = (!pattern).then_some(namespace);
@@ -126,7 +128,7 @@ fn main() {
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {
-            eprintln!("error: --wall: this build has no window (the `windowed` feature is off)");
+            eprintln!("error: the wall needs a window, and this build has none (the `windowed` feature is off); render a glyph scene offscreen with --screenshot PATH");
             std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]
