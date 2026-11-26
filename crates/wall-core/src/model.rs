@@ -40,9 +40,11 @@ use crate::snap::{snap_step, snap_to, GridSpec};
 use crate::split::{
     self, Direction, Divider, InsertSide, PaneMap, Size as SplitSize, SplitDir, SplitNode,
 };
+// The store keeps the split tree in split.rs's own types (one definition).
+use crate::split::{SplitDir as StoreSplitDir, SplitNode as StoreSplitNode};
 use crate::store::{
     HelpPanelPatch, HelpPanelState, PanelSide, SettingsPanelPatch, SettingsPanelState,
-    SidebarPatch, SidebarState, SplitDir as StoreSplitDir, SplitNode as StoreSplitNode,
+    SidebarPatch, SidebarState, 
     StatusWindowPatch, StatusWindowState, Storage, WallGroup, WallSplit, WallStore,
 };
 

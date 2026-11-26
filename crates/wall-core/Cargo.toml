@@ -7,10 +7,7 @@ description = "The wall's model: terminals on an infinite canvas, their layout, 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-<<<<<<< HEAD
 term-cells = { path = "../term-cells" }
-=======
->>>>>>> wall-core-keys
 
 [lints]
 workspace = true

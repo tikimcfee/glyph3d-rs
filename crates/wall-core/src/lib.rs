@@ -13,37 +13,25 @@
 pub mod geom;
 pub mod input;
 
-<<<<<<< HEAD
-pub mod camera;
-=======
 pub mod agent_view;
 pub mod bus;
->>>>>>> wall-core-config
+pub mod camera;
 pub mod chord;
 pub mod commands;
 pub mod config;
 pub mod dock;
-<<<<<<< HEAD
-pub mod groups;
-=======
 pub mod fullscreen;
->>>>>>> wall-core-menu
+pub mod groups;
 pub mod keymap;
 pub mod labels;
 pub mod layout;
 pub mod menu;
 pub mod model;
 pub mod mouse;
-<<<<<<< HEAD
-<<<<<<< HEAD
 pub mod names;
 pub mod palette;
-=======
 pub mod pointer;
->>>>>>> wall-core-snap-scroll
-=======
 pub mod router;
->>>>>>> wall-core-keys
 pub mod scroll;
 pub mod selection;
 pub mod settings;

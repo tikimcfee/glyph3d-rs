@@ -1607,13 +1607,13 @@ fn js_round_i64(value: f64) -> i64 {
     rounded as i64
 }
 
-fn to_split_tree(node: &crate::store::SplitNode) -> split::SplitNode {
+fn to_split_tree(node: &crate::split::SplitNode) -> split::SplitNode {
     match node {
-        crate::store::SplitNode::Leaf { id } => split::SplitNode::Leaf { id: id.clone() },
-        crate::store::SplitNode::Branch { dir, ratio, a, b } => {
+        crate::split::SplitNode::Leaf { id } => split::SplitNode::Leaf { id: id.clone() },
+        crate::split::SplitNode::Branch { dir, ratio, a, b } => {
             let split_dir = match dir {
-                crate::store::SplitDir::Row => split::SplitDir::Row,
-                crate::store::SplitDir::Col => split::SplitDir::Col,
+                crate::split::SplitDir::Row => split::SplitDir::Row,
+                crate::split::SplitDir::Col => split::SplitDir::Col,
             };
             split::SplitNode::Branch {
                 dir: split_dir,
@@ -2283,13 +2283,13 @@ mod tests {
                     w: split_union.width(),
                     h: split_union.height(),
                     bars: true,
-                    tree: crate::store::SplitNode::Branch {
-                        dir: crate::store::SplitDir::Row,
+                    tree: crate::split::SplitNode::Branch {
+                        dir: crate::split::SplitDir::Row,
                         ratio: 0.5,
-                        a: Box::new(crate::store::SplitNode::Leaf {
+                        a: Box::new(crate::split::SplitNode::Leaf {
                             id: "a".to_owned(),
                         }),
-                        b: Box::new(crate::store::SplitNode::Leaf {
+                        b: Box::new(crate::split::SplitNode::Leaf {
                             id: "b".to_owned(),
                         }),
                     },
@@ -2326,7 +2326,7 @@ mod tests {
         assert!(fs_split_rect.width() > 0.0);
         let mut updated = wall.store.group(g_split).unwrap().clone();
         if let Some(ref mut sp) = updated.split {
-            if let crate::store::SplitNode::Branch { ref mut ratio, .. } = sp.tree {
+            if let crate::split::SplitNode::Branch { ref mut ratio, .. } = sp.tree {
                 *ratio = 0.35;
             }
         }
