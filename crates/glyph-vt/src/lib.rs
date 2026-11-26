@@ -23,7 +23,7 @@ use term::stream::Stream;
 use term::style::{Style, StyleColor, StyleFlags, Underline};
 use term::terminal::{ActiveScreen, TermEvent, Terminal};
 use term_cells::{
-    attrs, rgb, Cell, Cursor, CursorShape, Modes, MouseFormat, Screen, CLUSTER_BASE,
+    attrs, rgb, Cell, Cursor, CursorShape, LinkSpan, Modes, MouseFormat, Screen, CLUSTER_BASE,
 };
 
 /// Upper bound on distinct multi-codepoint grapheme clusters interned per
@@ -203,6 +203,9 @@ pub struct Vt {
     cluster_ids: HashMap<String, u32>,
     row_scratch: Vec<Cell>,
     cluster_scratch: String,
+    link_spans_scratch: Vec<LinkSpan>,
+    link_uris_scratch: Vec<String>,
+    link_remap_scratch: Vec<u32>,
     /// `(screen.cells.as_ptr() as usize, screen.generation)` produced by the
     /// most recent [`Vt::fill`] call on this instance, enabling both an O(1)
     /// idle fast path and safe per-row dirty skipping when filling the same
@@ -229,6 +232,9 @@ impl Vt {
             cluster_ids: HashMap::new(),
             row_scratch: Vec::with_capacity(cols_usize),
             cluster_scratch: String::new(),
+            link_spans_scratch: Vec::new(),
+            link_uris_scratch: Vec::new(),
+            link_remap_scratch: Vec::new(),
             last_filled: None,
             last_delta: FillDelta {
                 rewritten_cols: vec![(0, 0); rows_usize],
@@ -540,6 +546,12 @@ impl Vt {
         // stable `CLUSTER_BASE + index` handles so unchanged rows never renumber.
         self.sync_clusters(&mut screen.clusters);
 
+        // Sync visible OSC 8 hyperlink runs into `screen.hyperlinks` / `screen.link_spans`
+        // (O(1) no-op on screens without links).
+        if self.sync_hyperlinks(screen) {
+            any_changed = true;
+        }
+
         if screen.default_fg != panel_fg {
             screen.default_fg = panel_fg;
             any_changed = true;
@@ -834,6 +846,116 @@ impl Vt {
         if dst.len() < self.clusters.len() {
             dst.extend(self.clusters[dst.len()..].iter().cloned());
         }
+    }
+
+    fn sync_hyperlinks(&mut self, screen: &mut Screen) -> bool {
+        if self.terminal.hyperlinks.is_empty()
+            && screen.link_spans.is_empty()
+            && screen.hyperlinks.is_empty()
+        {
+            return false;
+        }
+
+        self.link_spans_scratch.clear();
+        self.link_uris_scratch.clear();
+
+        let term_links = &self.terminal.hyperlinks;
+        if !term_links.is_empty() {
+            self.link_remap_scratch.clear();
+            self.link_remap_scratch.resize(term_links.len(), u32::MAX);
+
+            let active = match self.terminal.active {
+                ActiveScreen::Primary => &self.terminal.primary,
+                ActiveScreen::Alternate => &self.terminal.alternate,
+            };
+            let rows_usize = active.rows.min(usize::from(screen.rows));
+            let cols_usize = active.cols.min(usize::from(screen.cols));
+
+            for y in 0..rows_usize {
+                let row_cells = &active.active[y].cells;
+                let stored_len = row_cells.len().min(cols_usize);
+                let mut open: Option<(u16, u16, u32)> = None;
+                let mut prev_raw_id = 0u32;
+
+                for (x, cell) in row_cells[..stored_len].iter().enumerate() {
+                    let raw_id = if cell.hyperlink != 0 {
+                        cell.hyperlink
+                    } else if cell.content == CellContent::WideTail && x > 0 {
+                        prev_raw_id
+                    } else {
+                        0
+                    };
+                    prev_raw_id = raw_id;
+
+                    let mapped = if raw_id != 0 {
+                        let idx = (raw_id - 1) as usize;
+                        if idx < term_links.len() {
+                            let existing = self.link_remap_scratch[idx];
+                            if existing != u32::MAX {
+                                Some(existing)
+                            } else {
+                                let next_id = self.link_uris_scratch.len() as u32;
+                                self.link_uris_scratch.push(term_links[idx].clone());
+                                self.link_remap_scratch[idx] = next_id;
+                                Some(next_id)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let col = x as u16;
+                    match (open, mapped) {
+                        (Some((start, end, id)), Some(next_id))
+                            if id == next_id && end == col =>
+                        {
+                            open = Some((start, col + 1, id));
+                        }
+                        (prev, Some(next_id)) => {
+                            if let Some((start, end, id)) = prev {
+                                self.link_spans_scratch.push(LinkSpan {
+                                    row: y as u16,
+                                    start_col: start,
+                                    end_col: end,
+                                    link_id: id,
+                                });
+                            }
+                            open = Some((col, col + 1, next_id));
+                        }
+                        (Some((start, end, id)), None) => {
+                            self.link_spans_scratch.push(LinkSpan {
+                                row: y as u16,
+                                start_col: start,
+                                end_col: end,
+                                link_id: id,
+                            });
+                            open = None;
+                        }
+                        (None, None) => {}
+                    }
+                }
+
+                if let Some((start, end, id)) = open {
+                    self.link_spans_scratch.push(LinkSpan {
+                        row: y as u16,
+                        start_col: start,
+                        end_col: end,
+                        link_id: id,
+                    });
+                }
+            }
+        }
+
+        if screen.hyperlinks == self.link_uris_scratch
+            && screen.link_spans == self.link_spans_scratch
+        {
+            return false;
+        }
+        screen.hyperlinks.clone_from(&self.link_uris_scratch);
+        screen.link_spans.clone_from(&self.link_spans_scratch);
+        true
     }
 }
 
