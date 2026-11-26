@@ -15,6 +15,8 @@
 #   GLYPH_RELAX           Path to relax binary (default: /Users/lugo/localdev/makepad/target/release/relax, else `relax`)
 #   GLYPH_WALL_SHADER_DIR Directory for disk-loaded WGSL shaders (default: <repo>/native/src/shaders)
 #   G3D_BIN               Path to g3d CLI for scratch daemon teardown (default: ~/.local/bin/g3d, else `g3d`)
+#   RELAX_BG_TYPECK       Background typecheck toggle (default: 0; avoids a host SIGSEGV in relax's
+#                         const_drain/pmhost interaction on warm boots; set to 1 to re-enable)
 
 set -euo pipefail
 
@@ -45,7 +47,7 @@ WALL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         --ns)
@@ -93,6 +95,11 @@ if [[ "$SCRATCH" -eq 1 ]]; then
 fi
 
 export GLYPH_WALL_SHADER_DIR="${GLYPH_WALL_SHADER_DIR:-$REPO_ROOT/native/src/shaders}"
+# Disable relax's background full-graph typeck by default: on warm boots it
+# triggers proc-macro expansion (pmhost) concurrently with worker const_drain,
+# which hits a host SIGSEGV in relax_compiler::jit::Unit::{vtable,const_addr}
+# and stalls the owner thread for ~40 s. Override with RELAX_BG_TYPECK=1.
+export RELAX_BG_TYPECK="${RELAX_BG_TYPECK:-0}"
 # Ensure g3d-termd is on PATH for Termd::connect_or_start.
 if [[ -d "${HOME}/.local/bin" && ":${PATH}:" != *":${HOME}/.local/bin:"* ]]; then
     export PATH="${HOME}/.local/bin:${PATH}"
