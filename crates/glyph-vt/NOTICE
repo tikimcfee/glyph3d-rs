@@ -6,10 +6,67 @@ emulator core and codepoint width / UAX #29 grapheme-break library:
 
 - `src/term/` — copied from `makepad/apps/terminal/src/term/` at makepad
   commit `7a258a35221e084fd21803a08ba4c57ab5c0b230` (omitting `key_encode.rs`
-  and `mouse_encode.rs`, as `g3d-termd` encodes input on the daemon side, and
-  adapted for passive client operation).
+  and `mouse_encode.rs`, as `g3d-termd` encodes input on the daemon side).
 - `src/cell_width/` — copied from `makepad/libs/cell_width/src/` at makepad
   commit `7a258a35221e084fd21803a08ba4c57ab5c0b230`.
+
+Local changes to the vendored core (`src/term/`)
+------------------------------------------------
+
+1. Passive-viewer operation & bounded side buffers (`terminal.rs`):
+   - Added `Terminal::with_scrollback` (used with `max_scrollback = 0` in `Vt`)
+     and fixed `full_reset` (`RIS`) to preserve `max_scrollback` rather than
+     reverting to `DEFAULT_SCROLLBACK` (10,000), and to clear `title` and `pwd`.
+   - Added `Terminal::passive` so query replies (`outbound`) and `DCS` query
+     accumulation are discarded as produced instead of growing unboundedly.
+   - Converted `events` into a bounded `VecDeque<TermEvent>` (`MAX_PENDING_EVENTS = 256`)
+     and added `TermEvent::ClipboardRead` (`OSC 52 ; selection ; ?`).
+   - Deduplicated `OSC 8` hyperlinks via `hyperlink_ids` and added mark-and-remap
+     garbage collection (`gc_hyperlinks`) plus a hard cap (`4,096` live URIs)
+     and `Terminal::cell_hyperlink`.
+2. `DECSTR` (`CSI ! p`, `soft_reset`) & mode parity with Ghostty (`terminal.rs`):
+   - Added missing `DECSTR` resets required by `g3d-termd` repaints:
+     `Wraparound`, `ReverseWrap`, `ReverseWrapExtended`, `DisableKeyboard`,
+     `EnableLeftAndRightMargin` (`?69`), `CursorBlinking`, `modify_other_keys`,
+     `current_hyperlink`, and resetting the 256-colour `palette` to
+     `base_palette` (while preserving dynamic `OSC 10/11/12` overrides).
+   - Cleared `current_hyperlink` on alternate-screen switches (`?47`/`?1047`/`?1049`)
+     and cleared `SynchronizedOutput` (`?2026`) on `Terminal::resize`.
+   - Tracked `mouse_tracking` (`9/1000/1002/1003`) and `mouse_format`
+     (`1005/1006/1015/1016`) with xterm/Ghostty last-DECSET-wins semantics, and
+     synced `Mode::CursorBlinking` on `DECSCUSR` (`CSI Ps SP q`).
+3. Fuzz / edge-case hardening (`terminal.rs`, `screen.rs`, `page.rs`):
+   - Fixed `Screen::resize_reflow` emitting a 3rd column (and orphan `WideTail`s)
+     for every wide character by skipping old `WideTail` cells during reflow and
+     regenerating tails directly beside wide heads, and degraded width-2 cells
+     cleanly when reflowing onto a 1-column (`cols == 1`) grid.
+   - Fixed margin-limited `Screen::scroll_up`, `Screen::scroll_down`,
+     `Terminal::insert_blanks` (`ICH`), `Terminal::delete_chars` (`DCH`), and
+     mode-2027 `try_grapheme_attach` (`1 <-> 2` width transitions and `cols == 1`)
+     to split straddling wide characters at both boundaries and copy head style
+     and hyperlink onto `WideTail`.
+   - Capped per-cell grapheme cluster length (`MAX_CLUSTER_CPS = 32`) in both
+     `attach_zero_width` and `try_grapheme_attach` to prevent unbounded memory
+     growth and O(N^2) UAX #29 break replay on combining-mark floods; capped
+     `CHT` (`CSI Ps I`) iterations to grid width.
+   - Replaced potentially underflowing unsigned subtractions in `CPR` (`CSI 6 n`
+     under `DECOM` when `cursor.y < scroll_top`), `CHA`/`VPA`/`CUP`,
+     `cursor_left`, `erase_chars`, and `scroll_up`/`scroll_down` with saturating
+     arithmetic, and removed the non-test `.unwrap()` in `Screen::resize_clamped`.
+   - Added missing `dirty = true` marks on `cursor_up`, `cursor_down`,
+     `cursor_right`, `cursor_left`, `carriage_return`, `horizontal_tab`,
+     `horizontal_tab_back`, `restore_cursor` (default branch), `OscCommand::ChangeWindowTitle`,
+     Kitty keyboard `CSI > / < / = u`, `XTMODKEYS`, and `DECKPAM`/`DECKPNM`.
+4. Hot-path performance (`page.rs`, `screen.rs`, `stream.rs`, `parser.rs`, `terminal.rs`):
+   - Added per-row `Row::dirty` + `Terminal::all_rows_dirty` so incremental
+     `Vt::fill` skips clean rows instead of re-resolving the whole grid.
+   - Recycled evicted `Row` buffers in full-width `scroll_up` / `scroll_down`
+     instead of dropping and reallocating `Vec<Cell>` on every linefeed.
+   - Added `Stream::process` + `Terminal::print_ascii_slice` batched ground-state
+     fast path for printable ASCII runs (`0x20..=0x7e`) and direct `ESC` entry.
+   - Added `Parser::step` callback dispatch (avoiding 312-byte `[Option<Action>; 3]`
+     stack copies per non-ground byte) and eliminated per-SGR `Vec<Attribute>`
+     heap allocation in `Terminal::apply_sgr`.
 
 ------------------------------------------------------------------------------
 1. Makepad (`apps/terminal/src/term`, `libs/cell_width`) — MIT License
@@ -112,7 +169,7 @@ Permission is hereby granted, free of charge, to any person obtaining a
 copy of data files and any associated documentation (the "Data Files") or
 software and any associated documentation (the "Software") to deal in the
 Data Files or Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, and/or sell
+the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Data Files or Software, and to permit persons to whom the
 Data Files or Software are furnished to do so, provided that either
 (a) this copyright and permission notice appear with all copies of the
