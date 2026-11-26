@@ -50,6 +50,8 @@ IDLE_COUNTS="${GLYPH_WALL_PERF_IDLE_COUNTS:-1 14}"
 IDLE_MS="${GLYPH_WALL_PERF_IDLE_MS:-5000}"
 SETTLE_MS="${GLYPH_WALL_PERF_SETTLE_MS:-1200}"
 CAT_FILE="${GLYPH_WALL_PERF_CAT_FILE:-$REPO_ROOT/native/src/wall/renderer.rs}"
+CARGO_BUILD_EXTRA="-p wall-control"
+MODES="${GLYPH_WALL_PERF_MODES:-flood extra idle}"
 NO_BUILD="${GLYPH_WALL_PERF_NO_BUILD:-0}"
 
 while [[ $# -gt 0 ]]; do
@@ -57,15 +59,26 @@ while [[ $# -gt 0 ]]; do
     --no-build) NO_BUILD=1; shift ;;
     --frames)   FRAMES="$2"; shift 2 ;;
     --max-ms)   MAX_WALL_MS="$2"; shift 2 ;;
+    --modes)    MODES="$2"; shift 2 ;;
     *)          echo "wall-perf.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 
 if [[ "$NO_BUILD" != "1" ]]; then
-  echo "Building release glyph3d-native and termd_bench_ctl..." >&2
-  cargo build --release -p glyph3d-native --bin glyph3d-native >&2
+  echo "Building release glyph3d-native, wallctl, and termd_bench_ctl..." >&2
+  cargo build --release -p glyph3d-native --bin glyph3d-native $CARGO_BUILD_EXTRA >&2
   cargo build --release -p termd-client --example termd_bench_ctl >&2
 fi
+
+host_loadavg() {
+  if command -v sysctl >/dev/null 2>&1 && sysctl -n vm.loadavg >/dev/null 2>&1; then
+    sysctl -n vm.loadavg | tr -d '{}' | awk '{printf "%s/%s/%s", $1, $2, $3}'
+  elif [[ -r /proc/loadavg ]]; then
+    awk '{printf "%s/%s/%s", $1, $2, $3}' /proc/loadavg
+  else
+    printf "na"
+  fi
+}
 
 RENDERER="${GLYPH_RENDERER:-$REPO_ROOT/target/release/glyph3d-native}"
 CTL_BIN="$REPO_ROOT/target/release/examples/termd_bench_ctl"
@@ -196,7 +209,9 @@ run_flood_case() {
   ACTIVE_DIR="$SCRATCH_ROOT/${label}-n${n}"
   mkdir -m 0700 -p "$ACTIVE_DIR"
 
-  echo "Running flood: workload=$label terminals=$n (${COLS}x${ROWS}) target_frames=$FRAMES max_ms=$MAX_WALL_MS ttl=${FLOOD_TTL_SECS}s ..." >&2
+  local load_now
+  load_now="$(host_loadavg)"
+  echo "Running flood: workload=$label terminals=$n (${COLS}x${ROWS}) target_frames=$FRAMES max_ms=$MAX_WALL_MS ttl=${FLOOD_TTL_SECS}s load=$load_now ..." >&2
   "$CTL_BIN" start \
     --dir "$ACTIVE_DIR" \
     --ns "$NS" \
@@ -220,7 +235,106 @@ run_flood_case() {
     cat "$out_file" >&2
     exit 1
   fi
-  printf '%s\t%s\t%s\n' "$label" "$n" "$perf_line" >> "$RESULTS_TSV"
+  printf '%s\t%s\t%s\t%s\n' "$label" "$n" "$load_now" "$perf_line" >> "$RESULTS_TSV"
+
+  stop_scratch_dir "$ACTIVE_DIR"
+  ACTIVE_DIR=""
+}
+
+run_wheel_case() {
+  local n="$1"
+
+  ACTIVE_DIR="$SCRATCH_ROOT/wheel-n${n}"
+  mkdir -m 0700 -p "$ACTIVE_DIR"
+
+  local load_now
+  load_now="$(host_loadavg)"
+  echo "Running camera wheel pan/zoom: terminals=$n (${COLS}x${ROWS}) target_frames=$FRAMES max_ms=$MAX_WALL_MS ttl=${IDLE_TTL_SECS}s load=$load_now ..." >&2
+  "$CTL_BIN" start \
+    --dir "$ACTIVE_DIR" \
+    --ns "$NS" \
+    --count "$n" \
+    --cols "$COLS" \
+    --rows "$ROWS" \
+    --warmup-ms 200 \
+    --ttl-secs "$IDLE_TTL_SECS" \
+    -- /bin/sh -c "head -n $ROWS '$CAT_FILE'; exec sleep 30"
+
+  local out_file="$SCRATCH_ROOT/out-wheel-n${n}.log"
+  local driver_log="$SCRATCH_ROOT/wheel-driver-n${n}.log"
+  python3 - "$ACTIVE_DIR/wall-$NS.sock" "$FRAMES" > "$driver_log" 2>&1 <<'PY' &
+import math, os, socket, sys, time
+
+sock_path = sys.argv[1]
+target_frames = int(sys.argv[2])
+deadline = time.monotonic() + 8.0
+
+while time.monotonic() < deadline and not os.path.exists(sock_path):
+    time.sleep(0.01)
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(2.0)
+s.connect(sock_path)
+buf = b""
+
+def rpc(cmd: str) -> str:
+    global buf
+    s.sendall((cmd + "\n").encode("utf-8"))
+    while b"\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            return ""
+        buf += chunk
+    hdr, buf = buf.split(b"\n", 1)
+    need = int(hdr.decode("ascii")) + 1
+    while len(buf) < need:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    body = buf[: need - 1].decode("utf-8", errors="replace")
+    buf = buf[need:]
+    return body
+
+try:
+    w0 = rpc("app.where")
+    step = 0
+    while step < target_frames * 2 and time.monotonic() < deadline:
+        angle = step * 0.22
+        dx = round(95.0 * math.cos(angle), 1)
+        dy = round(70.0 * math.sin(angle), 1)
+        rpc(f"app.wheel 16 16 {dx} {dy}")
+        if step % 3 == 0:
+            z_dy = 28.0 if (step // 15) % 2 == 0 else -28.0
+            rpc(f"app.wheel 800 500 0 {z_dy} ctrl")
+        step += 1
+        time.sleep(0.006)
+except (BrokenPipeError, ConnectionResetError, OSError):
+    pass
+finally:
+    try:
+        s.close()
+    except OSError:
+        pass
+PY
+  local driver_pid="$!"
+
+  GLYPH_WALL_PERF=1 \
+  GLYPH_WALL_PERF_MAX_MS="$MAX_WALL_MS" \
+  G3D_TERMD_DIR="$ACTIVE_DIR" \
+  "$RENDERER" --wall --wall-ns "$NS" --frames "$FRAMES" > "$out_file"
+
+  kill "$driver_pid" >/dev/null 2>&1 || true
+  wait "$driver_pid" >/dev/null 2>&1 || true
+
+  local perf_line
+  perf_line="$(grep '^wall-perf: ' "$out_file" | tail -n 1)"
+  if [[ -z "$perf_line" ]]; then
+    echo "wall-perf.sh: missing wall-perf summary line for wheel-pan-zoom N=$n" >&2
+    cat "$out_file" >&2
+    exit 1
+  fi
+  printf '%s\t%s\t%s\t%s\n' "wheel-pan-zoom" "$n" "$load_now" "$perf_line" >> "$RESULTS_TSV"
 
   stop_scratch_dir "$ACTIVE_DIR"
   ACTIVE_DIR=""
@@ -232,7 +346,9 @@ run_idle_case() {
   ACTIVE_DIR="$SCRATCH_ROOT/idle-n${n}"
   mkdir -m 0700 -p "$ACTIVE_DIR"
 
-  echo "Running idle: terminals=$n (${COLS}x${ROWS}) settle=${SETTLE_MS}ms idle=${IDLE_MS}ms ttl=${IDLE_TTL_SECS}s ..." >&2
+  local load_now
+  load_now="$(host_loadavg)"
+  echo "Running idle: terminals=$n (${COLS}x${ROWS}) settle=${SETTLE_MS}ms idle=${IDLE_MS}ms ttl=${IDLE_TTL_SECS}s load=$load_now ..." >&2
   "$CTL_BIN" start \
     --dir "$ACTIVE_DIR" \
     --ns "$NS" \
@@ -257,26 +373,63 @@ run_idle_case() {
     cat "$out_file" >&2
     exit 1
   fi
-  printf 'idle\t%s\t%s\n' "$n" "$perf_line" >> "$IDLE_TSV"
+  printf 'idle\t%s\t%s\t%s\n' "$n" "$load_now" "$perf_line" >> "$IDLE_TSV"
 
   stop_scratch_dir "$ACTIVE_DIR"
   ACTIVE_DIR=""
 }
 
-for workload in yes seq cat-src; do
-  case "$workload" in
-    yes)     cmd="exec yes" ;;
-    seq)     cmd="while :; do /usr/bin/seq 1 2000000; done" ;;
-    cat-src) cmd="while :; do /bin/cat '$CAT_FILE'; done" ;;
-  esac
-  for n in $COUNTS; do
-    run_flood_case "$workload" "$n" "$cmd"
-  done
-done
+FULLSCREEN_TUI_CMD="python3 -c '
+import sys
+cols, rows = $COLS, $ROWS
+frames = []
+for f in range(16):
+    out = [\"\\x1b[H\"]
+    hdr = f\" top - tick {f:04d} up 4d, 14 tasks, cpu {(37 + f * 3) % 100:2d}% mem 68% \"
+    out.append(f\"\\x1b[1;37;44m{hdr:<{cols}.{cols}}\\x1b[0m\")
+    for r in range(2, rows + 1):
+        pid = 1000 + r * 17 + f
+        cpu = ((r * 13 + f * 7) % 990) / 10.0
+        bar_w = (r * 3 + f * 2) % 24
+        bar = \"#\" * bar_w + \".\" * (24 - bar_w)
+        fg = 31 + ((r + f) % 6)
+        line = f\"{pid:5d} worker-{r:02d}  {cpu:5.1f}% [{bar}] iter={f:02d}\"
+        out.append(f\"\\x1b[{r};1H\\x1b[{fg}m{line:<{cols}.{cols}}\\x1b[0m\")
+    frames.append((\"\".join(out)).encode(\"ascii\"))
+w = sys.stdout.buffer.write
+fl = sys.stdout.buffer.flush
+w(b\"\\x1b[?1049h\\x1b[?25l\")
+fl()
+i = 0
+while True:
+    w(frames[i & 15])
+    fl()
+    i += 1
+'"
 
-for n in $IDLE_COUNTS; do
-  run_idle_case "$n"
-done
+if [[ " $MODES " == *" flood "* ]]; then
+  for workload in yes seq cat-src; do
+    case "$workload" in
+      yes)     cmd="exec yes" ;;
+      seq)     cmd="while :; do /usr/bin/seq 1 2000000; done" ;;
+      cat-src) cmd="while :; do /bin/cat '$CAT_FILE'; done" ;;
+    esac
+    for n in $COUNTS; do
+      run_flood_case "$workload" "$n" "$cmd"
+    done
+  done
+fi
+
+if [[ " $MODES " == *" extra "* ]]; then
+  run_flood_case "fullscreen-tui" 1 "$FULLSCREEN_TUI_CMD"
+  run_wheel_case 14
+fi
+
+if [[ " $MODES " == *" idle "* ]]; then
+  for n in $IDLE_COUNTS; do
+    run_idle_case "$n"
+  done
+fi
 
 python3 - "$RESULTS_TSV" "$IDLE_TSV" <<'PY'
 import sys
@@ -304,7 +457,7 @@ print()
 print("### Wall Flood Performance")
 print()
 headers = [
-    "Workload", "N", "Frames", "Wall (s)", "FPS",
+    "Workload", "N", "Load", "Frames", "Wall (s)", "FPS",
     "Pump p50/p95/max (ms)", "Pump sum (ms) / Wakes",
     "Draw p50/p95/max (ms)", "Wait p50 (ms)",
     "Proc CPU (ms)", "Uploads (drawn/up/rows/writes)", "Status"
@@ -317,24 +470,26 @@ with open(results_path, "r", encoding="utf-8") as f:
         raw = raw.strip()
         if not raw:
             continue
-        workload, n, line = raw.split("\t", 2)
+        workload, n, load_str, line = raw.split("\t", 3)
         kv = parse_kv_line(line)
         pump = parse_sub(kv["pump_ms"])
         draw = parse_sub(kv["draw_ms"])
         wait = parse_sub(kv["wait_ms"])
         up = parse_sub(kv["uploads"])
         wall_s = float(kv["wall_ms"]) / 1000.0
+        wake_hz = pump.get("wake_hz", f"{float(pump['wakes']) / wall_s:.1f}" if wall_s > 0 else "0.0")
         status = "stalled in pump" if kv.get("stalled") == "1" else "ok"
         if kv.get("occluded", "0") != "0":
             status += f" (occl:{kv['occluded']})"
         row = [
             workload,
             n,
+            load_str,
             kv["frames"],
             f"{wall_s:.2f}",
             kv["fps"],
             f"{pump['p50']} / {pump['p95']} / {pump['max']}",
-            f"{pump['sum']} ({pump['wakes']}w)",
+            f"{pump['sum']} ({pump['wakes']}w, {wake_hz}/s)",
             f"{draw['p50']} / {draw['p95']} / {draw['max']}",
             wait["p50"],
             kv["proc_cpu_ms"],
@@ -347,7 +502,7 @@ print()
 print("### Wall Idle Check")
 print()
 idle_headers = [
-    "Case", "N", "Startup Frames", "Settle+Idle Wall (s)",
+    "Case", "N", "Load", "Startup Frames", "Settle+Idle Wall (s)",
     "Idle Window (s)", "Idle Frames", "Idle Proc CPU (ms)", "Total Proc CPU (ms)"
 ]
 print("| " + " | ".join(idle_headers) + " |")
@@ -358,13 +513,14 @@ with open(idle_path, "r", encoding="utf-8") as f:
         raw = raw.strip()
         if not raw:
             continue
-        case, n, line = raw.split("\t", 2)
+        case, n, load_str, line = raw.split("\t", 3)
         kv = parse_kv_line(line)
         wall_s = float(kv["wall_ms"]) / 1000.0
         idle_s = float(kv.get("idle_ms", "0")) / 1000.0
         row = [
             case,
             n,
+            load_str,
             kv["frames"],
             f"{wall_s:.2f}",
             f"{idle_s:.2f}",
