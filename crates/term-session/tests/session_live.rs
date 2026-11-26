@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use term_cells::MouseTracking;
 use term_session::{
-    ConnectOptions, DaemonEvent, DaemonState, HubOptions, Key, KeyAction, Role, SessionHub,
-    SpawnOptions, Target, TerminalSession, View,
+    Capture, CaptureFormat, ConnectOptions, DaemonEvent, DaemonState, HubOptions, Key, KeyAction,
+    Role, SessionHub, SpawnOptions, Target, TerminalSession, View,
 };
 use termd_client::Termd;
 
@@ -1090,5 +1090,231 @@ fn sessions_wall_seam_end_to_end() {
             saw_ended && sessions.screen("t1").is_none()
         }),
         "Sessions::pump did not emit News::Ended after kill"
+    );
+}
+
+#[test]
+fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
+    use term_session::{News, Sessions};
+
+    let scratch = ScratchDaemon::new("grow");
+    let wake = Arc::new(WakeSignal::default());
+    let hub = SessionHub::open_with(&scratch.target(), HubOptions::default(), wake.waker())
+        .expect("open scratch hub");
+
+    // 1. Finding T2 repro (`out/wall-port/vt-diff-2026-11-26.md`):
+    //    30 numbered lines on 80x24 under `sleep 60` (pushing lines 1..=7 into scrollback),
+    //    followed by a 14-step drag resize to 132x40.
+    let done_grow = scratch.dir.join("grow-done");
+    let script = "i=1; while [ $i -le 30 ]; do printf '%d\\r\\n' \"$i\"; i=$((i + 1)); done; \
+                  printf d > \"$1\"; exec sleep 60";
+    let mut session = hub
+        .spawn(&SpawnOptions {
+            id: "grow1".into(),
+            argv: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                done_grow.to_string_lossy().into_owned(),
+            ]),
+            cols: 80,
+            rows: 24,
+            env_base: Some(base_env()),
+            ..SpawnOptions::shell("grow1", 80, 24)
+        })
+        .expect("spawn grow1");
+
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            session.pump();
+            done_grow.exists() && session.row_text(22) == "30"
+        }),
+        "grow1 did not finish printing 1..30 at 80x24: {:?}",
+        screen_lines(&session)
+    );
+    assert_eq!(session.row_text(0), "8", "lines 1..=7 should be in scrollback at 80x24");
+    assert_eq!(session.stats().repaints_sent, 0);
+
+    // Drag across 14 resize steps from 80x24 to 132x40 (4 cols / ~1 row per step, 2 ms apart).
+    for step in 1..=14u16 {
+        let cols = 80 + (52 * step) / 14;
+        let rows = 24 + (16 * step) / 14;
+        session.send_resize(cols, rows);
+        if step < 14 {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            session.pump();
+            (session.screen().cols, session.screen().rows) == (132, 40)
+                && session.row_text(0) == "1"
+                && session.row_text(29) == "30"
+        }),
+        "grow1 at 132x40 did not pull scrollback history lines 1..=7 via coalesced repaint: rows={:?} stats={:?}",
+        screen_lines(&session),
+        session.stats()
+    );
+
+    // Compare every row of `session` against `TermdHandle::capture(Plain, unwrap: false)`.
+    let cap = hub
+        .client()
+        .capture(&Capture {
+            id: "grow1".into(),
+            format: Some(CaptureFormat::Plain),
+            history_rows: None,
+            unwrap: Some(false),
+        })
+        .expect("capture grow1 at 132x40");
+    let cap_lines: Vec<&str> = cap.text.split('\n').collect();
+    let vt_lines = screen_lines(&session);
+    for (r, vt_row) in vt_lines.iter().enumerate() {
+        let daemon_row = cap_lines.get(r).copied().unwrap_or("").trim_end();
+        assert_eq!(
+            vt_row, daemon_row,
+            "row {r} mismatch vs TermdHandle::capture at 132x40"
+        );
+    }
+
+    let grow_stats = session.stats();
+    println!(
+        "[bench T2 14-step primary grow 80x24->132x40] resizes_sent={} (of 14) · repaints_sent={} (expected 1)",
+        grow_stats.resizes_sent, grow_stats.repaints_sent
+    );
+    assert_eq!(
+        grow_stats.repaints_sent, 1,
+        "14-step primary grow should coalesce to a single repaint after settling, got {}",
+        grow_stats.repaints_sent
+    );
+
+    // 2. Shrinking on primary screen (132x40 -> 60x20) must NOT ask for a repaint and must still match capture.
+    session.send_resize(60, 20);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            session.pump();
+            (session.screen().cols, session.screen().rows) == (60, 20)
+        }),
+        "grow1 did not shrink to 60x20"
+    );
+    // Wait past `DEFAULT_GROW_REPAINT_SETTLE` (35ms) to prove no repaint fires on shrink.
+    std::thread::sleep(Duration::from_millis(60));
+    session.pump();
+    assert_eq!(
+        session.stats().repaints_sent,
+        1,
+        "primary-screen shrink must not request an extra repaint"
+    );
+    let cap_shrunk = hub
+        .client()
+        .capture(&Capture {
+            id: "grow1".into(),
+            format: Some(CaptureFormat::Plain),
+            history_rows: None,
+            unwrap: Some(false),
+        })
+        .expect("capture grow1 at 60x20");
+    let shrunk_daemon: Vec<&str> = cap_shrunk.text.split('\n').collect();
+    for (r, vt_row) in screen_lines(&session).iter().enumerate() {
+        let daemon_row = shrunk_daemon.get(r).copied().unwrap_or("").trim_end();
+        assert_eq!(vt_row, daemon_row, "row {r} mismatch after shrink to 60x20");
+    }
+
+    // 3. Alternate screen (`?1049h`) 14-step grow must NEVER ask termd for a repaint.
+    let alt_ready = scratch.dir.join("alt-ready");
+    let mut alt_sess = hub
+        .spawn(&SpawnOptions {
+            id: "alt1".into(),
+            argv: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '\\033[?1049hALT_VIEW'; printf a > \"$1\"; exec sleep 60".into(),
+                "sh".into(),
+                alt_ready.to_string_lossy().into_owned(),
+            ]),
+            cols: 80,
+            rows: 24,
+            env_base: Some(base_env()),
+            ..SpawnOptions::shell("alt1", 80, 24)
+        })
+        .expect("spawn alt1");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            alt_sess.pump();
+            alt_ready.exists() && alt_sess.modes().alt_screen
+        }),
+        "alt1 did not enter ?1049h"
+    );
+    for step in 1..=14u16 {
+        alt_sess.send_resize(80 + step * 3, 24 + step);
+    }
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            alt_sess.pump();
+            (alt_sess.screen().cols, alt_sess.screen().rows) == (122, 38)
+        }),
+        "alt1 did not settle at 122x38"
+    );
+    std::thread::sleep(Duration::from_millis(60));
+    alt_sess.pump();
+    assert_eq!(
+        alt_sess.stats().repaints_sent,
+        0,
+        "alternate-screen grow must not request a repaint from termd"
+    );
+
+    // 4. End-to-end `Sessions::resize` 14-step burst (`effect -> News::Resized`) settle timing &
+    //    outbound coalescing check.
+    let mut sessions =
+        Sessions::open_target(&scratch.target(), wake.waker()).expect("open Sessions for burst");
+    let (bid, _, _) = sessions
+        .spawn(
+            Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()]),
+            80,
+            24,
+        )
+        .expect("spawn burst terminal");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions.session(&bid).is_some_and(|s| s.stats().publishes >= 1)
+        }),
+        "burst terminal initial publish did not arrive"
+    );
+
+    seen = wake.current();
+    let t_burst = Instant::now();
+    for step in 1..=14u16 {
+        let cols = 80 + (52 * step) / 14;
+        let rows = 24 + (16 * step) / 14;
+        sessions.resize(&bid, cols, rows);
+    }
+    let mut resized_events = Vec::new();
+    let burst_settled = wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+        let (_, news) = sessions.pump();
+        for n in news {
+            if let News::Resized { id, cols, rows } = n {
+                if id == bid {
+                    resized_events.push((cols, rows));
+                }
+            }
+        }
+        resized_events.last().copied() == Some((132, 40))
+    });
+    let settle_ms = t_burst.elapsed().as_secs_f64() * 1000.0;
+    let burst_stats = sessions.session(&bid).expect("burst session").stats();
+    println!(
+        "[bench 14-step resize burst (effect -> News::Resized)] settle={settle_ms:.2} ms · \
+         outbound resizes_sent={} (of 14) · News::Resized events={} ({resized_events:?})",
+        burst_stats.resizes_sent,
+        resized_events.len()
+    );
+    assert!(burst_settled, "14-step burst did not settle to (132, 40)");
+    assert!(
+        burst_stats.resizes_sent < 14,
+        "outbound resize burst should coalesce queued intermediate sizes (sent {} of 14)",
+        burst_stats.resizes_sent
     );
 }
