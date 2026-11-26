@@ -24,6 +24,8 @@ pub mod paper;
 pub mod renderer;
 pub mod replay;
 #[cfg(feature = "windowed")]
+pub mod script;
+#[cfg(feature = "windowed")]
 pub mod session;
 pub mod shapes;
 pub mod test_pattern;
