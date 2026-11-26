@@ -709,3 +709,22 @@ fn fill_delta_reports_whole_screen_vs_margin_scroll_and_rewritten_spans() {
     assert_eq!(d.scroll_scope, ScrollScope::None);
 }
 
+#[test]
+fn keycap_variation_selector_matches_libghostty_in_mode_2027_off_and_on() {
+    let (mut vt, mut screen, _theme) = setup(20, 3);
+
+    // Mode 2027 off (`?2027l`): VS16 (`U+FE0F`) on ASCII `'1'` is ignored so the
+    // 1-column cell holds `"1\u{20E3}"`, while VS16 on non-ASCII `'❤'` (`U+2764`) stays.
+    vt.feed("\x1b[?2027l1\u{FE0F}\u{20E3} ❤\u{FE0F}".as_bytes());
+    vt.fill(&mut screen);
+    assert_eq!(screen.content_str(&screen.row(0)[0]), "1\u{20E3}");
+    assert_eq!(screen.row(0)[0].width, 1);
+    assert_eq!(screen.content_str(&screen.row(0)[2]), "❤\u{FE0F}");
+
+    // Mode 2027 on (`?2027h`): keycap sequence widens to 2 columns as `"1\u{FE0F}\u{20E3}"`.
+    vt.feed("\r\n\x1b[?2027h1\u{FE0F}\u{20E3}".as_bytes());
+    vt.fill(&mut screen);
+    assert_eq!(screen.content_str(&screen.row(1)[0]), "1\u{FE0F}\u{20E3}");
+    assert_eq!(screen.row(1)[0].width, 2);
+}
+

@@ -1824,6 +1824,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "naga",
+ "objc2-foundation 0.2.2",
  "pollster",
  "ratatui",
  "rayon",
@@ -4077,8 +4078,10 @@ dependencies = [
 name = "termd-client"
 version = "0.1.0"
 dependencies = [
+ "glyph-vt",
  "serde",
  "serde_json",
+ "term-cells",
 ]
 
 [[package]]

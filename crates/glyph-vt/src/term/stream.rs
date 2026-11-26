@@ -44,12 +44,29 @@ impl Stream {
                         break;
                     }
                 }
-                // Fast ESC entry without routing through Utf8Decoder.
-                if bytes[i] == 0x1b {
-                    self.parser.state = State::Escape;
-                    self.parser.clear();
-                    i += 1;
-                    continue;
+                // Fast ESC / CR / LF handling without routing through Utf8Decoder.
+                match bytes[i] {
+                    0x1b => {
+                        self.parser.state = State::Escape;
+                        self.parser.clear();
+                        i += 1;
+                        continue;
+                    }
+                    b'\r' => {
+                        terminal.execute(b'\r');
+                        i += 1;
+                        if i < len && bytes[i] == b'\n' {
+                            terminal.execute(b'\n');
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'\n' => {
+                        terminal.execute(b'\n');
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             self.next(bytes[i], terminal);

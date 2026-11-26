@@ -40,6 +40,9 @@ pub const MIN_LINE_PX: f64 = 4.0;
 /// Maximum fullscreen row height in CSS pixels (`LINE_PX.max`).
 pub const MAX_LINE_PX: f64 = 200.0;
 
+/// Opacity of the dimming backing veil behind fullscreen panes (`BACKDROP_OPACITY`).
+pub const BACKDROP_OPACITY: f64 = 0.9;
+
 const EDGE_EPS: f64 = 1e-6;
 
 /// Available viewport rectangle left clear of docked side panels, in CSS pixels.
