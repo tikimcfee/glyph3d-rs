@@ -217,6 +217,12 @@ impl GlyphSource {
         &self.atlas
     }
 
+    /// Mutable access to the underlying [`FontAtlas`] (dirty tracking remains automatic;
+    /// call [`Self::sync`] before drawing).
+    pub fn atlas_mut(&mut self) -> &mut FontAtlas {
+        &mut self.atlas
+    }
+
     /// Currently selected font family (default: Monaspace Neon).
     #[inline]
     pub fn family(&self) -> FamilyId {
@@ -263,6 +269,17 @@ impl GlyphSource {
         cell: &Cell,
     ) -> ResolvedCell {
         self.atlas.resolve_cell(family, screen, cell)
+    }
+
+    /// Resolve a UTF-8 label string into `(slot, span_cols)` pairs in the active family.
+    pub fn resolve_str_glyphs(&mut self, text: &str, emit: impl FnMut(u32, u8)) {
+        super::cell::resolve_str_glyphs(&mut self.atlas, self.active_family, text, emit);
+    }
+
+    /// Measure the unclipped world width of `text` drawn at `height_world` in the active family.
+    pub fn measure_label_width(&mut self, text: &str, height_world: f32) -> f32 {
+        let metrics = self.cell_metrics();
+        super::labels::measure_label_width(metrics, &mut self.atlas, self.active_family, text, height_world)
     }
 
     /// Snapped world-space [`CellMetrics`] for the active family (`CELL_HEIGHT_WORLD = 1.0`).

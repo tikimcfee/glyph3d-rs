@@ -26,7 +26,10 @@ pub mod shapes;
 pub mod test_pattern;
 
 pub use camera::WallCamera;
-pub use cell::{CellGpu, dirty_row_ranges, pack_cell, pack_cell_style, resolve_cell_glyph, resolve_str_glyphs};
+pub use cell::{
+    CellGpu, dirty_row_ranges, pack_cell, pack_cell_resolved, pack_cell_style, resolve_cell_glyph,
+    resolve_str_glyphs,
+};
 pub use glyphs::AtlasEmojiSource;
 #[cfg(feature = "wgpu")]
 pub use glyphs::{GlyphSource, GlyphSyncStats};

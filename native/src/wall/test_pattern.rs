@@ -2,9 +2,8 @@
 //! (`--wall-test-pattern --screenshot OUT.png`).
 
 use glam::Vec2;
+use glyph_font::{FamilyId, FontAtlas};
 use term_cells::{CLUSTER_BASE, Cell, Cursor, CursorShape, Screen, attrs, rgb};
-
-use crate::atlas::TrieTable;
 
 use super::labels::{Label, LabelHeight, measure_label_width};
 use super::metrics::{CellMetrics, WorldRect};
@@ -109,6 +108,32 @@ pub fn write_cluster(screen: &mut Screen, row: u16, col: u16, cluster: &str, sty
     col + 2
 }
 
+/// Write a 1-column multi-codepoint cluster (e.g. accented Latin base + combining marks).
+pub fn write_narrow_cluster(
+    screen: &mut Screen,
+    row: u16,
+    col: u16,
+    cluster: &str,
+    style: RunStyle,
+) -> u16 {
+    if col >= screen.cols {
+        return col;
+    }
+    let idx = screen.clusters.len() as u32;
+    screen.clusters.push(cluster.to_string());
+    screen.row_mut(row)[col as usize] = Cell {
+        content: CLUSTER_BASE + idx,
+        fg: style.fg,
+        bg: style.bg,
+        ul: style.ul,
+        attrs: style.attrs,
+        width: 1,
+        _pad: 0,
+    };
+    screen.touch_row(row);
+    col + 1
+}
+
 fn is_wide_test_char(ch: char) -> bool {
     let cp = ch as u32;
     cp >= 0x1F300
@@ -116,9 +141,11 @@ fn is_wide_test_char(ch: char) -> bool {
 
 /// Build the primary single-terminal test pattern exercising colours, fills,
 /// every underline style, coloured underline, strikethrough, overline, dim,
-/// wide emoji, cluster emoji, and a cursor.
+/// wide emoji, cluster emoji, regular/bold/italic/bold-italic faces,
+/// accented combining clusters, seamless box-drawing + blocks + powerline,
+/// and a cursor.
 pub fn build_primary_screen() -> Screen {
-    let mut s = Screen::new(62, 18);
+    let mut s = Screen::new(64, 24);
     s.default_fg = rgb(0xd8, 0xde, 0xe9);
     s.default_bg = rgb(0x1a, 0x1b, 0x26);
     s.title = "wall-test-pattern".to_string();
@@ -131,6 +158,7 @@ pub fn build_primary_screen() -> Screen {
     let magenta = rgb(0xbb, 0x9a, 0xf7);
     let orange = rgb(0xff, 0x9e, 0x64);
     let dark = rgb(0x12, 0x14, 0x1e);
+    let blue = rgb(0x3d, 0x59, 0xa1);
 
     // Row 0: title banner
     write_run(&mut s, 0, 1, "glyph3d wall cell renderer ", RunStyle::fg(cyan).with_attrs(attrs::BOLD));
@@ -244,22 +272,73 @@ pub fn build_primary_screen() -> Screen {
     );
     write_run(&mut s, 12, c, " zwj+curly", RunStyle::fg(fg));
 
-    // Row 14: prompt + cursor on 'w'
+    // Row 14: regular, bold, italic, and bold-italic side by side + accented clusters
     c = 1;
-    c = write_run(&mut s, 14, c, "lugo@wall", RunStyle::fg(green));
-    c = write_run(&mut s, 14, c, ":", RunStyle::fg(fg));
-    c = write_run(&mut s, 14, c, "~/glyph3d-rs", RunStyle::fg(cyan));
-    c = write_run(&mut s, 14, c, "$ ", RunStyle::fg(yellow));
-    let cursor_col = c;
-    write_run(&mut s, 14, c, "well hello there!", RunStyle::fg(fg));
+    c = write_run(&mut s, 14, c, "Faces: ", RunStyle::fg(fg));
+    c = write_run(&mut s, 14, c, "Regular ", RunStyle::fg(fg));
+    c = write_run(&mut s, 14, c, "Bold ", RunStyle::fg(cyan).with_attrs(attrs::BOLD));
+    c = write_run(&mut s, 14, c, "Italic ", RunStyle::fg(yellow).with_attrs(attrs::ITALIC));
+    c = write_run(
+        &mut s,
+        14,
+        c,
+        "BoldItalic ",
+        RunStyle::fg(magenta).with_attrs(attrs::BOLD | attrs::ITALIC),
+    );
+    c = write_run(&mut s, 14, c, "caf", RunStyle::fg(green));
+    c = write_narrow_cluster(&mut s, 14, c, "e\u{0301}", RunStyle::fg(green));
+    c = write_run(&mut s, 14, c, " ", RunStyle::fg(fg));
+    c = write_narrow_cluster(&mut s, 14, c, "x\u{0301}", RunStyle::fg(orange).with_attrs(attrs::BOLD));
+    c = write_run(&mut s, 14, c, " ", RunStyle::fg(fg));
+    c = write_narrow_cluster(&mut s, 14, c, "q\u{0308}\u{0304}", RunStyle::fg(cyan));
+    c = write_run(&mut s, 14, c, " ", RunStyle::fg(fg));
+    write_narrow_cluster(&mut s, 14, c, "n\u{0303}", RunStyle::fg(red).with_attrs(attrs::ITALIC));
 
-    // Row 16: contiguous fill gradient bar (verifies snapped zero-seam cell edges)
-    for col in 1..61u16 {
-        let t = (col - 1) as f32 / 59.0;
+    // Rows 16..18: seamless box drawing (light/double/heavy), blocks, shades, and powerline glyphs
+    c = 1;
+    c = write_run(&mut s, 16, c, "╭───┬───╮ ╔═══╗ ┏━━━┓ ", RunStyle::fg(cyan));
+    c = write_run(&mut s, 16, c, "████", RunStyle::fg(green));
+    c = write_run(&mut s, 16, c, "▓▒░ ", RunStyle::fg(yellow));
+    c = write_run(&mut s, 16, c, " main ", RunStyle::fg(dark).with_bg(cyan).with_attrs(attrs::BOLD));
+    c = write_run(&mut s, 16, c, "\u{E0B0}", RunStyle::fg(cyan).with_bg(blue));
+    c = write_run(&mut s, 16, c, " wall ", RunStyle::fg(fg).with_bg(blue));
+    c = write_run(&mut s, 16, c, "\u{E0B0}", RunStyle::fg(blue).with_bg(green));
+    c = write_run(&mut s, 16, c, " ok ", RunStyle::fg(dark).with_bg(green).with_attrs(attrs::BOLD));
+    write_run(&mut s, 16, c, "\u{E0B0}", RunStyle::fg(green));
+
+    c = 1;
+    c = write_run(&mut s, 17, c, "│Box│Lgt│ ║Dbl║ ┃Hvy┃ ", RunStyle::fg(cyan));
+    c = write_run(&mut s, 17, c, "▀▄▌▐", RunStyle::fg(magenta));
+    c = write_run(&mut s, 17, c, "▖▗▘▝ ", RunStyle::fg(orange));
+    c = write_run(&mut s, 17, c, "▁▂▃▄▅▆▇█ ", RunStyle::fg(green));
+    c = write_run(&mut s, 17, c, "\u{E0B2}", RunStyle::fg(magenta));
+    c = write_run(&mut s, 17, c, " neon ", RunStyle::fg(dark).with_bg(magenta));
+    c = write_run(&mut s, 17, c, "\u{E0B3}", RunStyle::fg(dark).with_bg(magenta));
+    c = write_run(&mut s, 17, c, " utf8 ", RunStyle::fg(dark).with_bg(magenta));
+    write_run(&mut s, 17, c, "\u{E0B0}", RunStyle::fg(magenta));
+
+    c = 1;
+    c = write_run(&mut s, 18, c, "╰───┴───╯ ╚═══╝ ┗━━━┛ ", RunStyle::fg(cyan));
+    c = write_run(&mut s, 18, c, "████", RunStyle::fg(green));
+    c = write_run(&mut s, 18, c, "░▒▓ ", RunStyle::fg(yellow));
+    write_run(&mut s, 18, c, "zero-seam sprites \u{E0B1} powerline", RunStyle::fg(fg));
+
+    // Row 20: prompt + cursor on 'w'
+    c = 1;
+    c = write_run(&mut s, 20, c, "lugo@wall", RunStyle::fg(green));
+    c = write_run(&mut s, 20, c, ":", RunStyle::fg(fg));
+    c = write_run(&mut s, 20, c, "~/glyph3d-rs", RunStyle::fg(cyan));
+    c = write_run(&mut s, 20, c, "$ ", RunStyle::fg(yellow));
+    let cursor_col = c;
+    write_run(&mut s, 20, c, "well hello there!", RunStyle::fg(fg));
+
+    // Row 22: contiguous fill gradient bar (verifies snapped zero-seam cell edges)
+    for col in 1..63u16 {
+        let t = (col - 1) as f32 / 61.0;
         let r = (30.0 + 180.0 * t) as u8;
         let g = (70.0 + 120.0 * (1.0 - (t - 0.5).abs() * 2.0)) as u8;
         let b = (210.0 - 150.0 * t) as u8;
-        s.row_mut(16)[col as usize] = Cell {
+        s.row_mut(22)[col as usize] = Cell {
             content: ' ' as u32,
             fg,
             bg: rgb(r, g, b),
@@ -269,11 +348,11 @@ pub fn build_primary_screen() -> Screen {
             _pad: 0,
         };
     }
-    s.touch_row(16);
+    s.touch_row(22);
 
     s.cursor = Cursor {
         col: cursor_col,
-        row: 14,
+        row: 20,
         visible: true,
         shape: CursorShape::Block,
         blink: false,
@@ -465,7 +544,8 @@ fn push_title_bar(
     shapes: &mut Vec<Shape>,
     labels: &mut Vec<Label<'static>>,
     metrics: CellMetrics,
-    trie: &TrieTable,
+    atlas: &mut FontAtlas,
+    family: FamilyId,
     spec: TitleBarSpec<'_>,
 ) -> WorldRect {
     let strip = WorldRect::new(
@@ -485,7 +565,7 @@ fn push_title_bar(
     let inset = spec.bar_h * TITLE_TEXT_INSET;
     let room = (strip.width() - 2.0 * inset).max(0.0);
     let natural_h = spec.bar_h * TITLE_TEXT_FRACTION;
-    let full_w = measure_label_width(metrics, trie, spec.title, natural_h);
+    let full_w = measure_label_width(metrics, atlas, family, spec.title, natural_h);
     let text_h = if full_w > room && full_w > 1e-4 {
         natural_h * (room / full_w)
     } else {
@@ -514,7 +594,8 @@ fn push_title_bar(
 /// pointing to the half-scale terminal 2.
 pub fn build_test_pattern_chrome(
     metrics: CellMetrics,
-    trie: &TrieTable,
+    atlas: &mut FontAtlas,
+    family: FamilyId,
     panel_padding: f32,
     zoom: f32,
     terminals: &[ChromeTerminalInfo<'_>],
@@ -555,7 +636,8 @@ pub fn build_test_pattern_chrome(
             &mut shapes,
             &mut labels,
             metrics,
-            trie,
+            atlas,
+            family,
             TitleBarSpec {
                 box_rect: panel,
                 bar_h,
@@ -610,7 +692,8 @@ pub fn build_test_pattern_chrome(
             &mut shapes,
             &mut labels,
             metrics,
-            trie,
+            atlas,
+            family,
             TitleBarSpec {
                 box_rect: backdrop,
                 bar_h,
@@ -646,7 +729,7 @@ pub fn build_test_pattern_chrome(
         let label_px = 12.0;
         let pill_h_px = 20.0;
         let pad_x_px = 7.0;
-        let text_w_world = measure_label_width(metrics, trie, text, label_px / safe_zoom);
+        let text_w_world = measure_label_width(metrics, atlas, family, text, label_px / safe_zoom);
         let pill_w = text_w_world + 2.0 * (pad_x_px / safe_zoom);
         let pill_h = pill_h_px / safe_zoom;
         let pill_min = Vec2::new(t2.max.x + 3.2, t2.max.y - pill_h * 0.4);

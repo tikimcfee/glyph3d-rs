@@ -1,15 +1,14 @@
 //! Packing `term_cells::Cell` records for the GPU cell pass and computing
 //! minimal dirty-row upload ranges.
 //!
-//! All glyph resolution flows through [`resolve_cell_glyph`] — the single
-//! seam `crates/glyph-font` will replace when runtime fonts land.
+//! All glyph resolution flows through [`glyph_font::FontAtlas`] via
+//! [`resolve_cell_glyph`] (terminal cells) and [`resolve_str_glyphs`] (canvas labels).
 
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use term_cells::{CLUSTER_BASE, Cell, Face, Screen, attrs};
-
-use crate::atlas::{FLAG_MISSING, TrieTable};
+use glyph_font::{Face, FamilyId, FontAtlas, GLYPH_MODE_BITMAP, ResolvedCell};
+use term_cells::{Cell, Screen, attrs};
 
 /// Style bits packed into `CellGpu::glyph_and_flags` at bit 16 (`cellAttrs.js` layout).
 pub mod style_bits {
@@ -61,155 +60,130 @@ pub const fn pack_cell_style(cell_attrs: u16) -> u32 {
     dim | strike | overline | ((underline & 7) << style_bits::UNDERLINE_SHIFT) | ul_color
 }
 
-/// Resolve which atlas glyph slot draws `cell`.
+/// Resolve `(slot, span_cols)` for `cell` in `family` through [`FontAtlas::resolve_cell`].
 ///
-/// This is the single glyph-lookup seam for the wall cell renderer: today it
-/// reads the prebaked Cousine/emoji atlas (`assets/atlas/`, where bold and
-/// italic draw as regular); later `crates/glyph-font` replaces this lookup.
-pub fn resolve_cell_glyph(trie: &TrieTable, screen: &Screen, cell: &Cell) -> u32 {
-    if cell.content == 0 || cell.width == 0 {
-        return 0;
-    }
-
-    // Face selection will route into bold/italic/bold-italic once glyph-font lands.
-    let _face = Face::from_bits(attrs::face(cell.attrs));
-
-    if cell.content < CLUSTER_BASE {
-        if cell.content == 0x20 {
-            return 0;
-        }
-        let entry = trie.lookup(cell.content);
-        if entry.flags & FLAG_MISSING != 0 {
-            return 0;
-        }
-        return entry.glyph_id;
-    }
-
-    // Multi-codepoint cluster: probe the atlas's v2 emoji sequence table
-    // (dropping VS16 U+FE0F from the probe key, matching char_resolve.rs),
-    // falling back to the first covered scalar in the cluster.
-    let text = screen.content_str(cell);
-    if text.is_empty() {
-        return 0;
-    }
-
-    let mut key = [0u32; 16];
-    let mut key_len = 0usize;
-    for ch in text.chars() {
-        let cp = ch as u32;
-        if cp == 0xFE0F {
-            continue;
-        }
-        if key_len < key.len() {
-            key[key_len] = cp;
-            key_len += 1;
-        }
-    }
-
-    if key_len >= 2 && trie.starts_a_sequence(key[0]) {
-        for len in (2..=key_len).rev() {
-            if let Some(slot) = trie.sequence_lookup(&key[..len]) {
-                return slot;
-            }
-        }
-    }
-
-    for &cp in &key[..key_len] {
-        if cp == 0x20 || cp == 0x200D || (0xFE00..=0xFE0F).contains(&cp) {
-            continue;
-        }
-        let entry = trie.lookup(cp);
-        if entry.flags & FLAG_MISSING == 0 && entry.glyph_id != 0 {
-            return entry.glyph_id;
-        }
-    }
-
-    0
+/// Handles ASCII/Unicode scalars, bold/italic/bold-italic faces from `cell.attrs`,
+/// generated cell sprites, combining-mark clusters, colour emoji, spaces, blanks,
+/// and trailing halves of wide characters.
+pub fn resolve_cell_glyph(
+    atlas: &mut FontAtlas,
+    family: FamilyId,
+    screen: &Screen,
+    cell: &Cell,
+) -> ResolvedCell {
+    atlas.resolve_cell(family, screen, cell)
 }
 
-/// Resolve a UTF-8 label string into `(glyph_id, span_cols)` pairs using the same
-/// atlas lookup seam as [`resolve_cell_glyph`].
+const fn is_regional_indicator(cp: u32) -> bool {
+    cp >= 0x1F1E6 && cp <= 0x1F1FF
+}
+
+const fn is_skin_tone(cp: u32) -> bool {
+    cp >= 0x1F3FB && cp <= 0x1F3FF
+}
+
+const fn is_combining_mark(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x0300..=0x036F
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
+/// East Asian Wide / Fullwidth and astral pictographic planes that occupy two monospace columns.
+const fn is_wide_codepoint(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x1100..=0x115F
+            | 0x2329..=0x232A
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0xA4CF
+            | 0xA960..=0xA97C
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            | 0x20000..=0x3FFFD
+    )
+}
+
+/// Resolve a UTF-8 label string into `(glyph_id, span_cols)` pairs using [`FontAtlas`].
 ///
-/// Spaces emit `(0, 1)`; multi-codepoint emoji sequences in the atlas sequence
-/// table coalesce into a single `(slot, 2)` glyph. When `crates/glyph-font` lands,
-/// replacing [`resolve_cell_glyph`] and this helper moves both cells and labels over.
-pub fn resolve_str_glyphs(trie: &TrieTable, text: &str, mut emit: impl FnMut(u32, u8)) {
-    let chars: Vec<u32> = text.chars().map(|c| c as u32).collect();
-    let wide_threshold = (trie.metrics.advance_fu as i32) * 3 / 2;
+/// Spaces emit `(0, 1)`; combining-mark clusters (e.g. `e\u{0301}`) and multi-codepoint
+/// emoji sequences (ZWJ chains, flags, skin-tone modifiers, keycaps, VS16) coalesce into
+/// a single glyph resolved through [`FontAtlas::cluster`]. Colour-emoji bitmap slots and
+/// wide East Asian scalars span 2 columns; all other glyphs span 1 column.
+pub fn resolve_str_glyphs(
+    atlas: &mut FontAtlas,
+    family: FamilyId,
+    text: &str,
+    mut emit: impl FnMut(u32, u8),
+) {
+    let mut chars: Vec<(usize, char)> = text.char_indices().collect();
+    let end_byte = text.len();
+    // Sentinel for easy slice-end lookup.
+    chars.push((end_byte, '\0'));
+    let n = chars.len() - 1;
+
     let mut i = 0usize;
-    while i < chars.len() {
-        let cp = chars[i];
-        if cp == 0x20 {
+    while i < n {
+        let (start_byte, ch0) = chars[i];
+        let cp0 = ch0 as u32;
+        if cp0 == 0x20 {
             emit(0, 1);
             i += 1;
             continue;
         }
-        if cp == 0xFE0F || cp == 0xFE0E || cp == 0x200D {
+        if cp0 == 0xFE0F || cp0 == 0xFE0E || cp0 == 0x200D {
             i += 1;
             continue;
         }
 
-        // Probe longest matching emoji sequence starting at `chars[i]` (ignoring VS16).
-        if trie.starts_a_sequence(cp) {
-            let mut key = [0u32; 16];
-            let mut raw_end = [0usize; 16];
-            let mut klen = 0usize;
-            let mut j = i;
-            while j < chars.len() && klen < key.len() {
-                let c = chars[j];
-                j += 1;
-                if c == 0xFE0F {
-                    if klen > 0 {
-                        raw_end[klen - 1] = j;
+        let mut next = i + 1;
+        if is_regional_indicator(cp0) && next < n && is_regional_indicator(chars[next].1 as u32) {
+            next += 1;
+        } else {
+            while next < n {
+                let cp = chars[next].1 as u32;
+                if cp == 0xFE0F || cp == 0xFE0E || cp == 0x20E3 || is_skin_tone(cp) || is_combining_mark(cp) {
+                    next += 1;
+                } else if cp == 0x200D {
+                    next += 1;
+                    if next < n {
+                        next += 1;
                     }
-                    continue;
-                }
-                key[klen] = c;
-                raw_end[klen] = j;
-                klen += 1;
-            }
-            let mut matched = None;
-            for len in (2..=klen).rev() {
-                if let Some(slot) = trie.sequence_lookup(&key[..len]) {
-                    matched = Some((slot, raw_end[len - 1]));
+                } else {
                     break;
                 }
             }
-            if let Some((slot, next_i)) = matched {
-                emit(slot, 2);
-                i = next_i;
-                continue;
-            }
         }
 
-        let entry = trie.lookup(cp);
-        let is_wide = entry.advance_fu > wide_threshold
-            || trie
-                .emoji_cell
-                .get(entry.glyph_id as usize)
-                .copied()
-                .flatten()
-                .is_some();
-        let span = if is_wide { 2 } else { 1 };
-        let gid = if entry.flags & FLAG_MISSING != 0 {
-            0
-        } else {
-            entry.glyph_id
-        };
-        emit(gid, span);
-        i += 1;
+        let cluster = &text[start_byte..chars[next].0];
+        let slot = atlas.cluster(family, Face::Regular, cluster);
+        let is_bitmap = slot != 0 && atlas.map_entry(slot)[2] == GLYPH_MODE_BITMAP;
+        let span = if is_bitmap || is_wide_codepoint(cp0) { 2 } else { 1 };
+        emit(slot, span);
+        i = next;
     }
 }
 
-/// Pack one `term_cells::Cell` into its 16-byte [`CellGpu`] record.
-pub fn pack_cell(trie: &TrieTable, screen: &Screen, cell: &Cell) -> CellGpu {
-    let span_cols = u32::from(cell.width.min(2));
+/// Pack one pre-resolved cell into its 16-byte [`CellGpu`] record.
+pub fn pack_cell_resolved(resolved: ResolvedCell, screen: &Screen, cell: &Cell) -> CellGpu {
+    let span_cols = u32::from(resolved.span_cols.min(2));
     let (glyph_id, style) = if span_cols == 0 {
         // Trailing half of a wide character: its fill still renders from `bg`,
         // while the leading cell's 2-column quad owns both the glyph and lines.
         (0u32, 0u32)
     } else {
-        let gid = resolve_cell_glyph(trie, screen, cell);
+        let gid = resolved.slot;
         debug_assert!(
             gid <= GLYPH_ID_MASK,
             "atlas glyph id {gid} exceeds 16-bit CellGpu lane"
@@ -227,6 +201,17 @@ pub fn pack_cell(trie: &TrieTable, screen: &Screen, cell: &Cell) -> CellGpu {
         bg: cell.bg,
         ul: cell.ul,
     }
+}
+
+/// Resolve and pack one `term_cells::Cell` into its 16-byte [`CellGpu`] record.
+pub fn pack_cell(
+    atlas: &mut FontAtlas,
+    family: FamilyId,
+    screen: &Screen,
+    cell: &Cell,
+) -> CellGpu {
+    let resolved = resolve_cell_glyph(atlas, family, screen, cell);
+    pack_cell_resolved(resolved, screen, cell)
 }
 
 /// Coalesce rows whose `row_gen[r] > uploaded_gen` into contiguous row ranges.
@@ -252,8 +237,27 @@ pub fn dirty_row_ranges(row_gen: &[u64], uploaded_gen: u64) -> Vec<Range<usize>>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use glyph_font::{
+        default_font_chain, GLYPH_MODE_OUTLINE, GLYPH_MODE_SPRITE, MONASPACE_NEON_FAMILY,
+    };
+    use term_cells::{CLUSTER_BASE, rgb};
+
     use super::*;
-    use term_cells::rgb;
+    use crate::atlas::Atlas;
+    use crate::wall::glyphs::{AtlasEmojiSource, default_fonts_dir};
+
+    fn test_font_atlas() -> (FontAtlas, FamilyId) {
+        let specs = default_font_chain(&default_fonts_dir());
+        let mut atlas = FontAtlas::load(&specs).expect("load default font chain");
+        let baked = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        atlas.set_emoji_source(Some(Arc::new(AtlasEmojiSource::new(baked))));
+        let family = atlas
+            .family_id(MONASPACE_NEON_FAMILY)
+            .unwrap_or_else(|| atlas.default_family());
+        (atlas, family)
+    }
 
     #[test]
     fn cell_gpu_size_is_16_bytes() {
@@ -285,8 +289,8 @@ mod tests {
     }
 
     #[test]
-    fn pack_cell_resolves_ascii_wide_emoji_and_trailing_cell() {
-        let trie = crate::atlas::default_trie();
+    fn pack_cell_resolves_faces_sprites_clusters_emoji_and_trailing_cell() {
+        let (mut atlas, family) = test_font_atlas();
         let mut screen = Screen::new(8, 2);
 
         // Plain 'A' with curly underline and custom underline colour.
@@ -299,12 +303,36 @@ mod tests {
             width: 1,
             _pad: 0,
         };
-        let gpu_a = pack_cell(&trie, &screen, &screen.row(0)[0]);
-        assert_eq!(gpu_a.glyph_and_flags & GLYPH_ID_MASK, 34, "'A' is slot 34 in the atlas");
+        let gpu_a = pack_cell(&mut atlas, family, &screen, &screen.row(0)[0]);
+        let slot_a = gpu_a.glyph_and_flags & GLYPH_ID_MASK;
+        assert_ne!(slot_a, 0);
+        assert_eq!(atlas.map_entry(slot_a)[2], GLYPH_MODE_OUTLINE);
         assert_eq!((gpu_a.glyph_and_flags >> SPAN_COLS_SHIFT) & SPAN_COLS_MASK, 1);
         assert_eq!(gpu_a.fg, rgb(0xee, 0xdd, 0xcc));
         assert_eq!(gpu_a.bg, rgb(0x11, 0x22, 0x33));
         assert_eq!(gpu_a.ul, rgb(0xff, 0x44, 0x55));
+
+        // Bold and italic 'A' resolve to distinct outline slots from regular 'A'.
+        let bold_a = Cell { attrs: attrs::BOLD, ..screen.row(0)[0] };
+        let italic_a = Cell { attrs: attrs::ITALIC, ..screen.row(0)[0] };
+        let slot_bold = pack_cell(&mut atlas, family, &screen, &bold_a).glyph_and_flags & GLYPH_ID_MASK;
+        let slot_italic = pack_cell(&mut atlas, family, &screen, &italic_a).glyph_and_flags & GLYPH_ID_MASK;
+        assert_ne!(slot_bold, slot_a);
+        assert_ne!(slot_italic, slot_a);
+        assert_ne!(slot_bold, slot_italic);
+
+        // Box-drawing sprite routes to mode 3.
+        let box_cell = Cell {
+            content: '╭' as u32,
+            fg: screen.default_fg,
+            bg: 0,
+            ul: 0,
+            attrs: 0,
+            width: 1,
+            _pad: 0,
+        };
+        let slot_box = pack_cell(&mut atlas, family, &screen, &box_cell).glyph_and_flags & GLYPH_ID_MASK;
+        assert_eq!(atlas.map_entry(slot_box)[2], GLYPH_MODE_SPRITE);
 
         // Wide emoji rocket (U+1F680) + trailing cell (width 0, same bg).
         screen.row_mut(0)[1] = Cell {
@@ -325,15 +353,16 @@ mod tests {
             width: 0,
             _pad: 0,
         };
-        let gpu_rocket = pack_cell(&trie, &screen, &screen.row(0)[1]);
-        assert_eq!(gpu_rocket.glyph_and_flags & GLYPH_ID_MASK, 4759, "🚀 is slot 4759");
+        let gpu_rocket = pack_cell(&mut atlas, family, &screen, &screen.row(0)[1]);
+        let slot_rocket = gpu_rocket.glyph_and_flags & GLYPH_ID_MASK;
+        assert_eq!(atlas.map_entry(slot_rocket)[2], GLYPH_MODE_BITMAP);
         assert_eq!((gpu_rocket.glyph_and_flags >> SPAN_COLS_SHIFT) & SPAN_COLS_MASK, 2);
 
-        let gpu_trail = pack_cell(&trie, &screen, &screen.row(0)[2]);
+        let gpu_trail = pack_cell(&mut atlas, family, &screen, &screen.row(0)[2]);
         assert_eq!(gpu_trail.glyph_and_flags, 0, "trailing half suppresses ink and lines");
         assert_eq!(gpu_trail.bg, rgb(0x20, 0x30, 0x40), "trailing half keeps its fill");
 
-        // Cluster emoji (ZWJ family U+1F468 U+200D U+1F469 U+200D U+1F467 -> slot 6819).
+        // Cluster emoji (ZWJ family U+1F468 U+200D U+1F469 U+200D U+1F467).
         screen.clusters.push("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".to_string());
         screen.row_mut(1)[0] = Cell {
             content: CLUSTER_BASE,
@@ -344,8 +373,22 @@ mod tests {
             width: 2,
             _pad: 0,
         };
-        let gpu_family = pack_cell(&trie, &screen, &screen.row(1)[0]);
-        assert_eq!(gpu_family.glyph_and_flags & GLYPH_ID_MASK, 6819, "ZWJ family sequence resolves");
+        let gpu_family = pack_cell(&mut atlas, family, &screen, &screen.row(1)[0]);
+        let slot_family = gpu_family.glyph_and_flags & GLYPH_ID_MASK;
+        assert_eq!(atlas.map_entry(slot_family)[2], GLYPH_MODE_BITMAP);
+
+        // Label string resolution coalesces clusters and ZWJ emoji.
+        let mut label_glyphs = Vec::new();
+        resolve_str_glyphs(&mut atlas, family, "A e\u{0301} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", |gid, span| {
+            label_glyphs.push((gid, span));
+        });
+        assert_eq!(label_glyphs.len(), 5, "'A', ' ', 'é', ' ', ZWJ");
+        assert_eq!(label_glyphs[0].1, 1);
+        assert_eq!(label_glyphs[1], (0, 1));
+        assert_eq!(label_glyphs[2].1, 1);
+        assert_ne!(label_glyphs[2].0, 0);
+        assert_eq!(label_glyphs[3], (0, 1));
+        assert_eq!(label_glyphs[4], (slot_family, 2));
     }
 
     #[test]
