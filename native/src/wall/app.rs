@@ -92,6 +92,17 @@ impl Terminals {
             Terminals::Fixed(m) => m.get(id),
         }
     }
+
+    fn scrollback(&self, id: &str) -> Option<super::describe::TerminalScrollback> {
+        match self {
+            Terminals::Live(s) => s.scrollback(id).map(|sb| super::describe::TerminalScrollback {
+                offset: sb.offset,
+                max: sb.max,
+                viewing: sb.viewing,
+            }),
+            Terminals::Fixed(_) => None,
+        }
+    }
 }
 
 /// What exists once there is a window.
@@ -1006,6 +1017,7 @@ impl App {
                         foreground: fg,
                     }
                 }),
+                hover_link: None,
             });
         }
 
@@ -1018,7 +1030,16 @@ impl App {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome(&described, &camera, viewport, sf, &mut fonts, &mut shapes, &mut labels)
+            super::describe::describe_frame_chrome_with_scrollback(
+                &described,
+                &camera,
+                viewport,
+                sf,
+                &mut fonts,
+                &mut shapes,
+                &mut labels,
+                |id| terms.scrollback(id),
+            )
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());

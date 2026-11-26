@@ -22,8 +22,8 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::cell::{
-    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges_with_selection,
-    pack_cell_resolved,
+    CellGpu, CellLinkHover, CellSelection, apply_hover_link_to_cell, apply_selection_to_cell,
+    dirty_row_ranges_with_overlays, pack_cell_resolved, snap_row_span_to_wide,
 };
 use super::glyphs::GlyphSource;
 use super::labels::{Label, LabelGlyphGpu, LabelHeight, pack_label_glyphs};
@@ -119,6 +119,8 @@ pub struct TerminalDraw<'a> {
     pub border_color: Option<u32>,
     /// Optional cell-coordinate text selection highlight (linear stream or column block).
     pub selection: Option<CellSelection>,
+    /// Optional cell-coordinate hovered hyperlink range drawn as a single underline.
+    pub hover_link: Option<CellLinkHover>,
 }
 
 /// Complete description of one wall frame submitted to [`WallRenderer::render`].
@@ -191,6 +193,7 @@ struct TerminalGpu {
     rows: u16,
     uploaded_gen: u64,
     uploaded_selection: Option<CellSelection>,
+    uploaded_hover_link: Option<CellLinkHover>,
     force_repack: bool,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
@@ -746,9 +749,33 @@ fn cursor_is_solid_block(draw: &TerminalDraw<'_>, blink_on: bool) -> bool {
         && draw.screen.cursor.shape == CursorShape::Block
 }
 
-fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
-    let screen = draw.screen;
+/// Resolve the cursor's anchor column and column span `(col, span_cols)`.
+///
+/// When the cursor lands on the trailing half (`width == 0`) of a 2-column wide
+/// character, snap back to its leading cell so the cursor covers the full glyph
+/// rather than splitting it. At the right margin, clamp `span_cols` to the
+/// remaining columns so a last-column wide cell never overflows the panel.
+fn resolved_cursor_cell(screen: &Screen) -> (u16, u32) {
     let cur = screen.cursor;
+    if cur.col >= screen.cols || cur.row >= screen.rows {
+        return (cur.col, 1);
+    }
+    let row = screen.row(cur.row);
+    let cell = row[cur.col as usize];
+    if cell.width == 0 && cur.col > 0 && row[cur.col as usize - 1].width == 2 {
+        let head = cur.col - 1;
+        let avail = u32::from(screen.cols - head);
+        (head, 2u32.min(avail).max(1))
+    } else if cell.width == 2 {
+        let avail = u32::from(screen.cols - cur.col);
+        (cur.col, 2u32.min(avail).max(1))
+    } else {
+        (cur.col, 1)
+    }
+}
+
+fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool, span_cols: u32) -> u32 {
+    let cur = draw.screen.cursor;
     let drawn = cursor_drawn_now(draw, blink_on);
     let solid_block = cursor_is_solid_block(draw, blink_on);
     let shape = match cur.shape {
@@ -756,13 +783,8 @@ fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
         CursorShape::Bar => 1u32,
         CursorShape::Underline => 2u32,
     };
-    let span_cols = if drawn {
-        let w = screen.row(cur.row)[cur.col as usize].width;
-        if w == 2 { 2u32 } else { 1u32 }
-    } else {
-        1u32
-    };
-    let mut flags = (shape << 1) | (span_cols << 4);
+    let span = if drawn { span_cols.clamp(1, 2) } else { 1u32 };
+    let mut flags = (shape << 1) | (span << 4);
     if drawn {
         flags |= CURSOR_VISIBLE_FLAG;
     }
@@ -1500,6 +1522,7 @@ impl WallRenderer {
                     rows,
                     uploaded_gen: 0,
                     uploaded_selection: None,
+                    uploaded_hover_link: None,
                     force_repack: false,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
@@ -1515,6 +1538,7 @@ impl WallRenderer {
             .get_mut(&draw.id)
             .expect("terminal GPU state just inserted");
 
+        let (cursor_col, cursor_span) = resolved_cursor_cell(screen);
         let term_uniform = TerminalUniform {
             origin: draw.position.to_array(),
             z: draw.z,
@@ -1523,9 +1547,9 @@ impl WallRenderer {
             rows: u32::from(rows),
             default_bg: screen.default_bg,
             panel_opacity: draw.panel_opacity.unwrap_or(self.style.panel_opacity),
-            cursor_col: u32::from(screen.cursor.col),
+            cursor_col: u32::from(cursor_col),
             cursor_row: u32::from(screen.cursor.row),
-            cursor_flags: pack_cursor_flags(draw, self.cursor_blink.visible),
+            cursor_flags: pack_cursor_flags(draw, self.cursor_blink.visible, cursor_span),
             border_override: draw.border_color.unwrap_or(0),
             scale: sanitize_scale(draw.scale),
             cursor_color: screen.cursor_color,
@@ -1535,10 +1559,12 @@ impl WallRenderer {
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
         let active_selection = draw.selection.filter(|s| !s.is_empty());
+        let active_hover_link = draw.hover_link.filter(|l| !l.is_empty());
 
         if cell_count == 0 {
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             return;
         }
 
@@ -1548,14 +1574,25 @@ impl WallRenderer {
             self.pack_scratch.reserve(cell_count);
             for r in 0..usize::from(rows) {
                 let mut any_bg = false;
-                let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
-                for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                let row_cells = screen.row(r as u16);
+                let sel_span = active_selection.map_or(0..0, |s| {
+                    snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
+                });
+                let link_span = active_hover_link.map_or(0..0, |l| {
+                    snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                });
+                for (c, cell) in row_cells.iter().enumerate() {
                     let mut packed =
                         pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                    let col_u16 = c as u16;
                     if let Some(sel) = active_selection {
-                        let col_u16 = c as u16;
                         if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                             apply_selection_to_cell(&mut packed, &sel);
+                        }
+                    }
+                    if let Some(link) = active_hover_link {
+                        if col_u16 >= link_span.start && col_u16 < link_span.end {
+                            apply_hover_link_to_cell(&mut packed, &link);
                         }
                     }
                     if (packed.bg >> 24) != 0 {
@@ -1569,19 +1606,24 @@ impl WallRenderer {
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             gpu.force_repack = false;
             stats.terminals_uploaded += 1;
             stats.rows_uploaded += usize::from(rows);
             stats.write_calls += 1;
-        } else if screen.generation != gpu.uploaded_gen || active_selection != gpu.uploaded_selection
+        } else if screen.generation != gpu.uploaded_gen
+            || active_selection != gpu.uploaded_selection
+            || active_hover_link != gpu.uploaded_hover_link
         {
-            let dirty = dirty_row_ranges_with_selection(
+            let dirty = dirty_row_ranges_with_overlays(
                 &screen.row_gen,
                 cols,
                 screen.generation,
                 gpu.uploaded_gen,
                 gpu.uploaded_selection,
                 active_selection,
+                gpu.uploaded_hover_link,
+                active_hover_link,
             );
             let cols_usize = usize::from(cols);
             if !dirty.is_empty() {
@@ -1592,17 +1634,28 @@ impl WallRenderer {
                 self.pack_scratch.reserve(range.len() * cols_usize);
                 for r in range.clone() {
                     let mut any_bg = false;
-                    let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
-                    for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                    let row_cells = screen.row(r as u16);
+                    let sel_span = active_selection.map_or(0..0, |s| {
+                        snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
+                    });
+                    let link_span = active_hover_link.map_or(0..0, |l| {
+                        snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                    });
+                    for (c, cell) in row_cells.iter().enumerate() {
                         let mut packed = pack_cell_resolved(
                             self.glyphs.resolve_cell(screen, cell),
                             screen,
                             cell,
                         );
+                        let col_u16 = c as u16;
                         if let Some(sel) = active_selection {
-                            let col_u16 = c as u16;
                             if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                                 apply_selection_to_cell(&mut packed, &sel);
+                            }
+                        }
+                        if let Some(link) = active_hover_link {
+                            if col_u16 >= link_span.start && col_u16 < link_span.end {
+                                apply_hover_link_to_cell(&mut packed, &link);
                             }
                         }
                         if (packed.bg >> 24) != 0 {
@@ -1624,6 +1677,7 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
         }
     }
 
@@ -2162,6 +2216,7 @@ pub fn render_test_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -2252,6 +2307,7 @@ pub fn render_chrome_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -2421,6 +2477,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let near = TerminalDraw {
                 id: 2,
@@ -2432,6 +2489,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
             let frame = WallFrame { terminals: &list, ..Default::default() };
@@ -2474,6 +2532,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
         let cam = WallCamera::new(Vec2::new(3.0, -4.0), 32.0);
@@ -2705,6 +2764,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let shapes = vec![
@@ -2946,6 +3006,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let w = 256u32;
@@ -3033,6 +3094,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             render_rgba_bytes(
                 &ctx,
@@ -3075,6 +3137,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let cam = WallCamera::new(Vec2::new(1.0, -0.5), 48.0);
         let s_before = renderer.prepare(
@@ -3104,6 +3167,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let s_after = renderer.prepare(
             &ctx.device,
@@ -3182,6 +3246,7 @@ mod tests {
                 panel_opacity: None,
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -3288,6 +3353,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -3463,6 +3529,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection,
+                hover_link: None,
             }
         }
 
@@ -3798,6 +3865,7 @@ mod tests {
             panel_opacity: None,
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let px = render_rgba_bytes(
             &ctx,
@@ -3878,5 +3946,509 @@ mod tests {
         });
         assert!(cursor_fill > 200, "focused block cursor must be #6ee7a0 ({cursor_fill} px)");
         assert!(cursor_ink > 80, "glyph over focused cursor must be #0a0a1e ({cursor_ink} px)");
+    }
+
+    /// Wide & combining edge cases at the right margin and inside wide cells:
+    /// 1. Wide glyph (`漢`) and wide colour emoji (`🚀`) placed in the last column clip cleanly at
+    ///    the right cell boundary and never bleed into the right padding or past the border.
+    /// 2. Combining-mark cluster (`e\u{0301}`) in the last column draws cleanly inside the cell
+    ///    without bleeding past the right margin.
+    /// 3. Text selections that split a wide cell (ending on its head OR starting on its tail)
+    ///    widen to cover both columns so neither half disappears.
+    /// 4. A focused solid block cursor on the trailing half of a wide cell snaps to the head and
+    ///    spans both columns, drawing inverted dark ink over both halves.
+    #[test]
+    fn gpu_wide_and_combining_right_margin_split_selection_and_trailing_cursor() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let cols = 10u16;
+        let rows = 5u16;
+        let mut screen = Screen::new(cols, rows);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        screen.cursor_color = rgb(0x6e, 0xe7, 0xa0);
+
+        let fg = rgb(0xcc, 0xcc, 0xcc);
+        let cyan = rgb(0x4d, 0xff, 0xff);
+        let magenta = rgb(0xff, 0x4d, 0xff);
+
+        // Row 0: normal wide outline 'W' (width=2, font-covered across both columns) at cols 1..3
+        // and an orphan wide outline 'W' (width=2) in the last column (col 9).
+        screen.row_mut(0)[1] = term_cells::Cell { content: 'W' as u32, fg, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.row_mut(0)[2] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        screen.row_mut(0)[9] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.touch_row(0);
+
+        // Row 1: orphan wide colour emoji '🚀' (width=2) at last column (col 9).
+        screen.row_mut(1)[9] = term_cells::Cell { content: '🚀' as u32, fg, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.touch_row(1);
+
+        // Row 2: combining cluster 'e\u{0301}' (width=1) at last column (col 9).
+        let cid = term_cells::CLUSTER_BASE + screen.clusters.len() as u32;
+        screen.clusters.push("e\u{0301}".to_string());
+        screen.row_mut(2)[9] = term_cells::Cell { content: cid, fg: magenta, bg: 0, ul: 0, attrs: 0, width: 1, _pad: 0 };
+        screen.touch_row(2);
+
+        // Row 3: two wide outline 'W' cells (width=2) at cols 2..4 and 6..8 for split-selection checks.
+        for head in [2usize, 6usize] {
+            screen.row_mut(3)[head] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+            screen.row_mut(3)[head + 1] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        }
+        screen.touch_row(3);
+
+        // Row 4: wide outline 'W' (width=2) at cols 3..5 with focused block cursor landing on TRAILING half col 4!
+        screen.row_mut(4)[3] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.row_mut(4)[4] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        screen.touch_row(4);
+        screen.cursor = term_cells::Cursor {
+            col: 4,
+            row: 4,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+
+        // Selection splits BOTH wide cells on row 3: starts on tail col 3, ends on head col 6 (excl 7)!
+        let split_sel = CellSelection::linear(3, 3, 3, 7);
+
+        let w = 800u32;
+        let h = 480u32;
+        let m = renderer.metrics();
+        let pad = renderer.style().panel_padding;
+        let bounds = m.panel_rect(Vec2::ZERO, cols, rows, pad);
+        // Frame wider than panel so pixels outside the right border are visible in the buffer.
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.35);
+
+        let draw = TerminalDraw {
+            id: 404,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: Some(split_sel),
+            hover_link: None,
+        };
+        let frame = WallFrame { terminals: &[draw], ..Default::default() };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+
+        if let Ok(path) = std::env::var("GLYPH_WALL_EDGE_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &frame, (w, h), 1, Path::new(&path));
+            }
+        }
+
+        let count_rect = |x0_w: f32, x1_w: f32, y_top_w: f32, y_bot_w: f32, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(x0_w, y_top_w), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(x1_w, y_bot_w), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let count_cell = |col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            count_rect(
+                f32::from(col) * m.cell_width,
+                f32::from(col + 1) * m.cell_width,
+                -f32::from(row) * m.cell_height,
+                -f32::from(row + 1) * m.cell_height,
+                pred,
+            )
+        };
+
+        let is_cyan = |c: [u8; 3]| c[1] > 180 && c[2] > 180 && c[0] < 120;
+        let is_magenta = |c: [u8; 3]| c[0] > 180 && c[2] > 180 && c[1] < 120;
+        let is_non_bg_non_border = |c: [u8; 3]| {
+            // Outside panel: clear colour (#0e1016) or dark navy panel (#0a0a1e).
+            let is_panel = c[0].abs_diff(0x0a) <= 4 && c[1].abs_diff(0x0a) <= 4 && c[2].abs_diff(0x1e) <= 4;
+            let is_clear = c[0].abs_diff(0x0e) <= 4 && c[1].abs_diff(0x10) <= 4 && c[2].abs_diff(0x16) <= 4;
+            let is_green_border = c[1] > 150 && c[0] < 140 && c[2] > 100 && c[2] < 200;
+            !is_panel && !is_clear && !is_green_border
+        };
+        let is_sel_bg = |c: [u8; 3]| c[0].abs_diff(0xcc) <= 3 && c[1].abs_diff(0xcc) <= 3 && c[2].abs_diff(0xcc) <= 3;
+        let is_dark_ink = |c: [u8; 3]| c[0].abs_diff(0x0a) <= 4 && c[1].abs_diff(0x0a) <= 4 && c[2].abs_diff(0x1e) <= 4;
+        let is_cursor = |c: [u8; 3]| c[0].abs_diff(0x6e) <= 4 && c[1].abs_diff(0xe7) <= 4 && c[2].abs_diff(0xa0) <= 4;
+
+        let grid_right = f32::from(cols) * m.cell_width;
+        let outside_right = grid_right + pad + m.cell_width;
+
+        // 1. Last-column wide '漢' (row 0, col 9): visible inside col 9, ZERO cyan bleed past grid_right.
+        assert!(count_cell(9, 0, is_cyan) > 80, "last-column wide '漢' should draw inside col 9");
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, 0.0, -m.cell_height, is_cyan),
+            0,
+            "last-column wide '漢' must clip at grid_right and never bleed past the right margin"
+        );
+
+        // 2. Last-column wide emoji '🚀' (row 1, col 9): visible inside col 9, ZERO bleed past grid_right.
+        assert!(
+            count_cell(9, 1, is_non_bg_non_border) > 60,
+            "last-column emoji '🚀' should draw inside col 9"
+        );
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, -m.cell_height, -2.0 * m.cell_height, is_non_bg_non_border),
+            0,
+            "last-column emoji '🚀' must clip at grid_right and never bleed past the right margin"
+        );
+
+        // 3. Last-column combining cluster 'e\u{0301}' (row 2, col 9): visible inside col 9, ZERO bleed past grid_right.
+        assert!(
+            count_cell(9, 2, is_magenta) > 50,
+            "last-column combining cluster should draw visibly inside col 9"
+        );
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, -2.0 * m.cell_height, -3.0 * m.cell_height, is_magenta),
+            0,
+            "last-column combining cluster must not bleed past grid_right"
+        );
+
+        // 4. Split selection `3..7` on row 3 widens to `2..8` so BOTH halves of BOTH wide '漢' cells
+        //    fill with #cccccc and draw dark #0a0a1e ink (zero cyan left over).
+        for col in [2u16, 3, 6, 7] {
+            assert!(
+                count_cell(col, 3, is_sel_bg) > 120,
+                "split-selected wide cell col {col} must have #cccccc selection fill"
+            );
+            assert!(
+                count_cell(col, 3, is_dark_ink) > 40,
+                "split-selected wide cell col {col} must draw dark #0a0a1e ink"
+            );
+            assert_eq!(
+                count_cell(col, 3, is_cyan),
+                0,
+                "split-selected wide cell col {col} must not leave unselected cyan ink"
+            );
+        }
+
+        // 5. Cursor on trailing half (col 4) of wide '漢' at cols 3..5 snaps to head (col 3)
+        //    and spans BOTH columns 3 and 4 with solid #6ee7a0 fill and #0a0a1e ink.
+        for col in [3u16, 4] {
+            assert!(
+                count_cell(col, 4, is_cursor) > 120,
+                "cursor on trailing half must fill both wide columns (col {col})"
+            );
+            assert!(
+                count_cell(col, 4, is_dark_ink) > 40,
+                "wide glyph under trailing-half cursor must invert ink across both columns (col {col})"
+            );
+            assert_eq!(
+                count_cell(col, 4, is_cyan),
+                0,
+                "wide glyph under trailing-half cursor must not leak un-inverted cyan (col {col})"
+            );
+        }
+    }
+
+    /// Hover-link underline (`TerminalDraw::hover_link` / `CellLinkHover`):
+    /// - Underlines single-row and soft-wrapped multi-row URLs in the cell's own fg or a custom colour
+    /// - Snaps split wide characters so both columns underline cleanly
+    /// - Uploads ONLY the row(s) whose hover-link span changed (0 rows steady, 1–2 rows on hover/clear)
+    #[test]
+    fn gpu_hover_link_underline_single_multi_row_wide_and_dirty_uploads() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Build a 32x4 screen with a plain URL on row 0, a wrapped OSC 8 link across rows 1..2,
+        // and a wide 'W' cell inside row 3.
+        let mut screen = Screen::new(32, 4);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        let cyan = rgb(0x7d, 0xcf, 0xff);
+        let green = rgb(0x6e, 0xe7, 0xa0);
+        let fg = screen.default_fg;
+
+        super::super::test_pattern::write_run(&mut screen, 0, 1, "see ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 0, 5, "https://glyph3d.dev/wall", super::super::test_pattern::RunStyle::fg(cyan));
+        super::super::test_pattern::write_run(&mut screen, 1, 1, "wrapped link: ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 1, 15, "https://example.o", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 2, 0, "rg/docs/rendering", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 3, 1, "plain text row (no link)", super::super::test_pattern::RunStyle::fg(fg));
+
+        let m = renderer.metrics();
+        let w = 960u32;
+        let h = 240u32;
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.08);
+
+        let make = |hover_link: Option<CellLinkHover>| TerminalDraw {
+            id: 505,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link,
+        };
+
+        // 1. Initial upload without hover link -> all 4 rows uploaded.
+        let s0 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s0.rows_uploaded, 4);
+
+        // 2. Hover row 0 URL `5..29` -> ONLY row 0 uploaded (1 row, 1 write_call)!
+        let link0 = CellLinkHover::single_row(0, 5, 29);
+        let s1 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 1, write_calls: 1 });
+
+        // Steady frame with same hover_link uploads 0 rows.
+        let s1_idle = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1_idle.rows_uploaded, 0);
+
+        // Count ink pixels in the underline band below the baseline (bottom 15% of cell height).
+        let count_ul_band = |px: &[u8], col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(f32::from(col) * m.cell_width, -(f32::from(row) + 0.85) * m.cell_height), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(f32::from(col + 1) * m.cell_width, -f32::from(row + 1) * m.cell_height), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let is_cyan = |c: [u8; 3]| c[0].abs_diff(0x7d) <= 15 && c[1].abs_diff(0xcf) <= 15 && c[2] > 220;
+        let is_amber = |c: [u8; 3]| c[0] > 210 && c[1] > 150 && c[2] < 130;
+
+        let px_row0 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+            w,
+            h,
+        );
+        // Col 5 ('h') and col 13 ('l') have cyan hover underline; col 2 ('e' in "see") has none.
+        assert!(count_ul_band(&px_row0, 5, 0, is_cyan) > 12, "hovered URL start cell should draw cyan underline");
+        assert!(count_ul_band(&px_row0, 13, 0, is_cyan) > 12, "hovered URL interior cell should draw cyan underline");
+        assert_eq!(count_ul_band(&px_row0, 2, 0, is_cyan), 0, "unhovered cell before URL must have no cyan underline");
+
+        // 3. Move hover to multi-row wrapped URL (1,15)..(2,17) with custom amber underline colour ->
+        //    ONLY rows 0..3 (3 rows: old row 0 + new rows 1..=2) uploaded; row 3 untouched!
+        let link_wrap = CellLinkHover::new(1, 15, 2, 17).with_color(rgb(0xf0, 0xb4, 0x5a));
+        let s2 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() },
+        );
+        assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 1 });
+
+        let wrap_frame = WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() };
+        let px_wrap = render_rgba_bytes(&ctx, &mut renderer, &cam, &wrap_frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_LINK_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &wrap_frame, (w, h), 1, Path::new(&path));
+            }
+        }
+        // Row 0 underline is gone; rows 1 (col 16) and 2 (col 4) show amber underline!
+        assert_eq!(count_ul_band(&px_wrap, 5, 0, is_cyan), 0, "clearing row 0 hover must remove its underline");
+        assert!(count_ul_band(&px_wrap, 16, 1, is_amber) > 12, "wrapped hover link row 1 must draw amber underline");
+        assert!(count_ul_band(&px_wrap, 4, 2, is_amber) > 12, "wrapped hover link row 2 must draw amber underline");
+        assert_eq!(count_ul_band(&px_wrap, 10, 1, is_amber), 0, "cells before wrapped link must not underline");
+
+        // 4. Clearing hover link uploads ONLY rows 1..3 (2 rows) and removes underline cleanly.
+        let s3 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 2, write_calls: 1 });
+        let px_clear = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+            w,
+            h,
+        );
+        assert_eq!(count_ul_band(&px_clear, 16, 1, is_amber), 0, "cleared hover link must leave zero underline");
+        assert_eq!(count_ul_band(&px_clear, 4, 2, is_amber), 0, "cleared hover link row 2 must leave zero underline");
+    }
+
+    /// Scrolled-back terminal state:
+    /// - Replaying a `g3d-termd` scrollback `REPAINT` (`\x1b[?25l` cursor hidden) draws ZERO
+    ///   focused cursor pixels on the cell grid.
+    /// - `push_scrollback_indicator` draws the right-edge thumb and top-right `↑42` pill in the
+    ///   JS `AgentViewOverlay` `liveChip` palette (`#1a3026` / `#356b4f` / `#8ef0b8`).
+    #[test]
+    fn gpu_scrolled_back_hides_cursor_and_draws_chrome_indicator() {
+        use super::super::metrics::WorldRect;
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Simulate g3d-termd's `repaint::view` payload: historical lines + `\x1b[0m\x1b[?25l`.
+        let mut vt_stream = String::from("\x1b[?1049l\x1b[!p\x1b[H\x1b[2J");
+        for i in 1..=10 {
+            vt_stream.push_str(&format!("HISTLINE_{i:02}  scrolled history output from earlier build"));
+            if i < 10 {
+                vt_stream.push_str("\r\n");
+            }
+        }
+        vt_stream.push_str("\x1b[5;12H\x1b[0m\x1b[?25l");
+        let screen = super::super::replay::replay_screen(vt_stream.as_bytes(), 60, 10);
+        assert!(!screen.cursor.visible, "termd scrollback view must hide the cursor via DECTCEM");
+
+        let m = renderer.metrics();
+        let pad = renderer.style().panel_padding;
+        let body_rect = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, pad);
+        let w = 960u32;
+        let h = 360u32;
+        let cam = WallCamera::frame_rect(body_rect, (w, h), 1.10);
+
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        let family = renderer.font_family();
+        let pill_rect = {
+            let mut fonts = super::super::chrome::ChromeFonts::new(
+                m,
+                renderer.glyphs_mut().atlas_mut(),
+                family,
+            );
+            super::super::chrome::push_scrollback_indicator(
+                &mut shapes,
+                &mut labels,
+                &mut fonts,
+                super::super::chrome::ChromeView::new(cam.zoom, 1.0),
+                &super::super::chrome::ScrollbackIndicatorDesc {
+                    body_rect,
+                    z: 2.0,
+                    offset: 42,
+                    max: 200,
+                    visible_rows: screen.rows,
+                    viewing: true,
+                    focused: true,
+                },
+            )
+        }
+        .expect("scrolled-back terminal must emit scrollback badge");
+
+        let draw = TerminalDraw {
+            id: 606,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+        let frame = WallFrame {
+            paper: None,
+            terminals: &[draw],
+            shapes: &shapes,
+            labels: &labels,
+        };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_SCROLL_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &frame, (w, h), 1, Path::new(&path));
+            }
+        }
+
+        let count_rect = |r: WorldRect, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(r.min.x, r.max.y), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(r.max.x, r.min.y), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Cursor at (col 11, row 4) must be completely hidden (0 bright #6ee7a0 cursor pixels).
+        let cur_rect = WorldRect::new(
+            Vec2::new(11.0 * m.cell_width, -5.0 * m.cell_height),
+            Vec2::new(12.0 * m.cell_width, -4.0 * m.cell_height),
+        );
+        let is_cursor = |c: [u8; 3]| c[0].abs_diff(0x6e) <= 6 && c[1].abs_diff(0xe7) <= 6 && c[2].abs_diff(0xa0) <= 6;
+        assert_eq!(count_rect(cur_rect, is_cursor), 0, "hidden scrollback cursor must draw 0 cursor pixels");
+
+        // 2. Top-right pill shows #1a3026 fill and #8ef0b8 text (strictly brighter than #356b4f border g=107).
+        let is_pill_bg = |c: [u8; 3]| c[0].abs_diff(0x1a) <= 4 && c[1].abs_diff(0x30) <= 4 && c[2].abs_diff(0x26) <= 4;
+        let is_pill_fg = |c: [u8; 3]| c[1] >= 135 && c[2] >= 95 && c[1] > c[0] + 35;
+        let bg_px = count_rect(pill_rect, is_pill_bg);
+        let fg_px = count_rect(pill_rect, is_pill_fg);
+        assert!(bg_px > 100, "scrollback pill must draw #1a3026 fill (got {bg_px} px)");
+        assert!(fg_px >= 25, "scrollback pill must draw #8ef0b8 text (got {fg_px} px)");
+
+        // 3. Right-edge thumb appears along the right inside edge of body_rect.
+        let right_strip = WorldRect::new(
+            Vec2::new(body_rect.max.x - 8.0 / cam.zoom, body_rect.min.y + 4.0 / cam.zoom),
+            Vec2::new(body_rect.max.x - 2.0 / cam.zoom, body_rect.max.y - 4.0 / cam.zoom),
+        );
+        let is_thumb = |c: [u8; 3]| c[1] > 120 && c[1] > c[0] + 30;
+        assert!(count_rect(right_strip, is_thumb) > 30, "scrollback right-edge thumb must be visible");
     }
 }
