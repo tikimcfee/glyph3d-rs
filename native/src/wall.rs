@@ -20,6 +20,8 @@ pub mod metrics;
 #[cfg(feature = "egui-ui")]
 pub mod panels;
 pub mod paper;
+#[cfg(feature = "windowed")]
+pub mod perf;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
 pub mod replay;

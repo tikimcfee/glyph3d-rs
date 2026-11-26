@@ -36,7 +36,7 @@ use wall_core::wall::{screen_lookup, TerminalAppeared, Wall, WallFrame as Descri
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 #[cfg(feature = "egui-ui")]
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
@@ -137,6 +137,7 @@ struct App {
     hud_open: bool,
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
+    perf: super::perf::WallPerf,
 }
 
 /// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
@@ -339,6 +340,7 @@ impl App {
         }
         self.apply_effects();
         self.redraw();
+        self.perf.mark_opened(&self.proxy);
     }
 
     /// Carry out what the wall asked for, until it asks for nothing more.
@@ -413,6 +415,7 @@ impl App {
     /// Take in what the terminals' reader thread queued.
     fn pump(&mut self) {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
+        let _pump = self.perf.pump_scope();
         let (changed, news) = sessions.pump();
         let heard = !news.is_empty();
         for n in news {
@@ -469,21 +472,29 @@ impl App {
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
-        let frame = match g.surface.get_current_texture() {
-            Cst::Success(f) | Cst::Suboptimal(f) => f,
+        let t_acquire = Instant::now();
+        let (frame, view) = match g.surface.get_current_texture() {
+            Cst::Success(f) | Cst::Suboptimal(f) => {
+                let v = f.texture.create_view(&Default::default());
+                (Some(f), v)
+            }
             Cst::Lost | Cst::Outdated => {
                 g.surface.configure(&self.ctx.device, &g.config);
                 g.window.request_redraw();
                 return;
             }
-            // Covered or asleep: the next event that matters asks again.
-            Cst::Occluded | Cst::Timeout => return,
+            // Covered or asleep: the next event that matters asks again, unless
+            // GLYPH_WALL_PERF is measuring rendering on an occluded screen.
+            Cst::Occluded | Cst::Timeout => match self.perf.occluded_view(&self.ctx.device, g.config.format, g.config.width, g.config.height) {
+                Some(v) => (None, v),
+                None => return,
+            },
             Cst::Validation => {
                 log::error!("the wall's surface failed validation; skipping the frame");
                 return;
             }
         };
-        let view = frame.texture.create_view(&Default::default());
+        let t_post_acquire = Instant::now();
         let target = WallTarget { color_view: &view, depth_view: &g.depth, width: g.config.width, height: g.config.height };
         let sf = g.window.scale_factor() as f32;
         // The wall's camera is in logical pixels per world unit; the
@@ -649,8 +660,7 @@ impl App {
             self.ui_repaint_at = None;
             None
         };
-        self.ctx.queue.submit([encoder.finish()]);
-        self.ctx.queue.present(frame);
+        self.perf.submit_and_record(&self.ctx, encoder, frame, (now, t_acquire, t_post_acquire), stats);
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
         // draws the same frame once more offscreen and saves it.
@@ -797,7 +807,11 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _wake: Wake) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _wake: Wake) {
+        if self.perf.should_exit_on_wake(event_loop.exiting()) {
+            event_loop.exit();
+            return;
+        }
         self.pump();
     }
 
@@ -881,17 +895,22 @@ impl ApplicationHandler<Wake> for App {
         if self.animating {
             self.redraw();
         }
+        let mut ui_wake_at = None;
         #[cfg(feature = "egui-ui")]
         if let Some(at) = self.ui_repaint_at {
             if Instant::now() >= at {
                 self.ui_repaint_at = None;
                 self.redraw();
             } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
-                return;
+                ui_wake_at = Some(at);
             }
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
+        let (exit_perf, flow) = self.perf.control_flow(self.frames, ui_wake_at);
+        if exit_perf {
+            event_loop.exit();
+            return;
+        }
+        event_loop.set_control_flow(flow);
     }
 }
 
@@ -920,9 +939,11 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         hud_open: std::env::var("GLYPH_WALL_HUD").is_ok_and(|v| !v.is_empty() && v != "0"),
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
+        perf: super::perf::WallPerf::from_env(),
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
+    app.perf.print_summary(app.frames);
     if app.exit_after.is_some() {
         // A counted run says what its terminals showed, as text, and where
         // the wall put them.
