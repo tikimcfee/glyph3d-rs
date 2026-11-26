@@ -86,7 +86,11 @@ fn main() {
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
         #[cfg(not(feature = "wgpu"))]
-        CliCommand::GpuInfo(_) | CliCommand::Render(_) | CliCommand::Wall { .. } | CliCommand::WallTestPattern { .. } => {
+        CliCommand::GpuInfo(_)
+        | CliCommand::Render(_)
+        | CliCommand::Wall { .. }
+        | CliCommand::WallTestPattern { .. }
+        | CliCommand::WallReplay { .. } => {
             eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
             std::process::exit(1);
         }
@@ -141,6 +145,15 @@ fn main() {
             };
             let ctx = pollster::block_on(gpu::init(None));
             wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallReplay { file, cols, rows, .. } => {
+            eprintln!(
+                "error: --wall-replay {} ({cols}x{rows}) is not built yet: crates/glyph-vt has not landed \
+                 (expected Vt::new / feed / fill per out/WALL-PLAN-2026-11-26.md section B)",
+                file.display()
+            );
+            std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {

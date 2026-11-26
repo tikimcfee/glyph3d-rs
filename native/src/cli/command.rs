@@ -41,6 +41,16 @@ pub enum CliCommand {
         frames: u32,
         zoom: f32,
     },
+    /// Replay a recorded terminal byte stream on the wall renderer (pending crates/glyph-vt).
+    WallReplay {
+        file: PathBuf,
+        cols: u16,
+        rows: u16,
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
 }
 
 /// Mode for GPU information inspection.
@@ -162,6 +172,18 @@ impl Cli {
         }
         if self.wall_test_pattern {
             return CliCommand::WallTestPattern {
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
+        if let Some(file) = &self.wall_replay {
+            let (cols, rows) = self.wall_size.unwrap_or((80, 24));
+            return CliCommand::WallReplay {
+                file: file.clone(),
+                cols,
+                rows,
                 emoji_sheet,
                 screenshot: self.screenshot.clone(),
                 frames: self.frames.unwrap_or(1),
