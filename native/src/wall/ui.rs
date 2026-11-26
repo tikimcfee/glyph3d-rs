@@ -335,45 +335,65 @@ pub fn color32_from_srgb(rgba: [f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(ch(rgba[0]), ch(rgba[1]), ch(rgba[2]), ch(rgba[3]))
 }
 
-/// Path to the bundled monospace UI font under `assets/fonts/`.
-pub fn wall_ui_font_path() -> PathBuf {
+/// Path to the bundled fonts directory under `assets/fonts/`.
+fn wall_fonts_dir() -> PathBuf {
     crate::atlas_dir()
         .parent()
-        .map(|assets| assets.join("fonts/Cousine-Regular.ttf"))
-        .unwrap_or_else(|| PathBuf::from("assets/fonts/Cousine-Regular.ttf"))
+        .map(|assets| assets.join("fonts"))
+        .unwrap_or_else(|| PathBuf::from("assets/fonts"))
+}
+
+/// Path to the bundled monospace UI font under `assets/fonts/`.
+pub fn wall_ui_font_path() -> PathBuf {
+    wall_fonts_dir().join("Cousine-Regular.ttf")
 }
 
 /// Apply the wall's dark visual theme (sourced from `config/defaults.toml [wall]`)
-/// and install the monospace UI font (`assets/fonts/Cousine-Regular.ttf`) once
-/// onto `ctx`. Also usable in headless panel tests (`egui::Context::default()`).
+/// and install the monospace UI font (`assets/fonts/Cousine-Regular.ttf`) plus
+/// the symbol-complete fallback faces (`MesloLGS-NF-Mono.ttf`, `DejaVuSans.ttf`)
+/// from `glyph_font::default_font_chain` once onto `ctx`.
+/// Also usable in headless panel tests (`egui::Context::default()`).
 pub fn configure_wall_context(ctx: &egui::Context, wall: &WallSettings) {
     install_wall_fonts(ctx);
     apply_wall_style(ctx, wall);
 }
 
 fn install_wall_fonts(ctx: &egui::Context) {
-    let path = wall_ui_font_path();
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!(
-                "wall ui: could not read monospace font {}: {e}; using egui default",
-                path.display()
-            );
-            return;
-        }
-    };
+    let dir = wall_fonts_dir();
+    // Mirrors `glyph_font::default_font_chain`: Cousine primary for crisp ASCII
+    // metrics, backed by MesloLGS NF Mono and DejaVu Sans so keycap/modifier
+    // glyphs (`⌘`, `⌥`, `⌃`, `⇧`, `↵`, `⌫`, `⇤`, `⇥`, `◫`, `▾`, `▸`) never draw tofu.
+    let chain = [
+        ("wall_mono", dir.join("Cousine-Regular.ttf")),
+        ("wall_meslo", dir.join("MesloLGS-NF-Mono.ttf")),
+        ("wall_dejavu", dir.join("DejaVuSans.ttf")),
+    ];
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "wall_mono".to_owned(),
-        egui::FontData::from_owned(bytes).into(),
-    );
+    let mut loaded = Vec::new();
+    for (name, path) in chain {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                fonts
+                    .font_data
+                    .insert(name.to_owned(), egui::FontData::from_owned(bytes).into());
+                loaded.push(name.to_owned());
+            }
+            Err(e) => {
+                log::warn!(
+                    "wall ui: could not read font {}: {e}; skipping",
+                    path.display()
+                );
+            }
+        }
+    }
+    if loaded.is_empty() {
+        return;
+    }
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "wall_mono".to_owned());
+        let list = fonts.families.entry(family).or_default();
+        for (idx, name) in loaded.iter().enumerate() {
+            list.insert(idx, name.clone());
+        }
     }
     ctx.set_fonts(fonts);
 }

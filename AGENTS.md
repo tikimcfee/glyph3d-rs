@@ -202,7 +202,8 @@ cargo glyph test --frozen  assert currency instead of building it
 cargo glyph test --relax   the inner tier under makepad's relax JIT, nothing
                            built natively; never a landing run
 cargo glyph run --demo     build if stale, then launch the renderer; arguments
-                           pass through, and none opens its terminal launcher
+                           pass through, and none opens the wall (--launcher
+                           opens its terminal launcher)
 ```
 
 `run` executes in YOUR directory, so a file argument means what it says relative

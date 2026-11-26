@@ -20,7 +20,7 @@ false).
 | Land | `cargo glyph test` | All gates. Red on any warning, failed test, test count under `test_floor`, or golden mismatch. |
 | Validate a commit | `cargo glyph test --frozen` | Asserts the renderer is already current instead of building it; staleness IS the finding. |
 | One check | `cargo glyph gate <name>` | A single gate by name (`cargo glyph gates` lists them, with what each cannot see). |
-| Run | `cargo glyph run [args]` | Builds if stale, then runs the renderer in YOUR directory; no arguments opens the launcher. |
+| Run | `cargo glyph run [args]` | Builds if stale, then runs the renderer in YOUR directory; no arguments opens the wall (`--launcher` opens the launcher). |
 
 Do not hand-run `cargo build`, `tools/*.sh` or the binary's check flags in
 place of a gate: the ordering between them is what the tool holds for you.
@@ -58,7 +58,7 @@ needs cool-downs.
 
 ## 4. Launcher vs in-app UI
 
-- **Launcher** (`cargo glyph run` with no arguments, `cargo glyph tui`, or
+- **Launcher** (`cargo glyph tui`, `cargo glyph run --launcher`, or
   `glyph3d-native --launcher`): a terminal front end of the renderer
   (`native/src/launcher/`, default feature `launcher`). Its state is a
   `LaunchConfig`; choice rows are the flags' clap `ValueEnum` variants.

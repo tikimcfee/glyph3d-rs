@@ -3,7 +3,7 @@
 
 use crate::coalesce::CoalescePolicy;
 use crate::inbox::SessionInbox;
-use crate::session::{run_async_cmd_worker, AsyncCmd, TerminalSession};
+use crate::session::{run_async_cmd_worker, AsyncCmd, AsyncCmdQueue, TerminalSession};
 use glyph_vt::Theme;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,7 +110,7 @@ pub(crate) struct HubInner {
     termd_owner: Mutex<Option<Termd>>,
     routing: Mutex<RoutingTable>,
     daemon: Mutex<DaemonTracking>,
-    async_tx: Mutex<Option<mpsc::Sender<AsyncCmd>>>,
+    async_queue: Arc<AsyncCmdQueue>,
     async_worker: Mutex<Option<JoinHandle<()>>>,
     router_thread: Mutex<Option<JoinHandle<()>>>,
     closing: AtomicBool,
@@ -121,10 +121,7 @@ pub(crate) struct HubInner {
 impl Drop for HubInner {
     fn drop(&mut self) {
         self.closing.store(true, Ordering::Release);
-        {
-            let mut tx_guard = self.async_tx.lock().expect("async_tx mutex poisoned");
-            *tx_guard = None;
-        }
+        self.async_queue.close();
         {
             let table = self.routing.lock().expect("routing mutex poisoned");
             for inbox in table.inboxes.values() {
@@ -163,11 +160,7 @@ impl HubInner {
     }
 
     pub(crate) fn send_async(&self, cmd: AsyncCmd) {
-        if let Ok(guard) = self.async_tx.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(cmd);
-            }
-        }
+        self.async_queue.push(cmd);
     }
 
     pub(crate) fn register_session(&self, handle: u32, inbox: Arc<SessionInbox>) {
@@ -251,11 +244,12 @@ impl SessionHub {
     ) -> Result<Self, Error> {
         let termd_handle = termd.handle();
         let welcome = termd_handle.welcome();
-        let (async_tx, async_rx) = mpsc::channel();
+        let async_queue = Arc::new(AsyncCmdQueue::new());
+        let worker_queue = Arc::clone(&async_queue);
         let cmd_termd = termd_handle.clone();
         let async_worker = thread::Builder::new()
             .name("term-session-io".into())
-            .spawn(move || run_async_cmd_worker(cmd_termd, async_rx))
+            .spawn(move || run_async_cmd_worker(cmd_termd, worker_queue))
             .map_err(Error::Io)?;
 
         let inner = Arc::new(HubInner {
@@ -273,7 +267,7 @@ impl SessionHub {
                 },
                 events: VecDeque::new(),
             }),
-            async_tx: Mutex::new(Some(async_tx)),
+            async_queue,
             async_worker: Mutex::new(Some(async_worker)),
             router_thread: Mutex::new(None),
             closing: AtomicBool::new(false),

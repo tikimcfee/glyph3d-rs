@@ -7,7 +7,7 @@
 //!   in slices of at most `feed_quantum_bytes` (`16 KiB`) and publish once at each `interval`
 //!   boundary, keeping the publish rate strictly bounded under `yes` or build-log floods.
 //! - While DEC mode 2026 (`CSI ? 2026 h`, synchronized output) is active, publication waits for
-//!   `CSI ? 2026 l` so partial mid-redraw frames never tear, bounded by `sync_timeout` (`200 ms`)
+//!   `CSI ? 2026 l` so partial mid-redraw frames never tear, bounded by `sync_timeout` (`1 s`)
 //!   so a program killed mid-frame cannot freeze its display.
 
 use std::time::{Duration, Instant};
@@ -20,8 +20,12 @@ pub const DEFAULT_COALESCE_INTERVAL: Duration = Duration::from_millis(16);
 pub const DEFAULT_FEED_QUANTUM_BYTES: usize = 16 * 1024;
 
 /// Maximum time DEC mode 2026 (`SynchronizedOutput`) may hold back a dirty screen without seeing
-/// `CSI ? 2026 l`.
-pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_millis(200);
+/// `CSI ? 2026 l` (1 s, matching the DEC 2026 / Ghostty / kitty synchronized-update spec).
+pub const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Settle window after a primary-screen resize that grew `cols` or `rows` before asking
+/// `g3d-termd` for a single `REPAINT` to pull scrollback rows onto the enlarged screen (`35 ms`).
+pub const DEFAULT_GROW_REPAINT_SETTLE: Duration = Duration::from_millis(35);
 
 /// Per-terminal unread event-queue ceiling before backpressure pushes back to the socket (2 MiB).
 pub const DEFAULT_INBOX_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -32,6 +36,7 @@ pub struct CoalescePolicy {
     pub interval: Duration,
     pub feed_quantum_bytes: usize,
     pub sync_timeout: Duration,
+    pub grow_repaint_settle: Duration,
     pub inbox_max_bytes: usize,
 }
 
@@ -41,6 +46,7 @@ impl Default for CoalescePolicy {
             interval: DEFAULT_COALESCE_INTERVAL,
             feed_quantum_bytes: DEFAULT_FEED_QUANTUM_BYTES,
             sync_timeout: DEFAULT_SYNC_TIMEOUT,
+            grow_repaint_settle: DEFAULT_GROW_REPAINT_SETTLE,
             inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
         }
     }

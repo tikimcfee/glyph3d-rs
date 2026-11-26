@@ -87,7 +87,7 @@ enum Cmd {
         jobs: usize,
     },
     /// Bring the renderer up to date, then launch it. Arguments are passed
-    /// through; none at all opens its launcher.
+    /// through; none at all opens the wall (`--launcher` opens its launcher).
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
