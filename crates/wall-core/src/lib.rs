@@ -40,3 +40,4 @@ pub mod snap;
 pub mod split;
 pub mod status;
 pub mod store;
+pub mod wall;

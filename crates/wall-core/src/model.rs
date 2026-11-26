@@ -29,12 +29,15 @@ use crate::camera::{CameraPose, WallCamera};
 use crate::config::{CopyOnSelect, GroupLayout, WallConfig};
 use crate::dock::dock_layout;
 use crate::geom::{Point, Rect};
+use crate::keymap::TerminalKey;
 use crate::layout::{
     cycle, free_flow_slot, hit_test, lasso_touches, pad_rect, reading_order, tile_layout,
     union_rect, z_stack_layout, Hit, HitPart, HitTarget, ReadingItem, Size, TileOptions,
     ZStackOptions, BAR_ROOM, DEFAULT_FIT_MARGIN,
 };
 use crate::menu::MenuTarget;
+use crate::mouse::MouseTracking;
+use crate::pointer::{CursorIcon, TerminalMouseEvent};
 use crate::settings::{KnobInput, KnobValue};
 use crate::snap::{snap_step, snap_to, GridSpec};
 use crate::split::{self, Direction, Divider, InsertSide, PaneMap, SplitDir};
@@ -173,6 +176,8 @@ pub struct TerminalEntry {
     pub rows: u32,
     /// Top-left corner `(min_x, max_y)` of the terminal's body panel in world units (y up).
     pub position: Point,
+    /// Per-terminal scale factor (`1.0` default).
+    pub scale: f64,
     /// World Z coordinate assigned by [`z_stack_layout`].
     pub z: f64,
     /// Raw window title set by the running program (`OSC 0` / `OSC 2`).
@@ -183,6 +188,8 @@ pub struct TerminalEntry {
     pub has_selection: bool,
     /// Whether the program inside this terminal has enabled DECSET mouse tracking.
     pub mouse_reporting: bool,
+    /// Latest terminal modes reported by the emulator/daemon (mouse tracking, alt screen, etc.).
+    pub modes: term_cells::Modes,
     /// Split-pane title-bar room override (`None` = `BAR_ROOM`, `Some(0.0)` = hidden bar).
     pub bar_room_override: Option<f64>,
 }
@@ -190,19 +197,33 @@ pub struct TerminalEntry {
 impl TerminalEntry {
     /// Top-left corner of cell `(0, 0)` in world space (inside `geometry.padding`).
     pub fn cell_origin(&self, geometry: CellGeometry) -> Point {
+        let s = self.scale;
         Point::new(
-            self.position.x + geometry.padding.x,
-            self.position.y - geometry.padding.y,
+            self.position.x + geometry.padding.x * s,
+            self.position.y - geometry.padding.y * s,
         )
     }
 
     /// World-space rectangle of the terminal's body panel (cells + padding).
     pub fn body_rect(&self, geometry: CellGeometry) -> Rect {
+        let s = self.scale;
         let width =
-            f64::from(self.cols) * geometry.stride.x + 2.0 * geometry.padding.x;
+            (f64::from(self.cols) * geometry.stride.x + 2.0 * geometry.padding.x) * s;
         let height =
-            f64::from(self.rows) * geometry.stride.y + 2.0 * geometry.padding.y;
+            (f64::from(self.rows) * geometry.stride.y + 2.0 * geometry.padding.y) * s;
         Rect::from_top_left(self.position.x, self.position.y, width, height)
+    }
+
+    /// Effective DECSET mouse-tracking mode for this terminal.
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        let from_modes = MouseTracking::from(self.modes.mouse);
+        if from_modes != MouseTracking::None {
+            from_modes
+        } else if self.mouse_reporting {
+            MouseTracking::Normal
+        } else {
+            MouseTracking::None
+        }
     }
 }
 
@@ -249,13 +270,29 @@ pub enum WallEffect {
     SpawnTerminal {
         window_top_left: Option<Point>,
         argv: Option<Vec<String>>,
+        cols: u32,
+        rows: u32,
     },
     /// Ask `termd` to kill terminal `id` (its store state has already been forgotten).
     KillTerminal { id: String },
     /// Ask `termd` to resize terminal `id` to `cols × rows` cells.
     ResizeTerminal { id: String, cols: u32, rows: u32 },
-    /// Copy `text` onto the OS system clipboard (`copyOnSelect == "clipboard"`).
+    /// Ask `termd` to deliver a key event to terminal `id`.
+    SendKey { id: String, key: TerminalKey },
+    /// Ask `termd` to paste `text` into terminal `id`.
+    PasteTerminal { id: String, text: String },
+    /// Ask `termd` to deliver a DECSET mouse event to terminal `id`.
+    SendMouse { id: String, event: TerminalMouseEvent },
+    /// Ask `termd` to scroll terminal `id`'s view by `lines` (negative = up into history) at `cell`.
+    ScrollTerminal { id: String, lines: i32, cell: Point },
+    /// Ask `termd` to send a full repaint for terminal `id`.
+    RefreshTerminal { id: String },
+    /// Copy `text` onto the OS system clipboard (`wall.copy` or `copyOnSelect == "clipboard"`).
     WriteClipboard { text: String },
+    /// Ask the host to read the OS system clipboard and call `Wall::deliver_clipboard(target, text)`.
+    ReadClipboard { target: String },
+    /// Ask the window to set the pointer's cursor shape.
+    SetCursor { cursor: CursorIcon },
     /// A configuration knob changed or reset; renderer/emulator state may sync to it.
     ConfigKnobChanged { key: String, value: KnobValue },
     /// Visible canvas or UI chrome state changed; schedule a frame redraw.
@@ -878,22 +915,29 @@ impl WallModel {
 
     /// Recompute normalized `z_order` and world Z coordinates for all terminals and group frames.
     pub fn apply_z_order(&mut self) {
-        let scale_z = self.geometry.scale_z;
-        let scale_fn = |_: &str| scale_z;
-        let store_ref = &self.store;
-        let group_fn = |id: &str| store_ref.group_of(id).map(str::to_owned);
         let fullscreen_ids = self
             .solo_fullscreen_id
             .as_ref()
             .filter(|id| self.is_shown(id))
             .map(|id| vec![id.clone()])
             .unwrap_or_default();
+        self.apply_z_order_with(&fullscreen_ids);
+    }
+
+    /// Recompute normalized `z_order` and world Z coordinates using explicit `elevated_ids`
+    /// (from [`crate::fullscreen::WallFullscreen::elevated_ids`]), returning the assigned
+    /// per-group depths.
+    pub fn apply_z_order_with(&mut self, elevated_ids: &[String]) -> HashMap<String, f64> {
+        let scale_z = self.geometry.scale_z;
+        let scale_fn = |_: &str| scale_z;
+        let store_ref = &self.store;
+        let group_fn = |id: &str| store_ref.group_of(id).map(str::to_owned);
 
         let stack = z_stack_layout(
             &self.z_order,
             ZStackOptions {
                 fullscreen_id: None,
-                fullscreen_ids: Some(fullscreen_ids),
+                fullscreen_ids: Some(elevated_ids.to_vec()),
                 scale_of: Some(&scale_fn),
                 group_of: Some(&group_fn),
             },
@@ -904,7 +948,307 @@ impl WallModel {
                 entry.z = z;
             }
         }
-        self.group_z = stack.groups;
+        self.group_z = stack.groups.clone();
+        stack.groups
+    }
+
+    /// Push a host effect onto the unified outbox drained by [`Self::drain_effects`].
+    pub fn push_effect(&mut self, effect: WallEffect) {
+        self.effects.push(effect);
+    }
+
+    /// Bump generation, mark dirty, prune an invalid menu, and queue [`WallEffect::Redraw`].
+    pub fn notify_changed(&mut self) {
+        self.emit_change();
+    }
+
+    /// Mutable access to terminal `id`'s live entry.
+    pub fn terminal_mut(&mut self, id: &str) -> Option<&mut TerminalEntry> {
+        self.terminals.get_mut(id)
+    }
+
+    /// Update terminal `id`'s world position directly (without persisting or relayout).
+    pub fn set_terminal_position(&mut self, id: &str, pos: Point) -> bool {
+        let Some(entry) = self.terminals.get_mut(id) else {
+            return false;
+        };
+        entry.position = pos;
+        self.emit_change();
+        true
+    }
+
+    /// Set terminal `id`'s visual scale factor (`> 0`).
+    pub fn set_terminal_scale(&mut self, id: &str, scale: f64) -> bool {
+        if !scale.is_finite() || scale <= 0.0 {
+            return false;
+        }
+        let Some(entry) = self.terminals.get_mut(id) else {
+            return false;
+        };
+        if (entry.scale - scale).abs() <= 1e-12 {
+            return true;
+        }
+        entry.scale = scale;
+        self.emit_change();
+        true
+    }
+
+    /// Update terminal `id`'s emulator modes (mouse tracking, alternate screen, etc.).
+    pub fn set_terminal_modes(&mut self, id: &str, modes: term_cells::Modes) -> bool {
+        let Some(entry) = self.terminals.get_mut(id) else {
+            return false;
+        };
+        let reporting = modes.mouse != term_cells::MouseTracking::Off;
+        if entry.modes == modes && entry.mouse_reporting == reporting {
+            return true;
+        }
+        entry.modes = modes;
+        entry.mouse_reporting = reporting;
+        self.emit_change();
+        true
+    }
+
+    /// Effective DECSET mouse-tracking mode for terminal `id`.
+    pub fn mouse_tracking(&self, id: &str) -> MouseTracking {
+        self.terminals
+            .get(id)
+            .map_or(MouseTracking::None, TerminalEntry::mouse_tracking)
+    }
+
+    /// Override a split pane's title-bar room (`None` restores default `BAR_ROOM`).
+    pub fn set_bar_room_override(&mut self, id: &str, room: Option<f64>) {
+        if let Some(entry) = self.terminals.get_mut(id) {
+            entry.bar_room_override = room;
+        }
+    }
+
+    /// Update terminal `id`'s grid cell dimensions without triggering inline group relayout.
+    pub fn set_terminal_size_raw(&mut self, id: &str, cols: u32, rows: u32) -> bool {
+        let Some(entry) = self.terminals.get_mut(id) else {
+            return false;
+        };
+        if entry.cols == cols && entry.rows == rows {
+            return true;
+        }
+        entry.cols = cols;
+        entry.rows = rows;
+        self.emit_change();
+        true
+    }
+
+    /// Clear the active spawn flow grid anchor (e.g. after explicit `at` placement).
+    pub fn clear_flow(&mut self) {
+        self.flow = None;
+    }
+
+    /// Focus navigation history (oldest to newest).
+    pub fn focus_history(&self) -> &[String] {
+        &self.focus_history
+    }
+
+    /// Mount terminal `spec` into `terminals`, `order`, and `z_order` using either a saved
+    /// store spot or the next free flow slot, without running inline split/group relayout.
+    pub(crate) fn mount_terminal_raw(
+        &mut self,
+        spec: TerminalSpec,
+        modes: term_cells::Modes,
+        canvas_camera_override: Option<CameraPose>,
+        track_flow: bool,
+    ) -> Point {
+        let id = spec.id;
+        let saved_cam = self.pre_fullscreen_camera;
+        if let Some(pose) = canvas_camera_override {
+            self.pre_fullscreen_camera = Some(pose);
+        }
+        let saved_split = self.split_landing.take();
+        if !track_flow {
+            self.split_landing = Some(PendingSplit {
+                at: String::new(),
+                axis: SplitAxis::Right,
+            });
+        }
+        let position = self.compute_initial_position(&id, spec.cols, spec.rows);
+        self.split_landing = saved_split;
+        self.pre_fullscreen_camera = saved_cam;
+
+        let entry = TerminalEntry {
+            id: id.clone(),
+            cols: spec.cols,
+            rows: spec.rows,
+            position,
+            scale: 1.0,
+            z: 0.0,
+            shell_title: spec.shell_title,
+            preview: String::new(),
+            has_selection: false,
+            mouse_reporting: modes.mouse != term_cells::MouseTracking::Off,
+            modes,
+            bar_room_override: None,
+        };
+        self.terminals.insert(id.clone(), entry);
+        if !self.order.contains(&id) {
+            self.order.push(id.clone());
+        }
+        if !self.z_order.contains(&id) {
+            self.z_order.push(id);
+        }
+        position
+    }
+
+    /// Unmount `id` from the live maps and prune focus history without running inline
+    /// group relayout or focus restoration. Returns `(existed, was_focused)`.
+    pub(crate) fn unmount_terminal_raw(&mut self, id: &str) -> (bool, bool) {
+        let existed = self.terminals.remove(id).is_some();
+        let was_focused = self.focused_id.as_deref() == Some(id);
+        if was_focused {
+            self.focused_id = None;
+        }
+        self.order.retain(|x| x != id);
+        self.z_order.retain(|x| x != id);
+        self.selection.retain(|x| x != id);
+        if self.hovered_id.as_deref() == Some(id) {
+            self.hovered_id = None;
+        }
+        self.prune_focus_history();
+        (existed, was_focused)
+    }
+
+    /// Update `focused_id`, optionally recording focus history and raising `z_order`,
+    /// without invoking inline solo-fullscreen logic.
+    pub(crate) fn set_focused_raw(&mut self, id: Option<&str>, record_history: bool) -> bool {
+        let Some(target_id) = id else {
+            if self.focused_id.is_some() {
+                self.focused_id = None;
+                self.emit_change();
+            }
+            return true;
+        };
+        if !self.terminals.contains_key(target_id) {
+            return false;
+        }
+        if self.store.hidden(target_id) {
+            self.store.set_hidden(target_id, false);
+        }
+        self.focused_id = Some(target_id.to_owned());
+        if record_history && !self.stepping_history {
+            self.record_focus(target_id);
+        }
+        if let Some(pos) = self.z_order.iter().position(|x| x == target_id) {
+            if pos + 1 != self.z_order.len() {
+                self.z_order.remove(pos);
+                self.z_order.push(target_id.to_owned());
+            }
+        }
+        self.emit_change();
+        true
+    }
+
+    /// Choose the best remaining shown terminal to focus after `gone_id` hid or closed,
+    /// without focusing it directly.
+    pub(crate) fn pick_focus_fallback(
+        &mut self,
+        gone_id: &str,
+        preferred_group: Option<&str>,
+    ) -> Option<String> {
+        self.focused_id = None;
+        self.prune_focus_history();
+        let group_shown: Vec<String> = preferred_group
+            .filter(|gid| self.store.group(gid).is_some())
+            .map(|gid| {
+                self.shown_group_members(gid)
+                    .into_iter()
+                    .filter(|m| m != gone_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !group_shown.is_empty() {
+            for hist_id in self.focus_history.iter().rev() {
+                if group_shown.contains(hist_id) {
+                    return Some(hist_id.clone());
+                }
+            }
+            return Some(group_shown[0].clone());
+        }
+        if let Some(cur_idx) = self.focus_index {
+            for i in (0..=cur_idx.min(self.focus_history.len().saturating_sub(1))).rev() {
+                let candidate = &self.focus_history[i];
+                if candidate != gone_id && self.is_shown(candidate) {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+        for candidate in self.z_order.iter().rev() {
+            if candidate != gone_id && self.is_shown(candidate) {
+                return Some(candidate.clone());
+            }
+        }
+        None
+    }
+
+    /// Advance `focus_index` by `dir` (`-1` back, `+1` forward) and return the chosen
+    /// terminal id without mutating focus or camera.
+    pub(crate) fn step_focus_history_pick(&mut self, dir: i32) -> Option<String> {
+        self.prune_focus_history();
+        if self.focus_history.is_empty() {
+            return None;
+        }
+        if self.focused_id.is_none() {
+            if dir > 0 {
+                return None;
+            }
+            let idx = self.focus_index?;
+            return self.focus_history.get(idx).cloned();
+        }
+        let cur = self.focus_index?;
+        let next_idx = if dir < 0 {
+            cur.checked_sub(1)?
+        } else if cur + 1 < self.focus_history.len() {
+            cur + 1
+        } else {
+            return None;
+        };
+        self.focus_index = Some(next_idx);
+        self.focus_history.get(next_idx).cloned()
+    }
+
+    /// Mark whether a focus change is stepping through focus history (suppressing history push).
+    pub(crate) fn set_stepping_history(&mut self, stepping: bool) {
+        self.stepping_history = stepping;
+    }
+
+    /// Clear `focused_id` without pushing to history (used when hiding/closing focused).
+    pub(crate) fn clear_focused_raw(&mut self) {
+        self.focused_id = None;
+    }
+
+    /// Prune hidden or removed terminals from focus history.
+    pub(crate) fn prune_focus_history_raw(&mut self) {
+        self.prune_focus_history();
+    }
+
+    /// Remove `id` from `selection` without emitting.
+    pub(crate) fn deselect_one_raw(&mut self, id: &str) {
+        self.selection.retain(|x| x != id);
+    }
+
+    /// Step the camera ease/wheel glide and clear expired notices at `now_ms`.
+    pub(crate) fn step_camera_and_notice(&mut self, dt_secs: f64, now_ms: f64) -> bool {
+        let was_moving = self.camera.moving();
+        self.camera.step(dt_secs);
+        let still_moving = self.camera.moving();
+        let mut changed = was_moving || still_moving;
+        if let Some(expires) = self.notice_expires_at_ms {
+            if now_ms >= expires {
+                self.notice = None;
+                self.notice_expires_at_ms = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit_change();
+        }
+        still_moving
     }
 
     // ── placement, spawn, split landing, reconcile ──────────────────────────
@@ -1007,6 +1351,8 @@ impl WallModel {
         self.effects.push(WallEffect::SpawnTerminal {
             window_top_left,
             argv: None,
+            cols: 100,
+            rows: 30,
         });
     }
 
@@ -1032,11 +1378,13 @@ impl WallModel {
             cols: spec.cols,
             rows: spec.rows,
             position,
+            scale: 1.0,
             z: 0.0,
             shell_title: spec.shell_title,
             preview: String::new(),
             has_selection: false,
             mouse_reporting: false,
+            modes: term_cells::Modes::default(),
             bar_room_override: None,
         };
         self.terminals.insert(id.clone(), entry);
@@ -2024,6 +2372,8 @@ impl WallModel {
         self.effects.push(WallEffect::SpawnTerminal {
             window_top_left: None,
             argv: None,
+            cols: 100,
+            rows: 30,
         });
         Ok(())
     }
