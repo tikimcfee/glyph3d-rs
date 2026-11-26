@@ -492,24 +492,12 @@ pub fn push_title_bar(
     } else {
         style.bar_text_idle
     };
-    let stroke = if desc.selected {
-        Some(style.selection_color)
-    } else if desc.hovered {
-        Some(style.bar_hover_stroke)
-    } else {
-        None
-    };
-
     shapes.push(Shape::Rect(RectShape {
         rect: strip,
         z: desc.z,
         fill: Some(fill),
-        stroke,
-        stroke_px: if stroke.is_some() {
-            view.phys_px(1.0)
-        } else {
-            0.0
-        },
+        stroke: None,
+        stroke_px: 0.0,
         dash: DashStyle::SOLID,
         corner_radius_px: 0.0,
     }));
