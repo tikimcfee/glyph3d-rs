@@ -1768,6 +1768,9 @@ dependencies = [
 [[package]]
 name = "glyph-font"
 version = "0.1.0"
+dependencies = [
+ "ttf-parser",
+]
 
 [[package]]
 name = "glyph-scene-graph"
