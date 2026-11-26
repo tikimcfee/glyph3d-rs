@@ -2538,6 +2538,34 @@ fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice(
     assert!(h.wall.dismiss_termd_lost());
     assert_eq!(h.frame().status_notice, None);
     assert!(h.frame().notice.is_some());
+
+    // Epoch-ms timestamps combined with clamped dt (1/30 s) must advance by real wall-clock delta.
+    let epoch_base: u64 = 1_795_000_000_000;
+    let ok_doc2 = serde_json::json!({
+        "daemon": { "version": "g3d-termd/0.2.0", "engine": "glyph-vt/0.1", "ns": "test", "started_at": epoch_base },
+        "terminals": [{ "id": t1, "cols": 100, "rows": 30, "flow": "ok", "subscribers": [] }]
+    });
+    h.wall.on_termd_status(ok_doc2, epoch_base).expect("status ok");
+    h.wall.on_termd_disconnected(false, epoch_base);
+    // Anchor tick right after disconnect at monotonic t = 10_000 ms.
+    h.wall.tick(1.0 / 60.0, 10_000.0);
+    assert_eq!(h.frame().status_notice, None);
+    // Single idle wakeup 500 ms later with clamped dt (33 ms): must still trigger Amber (>= 400 ms).
+    h.wall.tick(1.0 / 30.0, 10_500.0);
+    let amber = h
+        .frame()
+        .status_notice
+        .expect("epoch-ms disconnect must show Amber after 500 ms even with clamped dt");
+    assert_eq!(amber.kind, NoticeKind::Restarting);
+    assert_eq!(amber.tone, StatusTone::Amber);
+    // Single idle wakeup 5 s later with clamped dt: must escalate to Red Unreachable.
+    h.wall.tick(1.0 / 30.0, 15_500.0);
+    let red = h
+        .frame()
+        .status_notice
+        .expect("epoch-ms disconnect must escalate to Unreachable after 5 s even with clamped dt");
+    assert_eq!(red.kind, NoticeKind::Unreachable);
+    assert_eq!(red.tone, StatusTone::Red);
 }
 
 #[test]
@@ -2689,6 +2717,226 @@ fn frame_map_label_hovered_tracks_terminal_and_label_pill_hover() {
     assert!(
         f3.map_labels.iter().all(|m| !m.hovered),
         "moving to empty canvas must clear MapLabelFrame::hovered"
+    );
+}
+
+#[test]
+fn fit_and_frame_shrink_and_shift_clear_of_docked_panels() {
+    use wall_core::dock::DOCK_WIDTHS;
+
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h
+        .wall
+        .groups()
+        .ids()
+        .into_iter()
+        .next()
+        .expect("group id");
+
+    // Baseline fit with no panels docked.
+    h.run_ok("wall.fit");
+    h.settle();
+    let f_none = h.frame();
+    let vw = f_none.viewport.w;
+    assert_eq!(f_none.panels.dock.edges.left, 0.0);
+    assert_eq!(f_none.panels.dock.edges.right, 0.0);
+    let zoom_none = f_none.camera.zoom;
+
+    // 1. Dock sidebar left (248 px): `wall.fit` shrinks zoom and shifts terminals right of `edges.left`.
+    h.run_ok("wall.sidebar left");
+    h.run_ok("wall.fit");
+    h.settle();
+    let f_left = h.frame();
+    assert_eq!(f_left.panels.dock.edges.left, DOCK_WIDTHS.sidebar);
+    assert!(
+        f_left.camera.zoom < zoom_none,
+        "left-docked sidebar must shrink fit_all zoom ({} < {})",
+        f_left.camera.zoom,
+        zoom_none
+    );
+    let all_left_boxes: Vec<_> = f_left
+        .terminals
+        .iter()
+        .map(|t| f_left.camera.to_screen_box(t.body_rect, vw, f_left.viewport.h))
+        .collect();
+    let min_left = all_left_boxes
+        .iter()
+        .map(|b| b.left)
+        .fold(f64::INFINITY, f64::min);
+    let max_right = all_left_boxes
+        .iter()
+        .map(|b| b.right)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        min_left >= DOCK_WIDTHS.sidebar - 0.5,
+        "fitted terminals must stay clear of left sidebar (left={min_left}, dock={})",
+        DOCK_WIDTHS.sidebar
+    );
+    assert!(
+        max_right <= vw + 0.5,
+        "fitted terminals must stay inside right viewport edge (right={max_right}, vw={vw})"
+    );
+    let expected_cx = DOCK_WIDTHS.sidebar + 0.5 * (vw - DOCK_WIDTHS.sidebar);
+    let actual_cx = 0.5 * (min_left + max_right);
+    assert!(
+        (actual_cx - expected_cx).abs() < 2.0,
+        "fit_all should centre in remaining clear width (actual_cx={actual_cx}, expected={expected_cx})"
+    );
+
+    // 2. Dock status window right (440 px) as well: `wall.reveal t1` (`frame_target`) stays clear of both edges.
+    h.run_ok("wall.status right");
+    h.run_ok(&format!("wall.reveal {t1}"));
+    h.settle();
+    let f_both = h.frame();
+    let left_edge = DOCK_WIDTHS.sidebar;
+    let right_edge = vw - DOCK_WIDTHS.status;
+    let t1_box = f_both.camera.to_screen_box(
+        f_both
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .body_rect,
+        vw,
+        f_both.viewport.h,
+    );
+    assert!(
+        t1_box.left >= left_edge - 0.5 && t1_box.right <= right_edge + 0.5,
+        "frame_target must keep {t1} inside [{left_edge}, {right_edge}], got [{}, {}]",
+        t1_box.left,
+        t1_box.right
+    );
+    let clear_cx = 0.5 * (left_edge + right_edge);
+    assert!(
+        (0.5 * (t1_box.left + t1_box.right) - clear_cx).abs() < 2.0,
+        "frame_target should centre in [{left_edge}, {right_edge}]"
+    );
+
+    // 3. `wall.group.frame` also fits and centres the group box inside `[left_edge, right_edge]`.
+    h.run_ok(&format!("wall.group.frame {gid}"));
+    h.settle();
+    let f_grp = h.frame();
+    let grp = f_grp.groups.iter().find(|g| g.id == gid).expect("group");
+    let g_box = f_grp.camera.to_screen_box(grp.frame_rect, vw, f_grp.viewport.h);
+    assert!(
+        g_box.left >= left_edge - 0.5 && g_box.right <= right_edge + 0.5,
+        "frame_group must keep group inside [{left_edge}, {right_edge}], got [{}, {}]",
+        g_box.left,
+        g_box.right
+    );
+}
+
+#[test]
+fn wall_blur_clears_pressed_keys_cancels_close_hold_and_cancels_active_drag() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    h.run_ok("wall.fit");
+    h.settle();
+    assert_eq!(h.wall.focused_id(), Some(t1.as_str()));
+
+    // 1. Repro from keyboard agent: press Cmd+X (starts close hold), do NOT deliver keyup,
+    //    call Wall::blur(), then tick past closeHoldMs -> terminal must survive!
+    h.key_press("x", "KeyX", MODS_META);
+    let f_holding = h.frame();
+    assert!(
+        f_holding
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .close_hold_progress
+            .is_some(),
+        "Cmd+X must start close_hold on focused terminal"
+    );
+
+    // Also press a normal terminal key without releasing it, and start a Shift-lasso drag.
+    h.key_press("a", "KeyA", MODS_NONE);
+    h.keys_sent.clear();
+    h.now_ms += 16.0;
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 7,
+            x: 10.0,
+            y: 10.0,
+            button: Some(Button::Left),
+            buttons: Buttons::LEFT,
+            mods: MODS_SHIFT,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    h.now_ms += 16.0;
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 7,
+            x: 60.0,
+            y: 60.0,
+            button: None,
+            buttons: Buttons::LEFT,
+            mods: MODS_SHIFT,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    assert!(h.wall.pointer().busy(), "lasso drag should be active");
+    assert!(h.frame().lasso.is_some(), "lasso overlay should be visible");
+
+    // Window loses focus -> Wall::blur().
+    h.wall.blur();
+    h.pump();
+
+    assert!(
+        !h.wall.pointer().busy(),
+        "Wall::blur must cancel any active pointer drag regardless of pointer_id"
+    );
+    let f_blurred = h.frame();
+    assert!(f_blurred.lasso.is_none(), "Wall::blur must clear active lasso");
+    assert!(
+        f_blurred
+            .terminals
+            .iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .close_hold_progress
+            .is_none(),
+        "Wall::blur must cancel active close hold"
+    );
+    assert_eq!(
+        h.wall.focused_id(),
+        Some(t1.as_str()),
+        "Wall::blur must preserve terminal keyboard focus for when window regains focus"
+    );
+    assert_eq!(h.wall.hovered_id(), None);
+    assert_eq!(h.wall.hovered_group_id(), None);
+
+    // Tick well past closeHoldMs (default 600 ms): terminal must NOT be killed.
+    h.now_ms += 1_500.0;
+    let _ = h.wall.tick(0.016, h.now_ms);
+    h.pump();
+    assert!(
+        h.wall.terminal(&t1).is_some(),
+        "terminal must survive ticking past closeHoldMs after Wall::blur"
+    );
+
+    // A stray KeyA release after blur must NOT be forwarded to the terminal (pressed keys cleared).
+    h.keys_sent.clear();
+    h.wall.key(
+        &KeyEvent {
+            code: "KeyA".to_owned(),
+            key: "a".to_owned(),
+            pressed: false,
+            mods: MODS_NONE,
+            ..Default::default()
+        },
+        &h.screens,
+    );
+    h.pump();
+    assert!(
+        h.keys_sent.is_empty(),
+        "releasing a key that was down before Wall::blur must not send a stray release"
     );
 }
 

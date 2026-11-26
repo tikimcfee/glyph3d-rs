@@ -613,6 +613,10 @@ struct WallCore {
     /// Latest clock timestamp (ms) observed on `termd` status transitions or ticks,
     /// supporting callers that pass either monotonic or Unix epoch ms into `on_termd_*`.
     termd_now_ms: Option<u64>,
+    /// `WallCore::now_ms` at the previous `advance_termd_clock` step after an out-of-band
+    /// epoch-ms `on_termd_*` update, so unclamped real elapsed time drives grace escalation
+    /// even when the window caps `dt_secs` at `1/30 s`.
+    termd_tick_wall_ms: Option<f64>,
     bus: Option<GomuxSnapshot>,
     bus_reason: String,
     platform: Platform,
@@ -1248,6 +1252,7 @@ impl WallCore {
             pressed_keys: PressedKeys::new(),
             termd: TermdStatus::new(opts.namespace),
             termd_now_ms: None,
+            termd_tick_wall_ms: None,
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
             platform: opts.platform,
@@ -1521,6 +1526,7 @@ impl WallCore {
 
     fn record_termd_now_ms(&mut self, now_ms: u64) {
         self.termd_now_ms = Some(self.termd_now_ms.map_or(now_ms, |prev| prev.max(now_ms)));
+        self.termd_tick_wall_ms = None;
     }
 
     fn effective_termd_now_ms(&self) -> u64 {
@@ -1552,10 +1558,15 @@ impl WallCore {
         let wall_ms = now_ms.max(0.0) as u64;
         if let Some(t) = self.termd_now_ms {
             if t > wall_ms.saturating_add(60_000) {
-                let delta = (dt_secs.max(0.0) * 1000.0).round() as u64;
+                let delta = match self.termd_tick_wall_ms {
+                    Some(prev_wall) => (now_ms - prev_wall).max(0.0).round() as u64,
+                    None => (dt_secs.max(0.0) * 1000.0).round() as u64,
+                };
                 self.termd_now_ms = Some(t.saturating_add(delta));
+                self.termd_tick_wall_ms = Some(now_ms);
             } else {
                 self.termd_now_ms = Some(wall_ms.max(t));
+                self.termd_tick_wall_ms = Some(now_ms);
             }
         }
         let effective = self.effective_termd_now_ms();
@@ -1736,6 +1747,25 @@ impl WallCore {
         true
     }
 
+    fn dock_edges(&self) -> crate::dock::EdgeWidths {
+        dock_layout(&dock_state_from_store(self.model.store())).edges
+    }
+
+    /// Compute the [`CameraPose`] that fits `rect` inside the viewport area left
+    /// clear of any docked left/right panels (`dockLayout.edges`), shifting the
+    /// camera horizontally so `rect` centres in `[edges.left, view_w - edges.right]`.
+    fn fit_target_in_dock(&self, rect: Rect, margin: f64, max_zoom: f64) -> CameraPose {
+        let (vw, vh) = self.model.camera().view();
+        let edges = self.dock_edges();
+        let avail_w = (vw - edges.left - edges.right).max(1.0);
+        let mut pose = crate::layout::fit_rect(rect, avail_w, vh, margin, max_zoom);
+        let area_cx = (edges.left + avail_w * 0.5).clamp(0.0, vw);
+        if pose.zoom > 0.0 {
+            pose.x += (vw * 0.5 - area_cx) / pose.zoom;
+        }
+        pose
+    }
+
     fn focus_in_view(&mut self, id: &str) {
         if self.fullscreen.active() {
             self.focus(Some(id), true);
@@ -1745,7 +1775,11 @@ impl WallCore {
             Some(win) => {
                 let sbox = self.model.camera().to_screen_box(win);
                 let (vw, vh) = self.model.camera().view();
-                sbox.left < 0.0 || sbox.top < 0.0 || sbox.right > vw || sbox.bottom > vh
+                let edges = self.dock_edges();
+                sbox.left < edges.left
+                    || sbox.top < 0.0
+                    || sbox.right > vw - edges.right
+                    || sbox.bottom > vh
             }
             None => false,
         };
@@ -1760,16 +1794,9 @@ impl WallCore {
         let initial_rect = self
             .footprint_rect(id, self.model.camera().zoom())
             .unwrap_or(body);
-        let first = self
-            .model
-            .camera()
-            .fit_target(initial_rect, DEFAULT_FIT_MARGIN, cap);
+        let first = self.fit_target_in_dock(initial_rect, DEFAULT_FIT_MARGIN, cap);
         let second_rect = self.footprint_rect(id, first.zoom).unwrap_or(body);
-        Some(
-            self.model
-                .camera()
-                .fit_target(second_rect, DEFAULT_FIT_MARGIN, cap),
-        )
+        Some(self.fit_target_in_dock(second_rect, DEFAULT_FIT_MARGIN, cap))
     }
 
     fn frame_terminal(&mut self, id: &str) -> bool {
@@ -1796,20 +1823,13 @@ impl WallCore {
             return false;
         };
         self.pending_quench_wheel = true;
-        let first = self
-            .model
-            .camera()
-            .fit_target(all, FIT_ALL_MARGIN, f64::INFINITY);
+        let first = self.fit_target_in_dock(all, FIT_ALL_MARGIN, f64::INFINITY);
         let second_rects: Vec<Rect> = shown
             .iter()
             .filter_map(|id| self.footprint_rect(id, first.zoom))
             .collect();
         let target = union_rect(&second_rects)
-            .map(|r| {
-                self.model
-                    .camera()
-                    .fit_target(r, FIT_ALL_MARGIN, f64::INFINITY)
-            })
+            .map(|r| self.fit_target_in_dock(r, FIT_ALL_MARGIN, f64::INFINITY))
             .unwrap_or(first);
         self.model.camera_mut().ease_to(target);
         self.model.notify_changed();
@@ -1832,10 +1852,7 @@ impl WallCore {
             return Ok(false);
         };
         self.pending_quench_wheel = true;
-        let first = self
-            .model
-            .camera()
-            .fit_target(first_box, FIT_ALL_MARGIN, f64::INFINITY);
+        let first = self.fit_target_in_dock(first_box, FIT_ALL_MARGIN, f64::INFINITY);
         let second_box = {
             let view = self.read_groups_view();
             self.groups
@@ -1843,11 +1860,7 @@ impl WallCore {
                 .map_err(|e| e.to_string())?
         };
         let target = second_box
-            .map(|b| {
-                self.model
-                    .camera()
-                    .fit_target(b, FIT_ALL_MARGIN, f64::INFINITY)
-            })
+            .map(|b| self.fit_target_in_dock(b, FIT_ALL_MARGIN, f64::INFINITY))
             .unwrap_or(first);
         self.model.camera_mut().ease_to(target);
         self.model.notify_changed();
@@ -2343,8 +2356,13 @@ impl WallCore {
         } else if *is_group {
             let sbox = self.model.camera().to_screen_box(*unit_rect);
             let (vw, vh) = self.model.camera().view();
+            let edges = self.dock_edges();
             self.focus(Some(&target), false);
-            if sbox.left < 0.0 || sbox.top < 0.0 || sbox.right > vw || sbox.bottom > vh {
+            if sbox.left < edges.left
+                || sbox.top < 0.0
+                || sbox.right > vw - edges.right
+                || sbox.bottom > vh
+            {
                 let _ = self.frame_group(unit_id);
             }
         } else {
@@ -4556,6 +4574,27 @@ impl Wall {
             };
             self.pointer.on_up(&mut bridge, event);
         }
+        self.sync_pointer_flags();
+        self.router.context.model.notify_changed();
+    }
+
+    /// Handle window focus loss (`WindowEvent::Focused(false)` / browser `blur` &
+    /// `visibilitychange`): clears tracked pressed keys, cancels any held close chord,
+    /// cancels any in-flight pointer gesture and buffered wheel scroll glide, and clears
+    /// transient hover highlights while preserving terminal keyboard focus (`focused_id`).
+    pub fn blur(&mut self) {
+        self.router.context.pressed_keys.clear();
+        self.router.context.cancel_close_hold();
+        {
+            let mut bridge = PointerBridge {
+                router: &mut self.router,
+                screens: None,
+            };
+            self.pointer.cancel_active(&mut bridge);
+        }
+        self.router.context.model.set_hovered(None);
+        self.router.context.set_hovered_group(None);
+        self.router.context.set_hovered_label(None);
         self.sync_pointer_flags();
         self.router.context.model.notify_changed();
     }
