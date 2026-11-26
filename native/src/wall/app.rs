@@ -442,6 +442,8 @@ impl App {
             wall.run("wall.fit");
         }
         self.apply_effects();
+        self.serve_control();
+        self.pump();
         self.redraw();
     }
 
@@ -1168,6 +1170,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.serve_control();
         if self.quit {
             event_loop.exit();
             return;
