@@ -27,7 +27,8 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::metrics::WorldRect;
-use super::renderer::{TerminalDraw, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
+use super::paper::PaperStyle;
+use super::renderer::{TerminalDraw, WALL_DEPTH_FORMAT, WallFrame, WallRenderer, WallStyle, WallTarget};
 
 /// Physical pixels a wheel "line" is worth when a mouse reports lines.
 const PX_PER_LINE: f32 = 53.0;
@@ -251,8 +252,10 @@ impl App {
                 border_color: None,
             })
             .collect();
+        let paper = PaperStyle::default();
+        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws };
         let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") });
-        g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &draws);
+        g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.queue.present(frame);
         self.frames += 1;

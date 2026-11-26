@@ -21,6 +21,7 @@ use crate::gpu::GpuContext;
 use super::camera::WallCamera;
 use super::cell::{CellGpu, dirty_row_ranges, pack_cell};
 use super::metrics::CellMetrics;
+use super::paper::{PaperStyle, WallPaperUniform, build_paper_uniform};
 
 /// Depth texture format expected by [`WallRenderer`] (reverse-Z, clear 0.0).
 pub const WALL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -101,6 +102,16 @@ pub struct TerminalDraw<'a> {
     pub border_color: Option<u32>,
 }
 
+/// Complete description of one wall frame submitted to [`WallRenderer::render`].
+#[derive(Default)]
+pub struct WallFrame<'a> {
+    /// Optional drafting paper (canvas clear colour + discrete minor/major grid).
+    /// When `None`, `render` clears to [`WallStyle::clear_color`] without grid lines.
+    pub paper: Option<&'a PaperStyle>,
+    /// Live or static terminals to draw (sorted internally back-to-front by `z`).
+    pub terminals: &'a [TerminalDraw<'a>],
+}
+
 /// Shared per-frame uniform block (`WallFrameUniform` in `wall_cells.wgsl`, 224 B).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -177,6 +188,10 @@ pub struct WallRenderer {
     metrics: CellMetrics,
     style: WallStyle,
     color_format: wgpu::TextureFormat,
+    paper_buf: wgpu::Buffer,
+    paper_bg: wgpu::BindGroup,
+    paper_pipeline: wgpu::RenderPipeline,
+    draw_paper: bool,
     frame_buf: wgpu::Buffer,
     quad_index_buf: wgpu::Buffer,
     shared_bg: wgpu::BindGroup,
@@ -268,6 +283,78 @@ impl WallRenderer {
     ) -> Self {
         let atlas_gpu = AtlasGpu::upload(device, queue, &atlas);
         let metrics = CellMetrics::from_primary(atlas.metrics);
+
+        let paper_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wall paper uniform"),
+            size: std::mem::size_of::<WallPaperUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let paper_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("wall paper bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let paper_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wall paper bg"),
+            layout: &paper_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: paper_buf.as_entire_binding(),
+            }],
+        });
+        let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wall_paper.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_paper.wgsl").into()),
+        });
+        let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("wall paper pl"),
+            bind_group_layouts: &[Some(&paper_bgl)],
+            immediate_size: 0,
+        });
+        let paper_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wall paper pipeline"),
+            layout: Some(&paper_pl),
+            vertex: wgpu::VertexState {
+                module: &paper_shader,
+                entry_point: Some("vs_paper"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &paper_shader,
+                entry_point: Some("fs_paper"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -463,6 +550,10 @@ impl WallRenderer {
             metrics,
             style,
             color_format,
+            paper_buf,
+            paper_bg,
+            paper_pipeline,
+            draw_paper: false,
             frame_buf,
             quad_index_buf,
             shared_bg,
@@ -658,19 +749,30 @@ impl WallRenderer {
         }
     }
 
-    /// Upload frame uniforms and any dirty terminal rows, and sort `terminals`
-    /// back-to-front by `z`. Call before [`Self::record_into_pass`].
+    /// Upload frame uniforms, paper parameters, and any dirty terminal rows,
+    /// and sort `frame.terminals` back-to-front by `z`. Call before [`Self::record_into_pass`].
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         viewport: (u32, u32),
         camera: &WallCamera,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
     ) -> UploadStats {
+        let target_is_srgb = self.color_format.is_srgb();
+        if let Some(paper_uniform) = frame
+            .paper
+            .and_then(|p| build_paper_uniform(p, camera, viewport, target_is_srgb))
+        {
+            queue.write_buffer(&self.paper_buf, 0, bytemuck::bytes_of(&paper_uniform));
+            self.draw_paper = true;
+        } else {
+            self.draw_paper = false;
+        }
+
         let (line_a, line_b) = fold_line_uniforms(&self.style);
         let sheet = &self.atlas.emoji.sheet;
-        let frame = WallFrameUniform {
+        let frame_uniform = WallFrameUniform {
             view_proj: camera.view_proj(viewport).to_cols_array_2d(),
             viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32],
             cell_size: [self.metrics.cell_width, self.metrics.cell_height],
@@ -690,12 +792,13 @@ impl WallRenderer {
             border_focused_scale: self.style.border_focused_scale,
             cursor_fill_alpha: self.style.cursor_fill_opacity,
             cursor_border_px: self.style.cursor_border_px,
-            target_is_srgb: u32::from(self.color_format.is_srgb()),
+            target_is_srgb: u32::from(target_is_srgb),
             _pad0: 0,
             _pad1: 0,
         };
-        queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
+        queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame_uniform));
 
+        let terminals = frame.terminals;
         let mut stats = UploadStats {
             terminals_drawn: terminals.len(),
             ..Default::default()
@@ -714,14 +817,25 @@ impl WallRenderer {
         stats
     }
 
-    /// Record draw calls for the prepared `terminals` into an existing render pass.
+    /// Record draw calls for the prepared `frame` into an existing render pass.
     /// The pass's colour attachment must match `color_format` and its depth
     /// attachment must be [`WALL_DEPTH_FORMAT`] (reverse-Z, cleared to 0.0).
     pub fn record_into_pass<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
     ) {
+        if self.draw_paper {
+            pass.set_pipeline(&self.paper_pipeline);
+            pass.set_bind_group(0, &self.paper_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let terminals = frame.terminals;
+        if terminals.is_empty() {
+            return;
+        }
+
         pass.set_bind_group(0, &self.shared_bg, &[]);
         pass.set_index_buffer(self.quad_index_buf.slice(..), wgpu::IndexFormat::Uint16);
 
@@ -755,8 +869,9 @@ impl WallRenderer {
         }
     }
 
-    /// Upload any changed terminal rows, clear `target` to `style.clear_color`
-    /// and depth 0.0, and draw `terminals`.
+    /// Upload any changed terminal rows, clear `target` to `paper.background`
+    /// (or `style.clear_color` when `frame.paper` is `None`) and depth 0.0,
+    /// then draw `frame`.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -764,14 +879,18 @@ impl WallRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &WallTarget<'_>,
         camera: &WallCamera,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
     ) -> UploadStats {
-        let clear = srgb_to_wgpu_clear_color(self.style.clear_color, self.color_format.is_srgb());
-        self.render_pass_impl(device, queue, encoder, target, camera, terminals, Some(clear))
+        let clear_rgba = frame
+            .paper
+            .map(|p| p.background)
+            .unwrap_or(self.style.clear_color);
+        let clear = srgb_to_wgpu_clear_color(clear_rgba, self.color_format.is_srgb());
+        self.render_pass_impl(device, queue, encoder, target, camera, frame, Some(clear))
     }
 
-    /// Upload any changed terminal rows and draw `terminals` over existing
-    /// colour and depth contents (`LoadOp::Load`), e.g. on top of grid paper.
+    /// Upload any changed terminal rows and draw `frame` over existing
+    /// colour and depth contents (`LoadOp::Load`).
     pub fn render_over(
         &mut self,
         device: &wgpu::Device,
@@ -779,9 +898,9 @@ impl WallRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &WallTarget<'_>,
         camera: &WallCamera,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
     ) -> UploadStats {
-        self.render_pass_impl(device, queue, encoder, target, camera, terminals, None)
+        self.render_pass_impl(device, queue, encoder, target, camera, frame, None)
     }
 
     #[expect(clippy::too_many_arguments, reason = "internal pass helper shared by render and render_over")]
@@ -792,10 +911,10 @@ impl WallRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &WallTarget<'_>,
         camera: &WallCamera,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
         clear: Option<wgpu::Color>,
     ) -> UploadStats {
-        let stats = self.prepare(device, queue, (target.width, target.height), camera, terminals);
+        let stats = self.prepare(device, queue, (target.width, target.height), camera, frame);
         let (color_load, depth_load) = match clear {
             Some(c) => (wgpu::LoadOp::Clear(c), wgpu::LoadOp::Clear(0.0)),
             None => (wgpu::LoadOp::Load, wgpu::LoadOp::Load),
@@ -821,7 +940,7 @@ impl WallRenderer {
             }),
             ..Default::default()
         });
-        self.record_into_pass(&mut pass, terminals);
+        self.record_into_pass(&mut pass, frame);
         stats
     }
 }
@@ -831,7 +950,7 @@ pub fn render_wall_to_png(
     ctx: &GpuContext,
     renderer: &mut WallRenderer,
     camera: &WallCamera,
-    terminals: &[TerminalDraw<'_>],
+    frame: &WallFrame<'_>,
     viewport: (u32, u32),
     frames: u32,
     path: &Path,
@@ -879,7 +998,7 @@ pub fn render_wall_to_png(
             width,
             height,
         };
-        renderer.render(device, &ctx.queue, &mut encoder, &target, camera, terminals);
+        renderer.render(device, &ctx.queue, &mut encoder, &target, camera, frame);
         if frame_idx == frames - 1 {
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -930,7 +1049,7 @@ pub fn render_wall_to_png(
         "wall offscreen: {}x{}, {} terminal(s), {} frame(s) in {:.2?}",
         width,
         height,
-        terminals.len(),
+        frame.terminals.len(),
         frames,
         t0.elapsed(),
     );
@@ -983,11 +1102,16 @@ pub fn render_test_pattern_offscreen(
     if zoom_multiplier > 0.0 && zoom_multiplier.is_finite() {
         camera.zoom *= zoom_multiplier;
     }
+    let paper = PaperStyle::default();
+    let frame = WallFrame {
+        paper: Some(&paper),
+        terminals: &draws,
+    };
     render_wall_to_png(
         ctx,
         &mut renderer,
         &camera,
-        &draws,
+        &frame,
         (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT),
         frames,
         path,
@@ -1009,7 +1133,7 @@ mod tests {
         ctx: &GpuContext,
         renderer: &mut WallRenderer,
         camera: &WallCamera,
-        terminals: &[TerminalDraw<'_>],
+        frame: &WallFrame<'_>,
         width: u32,
         height: u32,
     ) -> Vec<u8> {
@@ -1051,7 +1175,7 @@ mod tests {
             width,
             height,
         };
-        let _stats = renderer.render(device, &ctx.queue, &mut encoder, &target, camera, terminals);
+        let _stats = renderer.render(device, &ctx.queue, &mut encoder, &target, camera, frame);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -1134,7 +1258,8 @@ mod tests {
                 border_color: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
-            let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &list, w, h);
+            let frame = WallFrame { paper: None, terminals: &list };
+            let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
             let center_idx = ((h / 2) * w + (w / 2)) as usize * 4;
             let got = [px[center_idx], px[center_idx + 1], px[center_idx + 2]];
             assert!(
@@ -1178,12 +1303,24 @@ mod tests {
         let vp = (320, 320);
 
         // Frame 1: initial upload of all 8 rows in 1 write.
-        let s1 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        let s1 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+        );
         assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 8, write_calls: 1 });
         assert_eq!(renderer.cached_terminal_count(), 1);
 
         // Frame 2: unchanged generation -> zero row uploads.
-        let s2 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        let s2 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+        );
         assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 0, rows_uploaded: 0, write_calls: 0 });
 
         // Frame 3: edit rows 1, 2 (contiguous) and row 5 (disjoint) -> 3 rows, 2 writes.
@@ -1193,7 +1330,13 @@ mod tests {
         screen.touch_row(2);
         screen.row_mut(5)[0].bg = rgb(0xe0, 0x30, 0x30);
         screen.touch_row(5);
-        let s3 = renderer.prepare(&ctx.device, &ctx.queue, vp, &cam, &[make_draw(&screen, true)]);
+        let s3 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&screen, true)] },
+        );
         assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 2 });
 
         // Verify all 4 cursor states render into expected cell regions (Block, Bar, Underline, Hollow).
@@ -1223,27 +1366,137 @@ mod tests {
         let top_mid_px = cell_cam.world_to_screen(Vec2::new(cell_w * 0.5, -cell_h * 0.2), (w, h));
 
         // 1. Focused Block: interior is lit green.
-        let px_block = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        let px_block = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cell_cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            w,
+            h,
+        );
         assert!(sample_g(&px_block, center_px.x, center_px.y) > 80, "focused block interior should be lit");
 
         // 2. Unfocused Hollow: border is lit green, interior center stays dark.
-        let px_hollow = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, false)], w, h);
+        let px_hollow = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cell_cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, false)] },
+            w,
+            h,
+        );
         assert!(sample_g(&px_hollow, left_px.x, left_px.y) > 80, "hollow cursor edge should be lit");
         assert!(sample_g(&px_hollow, center_px.x, center_px.y) < 10, "hollow cursor centre must stay dark");
 
         // 3. Focused Bar: left edge lit, right side dark.
         cursor_screen.cursor.shape = CursorShape::Bar;
-        let px_bar = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        let px_bar = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cell_cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            w,
+            h,
+        );
         assert!(sample_g(&px_bar, left_px.x, left_px.y) > 100, "bar cursor left edge should be lit");
         assert!(sample_g(&px_bar, right_px.x, right_px.y) < 10, "bar cursor right side must stay dark");
 
         // 4. Focused Underline: bottom edge lit, upper interior dark.
         cursor_screen.cursor.shape = CursorShape::Underline;
-        let px_ul = render_rgba_bytes(&ctx, &mut renderer, &cell_cam, &[make_draw(&cursor_screen, true)], w, h);
+        let px_ul = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cell_cam,
+            &WallFrame { paper: None, terminals: &[make_draw(&cursor_screen, true)] },
+            w,
+            h,
+        );
         assert!(sample_g(&px_ul, bottom_px.x, bottom_px.y) > 100, "underline cursor bottom should be lit");
         assert!(sample_g(&px_ul, top_mid_px.x, top_mid_px.y) < 10, "underline cursor top must stay dark");
 
         assert!(renderer.remove_terminal(42));
         assert_eq!(renderer.cached_terminal_count(), 0);
+    }
+
+    /// Verifies drafting paper renders exact sRGB minor/major colours at world
+    /// grid crossings and hard-switches minor lines off below `min_px`.
+    #[test]
+    fn gpu_paper_draws_exact_minor_and_major_lines_and_hard_switches() {
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let paper = PaperStyle {
+            show: true,
+            background: crate::wall::srgb_hex(0x07080b, 1.0),
+            minor_color: crate::wall::srgb_hex(0x204080, 1.0),
+            major_color: crate::wall::srgb_hex(0x90b0d0, 1.0),
+            minor_spacing: 4.0,
+            major_every: 5,
+            line_px: 2.0,
+            min_px: 6.0,
+        };
+        let w = 256u32;
+        let h = 256u32;
+        let sample = |px: &[u8], cam: &WallCamera, world: Vec2| -> [u8; 3] {
+            let s = cam.world_to_screen(world, (w, h));
+            let x = (s.x.floor() as u32).min(w - 1);
+            let y = (s.y.floor() as u32).min(h - 1);
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        // Zoom 4.0: minor_px = 16 >= 6, major_px = 80 >= 6 -> both levels draw.
+        let cam_both = WallCamera::new(Vec2::new(2.0, 2.0), 4.0);
+        let px_both = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam_both,
+            &WallFrame { paper: Some(&paper), terminals: &[] },
+            w,
+            h,
+        );
+        let on_major = sample(&px_both, &cam_both, Vec2::new(0.0, 2.0));
+        let on_minor = sample(&px_both, &cam_both, Vec2::new(4.0, 2.0));
+        let on_bg = sample(&px_both, &cam_both, Vec2::new(2.0, 2.0));
+        assert!(
+            on_major[0].abs_diff(0x90) <= 1 && on_major[1].abs_diff(0xb0) <= 1 && on_major[2].abs_diff(0xd0) <= 1,
+            "expected major line #90b0d0, got {on_major:?}"
+        );
+        assert!(
+            on_minor[0].abs_diff(0x20) <= 1 && on_minor[1].abs_diff(0x40) <= 1 && on_minor[2].abs_diff(0x80) <= 1,
+            "expected minor line #204080, got {on_minor:?}"
+        );
+        assert!(
+            on_bg[0].abs_diff(0x07) <= 1 && on_bg[1].abs_diff(0x08) <= 1 && on_bg[2].abs_diff(0x0b) <= 1,
+            "expected paper background #07080b, got {on_bg:?}"
+        );
+
+        // Zoom 1.0: minor_px = 4 < 6 (hard-switched off!), major_px = 20 >= 6 (still on!).
+        let cam_major = WallCamera::new(Vec2::new(2.0, 2.0), 1.0);
+        let px_major = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam_major,
+            &WallFrame { paper: Some(&paper), terminals: &[] },
+            w,
+            h,
+        );
+        let on_major2 = sample(&px_major, &cam_major, Vec2::new(0.0, 2.0));
+        let on_hidden_minor = sample(&px_major, &cam_major, Vec2::new(4.0, 2.0));
+        assert!(
+            on_major2[0].abs_diff(0x90) <= 1 && on_major2[1].abs_diff(0xb0) <= 1 && on_major2[2].abs_diff(0xd0) <= 1,
+            "expected major line still #90b0d0 at zoom 1.0, got {on_major2:?}"
+        );
+        assert!(
+            on_hidden_minor[0].abs_diff(0x07) <= 1 && on_hidden_minor[1].abs_diff(0x08) <= 1 && on_hidden_minor[2].abs_diff(0x0b) <= 1,
+            "minor line must hard-switch off to #07080b (never fade), got {on_hidden_minor:?}"
+        );
     }
 }
