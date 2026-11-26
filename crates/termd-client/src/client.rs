@@ -360,6 +360,12 @@ impl TermdHandle {
         Ok(())
     }
 
+    /// Captures terminal `opts.id`'s server-side screen (and optional scrollback) as plain or VT text.
+    pub fn capture(&self, opts: &Capture) -> Result<CaptureReply, Error> {
+        paths::validate_name("terminal id", &opts.id).map_err(Error::Start)?;
+        self.request(WireOp::Capture(opts))
+    }
+
     /// Scrolls this connection's view into scrollback or returns to the live screen.
     pub fn view(&self, handle: u32, view: View) -> Result<ViewReply, Error> {
         let (delta, live) = match view {

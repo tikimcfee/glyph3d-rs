@@ -253,6 +253,36 @@ pub struct Subscription {
     pub rows: u16,
 }
 
+/// Output format for [`Capture`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    /// Plain text, trailing spaces trimmed.
+    #[default]
+    Plain,
+    /// Text with SGR colour and attribute sequences.
+    Vt,
+}
+
+/// Options for the `capture` request (`PROTOCOL.md` "capture").
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capture {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<CaptureFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_rows: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unwrap: Option<bool>,
+}
+
+/// Reply returned by `capture`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureReply {
+    pub text: String,
+    pub rows: u64,
+}
+
 /// Scrollback view movement for [`crate::TermdHandle::view`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -547,6 +577,7 @@ pub(crate) enum WireOp<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         history_rows: Option<u32>,
     },
+    Capture(&'a Capture),
     View {
         handle: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -603,6 +634,7 @@ impl WireOp<'_> {
             WireOp::Take { .. } => "take",
             WireOp::Resize { .. } => "resize",
             WireOp::Repaint { .. } => "repaint",
+            WireOp::Capture(_) => "capture",
             WireOp::View { .. } => "view",
             WireOp::Key { .. } => "key",
             WireOp::Paste { .. } => "paste",

@@ -444,7 +444,10 @@ impl Vt {
         self.terminal.resized_since_fill = false;
         self.terminal.screen_switched_since_fill = false;
 
-        let incremental_rows = same_screen && !self.terminal.all_rows_dirty;
+        let incremental_rows = same_screen
+            && !self.terminal.all_rows_dirty
+            && scrolled_top == 0
+            && scroll_scope == ScrollScope::None;
 
         // Resolve panel defaults, honouring DECSCNM (`?5` reverse screen mode).
         let reverse_screen = self.terminal.modes.get(Mode::ReverseColors);

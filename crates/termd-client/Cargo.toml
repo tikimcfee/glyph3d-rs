@@ -8,5 +8,9 @@ description = "A client for g3d-termd's socket protocol: frames, requests, and a
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+glyph-vt = { path = "../glyph-vt" }
+term-cells = { path = "../term-cells" }
+
 [lints]
 workspace = true

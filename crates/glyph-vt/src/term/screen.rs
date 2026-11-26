@@ -284,34 +284,43 @@ impl Screen {
 
         if self.full_width_margins() {
             let to_history = self.scroll_top == 0 && self.max_scrollback > 0;
-            for _ in 0..count {
-                let mut row = std::mem::take(&mut self.active[self.scroll_top]);
-                // Shift rows up within the region.
-                for y in self.scroll_top..self.scroll_bottom {
-                    self.active.swap(y, y + 1);
-                }
-                if to_history {
+            if to_history {
+                for _ in 0..count {
+                    let mut row = std::mem::take(&mut self.active[self.scroll_top]);
+                    for y in self.scroll_top..self.scroll_bottom {
+                        self.active.swap(y, y + 1);
+                    }
                     row.trim();
                     if let Some(sink) = &self.scrollback_sink {
                         sink(&row);
                     }
                     self.scrollback.push_back(row);
                     self.active[self.scroll_bottom].clear(style, self.cols);
-                } else {
-                    // Recycle the evicted row's Vec<Cell> capacity into scroll_bottom.
+                }
+                for y in self.scroll_top..=self.scroll_bottom {
+                    self.active[y].dirty = true;
+                }
+                if self.scrollback.len() > self.max_scrollback {
+                    let overflow = self.scrollback.len() - self.max_scrollback;
+                    for _ in 0..overflow {
+                        self.scrollback.pop_front();
+                    }
+                    self.evicted += overflow as u64;
+                }
+            } else {
+                // Recycle the evicted rows' Vec<Cell> capacity in place and shift via a
+                // single slice rotation (`memmove`). Full-screen scrolls already disable
+                // per-row dirty skipping via `pending_scroll`, avoiding walking every row
+                // on each `\n`.
+                for row in &mut self.active[self.scroll_top..self.scroll_top + count] {
                     row.clear(style, self.cols);
-                    self.active[self.scroll_bottom] = row;
                 }
-            }
-            for y in self.scroll_top..=self.scroll_bottom {
-                self.active[y].dirty = true;
-            }
-            if to_history && self.scrollback.len() > self.max_scrollback {
-                let overflow = self.scrollback.len() - self.max_scrollback;
-                for _ in 0..overflow {
-                    self.scrollback.pop_front();
+                self.active[self.scroll_top..=self.scroll_bottom].rotate_left(count);
+                if self.scroll_top > 0 || self.scroll_bottom + 1 < self.rows {
+                    for y in self.scroll_top..=self.scroll_bottom {
+                        self.active[y].dirty = true;
+                    }
                 }
-                self.evicted += overflow as u64;
             }
         } else {
             // Margin-limited scroll: move cell spans, never touches history.

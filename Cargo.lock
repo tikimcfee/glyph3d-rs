@@ -4063,8 +4063,10 @@ dependencies = [
 name = "termd-client"
 version = "0.1.0"
 dependencies = [
+ "glyph-vt",
  "serde",
  "serde_json",
+ "term-cells",
 ]
 
 [[package]]
