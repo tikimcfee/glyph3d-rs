@@ -200,6 +200,13 @@ pub fn is_copy_chord(platform: Platform, event: &KeyEvent) -> bool {
 ///
 /// Plain `Ctrl+V` (`\x16`, readline's quoted-insert) is never a paste chord and still
 /// reaches the focused program.
+///
+/// **Deliberate difference from JS (`keyEncoding.js`):** `keyEncoding.isPasteChord` lives
+/// in `@glyph3d/core` without `chord.js`'s `IS_MAC` flag and therefore matches both
+/// `Meta+V` and `Ctrl+Shift+V` on every OS (swallowing `Ctrl+Shift+V` on macOS and
+/// `Super+V` on Linux/Windows instead of forwarding them to the terminal). Taking
+/// [`Platform`] here keeps `is_paste_chord` symmetric with [`is_copy_chord`] and
+/// [`paste_label`].
 pub fn is_paste_chord(platform: Platform, event: &KeyEvent) -> bool {
     if event.key != "v" && event.key != "V" {
         return false;

@@ -15,6 +15,7 @@ pub mod input;
 
 pub mod camera;
 pub mod chord;
+pub mod commands;
 pub mod config;
 pub mod dock;
 pub mod groups;
@@ -25,11 +26,15 @@ pub mod menu;
 pub mod model;
 pub mod mouse;
 <<<<<<< HEAD
+<<<<<<< HEAD
 pub mod names;
 pub mod palette;
 =======
 pub mod pointer;
 >>>>>>> wall-core-snap-scroll
+=======
+pub mod router;
+>>>>>>> wall-core-keys
 pub mod scroll;
 pub mod selection;
 pub mod settings;
