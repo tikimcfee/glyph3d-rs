@@ -1267,12 +1267,19 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
     );
 
     // 4. End-to-end `Sessions::resize` 14-step burst (`effect -> News::Resized`) settle timing &
-    //    outbound coalescing check.
+    //    outbound coalescing check on an already-running terminal.
+    let burst_ready = scratch.dir.join("burst-ready");
     let mut sessions =
         Sessions::open_target(&scratch.target(), wake.waker()).expect("open Sessions for burst");
     let (bid, _, _) = sessions
         .spawn(
-            Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()]),
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf b > \"$1\"; exec sleep 60".into(),
+                "sh".into(),
+                burst_ready.to_string_lossy().into_owned(),
+            ]),
             80,
             24,
         )
@@ -1280,10 +1287,13 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(10), || {
             let _ = sessions.pump();
-            sessions.session(&bid).is_some_and(|s| s.stats().publishes >= 1)
+            burst_ready.exists()
+                && sessions.session(&bid).is_some_and(|s| s.stats().publishes >= 1)
         }),
         "burst terminal initial publish did not arrive"
     );
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = sessions.pump();
 
     seen = wake.current();
     let t_burst = Instant::now();
