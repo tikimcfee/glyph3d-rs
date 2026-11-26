@@ -1,9 +1,10 @@
 //! Run-time font loading and Slug quadratic-curve atlas (`out/WALL-PLAN-2026-11-26.md`, package C).
 //!
 //! Loads TrueType (`glyf`), variable TrueType (`fvar`/`gvar`), and OpenType CFF font files at
-//! run time, extracts and normalises glyph outlines into the engine's Slug RGBA32Uint texture
-//! layout (`assets/atlas/FORMAT.md`), and grows the backing textures on demand while reporting
-//! exact dirty texel spans for incremental GPU upload.
+//! run time, generates terminal cell sprites (box drawing, blocks, braille, legacy computing,
+//! powerline), composes combining-mark clusters, normalises glyph outlines into the engine's
+//! Slug RGBA32Uint texture layout (`assets/atlas/FORMAT.md`), and grows the backing textures
+//! on demand while reporting exact dirty texel spans for incremental GPU upload.
 //!
 //! # Quick start
 //!
@@ -15,8 +16,10 @@
 //! let mut atlas = FontAtlas::load(&specs).expect("load default fonts");
 //! let neon = atlas.family_id(MONASPACE_NEON_FAMILY).expect("monaspace-neon family");
 //! let slot = atlas.glyph(neon, Face::Bold, 'A');
+//! let sprite = atlas.glyph(neon, Face::Regular, '╭');
+//! let cluster = atlas.cluster(neon, Face::Regular, "x\u{0301}");
 //! let dirty = atlas.take_dirty();
-//! # let _ = (slot, dirty);
+//! # let _ = (slot, sprite, cluster, dirty);
 //! ```
 
 pub mod atlas;
@@ -26,23 +29,32 @@ pub mod encode;
 pub mod families;
 pub mod metrics;
 pub mod raster;
+pub mod sprites;
 
-pub use atlas::{Face, FamilyId, FontAtlas, FontError, Slot, SlotInfo};
-pub use buffer::{texel_range_to_rects, DirtyUpdate, SlugBuffer, TexelRect, TextureBacking, TextureDirty};
+pub use atlas::{Face, FamilyId, FontAtlas, FontError, Slot, SlotInfo, SlotKind};
+pub use buffer::{
+    texel_range_to_rects, DirtyUpdate, SlugBuffer, TexelRect, TextureBacking, TextureDirty,
+};
 pub use constants::{
     pack_u16, unpack_u16, BLANK_SLOT, CURVE_INITIAL_ROWS, GLYPH_MODE_BITMAP, GLYPH_MODE_OUTLINE,
     GLYPH_MODE_SPRITE, MAP_INITIAL_ROWS, TEXELS_PER_CURVE, TEXTURE_WIDTH, U32S_PER_CURVE,
     U32S_PER_TEXEL,
 };
 pub use encode::{
-    compute_bbox, encode_glyph, encode_raw_curves, is_cff_face, reverse_curves, Curve, CurveBBox,
+    compute_bbox, encode_composite_part_curves, encode_glyph, encode_raw_curves,
+    extract_raw_curves, is_cff_face, reverse_curves, CompositePart, Curve, CurveBBox,
     EncodedGlyph, OutlineCollector, PackedCurve,
 };
 pub use families::{
     cousine_family_spec, default_font_chain, monaspace_family_spec, FaceSpec, FontSource, FontSpec,
-    Variation, DEFAULT_FONT_FAMILY, MONASPACE_NEON_FAMILY,
+    Variation, DEFAULT_FONT_FAMILY, MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
 };
 pub use metrics::{
-    compute_cell_metrics, derive_char_size, snap_cell_dimension, CharSize, FamilyMetrics,
-    FontExtents, LineMetrics, RawLineMetrics, WorldCellMetrics, LETTER_SPACING, LINE_PITCH,
+    compute_cell_metrics, compute_sprite_metrics, derive_char_size, snap_cell_dimension, CharSize,
+    FamilyMetrics, FontExtents, LineMetrics, RawLineMetrics, WorldCellMetrics, LETTER_SPACING,
+    LINE_PITCH,
+};
+pub use sprites::{
+    encode_sprite, is_sprite_codepoint, sprite_outline, SpriteMetrics, SpriteOutline,
+    SPRITE_VERSION,
 };

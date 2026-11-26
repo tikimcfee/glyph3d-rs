@@ -275,6 +275,27 @@ pub fn is_cff_face(face: &Face<'_>) -> bool {
     face.tables().cff.is_some() || face.tables().cff2.is_some()
 }
 
+/// Extract raw font-unit quadratic curves for `glyph_id` (reversing CFF CCW winding to match CW),
+/// along with its tight ink bounding box returned by `ttf_parser::Face::outline_glyph`.
+pub fn extract_raw_curves(
+    face: &Face<'_>,
+    glyph_id: GlyphId,
+    extents: FontExtents,
+) -> (Vec<Curve>, Option<ttf_parser::Rect>, bool) {
+    let y_range = extents.em_height();
+    let cubic_tolerance = (y_range.abs().max(1.0)) * CUBIC_TOLERANCE_EM;
+    let mut collector = OutlineCollector::new(cubic_tolerance);
+    let rect = face.outline_glyph(glyph_id, &mut collector);
+    let Some(rect) = rect else {
+        return (Vec::new(), None, false);
+    };
+    let (mut raw_curves, had_cubics) = collector.into_curves();
+    if is_cff_face(face) && !raw_curves.is_empty() {
+        reverse_curves(&mut raw_curves);
+    }
+    (raw_curves, Some(rect), had_cubics)
+}
+
 /// Encode a single glyph from a `ttf_parser::Face` into packed Slug curves normalised to its cell.
 ///
 /// `extents` must be the vertical extents of `face` (already including line-gap adjustment if
@@ -282,39 +303,51 @@ pub fn is_cff_face(face: &Face<'_>) -> bool {
 /// by `[extents.descender, extents.ascender]` with y up.
 pub fn encode_glyph(face: &Face<'_>, glyph_id: GlyphId, extents: FontExtents) -> EncodedGlyph {
     let advance_fu = face.glyph_hor_advance(glyph_id).unwrap_or(0) as i32;
-    let y_range = extents.em_height();
-    let cubic_tolerance = (y_range.abs().max(1.0)) * CUBIC_TOLERANCE_EM;
-
-    let mut collector = OutlineCollector::new(cubic_tolerance);
-    if face.outline_glyph(glyph_id, &mut collector).is_none() {
-        return EncodedGlyph {
-            curves: Vec::new(),
-            advance_fu,
-            raw_bbox: None,
-            overhang_fraction: None,
-            had_cubics: false,
-        };
-    }
-
-    let (mut raw_curves, had_cubics) = collector.into_curves();
-    if raw_curves.is_empty() {
-        return EncodedGlyph {
-            curves: Vec::new(),
-            advance_fu,
-            raw_bbox: None,
-            overhang_fraction: None,
-            had_cubics,
-        };
-    }
-
-    // CFF outlines are wound CCW-outer / CW-inner; flip to TrueType CW-outer / CCW-inner so
-    // the engine's current `clamp(coverage * 0.5, 0, 1)` shader draws positive coverage even
-    // before it switches to `abs(coverage)`. Under `abs(coverage)` the flip is a no-op.
-    if is_cff_face(face) {
-        reverse_curves(&mut raw_curves);
-    }
-
+    let (raw_curves, _rect, had_cubics) = extract_raw_curves(face, glyph_id, extents);
     encode_raw_curves(&raw_curves, advance_fu, extents, had_cubics)
+}
+
+/// One placed glyph part of a composite cluster, matching `slugData.js::encodeComposite`:
+/// its curves are translated by `(offset_x_fu, offset_y_fu)` in its own font's units and
+/// normalised across `units_per_cell` horizontally and `[extents.descender, extents.ascender]`
+/// vertically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CompositePart {
+    pub font_index: usize,
+    pub glyph_id: u16,
+    pub offset_x_fu: i32,
+    pub offset_y_fu: i32,
+    pub units_per_cell: i32,
+}
+
+/// Normalise and pack raw font-unit curves of one composite part into cell-space `PackedCurve`s.
+pub fn encode_composite_part_curves(
+    raw_curves: &[Curve],
+    offset_x_fu: i32,
+    offset_y_fu: i32,
+    units_per_cell: i32,
+    extents: FontExtents,
+    out: &mut Vec<PackedCurve>,
+) {
+    let y_range = extents.em_height();
+    if raw_curves.is_empty() || units_per_cell <= 0 || y_range <= 0.0 {
+        return;
+    }
+    let xs = 1.0 / (units_per_cell as f64);
+    let ys = 1.0 / y_range;
+    let x0 = offset_x_fu as f64;
+    let y0 = offset_y_fu as f64 - extents.descender;
+    out.reserve(raw_curves.len());
+    for c in raw_curves {
+        out.push(PackedCurve::pack(Curve {
+            p0x: (c.p0x + x0) * xs,
+            p0y: (c.p0y + y0) * ys,
+            p1x: (c.p1x + x0) * xs,
+            p1y: (c.p1y + y0) * ys,
+            p2x: (c.p2x + x0) * xs,
+            p2y: (c.p2y + y0) * ys,
+        }));
+    }
 }
 
 /// Normalise and pack raw font-unit curves against `(advance_fu, extents)`.

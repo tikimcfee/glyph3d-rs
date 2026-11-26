@@ -1769,6 +1769,7 @@ dependencies = [
 name = "glyph-font"
 version = "0.1.0"
 dependencies = [
+ "icu_normalizer",
  "ttf-parser",
 ]
 

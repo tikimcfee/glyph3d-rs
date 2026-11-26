@@ -1,13 +1,22 @@
-//! Render a sample strip of glyphs from Cousine and Monaspace Neon to a PGM image
-//! using the CPU Slug rasteriser (`glyph_font::raster`).
+//! Render a sample grid of font faces, clusters, and generated cell sprites from Cousine,
+//! Monaspace Neon, and Monaspace Argon to a PGM image using the CPU Slug rasteriser.
 //!
 //! Run with:
 //! `cargo run -p glyph-font --example raster_preview -- /tmp/glyph-preview.pgm`
 
 use std::path::Path;
 
+use glyph_font::constants::GLYPH_MODE_SPRITE;
 use glyph_font::raster::{rasterize_glyph, write_pgm};
-use glyph_font::{default_font_chain, Face, FontAtlas, DEFAULT_FONT_FAMILY, MONASPACE_NEON_FAMILY};
+use glyph_font::{
+    default_font_chain, Face, FamilyId, FontAtlas, DEFAULT_FONT_FAMILY, MONASPACE_ARGON_FAMILY,
+    MONASPACE_NEON_FAMILY,
+};
+
+enum CellSpec {
+    Char(char),
+    Cluster(&'static str),
+}
 
 fn main() {
     let out_path = std::env::args()
@@ -24,30 +33,91 @@ fn main() {
     let mut atlas = FontAtlas::load(&specs).expect("load default fonts");
     let cousine = atlas.family_id(DEFAULT_FONT_FAMILY).expect("cousine");
     let neon = atlas.family_id(MONASPACE_NEON_FAMILY).expect("monaspace-neon");
+    let argon = atlas.family_id(MONASPACE_ARGON_FAMILY).expect("monaspace-argon");
 
-    let sample = "AgéH@09─│";
-    let rows = [
-        (cousine, Face::Regular),
-        (cousine, Face::Bold),
-        (cousine, Face::Italic),
-        (neon, Face::Regular),
-        (neon, Face::Bold),
-        (neon, Face::Italic),
-        (neon, Face::BoldItalic),
+    let text_cells = || {
+        vec![
+            CellSpec::Char('A'),
+            CellSpec::Char('g'),
+            CellSpec::Char('H'),
+            CellSpec::Char('@'),
+            CellSpec::Char('0'),
+            CellSpec::Cluster("e\u{0301}"),
+            CellSpec::Cluster("x\u{0301}"),
+            CellSpec::Cluster("q\u{0308}\u{0304}"),
+            CellSpec::Char('╭'),
+            CellSpec::Char('─'),
+            CellSpec::Char('╮'),
+            CellSpec::Char('╬'),
+        ]
+    };
+
+    // Cell sprites: box drawing (light/heavy/double/rounded/diag), blocks & shades,
+    // braille, legacy sextants/wedges, and powerline separators.
+    let sprite_row_1 = vec![
+        CellSpec::Char('╭'),
+        CellSpec::Char('─'),
+        CellSpec::Char('┬'),
+        CellSpec::Char('─'),
+        CellSpec::Char('╮'),
+        CellSpec::Char('╔'),
+        CellSpec::Char('═'),
+        CellSpec::Char('╬'),
+        CellSpec::Char('═'),
+        CellSpec::Char('╗'),
+        CellSpec::Char('╱'),
+        CellSpec::Char('╳'),
+    ];
+    let sprite_row_2 = vec![
+        CellSpec::Char('█'),
+        CellSpec::Char('▓'),
+        CellSpec::Char('▒'),
+        CellSpec::Char('░'),
+        CellSpec::Char('▀'),
+        CellSpec::Char('▄'),
+        CellSpec::Char('▚'),
+        CellSpec::Char('⣿'),
+        CellSpec::Char('🬼'),
+        CellSpec::Char('\u{E0B0}'),
+        CellSpec::Char('\u{E0B4}'),
+        CellSpec::Char('\u{E0B5}'),
+    ];
+
+    let rows: Vec<(FamilyId, Face, Vec<CellSpec>)> = vec![
+        (cousine, Face::Regular, text_cells()),
+        (cousine, Face::Bold, text_cells()),
+        (neon, Face::Regular, text_cells()),
+        (neon, Face::Bold, text_cells()),
+        (neon, Face::Italic, text_cells()),
+        (argon, Face::Regular, text_cells()),
+        (argon, Face::BoldItalic, text_cells()),
+        (neon, Face::Regular, sprite_row_1),
+        (neon, Face::Regular, sprite_row_2),
     ];
 
     let cell_w = 48usize;
     let cell_h = 80usize;
-    let cols = sample.chars().count();
+    let cols = rows[0].2.len();
     let img_w = cols * cell_w;
     let img_h = rows.len() * cell_h;
     let mut img = vec![0u8; img_w * img_h];
 
-    for (r, &(fam, face)) in rows.iter().enumerate() {
-        for (c, ch) in sample.chars().enumerate() {
-            let slot = atlas.glyph(fam, face, ch);
+    for (r, (fam, face, cells)) in rows.iter().enumerate() {
+        for (c, cell) in cells.iter().enumerate() {
+            let slot = match *cell {
+                CellSpec::Char(ch) => atlas.glyph(*fam, *face, ch),
+                CellSpec::Cluster(s) => atlas.cluster(*fam, *face, s),
+            };
+            let entry = atlas.map_entry(slot);
             let curves = atlas.slot_curves(slot);
-            let tile = rasterize_glyph(&curves, cell_w, cell_h, true);
+            let mut tile = rasterize_glyph(&curves, cell_w, cell_h, true);
+            // Apply sprite ink alpha (e.g. shades ░ ▒ ▓) just as the shader does for mode 3.
+            if entry[2] == GLYPH_MODE_SPRITE && entry[3] < 255 {
+                let alpha = entry[3] as u32;
+                for px in &mut tile {
+                    *px = ((*px as u32 * alpha + 127) / 255) as u8;
+                }
+            }
             for y in 0..cell_h {
                 let dst = (r * cell_h + y) * img_w + c * cell_w;
                 let src = y * cell_w;
