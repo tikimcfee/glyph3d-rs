@@ -14,10 +14,10 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use std::time::Duration;
 
 use wall_core::geom::Point;
-use wall_core::input::{Button, Mods, Platform};
+use wall_core::input::Platform;
 use wall_core::menu::{
     ChoiceOption, MenuConfig, MenuDimensions, MenuItem, MenuState, MenuTarget, SizeEdit,
-    check_size, is_secondary_press, menu_items, place_menu,
+    check_size, menu_items, place_menu,
 };
 
 /// Default hold-to-close duration in milliseconds (`closeHoldMs` in `wall/wallConfig.js`).
@@ -43,7 +43,6 @@ const CHIP_ACTIVE_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x43, 0x
 const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x0b, 0x0d, 0x13);
 const FIELD_FOCUS_BORDER: egui::Color32 = egui::Color32::from_rgb(0x4b, 0x56, 0x6b);
 const REFUSED_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe5, 0x53, 0x4b);
-const HINT_COLOR: egui::Color32 = egui::Color32::from_rgb(0x4f, 0x56, 0x65);
 
 /// Compute the menu's header caption for `target` (`captionOf` in `wall/ContextMenu.jsx`).
 pub fn caption_of(target: &MenuTarget, state: &MenuState) -> String {
@@ -299,33 +298,14 @@ fn set_active_row(state: &mut ContextMenuState, non_sep_items: &[&MenuItem], row
     }
 }
 
-fn estimate_menu_size(menu: &OpenContextMenu, menu_hint: bool) -> egui::Vec2 {
+fn estimate_menu_size(menu: &OpenContextMenu, _menu_hint: bool) -> egui::Vec2 {
     let row_h = menu
         .items
         .iter()
         .map(|it| if it.is_sep() { 9.0 } else { ROW_MIN_HEIGHT + 2.0 })
         .sum::<f32>()
         .max(ROW_MIN_HEIGHT);
-    let hint_h = if menu_hint { 24.0 } else { 0.0 };
-    egui::vec2(236.0, 24.0 + row_h + hint_h)
-}
-
-fn egui_mods_to_wall(m: egui::Modifiers) -> Mods {
-    Mods {
-        shift: m.shift,
-        ctrl: m.ctrl,
-        alt: m.alt,
-        meta: m.mac_cmd || (!cfg!(target_os = "macos") && m.command && !m.ctrl),
-    }
-}
-
-fn egui_button_to_wall(button: egui::PointerButton) -> Option<Button> {
-    match button {
-        egui::PointerButton::Primary => Some(Button::Left),
-        egui::PointerButton::Middle => Some(Button::Middle),
-        egui::PointerButton::Secondary => Some(Button::Right),
-        _ => None,
-    }
+    egui::vec2(236.0, 24.0 + row_h)
 }
 
 /// Draw the context menu into `ctx` and append any triggered wall verb lines to `out`.
@@ -615,10 +595,6 @@ pub fn show(
                     }
                 }
             }
-
-            if input.menu_hint {
-                draw_hint_footer(ui);
-            }
         });
     });
 
@@ -633,18 +609,17 @@ pub fn show(
     }
     state.last_rect = Some(rect);
 
-    // Dismiss on a non-secondary press outside the menu box (`WallMenu._onDown` in JS).
+    // Dismiss on any press outside the menu box (there is no browser menu passthrough in native).
     let clicked_outside = ctx.input(|i| {
-        i.events.iter().any(|ev| match ev {
-            egui::Event::PointerButton {
-                pos,
-                button,
-                pressed: true,
-                modifiers,
-            } if !rect.contains(*pos) => egui_button_to_wall(*button).is_some_and(|btn| {
-                !is_secondary_press(btn, egui_mods_to_wall(*modifiers), input.platform)
-            }),
-            _ => false,
+        i.events.iter().any(|ev| {
+            matches!(
+                ev,
+                egui::Event::PointerButton {
+                    pos,
+                    pressed: true,
+                    ..
+                } if !rect.contains(*pos)
+            )
         })
     });
     if clicked_outside {
@@ -1544,31 +1519,6 @@ fn paint_hold_ring(
         points,
         egui::Stroke::new(1.6, REFUSED_COLOR),
     ));
-}
-
-fn draw_hint_footer(ui: &mut egui::Ui) {
-    ui.add_space(4.0);
-    let width = ui.available_width().max(MENU_MIN_WIDTH);
-    let (line_rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
-    ui.painter().hline(
-        line_rect.x_range(),
-        line_rect.center().y,
-        egui::Stroke::new(1.0, SEP_COLOR),
-    );
-    egui::Frame::new()
-        .inner_margin(egui::Margin {
-            left: 26,
-            right: 10,
-            top: 5,
-            bottom: 2,
-        })
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("right-click again: browser menu")
-                    .font(egui::FontId::monospace(10.5))
-                    .color(HINT_COLOR),
-            );
-        });
 }
 
 #[cfg(test)]
