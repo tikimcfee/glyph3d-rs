@@ -3756,6 +3756,7 @@ mod tests {
                 panel_opacity: None,
                 border_color: None,
                 selection: None,
+                hover_link: None,
             })
             .collect();
         let paper = crate::wall::PaperStyle::default();
