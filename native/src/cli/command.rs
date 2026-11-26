@@ -31,6 +31,8 @@ pub enum CliCommand {
     Wall {
         emoji_sheet: PathBuf,
         pattern: bool,
+        /// The termd namespace its terminals live in.
+        namespace: String,
         /// Exit after this many frames (`--frames`).
         frames: Option<u32>,
     },
@@ -167,6 +169,7 @@ impl Cli {
             return CliCommand::Wall {
                 emoji_sheet,
                 pattern: self.wall_test_pattern,
+                namespace: self.wall_ns.clone(),
                 frames: self.frames,
             };
         }

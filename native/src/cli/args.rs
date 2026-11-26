@@ -100,6 +100,9 @@ pub struct Cli {
     /// --wall-test-pattern, the fixed test screen instead of live ones)
     #[arg(long)]
     pub wall: bool,
+    /// The termd namespace the wall keeps its terminals in
+    #[arg(long, value_name = "NAME", default_value = "rs-wall")]
+    pub wall_ns: String,
     /// Render the terminal wall test pattern (with --screenshot PATH)
     #[arg(long)]
     pub wall_test_pattern: bool,

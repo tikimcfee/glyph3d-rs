@@ -46,6 +46,8 @@ pub trait Terminal {
     }
     /// A key for the terminal's program.
     fn key(&mut self, _ev: &KeyEvent) {}
+    /// Text pasted into the terminal.
+    fn paste(&mut self, _text: &str) {}
     /// What the title bar would say.
     fn title(&self) -> &str {
         ""
@@ -256,6 +258,26 @@ impl App {
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.queue.present(frame);
         self.frames += 1;
+        // A counted run can type: GLYPH_WALL_PASTE is pasted into the
+        // focused terminal a moment in, so a script sees a program answer.
+        if self.exit_after.is_some() && self.frames == 30 {
+            if let Ok(text) = std::env::var("GLYPH_WALL_PASTE") {
+                if let Some(t) = self.focused.and_then(|id| self.terminals.iter_mut().find(|t| t.id == id)) {
+                    t.term.paste(&text);
+                }
+            }
+            // And press keys: GLYPH_WALL_TYPE goes in a key at a time, a
+            // newline as Enter, through the same path a keyboard takes
+            // after winit.
+            if let Ok(text) = std::env::var("GLYPH_WALL_TYPE") {
+                if let Some(t) = self.focused.and_then(|id| self.terminals.iter_mut().find(|t| t.id == id)) {
+                    for ch in text.chars() {
+                        let (key, typed) = if ch == '\n' { ("Enter".to_string(), None) } else { (ch.to_string(), Some(ch.to_string())) };
+                        t.term.key(&KeyEvent { code: String::new(), key, text: typed, pressed: true, ..KeyEvent::default() });
+                    }
+                }
+            }
+        }
     }
 
     fn wheel(&mut self, delta: MouseScrollDelta) {
@@ -381,4 +403,18 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
+    if app.exit_after.is_some() {
+        // A counted run says what its terminals showed, as text.
+        for t in &app.terminals {
+            let s = t.term.screen();
+            println!("--- terminal {} ({}x{}) {:?}", t.id, s.cols, s.rows, t.term.title());
+            for r in 0..s.rows {
+                let line: String = s.row(r).iter().map(|c| if c.content == 0 { " ".into() } else { s.content_str(c).into_owned() }).collect();
+                let line = line.trim_end();
+                if !line.is_empty() {
+                    println!("{line}");
+                }
+            }
+        }
+    }
 }

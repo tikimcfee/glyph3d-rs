@@ -17,6 +17,8 @@ pub mod keys;
 pub mod metrics;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
+#[cfg(feature = "windowed")]
+pub mod session;
 pub mod test_pattern;
 
 pub use camera::WallCamera;
