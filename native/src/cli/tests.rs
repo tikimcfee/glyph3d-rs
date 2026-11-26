@@ -705,29 +705,68 @@ fn cli_action_dispatch_variants() {
         other => panic!("expected Render, got {other:?}"),
     }
 
-    // 8. Render: Windowed with frames
-    let cli = parse(&["--frames", "1"]);
+    // 8. Default (no scene flag) with --frames: opens the wall in `rs-wall` and exits after N frames
+    let cli = parse(&["--frames", "60"]);
     match cli.action() {
-        CliCommand::Render(plan) => match plan.target {
-            RenderTarget::Windowed { frames, .. } => {
-                assert_eq!(frames, Some(1));
-            }
-            _ => panic!("expected Windowed"),
-        },
-        other => panic!("expected Render, got {other:?}"),
+        CliCommand::Wall { pattern, namespace, frames, .. } => {
+            assert!(!pattern);
+            assert_eq!(namespace, "rs-wall");
+            assert_eq!(frames, Some(60));
+        }
+        other => panic!("expected Wall on bare --frames, got {other:?}"),
     }
 
-    // 9. Render: Windowed without frames
-    let cli = parse(&[]);
+    // 9. Bare run (no arguments): opens the wall in `rs-wall`, identical to `--wall`
+    let bare = parse(&[]);
+    let explicit = parse(&["--wall"]);
+    match (bare.action(), explicit.action()) {
+        (
+            CliCommand::Wall {
+                emoji_sheet: sheet_a,
+                pattern: pat_a,
+                namespace: ns_a,
+                frames: frames_a,
+            },
+            CliCommand::Wall {
+                emoji_sheet: sheet_b,
+                pattern: pat_b,
+                namespace: ns_b,
+                frames: frames_b,
+            },
+        ) => {
+            assert_eq!(sheet_a, sheet_b);
+            assert!(!pat_a);
+            assert_eq!(pat_a, pat_b);
+            assert_eq!(ns_a, "rs-wall");
+            assert_eq!(ns_a, ns_b);
+            assert_eq!(frames_a, None);
+            assert_eq!(frames_a, frames_b);
+        }
+        other => panic!("expected Wall for both bare and --wall, got {other:?}"),
+    }
+
+    // 10. Windowed glyph scene when a scene flag IS given (`--render-file` with `--frames`)
+    let cli = parse(&["--render-file", "src/main.rs", "--frames", "1"]);
     match cli.action() {
-        CliCommand::Render(plan) => match plan.target {
-            RenderTarget::Windowed { frames, .. } => {
-                assert_eq!(frames, None);
+        CliCommand::Render(plan) => {
+            assert!(matches!(plan.choice, SceneChoice::Text { .. }));
+            match plan.target {
+                RenderTarget::Windowed { frames, .. } => assert_eq!(frames, Some(1)),
+                _ => panic!("expected Windowed"),
             }
-            _ => panic!("expected Windowed"),
-        },
+        }
         other => panic!("expected Render, got {other:?}"),
     }
+}
+
+#[cfg(all(feature = "windowed", target_os = "macos"))]
+#[test]
+fn macos_process_name_sets_nsprocessinfo_for_winit_menu() {
+    crate::set_macos_process_name(crate::WALL_MACOS_APP_NAME);
+    let got = objc2_foundation::NSProcessInfo::processInfo()
+        .processName()
+        .to_string();
+    assert_eq!(got, crate::WALL_MACOS_APP_NAME);
 }
 
 #[test]
