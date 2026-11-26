@@ -67,6 +67,7 @@ pub fn render_replay_offscreen(
         focused: true,
         panel_opacity: None,
         border_color: None,
+        selection: None,
     }];
 
     let pad = renderer.style().panel_padding;

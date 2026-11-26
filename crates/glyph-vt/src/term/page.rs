@@ -164,16 +164,14 @@ impl Row {
 
     /// Clear the whole row to blank-with-bg of `style`, at `cols` width.
     /// A fully default clear stores nothing (retaining existing capacity).
+    #[inline]
     pub fn clear(&mut self, style: &Style, cols: usize) {
         self.wrapped = false;
         self.semantic = SemanticPrompt::Output;
         self.dirty = true;
-        let blank = Cell::blank_with_bg(style);
-        if blank.is_default() {
-            self.cells.clear();
-        } else {
-            self.cells.clear();
-            self.cells.resize(cols, blank);
+        self.cells.clear();
+        if style.bg_color != crate::term::style::StyleColor::None {
+            self.cells.resize(cols, Cell::blank_with_bg(style));
         }
     }
 

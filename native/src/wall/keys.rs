@@ -57,16 +57,35 @@ fn text_of(logical: &Key, text: Option<&str>) -> Option<String> {
     }
 }
 
+/// Build a [`KeyEvent`] from physical/logical key parts and winit modifiers.
+pub fn key_from_parts(
+    physical_key: PhysicalKey,
+    logical_key: &Key,
+    text: Option<&str>,
+    state: ElementState,
+    repeat: bool,
+    modifiers: ModifiersState,
+) -> KeyEvent {
+    KeyEvent {
+        code: code_of(physical_key),
+        key: key_of(logical_key),
+        text: text_of(logical_key, text),
+        mods: mods(modifiers),
+        repeat,
+        pressed: state == ElementState::Pressed,
+    }
+}
+
 /// One winit key event as the wall's.
 pub fn key_event(ev: &winit::event::KeyEvent, modifiers: ModifiersState) -> KeyEvent {
-    KeyEvent {
-        code: code_of(ev.physical_key),
-        key: key_of(&ev.logical_key),
-        text: text_of(&ev.logical_key, ev.text.as_deref()),
-        mods: mods(modifiers),
-        repeat: ev.repeat,
-        pressed: ev.state == ElementState::Pressed,
-    }
+    key_from_parts(
+        ev.physical_key,
+        &ev.logical_key,
+        ev.text.as_deref(),
+        ev.state,
+        ev.repeat,
+        modifiers,
+    )
 }
 
 #[cfg(test)]

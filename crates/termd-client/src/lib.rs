@@ -16,8 +16,8 @@ pub use client::{
     DEFAULT_REQUEST_TIMEOUT,
 };
 pub use msg::{
-    code, Colors, Create, CreateReply, Flow, HolderInfo, IfExists, Key, KeyAction, Mode, Mouse,
-    MouseAction, MouseButton, OptionAsAlt, Role, Subscribe, SubscriberCounts, Subscription,
-    TermInfo, View, ViewReply, Welcome, WireError, PROTO,
+    code, Capture, CaptureFormat, CaptureReply, Colors, Create, CreateReply, Flow, HolderInfo,
+    IfExists, Key, KeyAction, Mode, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Subscribe,
+    SubscriberCounts, Subscription, TermInfo, View, ViewReply, Welcome, WireError, PROTO,
 };
 pub use paths::{find_termd, validate_name, Target, MAX_SOCKET_PATH_BYTES};
