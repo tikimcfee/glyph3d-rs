@@ -20,7 +20,10 @@ use crate::config::WallSettings;
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
-use super::cell::{CellGpu, dirty_row_ranges, pack_cell_resolved};
+use super::cell::{
+    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges_with_selection,
+    pack_cell_resolved,
+};
 use super::glyphs::GlyphSource;
 use super::labels::{Label, LabelGlyphGpu, LabelHeight, pack_label_glyphs};
 use super::metrics::{CellMetrics, sanitize_scale};
@@ -113,6 +116,8 @@ pub struct TerminalDraw<'a> {
     pub panel_opacity: Option<f32>,
     /// Optional per-terminal border colour override (packed sRGB RGBA8; `None` = focus/unfocused style).
     pub border_color: Option<u32>,
+    /// Optional cell-coordinate text selection highlight (linear stream or column block).
+    pub selection: Option<CellSelection>,
 }
 
 /// Complete description of one wall frame submitted to [`WallRenderer::render`].
@@ -184,6 +189,7 @@ struct TerminalGpu {
     cols: u16,
     rows: u16,
     uploaded_gen: u64,
+    uploaded_selection: Option<CellSelection>,
     force_repack: bool,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
@@ -1088,6 +1094,7 @@ impl WallRenderer {
                     cols,
                     rows,
                     uploaded_gen: 0,
+                    uploaded_selection: None,
                     force_repack: false,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
@@ -1122,8 +1129,11 @@ impl WallRenderer {
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
+        let active_selection = draw.selection.filter(|s| !s.is_empty());
+
         if cell_count == 0 {
             gpu.uploaded_gen = screen.generation;
+            gpu.uploaded_selection = active_selection;
             return;
         }
 
@@ -1133,8 +1143,16 @@ impl WallRenderer {
             self.pack_scratch.reserve(cell_count);
             for r in 0..usize::from(rows) {
                 let mut any_bg = false;
-                for cell in screen.row(r as u16) {
-                    let packed = pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
+                for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                    let mut packed =
+                        pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                    if let Some(sel) = active_selection {
+                        let col_u16 = c as u16;
+                        if col_u16 >= sel_span.start && col_u16 < sel_span.end {
+                            apply_selection_to_cell(&mut packed, &sel);
+                        }
+                    }
                     if (packed.bg >> 24) != 0 {
                         any_bg = true;
                     }
@@ -1145,12 +1163,21 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
+            gpu.uploaded_selection = active_selection;
             gpu.force_repack = false;
             stats.terminals_uploaded += 1;
             stats.rows_uploaded += usize::from(rows);
             stats.write_calls += 1;
-        } else if screen.generation != gpu.uploaded_gen {
-            let dirty = dirty_row_ranges(&screen.row_gen, gpu.uploaded_gen);
+        } else if screen.generation != gpu.uploaded_gen || active_selection != gpu.uploaded_selection
+        {
+            let dirty = dirty_row_ranges_with_selection(
+                &screen.row_gen,
+                cols,
+                screen.generation,
+                gpu.uploaded_gen,
+                gpu.uploaded_selection,
+                active_selection,
+            );
             let cols_usize = usize::from(cols);
             if !dirty.is_empty() {
                 stats.terminals_uploaded += 1;
@@ -1160,8 +1187,19 @@ impl WallRenderer {
                 self.pack_scratch.reserve(range.len() * cols_usize);
                 for r in range.clone() {
                     let mut any_bg = false;
-                    for cell in screen.row(r as u16) {
-                        let packed = pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                    let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
+                    for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                        let mut packed = pack_cell_resolved(
+                            self.glyphs.resolve_cell(screen, cell),
+                            screen,
+                            cell,
+                        );
+                        if let Some(sel) = active_selection {
+                            let col_u16 = c as u16;
+                            if col_u16 >= sel_span.start && col_u16 < sel_span.end {
+                                apply_selection_to_cell(&mut packed, &sel);
+                            }
+                        }
                         if (packed.bg >> 24) != 0 {
                             any_bg = true;
                         }
@@ -1180,6 +1218,7 @@ impl WallRenderer {
             }
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             gpu.uploaded_gen = screen.generation;
+            gpu.uploaded_selection = active_selection;
         }
     }
 
@@ -1717,6 +1756,7 @@ pub fn render_test_pattern_offscreen(
             focused: t.focused,
             panel_opacity: None,
             border_color: t.border_color,
+            selection: t.selection,
         })
         .collect();
 
@@ -1974,6 +2014,7 @@ mod tests {
                 focused: false,
                 panel_opacity: Some(1.0),
                 border_color: None,
+                selection: None,
             };
             let near = TerminalDraw {
                 id: 2,
@@ -1984,6 +2025,7 @@ mod tests {
                 focused: false,
                 panel_opacity: Some(1.0),
                 border_color: None,
+                selection: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
             let frame = WallFrame { terminals: &list, ..Default::default() };
@@ -2025,6 +2067,7 @@ mod tests {
                 focused,
                 panel_opacity: Some(1.0),
                 border_color: None,
+                selection: None,
             }
         }
         let cam = WallCamera::new(Vec2::new(3.0, -4.0), 32.0);
@@ -2255,6 +2298,7 @@ mod tests {
             focused: false,
             panel_opacity: Some(1.0),
             border_color: None,
+            selection: None,
         };
 
         let shapes = vec![
@@ -2495,6 +2539,7 @@ mod tests {
             focused: true,
             panel_opacity: Some(1.0),
             border_color: None,
+            selection: None,
         };
 
         let w = 256u32;
@@ -2581,6 +2626,7 @@ mod tests {
                 focused: false,
                 panel_opacity: Some(1.0),
                 border_color: None,
+                selection: None,
             };
             render_rgba_bytes(
                 &ctx,
@@ -2622,6 +2668,7 @@ mod tests {
             focused: false,
             panel_opacity: Some(1.0),
             border_color: None,
+            selection: None,
         };
         let cam = WallCamera::new(Vec2::new(1.0, -0.5), 48.0);
         let s_before = renderer.prepare(
@@ -2650,6 +2697,7 @@ mod tests {
             focused: false,
             panel_opacity: Some(1.0),
             border_color: None,
+            selection: None,
         };
         let s_after = renderer.prepare(
             &ctx.device,
@@ -2727,6 +2775,7 @@ mod tests {
                 focused,
                 panel_opacity: None,
                 border_color: None,
+                selection: None,
             }
         }
 
@@ -2832,6 +2881,7 @@ mod tests {
                 focused,
                 panel_opacity: Some(1.0),
                 border_color: None,
+                selection: None,
             }
         }
 
@@ -2962,5 +3012,205 @@ mod tests {
         });
         assert_eq!(green_when_off, 0, "blink-off must hide the block cursor");
         assert!(magenta_when_off > 100, "blink-off must restore normal glyph fg ({magenta_when_off} px)");
+    }
+
+    /// Verifies text selection highlighting: linear and block cell ranges,
+    /// JS wall default colours (`#cccccc` bg / `#0a0a1e` fg), `"keep"` foreground
+    /// mode (`foreground: None`), and minimal dirty-row uploads on selection edits.
+    #[test]
+    fn gpu_text_selection_linear_block_keep_fg_and_dirty_uploads() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let mut screen = Screen::new(10, 5);
+        screen.default_bg = rgb(0x0d, 0x10, 0x17);
+        screen.default_fg = rgb(0xe0, 0x30, 0xe0);
+        for r in 0..5u16 {
+            for c in 0..10u16 {
+                screen.row_mut(r)[c as usize] = term_cells::Cell {
+                    content: 'M' as u32,
+                    fg: rgb(0xe0, 0x30, 0xe0),
+                    bg: 0,
+                    ul: 0,
+                    attrs: 0,
+                    width: 1,
+                    _pad: 0,
+                };
+            }
+            screen.touch_row(r);
+        }
+
+        fn make(s: &Screen, selection: Option<CellSelection>) -> TerminalDraw<'_> {
+            TerminalDraw {
+                id: 303,
+                screen: s,
+                position: Vec2::ZERO,
+                z: 1.0,
+                scale: 1.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+                selection,
+            }
+        }
+
+        let m = renderer.metrics();
+        let w = 480u32;
+        let h = 400u32;
+        let cam = WallCamera::new(
+            Vec2::new(5.0 * m.cell_width, -2.5 * m.cell_height),
+            64.0,
+        );
+
+        let count_cell = |px: &[u8], col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let rect = m.cell_rect(Vec2::ZERO, col, row, 1);
+            let tl = cam.world_to_screen(Vec2::new(rect.min.x, rect.max.y), (w, h));
+            let br = cam.world_to_screen(Vec2::new(rect.max.x, rect.min.y), (w, h));
+            let x0 = (tl.x.ceil() as u32 + 1).min(w - 1);
+            let x1 = (br.x.floor() as u32).saturating_sub(1).min(w);
+            let y0 = (tl.y.ceil() as u32 + 1).min(h - 1);
+            let y1 = (br.y.floor() as u32).saturating_sub(1).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = ((y * w + x) * 4) as usize;
+                    if pred([px[i], px[i + 1], px[i + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Initial upload with no selection: all 5 rows uploaded, zero fills active.
+        let s0 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, None)], ..Default::default() },
+        );
+        assert_eq!(s0.rows_uploaded, 5);
+        assert_eq!(s0.write_calls, 1);
+
+        // 2. Apply linear selection across rows 1..=3: (1,3)..(3,6) -> ONLY 3 rows uploaded!
+        let lin = CellSelection::linear(1, 3, 3, 6);
+        let s1 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(lin))], ..Default::default() },
+        );
+        assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 1 });
+
+        // Steady frame with identical selection uploads 0 rows.
+        let s1_idle = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(lin))], ..Default::default() },
+        );
+        assert_eq!(s1_idle.rows_uploaded, 0);
+        assert_eq!(s1_idle.write_calls, 0);
+
+        // Render and verify linear selection pixels (#cccccc bg, #0a0a1e fg on selected cells).
+        let px_lin = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(lin))], ..Default::default() },
+            w,
+            h,
+        );
+        let is_sel_bg = |c: [u8; 3]| c[0].abs_diff(0xcc) <= 3 && c[1].abs_diff(0xcc) <= 3 && c[2].abs_diff(0xcc) <= 3;
+        let is_sel_fg = |c: [u8; 3]| c[0].abs_diff(0x0a) <= 3 && c[1].abs_diff(0x0a) <= 3 && c[2].abs_diff(0x1e) <= 3;
+        let is_orig_fg = |c: [u8; 3]| c[0].abs_diff(0xe0) <= 3 && c[1].abs_diff(0x30) <= 3 && c[2].abs_diff(0xe0) <= 3;
+
+        // Selected cells: (1, 5), (2, 0) [interior full row], (3, 4).
+        for (col, row) in [(5, 1), (0, 2), (4, 3)] {
+            assert!(count_cell(&px_lin, col, row, is_sel_bg) > 100, "cell ({col},{row}) should have #cccccc selection fill");
+            assert!(count_cell(&px_lin, col, row, is_sel_fg) > 40, "cell ({col},{row}) should have #0a0a1e selection fg");
+            assert_eq!(count_cell(&px_lin, col, row, is_orig_fg), 0, "cell ({col},{row}) should override orig fg");
+        }
+        // Unselected cells: (0, 0), (2, 1) [before start_col], (6, 3) [at end_col].
+        for (col, row) in [(0, 0), (2, 1), (6, 3)] {
+            assert_eq!(count_cell(&px_lin, col, row, is_sel_bg), 0, "unselected cell ({col},{row}) must not have selection fill");
+            assert!(count_cell(&px_lin, col, row, is_orig_fg) > 40, "unselected cell ({col},{row}) must keep original fg");
+        }
+
+        // 3. Extend drag right on row 3 -> ONLY 1 row (row 3) uploaded!
+        let lin_ext = CellSelection::linear(1, 3, 3, 9);
+        let s2 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(lin_ext))], ..Default::default() },
+        );
+        assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 1, write_calls: 1 });
+
+        // 4. "keep" foreground mode (`foreground: None`): custom blue fill + original magenta fg preserved!
+        let keep_sel = lin_ext.with_colors(rgb(0x28, 0x48, 0xa8), None);
+        let s3 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(keep_sel))], ..Default::default() },
+        );
+        assert_eq!(s3.rows_uploaded, 3);
+        let px_keep = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(keep_sel))], ..Default::default() },
+            w,
+            h,
+        );
+        let is_blue_bg = |c: [u8; 3]| c[0].abs_diff(0x28) <= 3 && c[1].abs_diff(0x48) <= 3 && c[2].abs_diff(0xa8) <= 3;
+        assert!(count_cell(&px_keep, 5, 2, is_blue_bg) > 100, "keep mode should paint selection background");
+        assert!(count_cell(&px_keep, 5, 2, is_orig_fg) > 40, "keep mode must preserve cell's original magenta fg");
+
+        // 5. Column-block selection: rows 0..=2, cols 2..5 only.
+        let blk = CellSelection::block(0, 2, 2, 5);
+        let px_blk = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, Some(blk))], ..Default::default() },
+            w,
+            h,
+        );
+        assert!(count_cell(&px_blk, 3, 1, is_sel_bg) > 100, "inside block must be selected");
+        assert_eq!(count_cell(&px_blk, 1, 1, is_sel_bg), 0, "left of block must stay unselected");
+        assert_eq!(count_cell(&px_blk, 5, 1, is_sel_bg), 0, "right of block must stay unselected");
+
+        // 6. Clearing selection re-uploads ONLY rows 0..=2 (3 rows) and restores original pixels.
+        let s_clear = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(&screen, None)], ..Default::default() },
+        );
+        assert_eq!(s_clear, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 1 });
+        let px_clear = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(&screen, None)], ..Default::default() },
+            w,
+            h,
+        );
+        assert_eq!(count_cell(&px_clear, 3, 1, is_sel_bg), 0, "cleared selection must restore original background");
+        assert!(count_cell(&px_clear, 3, 1, is_orig_fg) > 40, "cleared selection must restore original fg");
     }
 }

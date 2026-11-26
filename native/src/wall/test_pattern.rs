@@ -5,6 +5,7 @@ use glam::Vec2;
 use glyph_font::{FamilyId, FontAtlas};
 use term_cells::{CLUSTER_BASE, Cell, Cursor, CursorShape, Screen, attrs, rgb};
 
+use super::cell::CellSelection;
 use super::labels::{Label, LabelHeight, measure_label_width};
 use super::metrics::{CellMetrics, WorldRect};
 use super::paper::PaperStyle;
@@ -376,6 +377,7 @@ pub struct TestPatternTerminal {
     pub scale: f32,
     pub focused: bool,
     pub border_color: Option<u32>,
+    pub selection: Option<CellSelection>,
 }
 
 /// Terminal layout metadata needed to synthesize the test pattern's chrome
@@ -511,6 +513,7 @@ pub fn build_overlapping_test_pattern(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 0.5,
             focused: false,
             border_color: Some(rgb(0xf0, 0xb4, 0x5a)),
+            selection: None,
         },
         TestPatternTerminal {
             id: 3,
@@ -521,6 +524,8 @@ pub fn build_overlapping_test_pattern(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: true,
             border_color: None,
+            // Linear selection across "green yellow cyan" on row 2.
+            selection: Some(CellSelection::linear(2, 14, 2, 31)),
         },
         TestPatternTerminal {
             id: 1,
@@ -531,6 +536,8 @@ pub fn build_overlapping_test_pattern(metrics: CellMetrics) -> Vec<TestPatternTe
             scale: 1.0,
             focused: false,
             border_color: None,
+            // Rectangular column-block selection over existing ANSI fills.
+            selection: Some(CellSelection::block(6, 10, 8, 22)),
         },
     ]
 }

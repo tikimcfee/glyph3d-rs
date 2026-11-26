@@ -56,6 +56,7 @@ mod tests {
                 focused: t.focused,
                 panel_opacity: None,
                 border_color: t.border_color,
+                selection: t.selection,
             })
             .collect();
         let pad = wall_renderer.style().panel_padding;

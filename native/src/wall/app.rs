@@ -45,6 +45,7 @@ use winit::window::{Window, WindowId};
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
+use super::cell::CellSelection;
 use super::labels::{Label, LabelHeight};
 use super::metrics::WorldRect;
 use super::paper::PaperStyle;
@@ -153,18 +154,28 @@ struct App {
     blink_repaint_at: Option<Instant>,
 }
 
-/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
-fn css_color(s: &str, alpha: f32) -> [f32; 4] {
+fn parse_css_hex(s: &str) -> Option<u32> {
     let h = s.trim().trim_start_matches('#');
     let full = match h.len() {
         3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
         6 => h.to_string(),
-        _ => String::new(),
+        _ => return None,
     };
-    match u32::from_str_radix(&full, 16) {
-        Ok(v) if full.len() == 6 => srgb_hex(v, alpha),
-        _ => [1.0, 0.0, 1.0, alpha],
+    u32::from_str_radix(&full, 16).ok()
+}
+
+/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
+fn css_color(s: &str, alpha: f32) -> [f32; 4] {
+    match parse_css_hex(s) {
+        Some(v) => srgb_hex(v, alpha),
+        None => [1.0, 0.0, 1.0, alpha],
     }
+}
+
+/// `#rrggbb` (or `#rgb`) as packed opaque sRGB RGBA8; anything else is magenta.
+fn css_rgb_u32(s: &str) -> u32 {
+    let v = parse_css_hex(s).unwrap_or(0xff00ff);
+    term_cells::rgb(((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8)
 }
 
 fn world_rect(r: Rect) -> WorldRect {
@@ -624,6 +635,19 @@ impl App {
                 focused: t.focused,
                 panel_opacity: None,
                 border_color: t.hovered.then_some(term_cells::rgb(0x5a, 0x6b, 0x86)).filter(|_| !t.focused),
+                selection: t.text_selection.as_ref().map(|sel| {
+                    let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
+                        .then(|| css_rgb_u32(&sel.foreground));
+                    CellSelection {
+                        start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
+                        start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
+                        end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
+                        end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
+                        block: sel.block,
+                        background: css_rgb_u32(&sel.background),
+                        foreground: fg,
+                    }
+                }),
             });
         }
 
