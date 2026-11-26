@@ -868,8 +868,8 @@ impl App {
     }
 
     fn key_input(&mut self, key: KeyEvent) {
-        // Quitting is the window's, not the wall's.
-        if key.pressed && key.mods.meta && !key.mods.ctrl && !key.mods.alt && key.code == "KeyQ" {
+        // Quitting is the window's, not the wall's (Command+Q on macOS, Ctrl+Alt+Q elsewhere).
+        if key.pressed && key.code == "KeyQ" && key.mods == wall_core::chord::chord_mods(Platform::host()) {
             self.quit = true;
             return;
         }
@@ -1005,11 +1005,13 @@ impl App {
             self.buttons &= !bit;
         }
         let ev = self.pointer(Some(b));
+        let secondary = wall_core::menu::is_secondary_press(b, ev.mods, Platform::host());
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
         let lookup = screen_lookup(|id| terms.screen(id));
         if pressed {
-            // A right press may be the wall's menu, or the focused program's.
-            if b == Button::Right && wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+            // A secondary press (right-click, or Ctrl+left-click on macOS) may be
+            // the wall's menu, or the focused program's.
+            if secondary && wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
                 self.apply_effects();
                 self.redraw();
                 return;
@@ -1017,7 +1019,7 @@ impl App {
             wall.pointer_down(&ev, &lookup);
         } else {
             wall.pointer_up(&ev, &lookup);
-            if b == Button::Left {
+            if b == Button::Left && !secondary {
                 let here = Point::new(ev.x, ev.y);
                 let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
                 if double {

@@ -491,6 +491,12 @@ fn resolve_key_token(
         "f10" => Ok((KeyCode::F10, Key::Named(NamedKey::F10), None, false)),
         "f11" => Ok((KeyCode::F11, Key::Named(NamedKey::F11), None, false)),
         "f12" => Ok((KeyCode::F12, Key::Named(NamedKey::F12), None, false)),
+        "contextmenu" | "menu" => Ok((
+            KeyCode::ContextMenu,
+            Key::Named(NamedKey::ContextMenu),
+            None,
+            false,
+        )),
         "\\" | "backslash" => sym(KeyCode::Backslash, "\\", "|", false),
         "|" | "pipe" => sym(KeyCode::Backslash, "\\", "|", true),
         "/" | "slash" => sym(KeyCode::Slash, "/", "?", false),

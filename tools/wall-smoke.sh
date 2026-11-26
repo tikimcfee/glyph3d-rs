@@ -429,7 +429,10 @@ ctl terminal.scroll t1 -200 >/dev/null 2>&1 || true
 sleep 0.15
 
 # ── 9. Drag inside focused terminal selects text & copy chord copies ─────────
-ctl app.type $'clear; printf "SELTOKEN_%s\\n" 98765\n' >/dev/null
+# Frame t1 first so row 0 and columns sit well clear of the 7 px border-grab band.
+ctl wall.reveal t1 >/dev/null
+W="$(wait_settled)"
+ctl app.type $'clear; printf "  SELTOKEN_%s  \\n" 98765\n' >/dev/null
 wait_for_text t1 "SELTOKEN_98765" 40 || true
 sleep 0.10
 W="$(wait_settled)"
@@ -442,18 +445,24 @@ for line in sys.stdin:
         zoom = float(p["zoom"])
     elif line.startswith("terminal t1 "):
         parts = line.split()
+        cols = int([p[5:] for p in parts if p.startswith("cols=")][0])
         rows = int([p[5:] for p in parts if p.startswith("rows=")][0])
         l, t, r, b = map(float, [p[5:] for p in parts if p.startswith("rect=")][0].split(","))
         pad = 0.3 * zoom
+        cell_w = (r - l - 2.0 * pad) / max(1, cols)
         cell_h = (b - t - 2.0 * pad) / max(1, rows)
-        y = t + pad + 0.5 * cell_h
-        print(f"{l + pad + 2.0:.2f} {y:.2f} {r - pad - 4.0:.2f}")
+        x0 = l + max(pad + 1.2 * cell_w, 12.0)
+        x1 = min(r - 12.0, l + pad + 22.0 * cell_w)
+        y = t + max(pad + 0.5 * cell_h, 12.0)
+        print(f"{x0:.2f} {y:.2f} {x1:.2f}")
 ' <<<"$W")
+ctl app.drag "$SX0" "$SY" "$SX1" "$SY" 14 >/dev/null
+W_SEL="$(ctl app.where)"
+# Set sentinel AFTER drag so we prove specifically that the copy chord (`cmd+c`)
+# writes the selected text to the OS clipboard (rather than copyOnSelect).
 if [[ "$HAS_CLIP" -eq 1 ]]; then
     printf 'SENTINEL_BEFORE_COPY' | pbcopy
 fi
-ctl app.drag "$SX0" "$SY" "$SX1" "$SY" 14 >/dev/null
-W_SEL="$(ctl app.where)"
 ctl app.key cmd+c >/dev/null
 sleep 0.10
 COPIED=""
@@ -496,16 +505,16 @@ SEL_LIST="$(awk '/^selection / {print $2}' <<<"$W_LASSO")"
 ctl app.key cmd+g >/dev/null
 W_GROUP="$(wait_settled)"
 HAS_G1=0
-grep -q "^group g1 " <<<"$W_GROUP" && HAS_G1=1
+grep -q "^group g-1 " <<<"$W_GROUP" && HAS_G1=1
 if [[ "$SEL_LIST" == *"t1"* && "$SEL_LIST" == *"t2"* && "$HAS_G1" -eq 1 ]]; then
-    record_pass "shift+drag lasso & group" "selection=$SEL_LIST -> created group g1"
+    record_pass "shift+drag lasso & group" "selection=$SEL_LIST -> created group g-1"
 else
     record_fail "shift+drag lasso & group" "selection=$SEL_LIST has_g1=$HAS_G1"
 fi
 
 # Ungroup so t1 is standalone again for title-bar double-click & split checks.
-ctl wall.ungroup g1 >/dev/null 2>&1 || true
-ctl wall.select.clear >/dev/null 2>&1 || true
+ctl wall.ungroup g-1 >/dev/null 2>&1 || true
+ctl wall.select none >/dev/null 2>&1 || true
 ctl wall.fit >/dev/null
 wait_settled >/dev/null
 
@@ -572,6 +581,7 @@ else
 fi
 
 # ── 13. Right-click + 14. Escape ─────────────────────────────────────────────
+ctl wall.fit >/dev/null
 W_RC0="$(wait_settled)"
 read -r RC_X RC_Y < <(python3 -c '
 import sys
@@ -587,28 +597,41 @@ W_RC1="$(ctl app.where)"
 MENU_OPEN="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC1")"
 ctl app.shot "$SHOT_DIR/right-click.png" >/dev/null 2>&1 || true
 
-if [[ "$MENU_OPEN" == terminal:t1* ]]; then
-    record_pass "right-click" "opened model menu ($MENU_OPEN); shot saved to $SHOT_DIR/right-click.png"
-else
-    record_fail "right-click" "expected menu on t1, got '$MENU_OPEN'"
-fi
-
-# Escape dismisses open context menu, and a second Escape clears wall selection.
+# Dismiss with Escape, then verify macOS Ctrl+left-click secondary press also opens menu.
 ctl app.key Escape >/dev/null
 W_ESC1="$(ctl app.where)"
 MENU_AFTER_ESC="$(awk '/^menu / {print $2}' <<<"$W_ESC1")"
 
-ctl wall.select t1 >/dev/null
+CTRL_CLICK_MENU="skipped"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    ctl app.click "$RC_X" "$RC_Y" left ctrl >/dev/null
+    W_RC2="$(ctl app.where)"
+    CTRL_CLICK_MENU="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC2")"
+    ctl app.key Escape >/dev/null
+fi
+
+if [[ "$MENU_OPEN" == terminal:t1* && ( "$CTRL_CLICK_MENU" == "skipped" || "$CTRL_CLICK_MENU" == terminal:t1* ) ]]; then
+    record_pass "right-click" "opened model menu ($MENU_OPEN, ctrl+click=${CTRL_CLICK_MENU%% *}); no egui popup mounted yet"
+else
+    record_fail "right-click" "menu='$MENU_OPEN' ctrl_click='$CTRL_CLICK_MENU'"
+fi
+
+# Escape clears wall selection when NO terminal holds keyboard focus (`PLAIN_KEYS`).
+# Click empty paper at (18, 18) to blur focus, Shift-click t1 to select it without focusing,
+# then press Escape and verify selection clears.
+ctl app.click 18 18 >/dev/null
+ctl app.click "$RC_X" "$RC_Y" left shift >/dev/null
 W_SEL1="$(ctl app.where)"
+FOCUS_BEFORE_ESC="$(awk '/^focused / {print $2}' <<<"$W_SEL1")"
 SEL_BEFORE_ESC="$(awk '/^selection / {print $2}' <<<"$W_SEL1")"
 ctl app.key Escape >/dev/null
 W_ESC2="$(ctl app.where)"
 SEL_AFTER_ESC="$(awk '/^selection / {print $2}' <<<"$W_ESC2")"
 
-if [[ "$MENU_AFTER_ESC" == "none" && "$SEL_BEFORE_ESC" == "t1" && "$SEL_AFTER_ESC" == "none" ]]; then
-    record_pass "Escape" "dismissed context menu and cleared wall selection"
+if [[ "$MENU_AFTER_ESC" == "none" && "$FOCUS_BEFORE_ESC" == "none" && "$SEL_BEFORE_ESC" == "t1" && "$SEL_AFTER_ESC" == "none" ]]; then
+    record_pass "Escape" "closed context menu and cleared unfocused wall selection"
 else
-    record_fail "Escape" "menu_after=$MENU_AFTER_ESC sel_before=$SEL_BEFORE_ESC sel_after=$SEL_AFTER_ESC"
+    record_fail "Escape" "menu_after=$MENU_AFTER_ESC focus=$FOCUS_BEFORE_ESC sel_before=$SEL_BEFORE_ESC sel_after=$SEL_AFTER_ESC"
 fi
 
 echo ""
