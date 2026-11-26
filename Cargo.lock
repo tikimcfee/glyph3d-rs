@@ -1807,6 +1807,7 @@ dependencies = [
  "glam",
  "glyph-field",
  "glyph-field-derived",
+ "glyph-font",
  "glyph-scene-graph",
  "glyph-vt",
  "image",
