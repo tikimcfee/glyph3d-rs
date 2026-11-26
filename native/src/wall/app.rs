@@ -42,7 +42,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
-use crate::atlas::Atlas;
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
@@ -261,8 +260,7 @@ impl App {
 
         let opts = self.opts.take().expect("the window opens once");
         self.exit_after = opts.exit_after;
-        let atlas = Arc::new(Atlas::load(&opts.emoji_sheet));
-        let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, atlas, format, WallStyle::default());
+        let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
         renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;

@@ -7,16 +7,12 @@
 
 #[cfg(feature = "wgpu")]
 use std::path::Path;
-#[cfg(feature = "wgpu")]
-use std::sync::Arc;
 
 #[cfg(feature = "wgpu")]
 use glam::Vec2;
 use glyph_vt::{Theme, Vt};
 use term_cells::Screen;
 
-#[cfg(feature = "wgpu")]
-use crate::atlas::Atlas;
 #[cfg(feature = "wgpu")]
 use crate::gpu::GpuContext;
 
@@ -53,11 +49,10 @@ pub fn render_replay_offscreen(
     zoom_multiplier: f32,
 ) {
     let screen = replay_screen(bytes, cols, rows);
-    let atlas = Arc::new(Atlas::load(emoji_sheet));
     let mut renderer = WallRenderer::new(
         &ctx.device,
         &ctx.queue,
-        atlas,
+        emoji_sheet,
         wgpu::TextureFormat::Rgba8UnormSrgb,
         WallStyle::default(),
     );
