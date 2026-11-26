@@ -138,11 +138,23 @@ fn draw_section(f: &mut Frame, area: Rect, l: &Launcher, section: Section, title
         .filter(|c| c.section() == section && l.is_applicable(**c))
         .map(|c| control_line(l, *c))
         .collect();
+    if section == Section::Target && l.target == Target::Wall {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("The infinite canvas of live terminals", Style::default().fg(Color::Green)),
+        ]));
+    }
     if section == Section::Target && l.target == Target::Demo {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled("The quad-field stress demo", Style::default().fg(Color::Magenta)),
         ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (configured inside the wall)",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     let focused = l.focus.section() == section;
     let mut block = Block::default()
@@ -242,9 +254,9 @@ fn draw_footer(f: &mut Frame, area: Rect) {
 fn format_radio(label: &str, selected: bool, focused: bool) -> Span<'static> {
     if selected {
         let s = Style::default().fg(Color::Cyan).bold();
-        Span::styled(format!("[● {label}]"), if focused { s.bg(Color::Cyan).fg(Color::Black) } else { s })
+        Span::styled(format!("[●{label}]"), if focused { s.bg(Color::Cyan).fg(Color::Black) } else { s })
     } else {
-        Span::styled(format!("[○ {label}]"), Style::default().fg(Color::DarkGray))
+        Span::styled(format!("[○{label}]"), Style::default().fg(Color::DarkGray))
     }
 }
 

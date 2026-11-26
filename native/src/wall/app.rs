@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use glam::Vec2;
 use term_cells::Screen;
-use wall_core::geom::{Point, Rect};
+use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::layout::{ResizeCursor, Size};
 use wall_core::menu::Verdict;
@@ -46,13 +46,10 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::cell::CellSelection;
-use super::labels::{Label, LabelHeight};
-use super::metrics::WorldRect;
-use super::paper::PaperStyle;
+use super::labels::Label;
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 use super::session::{News, Sessions};
-use super::shapes::{DashStyle, LeaderShape, PolygonShape, RectShape, Shape};
-use super::srgb_hex;
+use super::shapes::Shape;
 #[cfg(feature = "egui-ui")]
 use super::ui::{show_debug_hud, DebugHudInput, HudTerminalInfo, UiEventOutcome, WallUi};
 
@@ -65,8 +62,6 @@ const PANEL_PAD: f32 = 0.3;
 /// Two presses this close in time and place are a double click.
 const DOUBLE_CLICK_MS: f64 = 500.0;
 const DOUBLE_CLICK_PX: f64 = 5.0;
-/// Depth of what always draws over the canvas (map labels, the notice).
-const Z_OVERLAY: f32 = 900.0;
 
 /// What a reader thread sends the event loop: something arrived, look.
 #[derive(Clone, Copy, Debug)]
@@ -85,7 +80,7 @@ pub struct WallOptions {
 
 /// Where the wall's terminals come from.
 enum Terminals {
-    Live(Sessions),
+    Live(Box<Sessions>),
     /// Screens that never change (the test pattern), by id.
     Fixed(BTreeMap<String, Screen>),
 }
@@ -154,6 +149,8 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
+    /// Persistent banner shown while `g3d-termd` is stopped/offline.
+    offline_notice: Option<String>,
     occluded: bool,
     wakes: Arc<WakeGate>,
     perf: super::perf::WallPerf,
@@ -175,22 +172,10 @@ fn parse_css_hex(s: &str) -> Option<u32> {
     u32::from_str_radix(&full, 16).ok()
 }
 
-/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
-fn css_color(s: &str, alpha: f32) -> [f32; 4] {
-    match parse_css_hex(s) {
-        Some(v) => srgb_hex(v, alpha),
-        None => [1.0, 0.0, 1.0, alpha],
-    }
-}
-
 /// `#rrggbb` (or `#rgb`) as packed opaque sRGB RGBA8; anything else is magenta.
 fn css_rgb_u32(s: &str) -> u32 {
     let v = parse_css_hex(s).unwrap_or(0xff00ff);
     term_cells::rgb(((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8)
-}
-
-fn world_rect(r: Rect) -> WorldRect {
-    WorldRect::new(Vec2::new(r.min_x as f32, r.min_y as f32), Vec2::new(r.max_x as f32, r.max_y as f32))
 }
 
 fn v2(p: Point) -> Vec2 {
@@ -288,6 +273,33 @@ impl App {
     }
 
     fn open(&mut self, event_loop: &ActiveEventLoop) {
+        let opts = self.opts.take().expect("the window opens once");
+        self.exit_after = opts.exit_after;
+
+        let proxy_ctl = self.proxy.clone();
+        let gate_ctl = self.wakes.clone();
+        let control_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_ctl.pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = proxy_ctl.send_event(Wake);
+            }
+        });
+        // Single-owner gate per namespace: refuse before creating a second GPU
+        // window, opening a second `WallStore` writer, or stealing `Role::Own`
+        // size ownership from the running wall window.
+        if let Some(ns) = &opts.namespace {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake) {
+                Ok(server) => self.control = Some(server),
+                Err(wall_control::Error::AlreadyRunning { path, .. }) => {
+                    eprintln!(
+                        "error: another wall window is already open on namespace `{ns}` ({}); close it first or choose another namespace with --wall-ns",
+                        path.display()
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
+            }
+        }
+
         let window = Arc::new(
             event_loop
                 .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
@@ -311,8 +323,6 @@ impl App {
         surface.configure(&self.ctx.device, &config);
         let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
 
-        let opts = self.opts.take().expect("the window opens once");
-        self.exit_after = opts.exit_after;
         let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
@@ -333,23 +343,8 @@ impl App {
         };
         let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
 
-        // The terminals and control socket. Duplicate queued `Wake`s are
-        // coalesced, and terminal publishes do not re-wake the loop while a
-        // surface redraw is already armed (`draw` pumps before building).
-        let proxy_ctl = self.proxy.clone();
-        let gate_ctl = self.wakes.clone();
-        let control_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            if !gate_ctl.pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                let _ = proxy_ctl.send_event(Wake);
-            }
-        });
-        // The door for `wallctl`: verbs arrive on a socket beside termd's.
-        if let Some(ns) = &opts.namespace {
-            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake) {
-                Ok(server) => self.control = Some(server),
-                Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
-            }
-        }
+        // The terminals: coalesce duplicate queued `Wake`s and suppress wakes
+        // while a surface redraw is already armed (`draw` pumps before building).
         let proxy_sess = self.proxy.clone();
         let gate_sess = self.wakes.clone();
         let session_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -385,7 +380,7 @@ impl App {
                 if ids.is_empty() {
                     wall.run("wall.spawn");
                 }
-                Terminals::Live(sessions)
+                Terminals::Live(Box::new(sessions))
             }
             None => {
                 let screen = super::test_pattern::build_primary_screen();
@@ -411,6 +406,8 @@ impl App {
             wall.run("wall.fit");
         }
         self.apply_effects();
+        self.serve_control();
+        self.pump(false);
         self.perf.mark_opened(&self.proxy);
         self.redraw();
     }
@@ -550,6 +547,46 @@ impl App {
                     responder.send(reply);
                     continue;
                 }
+                Some("app.perf") => {
+                    let reset = match argv.get(1).map(String::as_str) {
+                        None => false,
+                        Some("reset") if argv.len() == 2 => true,
+                        _ => {
+                            responder.send("ERR: usage: app.perf [reset]");
+                            continue;
+                        }
+                    };
+                    responder.send(self.perf.control_summary(reset));
+                    continue;
+                }
+                Some("app.state") => {
+                    let reply = match &self.wall {
+                        Some(wall) => {
+                            let snap = wall.model().snapshot();
+                            let notice = snap.notice.or_else(|| self.offline_notice.clone());
+                            let terms_desc: Vec<_> = snap
+                                .terminals
+                                .iter()
+                                .map(|t| {
+                                    let pos = wall
+                                        .model()
+                                        .terminal(&t.id)
+                                        .map_or((0.0, 0.0), |e| {
+                                            ((e.position.x * 10.0).round() / 10.0, (e.position.y * 10.0).round() / 10.0)
+                                        });
+                                    (t.id.clone(), t.name.clone(), pos, (t.cols, t.rows))
+                                })
+                                .collect();
+                            format!(
+                                "connected={} focused={:?} notice={:?} terminals={:?}",
+                                snap.connected, snap.focused_id, notice, terms_desc
+                            )
+                        }
+                        None => "ERR: the wall is not open yet".to_string(),
+                    };
+                    responder.send(reply);
+                    continue;
+                }
                 Some("app.quit") => {
                     responder.send("OK: quitting");
                     self.quit = true;
@@ -606,7 +643,7 @@ impl App {
         let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
         let (changed, news) = sessions.pump();
-        let heard = !news.is_empty();
+        let mut heard = !news.is_empty();
         for n in news {
             match n {
                 News::Resized { id, cols, rows } => wall.terminal_resized(&id, u32::from(cols), u32::from(rows)),
@@ -616,7 +653,37 @@ impl App {
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
+                    self.offline_notice = Some(format!(
+                        "termd ({}) disconnected — waiting for daemon",
+                        wall.termd().namespace()
+                    ));
                 }
+            }
+        }
+        if let Some(live_ids) = sessions.take_reconnected() {
+            log::info!("termd came back ({} terminal(s))", live_ids.len());
+            self.offline_notice = None;
+            if !live_ids.is_empty() {
+                wall.set_live_terminals(&live_ids);
+            }
+            for id in &live_ids {
+                match sessions.adopt(id) {
+                    Ok((cols, rows)) => {
+                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                    }
+                    Err(e) => log::error!("{e}"),
+                }
+            }
+            wall.set_connected(true);
+            heard = true;
+        }
+        for id in sessions.take_external_appeared() {
+            match sessions.adopt(&id) {
+                Ok((cols, rows)) => {
+                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    heard = true;
+                }
+                Err(e) => log::error!("{e}"),
             }
         }
         if heard {
@@ -655,9 +722,13 @@ impl App {
         let now_ms = self.now_ms();
         let Some(wall) = &mut self.wall else { return };
         let moving = wall.tick(dt, now_ms);
-        let described: Described = wall.frame();
+        let mut described: Described = wall.frame();
         self.animating = moving || described.animating;
         self.apply_effects();
+        // A daemon that went away says so on the notice line until it is back.
+        if described.notice.is_none() {
+            described.notice.clone_from(&self.offline_notice);
+        }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
 
@@ -704,8 +775,6 @@ impl App {
         // renderer's is in physical ones.
         let camera = WallCamera::new(Vec2::new(described.camera.x as f32, described.camera.y as f32), described.camera.zoom as f32 * sf);
         let viewport = (g.config.width, g.config.height);
-        // A point in logical screen pixels as a world point.
-        let to_world = |x: f64, y: f64| camera.screen_to_world(Vec2::new(x as f32 * sf, y as f32 * sf), viewport);
 
         let mut draws: Vec<TerminalDraw<'_>> = Vec::with_capacity(described.terminals.len());
         for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
@@ -736,106 +805,12 @@ impl App {
         }
 
         let mut shapes: Vec<Shape> = Vec::new();
-        let mut labels: Vec<Label<'_>> = Vec::new();
-        let solid = |rect: WorldRect, z: f32, fill: [f32; 4]| Shape::Rect(RectShape { rect, z, fill: Some(fill), stroke: None, stroke_px: 0.0, dash: DashStyle::SOLID, corner_radius_px: 0.0 });
-        let outline = |rect: WorldRect, z: f32, stroke: [f32; 4], px: f32, dash: DashStyle| Shape::Rect(RectShape { rect, z, fill: None, stroke: Some(stroke), stroke_px: px, dash, corner_radius_px: 0.0 });
-
-        // Group frames sit behind their members; their headers carry the name.
-        for group in &described.groups {
-            let z = group.z as f32;
-            shapes.push(Shape::Rect(RectShape {
-                rect: world_rect(group.frame_rect),
-                z,
-                fill: Some(srgb_hex(0x0d1017, 1.0)),
-                stroke: Some(srgb_hex(if group.focused { 0x3b4352 } else { 0x232936 }, 1.0)),
-                stroke_px: sf,
-                dash: DashStyle::SOLID,
-                corner_radius_px: 0.0,
-            }));
-            let header = world_rect(group.header_rect);
-            shapes.push(solid(header, z, srgb_hex(group.fill_color, 1.0)));
-            let h = group.text_height as f32;
-            if h > 1e-4 {
-                labels.push(Label::new(group.name.clone(), Vec2::new(group.text_left as f32, header.center().y + 0.5 * h), LabelHeight::World(h), srgb_hex(group.text_color, 1.0), z).with_clip(header));
-            }
-        }
-
-        // A title bar above each terminal: a strip and its name.
-        for bar in &described.title_bars {
-            let strip = world_rect(bar.rect);
-            let z = bar.z as f32;
-            shapes.push(solid(strip, z, srgb_hex(bar.fill_color, 1.0)));
-            let h = bar.text_height as f32;
-            if bar.text_visible && h > 1e-4 {
-                labels.push(Label::new(bar.text.clone(), Vec2::new(bar.text_left as f32, strip.center().y + 0.5 * h), LabelHeight::World(h), srgb_hex(bar.text_color, 1.0), z).with_clip(strip));
-            }
-        }
-
-        for sel in &described.selection_outlines {
-            shapes.push(outline(world_rect(sel.rect), sel.z as f32 + 0.5, srgb_hex(0x4c8dff, 1.0), 2.0 * sf, DashStyle::SOLID));
-        }
-        if let Some(lasso) = &described.lasso {
-            if lasso.len() >= 2 {
-                shapes.push(Shape::Polygon(PolygonShape {
-                    points: lasso.iter().map(|p| v2(*p)).collect(),
-                    z: Z_OVERLAY,
-                    fill: Some(srgb_hex(0x4c8dff, 0.03)),
-                    stroke: srgb_hex(0x4c8dff, 0.9),
-                    stroke_px: 1.5 * sf,
-                    dash: DashStyle::new(6.0 * sf, 4.0 * sf),
-                }));
-            }
-        }
-        if let Some(drop) = &described.drop_preview {
-            let (color, dash) = if drop.ok { (srgb_hex(0x6ee7a0, 1.0), DashStyle::SOLID) } else { (srgb_hex(0xff5c5c, 1.0), DashStyle::new(6.0 * sf, 4.0 * sf)) };
-            shapes.push(outline(world_rect(drop.rect), Z_OVERLAY, color, 2.0 * sf, dash));
-        }
-
-        // A terminal fullscreen: everything else is dimmed behind it.
-        if let Some(veil) = &described.fullscreen_backdrop {
-            shapes.push(solid(camera.visible_world_rect(viewport), veil.z as f32, css_color(&veil.background, 0.92)));
-        }
-
-        // Map labels: a terminal too small on screen to carry its name gets a
-        // pill beside it, with a leader. They are placed in screen pixels.
-        for label in &described.map_labels {
-            let b = label.label_box;
-            let top_left = to_world(b.left, b.top);
-            let bottom_right = to_world(b.right, b.bottom);
-            let pill = WorldRect::new(Vec2::new(top_left.x, bottom_right.y), Vec2::new(bottom_right.x, top_left.y));
-            shapes.push(Shape::Rect(RectShape {
-                rect: pill,
-                z: Z_OVERLAY,
-                fill: Some(srgb_hex(0x121722, 0.95)),
-                stroke: Some(srgb_hex(if label.focused { 0x6ee7a0 } else { 0x3b4352 }, 1.0)),
-                stroke_px: sf,
-                dash: DashStyle::SOLID,
-                corner_radius_px: 4.0 * sf,
-            }));
-            let px = ((b.bottom - b.top) as f32 * 0.62 * sf).max(1.0);
-            let h_world = px / camera.zoom;
-            labels.push(Label::new(label.text.clone(), Vec2::new(pill.min.x + 6.0 * sf / camera.zoom, pill.center().y + 0.5 * h_world), LabelHeight::ScreenPx(px), srgb_hex(0xc4ccd8, 1.0), Z_OVERLAY).with_clip(pill));
-            if let Some(l) = label.leader {
-                shapes.push(Shape::Leader(LeaderShape { from: to_world(l.x1, l.y1), to: to_world(l.x2, l.y2), z: Z_OVERLAY, color: srgb_hex(0x5a6b86, 1.0), width_px: sf, dot_radius_px: 2.5 * sf, dash: DashStyle::SOLID }));
-            }
-        }
-
-        // The notice: one line at the top of the wall.
-        if let Some(text) = &described.notice {
-            let px = 14.0 * sf;
-            let at = to_world(16.0, 14.0);
-            labels.push(Label::new(text.clone(), at, LabelHeight::ScreenPx(px), srgb_hex(0xffc857, 1.0), Z_OVERLAY));
-        }
-
-        let paper = PaperStyle {
-            show: described.paper.grid_show,
-            background: css_color(&described.paper.background, 1.0),
-            minor_color: css_color(&described.paper.minor_color, 1.0),
-            major_color: css_color(&described.paper.major_color, 1.0),
-            minor_spacing: described.paper.grid.grid_minor as f32,
-            major_every: described.paper.grid.grid_major_every,
-            line_px: described.paper.line_px as f32 * sf,
-            min_px: described.paper.grid.grid_min_px as f32 * sf,
+        let mut labels: Vec<Label<'static>> = Vec::new();
+        let paper = {
+            let metrics = g.renderer.metrics();
+            let family = g.renderer.font_family();
+            let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
+            super::describe::describe_frame_chrome(&described, &camera, viewport, sf, &mut fonts, &mut shapes, &mut labels)
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
@@ -851,7 +826,6 @@ impl App {
             }
             _ => super::renderer::UploadStats::default(),
         };
-        let _ = stats;
 
         #[cfg(feature = "egui-ui")]
         let mut panel_verbs: Vec<String> = Vec::new();
@@ -1317,6 +1291,7 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         const COVERED_TICK: std::time::Duration = std::time::Duration::from_millis(32);
+        self.serve_control();
         if self.quit || self.perf.should_exit_on_wake(false) {
             event_loop.exit();
             return;
@@ -1438,6 +1413,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
+        offline_notice: None,
         occluded: false,
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),

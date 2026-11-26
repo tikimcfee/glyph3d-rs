@@ -208,6 +208,23 @@ impl Cli {
                 zoom: self.zoom,
             };
         }
+        // With no scene, offscreen render, or pick/verb script named, open the wall.
+        let has_glyph_scene = self.demo
+            || self.agent_session.is_some()
+            || self.load_repo.is_some()
+            || self.render_file.is_some()
+            || self.screenshot.is_some()
+            || self.screenshot_frame.is_some()
+            || !self.ops.is_empty()
+            || self.copies != 1;
+        if !has_glyph_scene {
+            return CliCommand::Wall {
+                emoji_sheet,
+                pattern: false,
+                namespace: self.wall_ns.clone(),
+                frames: self.frames,
+            };
+        }
         let choice = if self.demo {
             SceneChoice::Demo
         } else if let Some(session) = &self.agent_session {

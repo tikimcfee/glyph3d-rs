@@ -28,6 +28,18 @@ use super::renderer::UploadStats;
 /// opening `wall.fit` camera ease (`EASE_RATE = 14/s`) has snapped home.
 const DEFAULT_IDLE_SETTLE_MS: u64 = 1200;
 const WATCHDOG_GRACE_MS: u64 = 250;
+const MAX_LIVE_SAMPLES: usize = 16_384;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WorstFrame {
+    idx: u64,
+    total_ns: u64,
+    acq_ns: u64,
+    render_ns: u64,
+    submit_ns: u64,
+    pump_ns: u64,
+    rows: usize,
+}
 
 #[derive(Clone, Copy, Debug)]
 enum IdleProbe {
@@ -64,6 +76,7 @@ struct PerfInner {
     frame_pump_ns: Vec<u64>,
     frame_draw_ns: Vec<u64>,
     frame_wait_ns: Vec<u64>,
+    worst: WorstFrame,
     uploads: UploadStats,
     idle: IdleProbe,
 }
@@ -243,7 +256,7 @@ fn format_summary_from_inner(
     };
     let (pump_p50, pump_p95, pump_max) = distribution_ms(&pump_samples);
     let (draw_p50, draw_p95, draw_max) = distribution_ms(&inner.frame_draw_ns);
-    let (wait_p50, _, _) = distribution_ms(&inner.frame_wait_ns);
+    let (wait_p50, wait_p95, wait_max) = distribution_ms(&inner.frame_wait_ns);
     let pump_sum_ms = ns_to_ms(inner.total_pump_ns.saturating_add(extra_pump_ns));
     let draw_sum_ms = ns_to_ms(inner.frame_draw_ns.iter().copied().sum());
     let wait_sum_ms = ns_to_ms(inner.frame_wait_ns.iter().copied().sum());
@@ -255,15 +268,24 @@ fn format_summary_from_inner(
         0.0
     };
     let cpu_field = proc_cpu_ns.map_or_else(|| "na".to_owned(), |ns| format!("{:.3}", ns_to_ms(ns)));
+    let w = inner.worst;
 
     let mut line = format!(
         "wall-perf: frames={frames} wall_ms={wall_ms:.2} fps={fps:.2} \
          pump_ms=p50:{pump_p50:.3},p95:{pump_p95:.3},max:{pump_max:.3},sum:{pump_sum_ms:.2},wakes:{wakes},wake_hz:{wake_hz:.1} \
          draw_ms=p50:{draw_p50:.3},p95:{draw_p95:.3},max:{draw_max:.3},sum:{draw_sum_ms:.2} \
-         wait_ms=p50:{wait_p50:.3},sum:{wait_sum_ms:.2} \
+         wait_ms=p50:{wait_p50:.3},p95:{wait_p95:.3},max:{wait_max:.3},sum:{wait_sum_ms:.2} \
+         worst_ms=total:{:.3},idx:{},acq:{:.3},render:{:.3},submit:{:.3},pump:{:.3},rows:{} \
          proc_cpu_ms={cpu_field} \
          uploads=drawn:{},uploaded:{},rows:{},writes:{} \
          stalled={stalled} occluded={occluded_skips}",
+        ns_to_ms(w.total_ns),
+        w.idx,
+        ns_to_ms(w.acq_ns),
+        ns_to_ms(w.render_ns),
+        ns_to_ms(w.submit_ns),
+        ns_to_ms(w.pump_ns),
+        w.rows,
         inner.uploads.terminals_drawn,
         inner.uploads.terminals_uploaded,
         inner.uploads.rows_uploaded,
@@ -325,6 +347,7 @@ impl WallPerf {
                     frame_pump_ns: Vec::new(),
                     frame_draw_ns: Vec::new(),
                     frame_wait_ns: Vec::new(),
+                    worst: WorstFrame::default(),
                     uploads: UploadStats::default(),
                     idle,
                 }),
@@ -344,9 +367,6 @@ impl WallPerf {
 
     /// Record when the window, renderer, and initial terminals have opened.
     pub fn mark_opened(&mut self, proxy: &EventLoopProxy<Wake>) {
-        if !self.enabled {
-            return;
-        }
         let now = Instant::now();
         {
             let mut inner = self.shared.inner.lock().expect("perf mutex poisoned");
@@ -360,6 +380,9 @@ impl WallPerf {
                     idle_ms,
                 };
             }
+        }
+        if !self.enabled {
+            return;
         }
 
         if let Some(cap) = self.max_wall {
@@ -461,26 +484,19 @@ impl WallPerf {
 
     /// Record a single `EventLoop` `Wake` event delivered to `user_event`.
     pub fn record_wake(&self) {
-        if !self.enabled {
-            return;
-        }
         let mut inner = self.shared.inner.lock().expect("perf mutex poisoned");
         inner.pump_wakes += 1;
     }
 
     /// Begin timing a single `App::pump` call on the window's thread.
     pub fn pump_scope(&self) -> PumpScope {
-        if !self.enabled {
-            return PumpScope {
-                shared: None,
-                start: Instant::now(),
-            };
-        }
         let start = Instant::now();
-        let marker = self.shared.rel_ns_plus_one(start);
-        self.shared
-            .in_pump_marker_ns
-            .store(marker, Ordering::Release);
+        if self.enabled {
+            let marker = self.shared.rel_ns_plus_one(start);
+            self.shared
+                .in_pump_marker_ns
+                .store(marker, Ordering::Release);
+        }
         self.shared
             .pump_calls_started
             .fetch_add(1, Ordering::Relaxed);
@@ -500,19 +516,13 @@ impl WallPerf {
         timings: (Instant, Instant, Instant),
         upload: UploadStats,
     ) {
+        let t_before_submit = Instant::now();
         let sub = ctx.queue.submit([encoder.finish()]);
-        if !self.enabled {
-            if let Some(f) = frame {
-                ctx.queue.present(f);
-            }
-            return;
-        }
-
         let (t_draw_start, t_acquire, t_post_acquire) = timings;
         let (t_cpu_done, extra_wait_ns) = if let Some(f) = frame {
             ctx.queue.present(f);
             (Instant::now(), 0u64)
-        } else {
+        } else if self.enabled {
             let cpu_done = Instant::now();
             glyph_field::wait_for(
                 &ctx.device,
@@ -525,6 +535,8 @@ impl WallPerf {
                 .as_nanos()
                 .min(u128::from(u64::MAX)) as u64;
             (cpu_done, gpu_wait)
+        } else {
+            (Instant::now(), 0u64)
         };
 
         let pre_ns = t_acquire
@@ -535,25 +547,83 @@ impl WallPerf {
             .saturating_duration_since(t_acquire)
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let post_ns = t_cpu_done
+        let post_render_ns = t_before_submit
             .saturating_duration_since(t_post_acquire)
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let draw_ns = pre_ns.saturating_add(post_ns);
+        let submit_ns = t_cpu_done
+            .saturating_duration_since(t_before_submit)
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let render_ns = pre_ns.saturating_add(post_render_ns);
+        let draw_ns = render_ns.saturating_add(submit_ns);
         let wait_ns = acq_wait_ns.saturating_add(extra_wait_ns);
 
         let mut inner = self.shared.inner.lock().expect("perf mutex poisoned");
+        if !self.enabled && inner.frame_draw_ns.len() >= MAX_LIVE_SAMPLES {
+            let half = MAX_LIVE_SAMPLES / 2;
+            inner.frame_pump_ns.drain(..half);
+            inner.frame_draw_ns.drain(..half);
+            inner.frame_wait_ns.drain(..half);
+        }
         let pump_ns = inner.pending_pump_ns;
         inner.pending_pump_ns = 0;
+        let frame_idx = inner.frames_recorded;
         inner.frame_pump_ns.push(pump_ns);
         inner.frame_draw_ns.push(draw_ns);
         inner.frame_wait_ns.push(wait_ns);
         inner.frames_recorded += 1;
 
+        let total_ns = pump_ns.saturating_add(draw_ns).saturating_add(wait_ns);
+        if total_ns >= inner.worst.total_ns {
+            inner.worst = WorstFrame {
+                idx: frame_idx,
+                total_ns,
+                acq_ns: wait_ns,
+                render_ns,
+                submit_ns,
+                pump_ns,
+                rows: upload.rows_uploaded,
+            };
+        }
+
         inner.uploads.terminals_drawn += upload.terminals_drawn;
         inner.uploads.terminals_uploaded += upload.terminals_uploaded;
         inner.uploads.rows_uploaded += upload.rows_uploaded;
         inner.uploads.write_calls += upload.write_calls;
+    }
+
+    /// Answer `wallctl app.perf [reset]` over the current accumulated window.
+    pub fn control_summary(&self, reset: bool) -> String {
+        let started = self.shared.pump_calls_started.load(Ordering::Acquire);
+        let occluded = if reset {
+            self.shared.occluded_skips.swap(0, Ordering::AcqRel)
+        } else {
+            self.shared.occluded_skips.load(Ordering::Acquire)
+        };
+        let mut inner = self.shared.inner.lock().expect("perf mutex poisoned");
+        let now = Instant::now();
+        let wall = inner.opened_at.map_or(Duration::ZERO, |t| now.saturating_duration_since(t));
+        let now_cpu = process_cpu_ns();
+        let proc_cpu_ns = now_cpu
+            .zip(inner.opened_cpu_ns)
+            .map(|(end, start)| end.saturating_sub(start));
+        let frames = inner.frames_recorded;
+        let out = format_summary_from_inner(&inner, frames, wall, proc_cpu_ns, None, started, occluded);
+        if reset {
+            inner.opened_at = Some(now);
+            inner.opened_cpu_ns = now_cpu;
+            inner.frames_recorded = 0;
+            inner.pending_pump_ns = 0;
+            inner.total_pump_ns = 0;
+            inner.pump_wakes = 0;
+            inner.frame_pump_ns.clear();
+            inner.frame_draw_ns.clear();
+            inner.frame_wait_ns.clear();
+            inner.worst = WorstFrame::default();
+            inner.uploads = UploadStats::default();
+        }
+        out
     }
 
     /// Advance optional wall-cap / idle-window timers and merge with `ui_wake_at`.
@@ -674,6 +744,15 @@ mod tests {
             frame_pump_ns: Vec::new(),
             frame_draw_ns: Vec::new(),
             frame_wait_ns: Vec::new(),
+            worst: WorstFrame {
+                idx: 19,
+                total_ns: 18_000_000,
+                acq_ns: 15_000_000,
+                render_ns: 800_000,
+                submit_ns: 200_000,
+                pump_ns: 2_000_000,
+                rows: 48,
+            },
             uploads: UploadStats::default(),
             idle: IdleProbe::Completed {
                 idle_wall: Duration::from_millis(5000),
@@ -707,6 +786,8 @@ mod tests {
         assert!(summary.starts_with("wall-perf: frames=20 wall_ms=1000.00 fps=20.00 "));
         assert!(summary.contains("pump_ms=p50:1.000,p95:1.900,max:2.000,sum:21.00,wakes:20,wake_hz:20.0"));
         assert!(summary.contains("draw_ms=p50:0.500,p95:0.950,max:1.000,sum:10.50"));
+        assert!(summary.contains("wait_ms=p50:15.000,p95:15.000,max:15.000,sum:300.00"));
+        assert!(summary.contains("worst_ms=total:18.000,idx:19,acq:15.000,render:0.800,submit:0.200,pump:2.000,rows:48"));
         assert!(summary.contains("proc_cpu_ms=42.500"));
         assert!(summary.contains("uploads=drawn:80,uploaded:40,rows:960,writes:40"));
         assert!(summary.contains("stalled=0 occluded=0"));

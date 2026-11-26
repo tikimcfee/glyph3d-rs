@@ -5,8 +5,9 @@ use crate::coalesce::{CoalescePolicy, Coalescer, PublishDecision};
 use crate::hub::HubInner;
 use crate::inbox::SessionInbox;
 use glyph_vt::{Theme, Vt};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use term_cells::{Modes, Screen};
@@ -38,6 +39,10 @@ pub struct SessionStats {
     pub bytes_parsed: u64,
     /// Total coalesced snapshots published from the session thread to the window slot.
     pub publishes: u64,
+    /// Total `resize` RPCs actually sent over the wire for this session.
+    pub resizes_sent: u64,
+    /// Total explicit `repaint` RPCs actually sent over the wire for this session.
+    pub repaints_sent: u64,
 }
 
 #[derive(Clone)]
@@ -66,6 +71,8 @@ pub(crate) struct SessionShared {
     has_news: AtomicBool,
     bytes_parsed: AtomicU64,
     publishes: AtomicU64,
+    resizes_sent: AtomicU64,
+    repaints_sent: AtomicU64,
 }
 
 /// Non-blocking fire-and-forget commands dispatched from UI callbacks so the window thread
@@ -73,7 +80,13 @@ pub(crate) struct SessionShared {
 pub(crate) enum AsyncCmd {
     Key { handle: u32, id: String, key: Key },
     Mouse { handle: u32, id: String, mouse: Mouse },
-    Resize { handle: u32, id: String, cols: u16, rows: u16 },
+    Resize {
+        handle: u32,
+        id: String,
+        cols: u16,
+        rows: u16,
+        shared: Arc<SessionShared>,
+    },
     Input { handle: u32, id: String, bytes: Vec<u8> },
     View {
         handle: u32,
@@ -82,9 +95,91 @@ pub(crate) enum AsyncCmd {
         shared: Arc<SessionShared>,
         wake: Arc<dyn Fn() + Send + Sync>,
     },
-    Repaint { handle: u32, id: String },
+    Repaint {
+        handle: u32,
+        id: String,
+        shared: Arc<SessionShared>,
+    },
     Kill { id: String },
     Unsubscribe { handle: u32 },
+}
+
+struct AsyncQueueState {
+    cmds: VecDeque<AsyncCmd>,
+    closed: bool,
+}
+
+/// Outbound async command queue that preserves FIFO ordering for input/lifecycle requests while
+/// coalescing queued `Resize` (keeping only the latest `(cols, rows)` per handle) and
+/// deduplicating queued `Repaint` per handle so a multi-step drag never queues a backlog of stale
+/// synchronous RPCs.
+pub(crate) struct AsyncCmdQueue {
+    state: Mutex<AsyncQueueState>,
+    cv: Condvar,
+}
+
+impl AsyncCmdQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(AsyncQueueState {
+                cmds: VecDeque::with_capacity(32),
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn push(&self, cmd: AsyncCmd) {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        if guard.closed {
+            return;
+        }
+        match &cmd {
+            AsyncCmd::Resize { handle, cols, rows, .. } => {
+                for existing in &mut guard.cmds {
+                    if let AsyncCmd::Resize {
+                        handle: h,
+                        cols: existing_cols,
+                        rows: existing_rows,
+                        ..
+                    } = existing
+                    {
+                        if h == handle {
+                            *existing_cols = *cols;
+                            *existing_rows = *rows;
+                            return;
+                        }
+                    }
+                }
+            }
+            AsyncCmd::Repaint { handle, .. } => {
+                let already_queued = guard
+                    .cmds
+                    .iter()
+                    .any(|c| matches!(c, AsyncCmd::Repaint { handle: h, .. } if h == handle));
+                if already_queued {
+                    return;
+                }
+            }
+            _ => {}
+        }
+        guard.cmds.push_back(cmd);
+        self.cv.notify_one();
+    }
+
+    pub(crate) fn pop(&self) -> Option<AsyncCmd> {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        while guard.cmds.is_empty() && !guard.closed {
+            guard = self.cv.wait(guard).expect("async cmd queue mutex poisoned");
+        }
+        guard.cmds.pop_front()
+    }
+
+    pub(crate) fn close(&self) {
+        let mut guard = self.state.lock().expect("async cmd queue mutex poisoned");
+        guard.closed = true;
+        self.cv.notify_all();
+    }
 }
 
 /// Window-side handle to one live terminal running its emulator on its own background thread.
@@ -166,6 +261,8 @@ impl TerminalSession {
             has_news: AtomicBool::new(false),
             bytes_parsed: AtomicU64::new(0),
             publishes: AtomicU64::new(0),
+            resizes_sent: AtomicU64::new(0),
+            repaints_sent: AtomicU64::new(0),
         });
 
         let vt = Arc::new(Mutex::new(initial_vt));
@@ -173,6 +270,7 @@ impl TerminalSession {
         let worker_inbox = Arc::clone(&inbox);
         let worker_shared = Arc::clone(&shared);
         let worker_hub = Arc::downgrade(&hub);
+        let worker_id = id.clone();
         let thread_name = format!("term-vt:{id}");
 
         let worker = thread::Builder::new()
@@ -180,6 +278,7 @@ impl TerminalSession {
             .spawn(move || {
                 session_worker_loop(
                     handle,
+                    worker_id,
                     cols,
                     rows,
                     theme,
@@ -296,11 +395,13 @@ impl TerminalSession {
         self.meta.last_error.as_ref().map(|(c, m)| (c.as_str(), m.as_str()))
     }
 
-    /// Live byte-parse and screen-publish counters.
+    /// Live byte-parse, screen-publish, and outbound resize/repaint RPC counters.
     pub fn stats(&self) -> SessionStats {
         SessionStats {
             bytes_parsed: self.shared.bytes_parsed.load(Ordering::Relaxed),
             publishes: self.shared.publishes.load(Ordering::Relaxed),
+            resizes_sent: self.shared.resizes_sent.load(Ordering::Relaxed),
+            repaints_sent: self.shared.repaints_sent.load(Ordering::Relaxed),
         }
     }
 
@@ -350,6 +451,7 @@ impl TerminalSession {
 
     /// Resizes the terminal in `g3d-termd` (requires [`Role::Own`]).
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Error> {
+        self.shared.resizes_sent.fetch_add(1, Ordering::Relaxed);
         self.hub.termd_handle().resize(self.handle, cols, rows)
     }
 
@@ -398,6 +500,7 @@ impl TerminalSession {
 
     /// Requests an explicit `REPAINT` from `g3d-termd`.
     pub fn repaint(&self) -> Result<(), Error> {
+        self.shared.repaints_sent.fetch_add(1, Ordering::Relaxed);
         self.hub.termd_handle().repaint(self.handle)
     }
 
@@ -448,7 +551,8 @@ impl TerminalSession {
         });
     }
 
-    /// Queues a terminal resize in FIFO order without blocking the window thread.
+    /// Queues a terminal resize without blocking the window thread, coalescing in place so only
+    /// the latest `(cols, rows)` for this terminal is sent over the wire during a multi-step drag.
     pub fn send_resize(&self, cols: u16, rows: u16) {
         if self.is_ended() {
             return;
@@ -458,6 +562,7 @@ impl TerminalSession {
             id: self.id.clone(),
             cols,
             rows,
+            shared: Arc::clone(&self.shared),
         });
     }
 
@@ -476,7 +581,7 @@ impl TerminalSession {
         });
     }
 
-    /// Queues an explicit `repaint` request without blocking the window thread.
+    /// Queues an explicit `repaint` request without blocking the window thread (deduplicated per handle).
     pub fn send_repaint(&self) {
         if self.is_ended() {
             return;
@@ -484,6 +589,7 @@ impl TerminalSession {
         self.hub.send_async(AsyncCmd::Repaint {
             handle: self.handle,
             id: self.id.clone(),
+            shared: Arc::clone(&self.shared),
         });
     }
 
@@ -507,7 +613,8 @@ impl TerminalSession {
     reason = "worker entrypoint owns all per-session handles moved onto its dedicated OS thread"
 )]
 fn session_worker_loop(
-    _handle: u32,
+    handle: u32,
+    session_id: String,
     initial_cols: u16,
     initial_rows: u16,
     theme: Theme,
@@ -539,6 +646,7 @@ fn session_worker_loop(
     let mut closed = false;
     let mut last_error: Option<(String, String)> = None;
     let mut meta_dirty = false;
+    let mut grow_repaint_due: Option<Instant> = None;
 
     loop {
         batch.clear();
@@ -576,30 +684,48 @@ fn session_worker_loop(
                         if !view {
                             view_offset_zeroed = true;
                             meta_dirty = true;
+                            // A live repaint already carries any scrollback rows `termd` pulled
+                            // onto the active grid, so cancel any pending post-resize repaint.
+                            grow_repaint_due = None;
                         }
-                        if view {
-                            coalescer.mark_immediate();
-                        } else {
-                            coalescer.mark_dirty();
-                        }
+                        // Every `REPAINT` is a single authoritative snapshot from `termd`
+                        // (initial attach, scrollback view, reconnect, lag resync, or settled
+                        // primary-grow pull-back), never a byte flood: publish immediately.
+                        coalescer.mark_immediate();
                     }
-                    Event::Size { cols, rows, handle: h, .. } => {
-                        {
+                    Event::Size { cols, rows, .. } => {
+                        let (grew_primary, on_alt) = {
                             let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
+                            let prev_cols = vt.cols();
+                            let prev_rows = vt.rows();
+                            let alt = vt.modes().alt_screen;
                             vt.resize(cols, rows);
-                        }
+                            (!alt && (cols > prev_cols || rows > prev_rows), alt)
+                        };
                         viewing_scrollback = false;
                         view_offset_zeroed = true;
                         meta_dirty = true;
                         coalescer.mark_dirty();
-                        // Ask `termd` for a reflowed repaint on the shared IO worker so lines
-                        // pulled back out of daemon scrollback on a height increase reach our
-                        // zero-scrollback viewer without spawning a thread per resize step.
-                        if let Some(hub) = hub_weak.upgrade() {
-                            hub.send_async(AsyncCmd::Repaint {
-                                handle: h,
-                                id: String::new(),
-                            });
+                        // `g3d-termd` sends raw subscribers `EVENT size` without `REPAINT`, so
+                        // when a primary-screen terminal grows `cols` or `rows` (pulling history
+                        // rows out of daemon scrollback), debounce and ask once after the drag
+                        // settles (`grow_repaint_settle`) rather than on every intermediate step,
+                        // and never on the alternate screen where the program redraws itself.
+                        if on_alt {
+                            grow_repaint_due = None;
+                        } else if grew_primary || grow_repaint_due.is_some() {
+                            if policy.grow_repaint_settle.is_zero() {
+                                grow_repaint_due = None;
+                                if let Some(hub) = hub_weak.upgrade() {
+                                    hub.send_async(AsyncCmd::Repaint {
+                                        handle,
+                                        id: session_id.clone(),
+                                        shared: Arc::clone(&shared),
+                                    });
+                                }
+                            } else {
+                                grow_repaint_due = Some(Instant::now() + policy.grow_repaint_settle);
+                            }
                         }
                     }
                     Event::Title { title, .. } => {
@@ -660,6 +786,21 @@ fn session_worker_loop(
             }
         }
 
+        if let Some(due) = grow_repaint_due {
+            if Instant::now() >= due {
+                grow_repaint_due = None;
+                if alive && !closed && exit_info.is_none() {
+                    if let Some(hub) = hub_weak.upgrade() {
+                        hub.send_async(AsyncCmd::Repaint {
+                            handle,
+                            id: session_id.clone(),
+                            shared: Arc::clone(&shared),
+                        });
+                    }
+                }
+            }
+        }
+
         let sync_active = {
             let vt = vt_mutex.lock().expect("vt mutex poisoned");
             vt.synchronized_output()
@@ -711,14 +852,15 @@ fn session_worker_loop(
                     );
                     return;
                 }
-                let _ = inbox.wait_for_activity(Some(deadline));
+                let wake_at = grow_repaint_due.map_or(deadline, |g| deadline.min(g));
+                let _ = inbox.wait_for_activity(Some(wake_at));
                 continue;
             }
             PublishDecision::Idle => {
                 if !alive || closed {
                     return;
                 }
-                if !inbox.wait_for_activity(None) {
+                if !inbox.wait_for_activity(grow_repaint_due) {
                     return;
                 }
             }
@@ -895,8 +1037,8 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
     true
 }
 
-pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncCmd>) {
-    while let Ok(cmd) = rx.recv() {
+pub(crate) fn run_async_cmd_worker(termd: TermdHandle, queue: Arc<AsyncCmdQueue>) {
+    while let Some(cmd) = queue.pop() {
         match cmd {
             AsyncCmd::Key { handle, id, key } => {
                 if let Err(e) = termd.key(handle, &key) {
@@ -908,7 +1050,14 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                     log::warn!("terminal {id}: mouse event was not sent: {e}");
                 }
             }
-            AsyncCmd::Resize { handle, id, cols, rows } => {
+            AsyncCmd::Resize {
+                handle,
+                id,
+                cols,
+                rows,
+                shared,
+            } => {
+                shared.resizes_sent.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = termd.resize(handle, cols, rows) {
                     log::warn!("terminal {id}: resize to {cols}x{rows} was refused: {e}");
                 }
@@ -933,7 +1082,8 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                 }
                 Err(e) => log::debug!("terminal {id}: view did not move: {e}"),
             },
-            AsyncCmd::Repaint { handle, id } => {
+            AsyncCmd::Repaint { handle, id, shared } => {
+                shared.repaints_sent.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = termd.repaint(handle) {
                     if !id.is_empty() {
                         log::warn!("terminal {id}: repaint was refused: {e}");
@@ -949,5 +1099,82 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                 let _ = termd.unsubscribe(handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_shared() -> Arc<SessionShared> {
+        Arc::new(SessionShared {
+            published: Mutex::new(PublishedSlot {
+                screen: Screen::new(80, 24),
+                meta: PublishedMeta {
+                    osc_title: String::new(),
+                    pwd: None,
+                    modes: Modes::default(),
+                    mouse_sgr: false,
+                    cursor_color: 0,
+                    scrollback: ScrollbackState::default(),
+                    bell_total: 0,
+                    role: Role::Own,
+                    exit: None,
+                    closed: false,
+                    last_error: None,
+                    meta_gen: 0,
+                },
+            }),
+            has_news: AtomicBool::new(false),
+            bytes_parsed: AtomicU64::new(0),
+            publishes: AtomicU64::new(0),
+            resizes_sent: AtomicU64::new(0),
+            repaints_sent: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn async_cmd_queue_coalesces_resize_in_place_and_dedups_repaint_per_handle() {
+        let q = AsyncCmdQueue::new();
+        let s1 = dummy_shared();
+        let s2 = dummy_shared();
+
+        for step in 1..=14u16 {
+            q.push(AsyncCmd::Resize {
+                handle: 1,
+                id: "t1".into(),
+                cols: 80 + step,
+                rows: 24 + step,
+                shared: Arc::clone(&s1),
+            });
+            q.push(AsyncCmd::Repaint {
+                handle: 1,
+                id: "t1".into(),
+                shared: Arc::clone(&s1),
+            });
+        }
+        q.push(AsyncCmd::Resize {
+            handle: 2,
+            id: "t2".into(),
+            cols: 100,
+            rows: 30,
+            shared: Arc::clone(&s2),
+        });
+        q.close();
+
+        let mut popped = Vec::new();
+        while let Some(cmd) = q.pop() {
+            popped.push(cmd);
+        }
+        assert_eq!(popped.len(), 3, "14 resizes + 14 repaints on h1 + 1 resize on h2 -> 3 cmds");
+        assert!(matches!(
+            popped[0],
+            AsyncCmd::Resize { handle: 1, cols: 94, rows: 38, .. }
+        ));
+        assert!(matches!(popped[1], AsyncCmd::Repaint { handle: 1, .. }));
+        assert!(matches!(
+            popped[2],
+            AsyncCmd::Resize { handle: 2, cols: 100, rows: 30, .. }
+        ));
     }
 }
