@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "egui-ui")]
+use std::time::Instant;
 
 use glam::Vec2;
 use term_cells::Screen;
@@ -19,6 +21,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+#[cfg(feature = "egui-ui")]
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
@@ -31,6 +35,8 @@ use super::labels::{measure_label_width, Label, LabelHeight};
 use super::paper::PaperStyle;
 use super::shapes::{DashStyle, RectShape, Shape};
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
+#[cfg(feature = "egui-ui")]
+use super::ui::{DebugHudInput, HudTerminalInfo, UiEventOutcome, WallUi, show_debug_hud};
 
 /// Physical pixels a wheel "line" is worth when a mouse reports lines.
 const PX_PER_LINE: f32 = 53.0;
@@ -67,6 +73,9 @@ pub struct StaticTerminal(pub Screen);
 impl Terminal for StaticTerminal {
     fn screen(&self) -> &Screen {
         &self.0
+    }
+    fn title(&self) -> &str {
+        &self.0.title
     }
 }
 
@@ -114,6 +123,8 @@ struct Gfx {
     config: wgpu::SurfaceConfiguration,
     depth: wgpu::TextureView,
     renderer: WallRenderer,
+    #[cfg(feature = "egui-ui")]
+    ui: WallUi,
 }
 
 struct App {
@@ -133,6 +144,10 @@ struct App {
     exit_after: Option<u64>,
     spawn: Option<Spawn>,
     next_id: u64,
+    #[cfg(feature = "egui-ui")]
+    hud_open: bool,
+    #[cfg(feature = "egui-ui")]
+    ui_repaint_at: Option<Instant>,
 }
 
 impl App {
@@ -208,9 +223,19 @@ impl App {
         self.exit_after = opts.exit_after;
         let atlas = Arc::new(Atlas::load(&opts.emoji_sheet));
         let renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, atlas, format, WallStyle::default());
+        #[cfg(feature = "egui-ui")]
+        let ui = WallUi::new(&self.ctx.device, &window, format);
         let metrics = renderer.metrics();
         let padding = renderer.style().panel_padding;
-        self.gfx = Some(Gfx { window, surface, config, depth, renderer });
+        self.gfx = Some(Gfx {
+            window,
+            surface,
+            config,
+            depth,
+            renderer,
+            #[cfg(feature = "egui-ui")]
+            ui,
+        });
 
         let proxy = self.proxy.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -339,7 +364,54 @@ impl App {
         }
         let paper = PaperStyle::default();
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
-        g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
+        let stats = g.renderer.render(&self.ctx.device, &self.ctx.queue, &mut encoder, &target, &self.camera, &wall_frame);
+        let _ = stats;
+        #[cfg(feature = "egui-ui")]
+        let mut ui_painted = if self.hud_open || g.ui.is_active() {
+            let hud_terms: Vec<HudTerminalInfo<'_>> = self
+                .terminals
+                .iter()
+                .map(|t| {
+                    let s = t.term.screen();
+                    HudTerminalInfo {
+                        id: t.id,
+                        title: t.term.title(),
+                        cols: s.cols,
+                        rows: s.rows,
+                        scale: t.scale,
+                        focused: self.focused == Some(t.id),
+                    }
+                })
+                .collect();
+            let hud_input = DebugHudInput {
+                camera_zoom: self.camera.zoom,
+                camera_center: self.camera.center,
+                viewport: (g.config.width, g.config.height),
+                stats,
+                terminals: &hud_terms,
+            };
+            let hud_open = &mut self.hud_open;
+            let mut ui_frame = g.ui.run(&g.window, (g.config.width, g.config.height), |ctx| {
+                if *hud_open {
+                    show_debug_hud(ctx, hud_open, &hud_input);
+                }
+            });
+            if let Some(painted) = ui_frame.painted.as_mut() {
+                g.ui.paint(&self.ctx.device, &self.ctx.queue, &mut encoder, &view, painted);
+            }
+            match ui_frame.repaint_after {
+                Some(delay) if delay.is_zero() => {
+                    self.ui_repaint_at = None;
+                    g.window.request_redraw();
+                }
+                Some(delay) => self.ui_repaint_at = Some(Instant::now() + delay),
+                None => self.ui_repaint_at = None,
+            }
+            ui_frame.painted
+        } else {
+            self.ui_repaint_at = None;
+            None
+        };
         self.ctx.queue.submit([encoder.finish()]);
         self.ctx.queue.present(frame);
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
@@ -348,7 +420,23 @@ impl App {
             if let Ok(path) = std::env::var("GLYPH_WALL_SHOT") {
                 let path = std::path::PathBuf::from(path);
                 let viewport = (g.config.width, g.config.height);
-                super::renderer::render_wall_to_png(&self.ctx, &mut g.renderer, &self.camera, &wall_frame, viewport, 1, &path);
+                super::renderer::render_wall_to_png_with_overlay(
+                    &self.ctx,
+                    &mut g.renderer,
+                    &self.camera,
+                    &wall_frame,
+                    viewport,
+                    1,
+                    &path,
+                    |enc, color_view| {
+                        #[cfg(feature = "egui-ui")]
+                        if let Some(painted) = ui_painted.as_mut() {
+                            g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, color_view, painted);
+                        }
+                        #[cfg(not(feature = "egui-ui"))]
+                        let _ = (enc, color_view);
+                    },
+                );
                 // The window's surface is BGRA; the PNG writer assumed RGBA.
                 if matches!(g.config.format, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm) {
                     if let Ok(img) = image::open(&path) {
@@ -469,6 +557,24 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(feature = "egui-ui")]
+        let ui_outcome = match &mut self.gfx {
+            Some(g) => g.ui.on_window_event(&g.window, &event),
+            None => UiEventOutcome::default(),
+        };
+        #[cfg(feature = "egui-ui")]
+        if ui_outcome.repaint {
+            self.redraw();
+        }
+        #[cfg(feature = "egui-ui")]
+        let (ui_consumed, ui_wants_keyboard, ui_wants_pointer) = (
+            ui_outcome.consumed,
+            ui_outcome.wants_keyboard,
+            ui_outcome.wants_pointer,
+        );
+        #[cfg(not(feature = "egui-ui"))]
+        let (ui_consumed, ui_wants_keyboard, ui_wants_pointer) = (false, false, false);
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
@@ -476,13 +582,16 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 let now = Vec2::new(position.x as f32, position.y as f32);
-                if self.panning {
+                if self.panning && !ui_consumed {
                     self.camera.pan_by_screen_delta(now - self.cursor);
                     self.redraw();
                 }
                 self.cursor = now;
             }
-            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left | MouseButton::Middle, .. } => {
+                self.panning = false;
+            }
+            WindowEvent::MouseInput { state, button, .. } if !ui_consumed && !ui_wants_pointer => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => match self.terminal_at(self.cursor) {
                     Some(id) => {
                         self.focus(id);
@@ -491,16 +600,27 @@ impl ApplicationHandler<Wake> for App {
                     None => self.panning = true,
                 },
                 (MouseButton::Middle, ElementState::Pressed) => self.panning = true,
-                (MouseButton::Left | MouseButton::Middle, ElementState::Released) => self.panning = false,
                 _ => {}
             },
-            WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
-            WindowEvent::PinchGesture { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !ui_consumed && !ui_wants_pointer => self.wheel(delta),
+            WindowEvent::PinchGesture { delta, .. } if !ui_consumed && !ui_wants_pointer => {
                 let viewport = self.viewport();
                 self.camera.zoom_about_screen_point(self.cursor, 1.0 + delta as f32, viewport);
                 self.redraw();
             }
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event, event_loop),
+            #[cfg(feature = "egui-ui")]
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
+                if !ui_consumed
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::F1) =>
+            {
+                self.hud_open = !self.hud_open;
+                self.redraw();
+            }
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if !ui_consumed && !ui_wants_keyboard => {
+                self.key(&event, event_loop);
+            }
             _ => {}
         }
     }
@@ -511,6 +631,16 @@ impl ApplicationHandler<Wake> for App {
             // A counted run draws without waiting to be asked.
             Some(_) => self.redraw(),
             None => {}
+        }
+        #[cfg(feature = "egui-ui")]
+        if let Some(deadline) = self.ui_repaint_at {
+            if Instant::now() >= deadline {
+                self.ui_repaint_at = None;
+                self.redraw();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
         }
         // Nothing animates yet: sleep until the next event or wake.
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -535,6 +665,11 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         exit_after: None,
         spawn: None,
         next_id: 0,
+        #[cfg(feature = "egui-ui")]
+        hud_open: std::env::var_os("GLYPH_WALL_HUD")
+            .is_some_and(|v| !v.is_empty() && v != "0"),
+        #[cfg(feature = "egui-ui")]
+        ui_repaint_at: None,
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);

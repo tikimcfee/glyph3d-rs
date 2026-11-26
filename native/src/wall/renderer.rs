@@ -1346,6 +1346,22 @@ pub fn render_wall_to_png(
     frames: u32,
     path: &Path,
 ) {
+    render_wall_to_png_with_overlay(ctx, renderer, camera, frame, viewport, frames, path, |_, _| {});
+}
+
+/// Render a wall frame offscreen into a PNG at `path`, invoking `overlay` after
+/// the wall's render pass on the final frame (e.g. to paint `WallUi` over the scene).
+#[expect(clippy::too_many_arguments, reason = "offscreen capture helper extending render_wall_to_png with an overlay hook")]
+pub fn render_wall_to_png_with_overlay(
+    ctx: &GpuContext,
+    renderer: &mut WallRenderer,
+    camera: &WallCamera,
+    frame: &WallFrame<'_>,
+    viewport: (u32, u32),
+    frames: u32,
+    path: &Path,
+    mut overlay: impl FnMut(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+) {
     let (width, height) = viewport;
     let device = &ctx.device;
     let format = renderer.color_format;
@@ -1391,6 +1407,7 @@ pub fn render_wall_to_png(
         };
         renderer.render(device, &ctx.queue, &mut encoder, &target, camera, frame);
         if frame_idx == frames - 1 {
+            overlay(&mut encoder, &color_view);
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
