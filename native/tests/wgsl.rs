@@ -74,7 +74,7 @@ fn all_wgsl_shaders_parse_and_validate() {
                         assert_eq!(span, 224, "WallFrameUniform WGSL struct size must match wall::renderer WallFrameUniform (224 B)");
                     }
                     if name == "TerminalUniform" {
-                        assert_eq!(span, 48, "TerminalUniform WGSL struct size must match wall::renderer TerminalUniform (48 B)");
+                        assert_eq!(span, 64, "TerminalUniform WGSL struct size must match wall::renderer TerminalUniform (64 B)");
                     }
                     if name == "CellGpu" {
                         assert_eq!(span, 16, "CellGpu WGSL struct size must match wall::cell CellGpu (16 B)");

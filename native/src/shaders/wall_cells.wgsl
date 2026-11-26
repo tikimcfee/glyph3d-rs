@@ -82,6 +82,10 @@ struct TerminalUniform {
     cursor_row: u32,
     cursor_flags: u32,
     border_override: u32,
+    scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct CellGpu {
@@ -275,9 +279,10 @@ struct PanelVsOut {
 @vertex
 fn vs_panel(@builtin(vertex_index) vi: u32) -> PanelVsOut {
     let c = quad_corner(vi);
-    let pad = frame.panel_padding;
-    let grid_w = f32(term.cols) * frame.cell_size.x;
-    let grid_h = f32(term.rows) * frame.cell_size.y;
+    let cell_size = frame.cell_size * term.scale;
+    let pad = frame.panel_padding * term.scale;
+    let grid_w = f32(term.cols) * cell_size.x;
+    let grid_h = f32(term.rows) * cell_size.y;
     let x0 = term.origin.x - pad;
     let x1 = term.origin.x + grid_w + pad;
     let y0 = term.origin.y - grid_h - pad;
@@ -350,14 +355,15 @@ fn vs_fill(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let col = ii % term.cols;
     let row = ii / term.cols;
     let c = quad_corner(vi);
+    let cell_size = frame.cell_size * term.scale;
     let x = select(
-        term.origin.x + f32(col) * frame.cell_size.x,
-        term.origin.x + f32(col + 1u) * frame.cell_size.x,
+        term.origin.x + f32(col) * cell_size.x,
+        term.origin.x + f32(col + 1u) * cell_size.x,
         c.x > 0.5,
     );
     let y = select(
-        term.origin.y - f32(row + 1u) * frame.cell_size.y,
-        term.origin.y - f32(row) * frame.cell_size.y,
+        term.origin.y - f32(row + 1u) * cell_size.y,
+        term.origin.y - f32(row) * cell_size.y,
         c.y > 0.5,
     );
     let z = term.z + Z_OFFSET_FILL;
@@ -436,14 +442,15 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     let col = ii % term.cols;
     let row = ii / term.cols;
     let c = quad_corner(vi);
-    let span_w = f32(span_cols) * frame.cell_size.x;
-    let quad_w = select(span_w, max(span_w, frame.cell_size.y), mode == 1u);
+    let cell_size = frame.cell_size * term.scale;
+    let span_w = f32(span_cols) * cell_size.x;
+    let quad_w = select(span_w, max(span_w, cell_size.y), mode == 1u);
 
-    let x0 = term.origin.x + f32(col) * frame.cell_size.x;
-    let exact_span_right = term.origin.x + f32(col + span_cols) * frame.cell_size.x;
+    let x0 = term.origin.x + f32(col) * cell_size.x;
+    let exact_span_right = term.origin.x + f32(col + span_cols) * cell_size.x;
     let x1 = select(x0 + quad_w, exact_span_right, quad_w == span_w);
-    let y0 = term.origin.y - f32(row + 1u) * frame.cell_size.y;
-    let y1 = term.origin.y - f32(row) * frame.cell_size.y;
+    let y0 = term.origin.y - f32(row + 1u) * cell_size.y;
+    let y1 = term.origin.y - f32(row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
     let y = select(y0, y1, c.y > 0.5);
     let z = term.z + Z_OFFSET_INK;
@@ -477,10 +484,10 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     out.glyph_arg = glyph_arg;
     out.style = style;
     out.cell_info = vec4<f32>(
-        quad_w / max(frame.cell_size.x, 1e-6),
-        frame.cell_size.x / max(frame.cell_size.y, 1e-6),
+        quad_w / max(cell_size.x, 1e-6),
+        cell_size.x / max(cell_size.y, 1e-6),
         f32(span_cols),
-        quad_w / max(frame.cell_size.y, 1e-6),
+        quad_w / max(cell_size.y, 1e-6),
     );
     out.emoji_cell_xy = emoji_cell_xy;
     out.emoji_layer = emoji_layer;
@@ -733,10 +740,11 @@ fn vs_cursor(@builtin(vertex_index) vi: u32) -> CursorVsOut {
     }
     let span_cols = max((term.cursor_flags >> 4u) & 3u, 1u);
     let c = quad_corner(vi);
-    let x0 = term.origin.x + f32(term.cursor_col) * frame.cell_size.x;
-    let x1 = term.origin.x + f32(term.cursor_col + span_cols) * frame.cell_size.x;
-    let y0 = term.origin.y - f32(term.cursor_row + 1u) * frame.cell_size.y;
-    let y1 = term.origin.y - f32(term.cursor_row) * frame.cell_size.y;
+    let cell_size = frame.cell_size * term.scale;
+    let x0 = term.origin.x + f32(term.cursor_col) * cell_size.x;
+    let x1 = term.origin.x + f32(term.cursor_col + span_cols) * cell_size.x;
+    let y0 = term.origin.y - f32(term.cursor_row + 1u) * cell_size.y;
+    let y1 = term.origin.y - f32(term.cursor_row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
     let y = select(y0, y1, c.y > 0.5);
     let z = term.z + Z_OFFSET_CURSOR;

@@ -247,6 +247,7 @@ impl App {
                 screen: t.term.screen(),
                 position: t.position,
                 z: t.z,
+                scale: 1.0,
                 focused: self.focused == Some(t.id),
                 panel_opacity: None,
                 border_color: None,

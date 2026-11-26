@@ -22,7 +22,7 @@ use crate::gpu::GpuContext;
 use super::camera::WallCamera;
 use super::cell::{CellGpu, dirty_row_ranges, pack_cell};
 use super::labels::{Label, LabelGlyphGpu, LabelHeight, measure_label_width, pack_label_glyphs};
-use super::metrics::CellMetrics;
+use super::metrics::{CellMetrics, sanitize_scale};
 use super::paper::{PaperStyle, WallPaperUniform, build_paper_uniform};
 use super::shapes::{Shape, ShapeFrameUniform, ShapeGpu, expand_shape};
 
@@ -97,6 +97,9 @@ pub struct TerminalDraw<'a> {
     pub position: Vec2,
     /// World depth; larger `z` is nearer to the camera and covers smaller `z`.
     pub z: f32,
+    /// Uniform world-space scale for this terminal (`1.0` = default cell size).
+    /// Scales cells, panel padding, fills, style lines, and cursor around `position`.
+    pub scale: f32,
     /// Whether this terminal holds keyboard focus (solid cursor + focused border).
     pub focused: bool,
     /// Optional per-terminal panel opacity override (`None` = [`WallStyle::panel_opacity`]).
@@ -149,7 +152,7 @@ struct WallFrameUniform {
     _pad1: u32,
 }
 
-/// Per-terminal uniform block (`TerminalUniform` in `wall_cells.wgsl`, 48 B).
+/// Per-terminal uniform block (`TerminalUniform` in `wall_cells.wgsl`, 64 B).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct TerminalUniform {
@@ -164,6 +167,10 @@ struct TerminalUniform {
     cursor_row: u32,
     cursor_flags: u32,
     border_override: u32,
+    scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct TerminalGpu {
@@ -905,6 +912,10 @@ impl WallRenderer {
             cursor_row: u32::from(screen.cursor.row),
             cursor_flags: pack_cursor_flags(screen),
             border_override: draw.border_color.unwrap_or(0),
+            scale: sanitize_scale(draw.scale),
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
@@ -1456,6 +1467,7 @@ pub fn render_test_pattern_offscreen(
             screen: &t.screen,
             position: t.position,
             z: t.z,
+            scale: 1.0,
             focused: t.focused,
             panel_opacity: None,
             border_color: t.border_color,
@@ -1503,7 +1515,7 @@ mod tests {
     #[test]
     fn uniform_sizes_match_wgsl() {
         assert_eq!(std::mem::size_of::<WallFrameUniform>(), 224);
-        assert_eq!(std::mem::size_of::<TerminalUniform>(), 48);
+        assert_eq!(std::mem::size_of::<TerminalUniform>(), 64);
     }
 
     fn render_rgba_bytes(
@@ -1621,6 +1633,7 @@ mod tests {
                 screen: &far_screen,
                 position: Vec2::new(0.0, 0.0),
                 z: 0.0,
+                scale: 1.0,
                 focused: false,
                 panel_opacity: Some(1.0),
                 border_color: None,
@@ -1630,6 +1643,7 @@ mod tests {
                 screen: &near_screen,
                 position: Vec2::new(0.0, 0.0),
                 z: 5.0,
+                scale: 1.0,
                 focused: false,
                 panel_opacity: Some(1.0),
                 border_color: None,
@@ -1671,6 +1685,7 @@ mod tests {
                 screen,
                 position: Vec2::ZERO,
                 z: 0.0,
+                scale: 1.0,
                 focused,
                 panel_opacity: Some(1.0),
                 border_color: None,
@@ -1902,6 +1917,7 @@ mod tests {
             screen: &term,
             position: Vec2::new(-1.5, 2.0),
             z: 1.0,
+            scale: 1.0,
             focused: false,
             panel_opacity: Some(1.0),
             border_color: None,
@@ -2103,5 +2119,78 @@ mod tests {
             (ratio - 1.0).abs() < 0.08,
             "ScreenPx label size should stay constant across 4x zoom change (n12={n12}, n48={n48})"
         );
+    }
+
+    /// Verifies `TerminalDraw::scale` scales panel, fills, ink, and cursor together.
+    #[test]
+    fn gpu_terminal_scale_scales_panel_fills_ink_and_cursor() {
+        let ctx = crate::gpu::test_device::context();
+        let atlas = Arc::new(Atlas::load(&crate::default_emoji_sheet()));
+        let mut style = WallStyle::default();
+        style.clear_color = [0.0, 0.0, 0.0, 1.0];
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            atlas,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            style,
+        );
+
+        let mut screen = Screen::new(10, 6);
+        screen.default_bg = rgb(0x18, 0x20, 0x30);
+        // Bright red fill at cell (4, 2) and cursor at cell (1, 1).
+        screen.row_mut(2)[4].bg = rgb(0xe0, 0x20, 0x20);
+        screen.touch_row(2);
+        screen.cursor = term_cells::Cursor {
+            col: 1,
+            row: 1,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+
+        let origin = Vec2::ZERO;
+        let half = TerminalDraw {
+            id: 99,
+            screen: &screen,
+            position: origin,
+            z: 1.0,
+            scale: 0.5,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+        };
+
+        let w = 256u32;
+        let h = 256u32;
+        let cam = WallCamera::new(Vec2::new(2.5, -3.0), 32.0);
+        let px = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[half], ..Default::default() },
+            w,
+            h,
+        );
+        let sample = |world: Vec2| -> [u8; 3] {
+            let s = cam.world_to_screen(world, (w, h));
+            let x = (s.x.round() as u32).min(w - 1);
+            let y = (s.y.round() as u32).min(h - 1);
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        let m_half = renderer.metrics().scaled(0.5);
+        let m_full = renderer.metrics();
+
+        // Red fill at scaled cell (4, 2) must be bright red; unscaled (8, 4) lies outside the 0.5x panel!
+        let fill_half = sample(m_half.cell_rect(origin, 4, 2, 1).center());
+        assert!(fill_half[0] > 200 && fill_half[2] < 50, "0.5x fill should be red, got {fill_half:?}");
+        let outside_half = sample(m_full.cell_rect(origin, 8, 4, 1).center());
+        assert_eq!(outside_half, [0, 0, 0], "outside 0.5x panel must stay black, got {outside_half:?}");
+
+        // Green focused block cursor sits at scaled cell (1, 1).
+        let cursor_half = sample(m_half.cell_rect(origin, 1, 1, 1).center());
+        assert!(cursor_half[1] > 120, "0.5x focused block cursor should light green, got {cursor_half:?}");
     }
 }
