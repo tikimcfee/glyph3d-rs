@@ -38,6 +38,7 @@ enum IdleProbe {
     },
     Settling {
         settle_until: Instant,
+        max_settle_until: Instant,
         idle_ms: u64,
     },
     Measuring {
@@ -131,7 +132,6 @@ impl Drop for PumpScope {
         let mut inner = shared.inner.lock().expect("perf mutex poisoned");
         inner.pending_pump_ns = inner.pending_pump_ns.saturating_add(elapsed_ns);
         inner.total_pump_ns = inner.total_pump_ns.saturating_add(elapsed_ns);
-        inner.pump_wakes += 1;
     }
 }
 
@@ -247,7 +247,8 @@ fn format_summary_from_inner(
     let pump_sum_ms = ns_to_ms(inner.total_pump_ns.saturating_add(extra_pump_ns));
     let draw_sum_ms = ns_to_ms(inner.frame_draw_ns.iter().copied().sum());
     let wait_sum_ms = ns_to_ms(inner.frame_wait_ns.iter().copied().sum());
-    let wakes = inner.pump_wakes.max(pump_calls_started);
+    let _ = pump_calls_started;
+    let wakes = inner.pump_wakes;
     let wake_hz = if wall_s > 0.0 {
         wakes as f64 / wall_s
     } else {
@@ -352,8 +353,10 @@ impl WallPerf {
             inner.opened_at = Some(now);
             inner.opened_cpu_ns = process_cpu_ns();
             if let IdleProbe::PendingOpen { settle_ms, idle_ms } = inner.idle {
+                let settle_until = now + Duration::from_millis(settle_ms);
                 inner.idle = IdleProbe::Settling {
-                    settle_until: now + Duration::from_millis(settle_ms),
+                    settle_until,
+                    max_settle_until: settle_until + Duration::from_millis(2000),
                     idle_ms,
                 };
             }
@@ -456,6 +459,15 @@ impl WallPerf {
         )
     }
 
+    /// Record a single `EventLoop` `Wake` event delivered to `user_event`.
+    pub fn record_wake(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut inner = self.shared.inner.lock().expect("perf mutex poisoned");
+        inner.pump_wakes += 1;
+    }
+
     /// Begin timing a single `App::pump` call on the window's thread.
     pub fn pump_scope(&self) -> PumpScope {
         if !self.enabled {
@@ -548,6 +560,7 @@ impl WallPerf {
     pub fn control_flow(
         &mut self,
         current_frames: u64,
+        animating: bool,
         ui_wake_at: Option<Instant>,
     ) -> (bool, ControlFlow) {
         if !self.enabled {
@@ -567,11 +580,14 @@ impl WallPerf {
             IdleProbe::Off | IdleProbe::PendingOpen { .. } => None,
             IdleProbe::Settling {
                 settle_until,
+                max_settle_until,
                 idle_ms,
             } => {
                 let now = Instant::now();
                 if now < settle_until {
                     Some(settle_until)
+                } else if animating && now < max_settle_until {
+                    Some(max_settle_until.min(now + Duration::from_millis(50)))
                 } else {
                     let measure_until = now + Duration::from_millis(idle_ms);
                     inner.idle = IdleProbe::Measuring {

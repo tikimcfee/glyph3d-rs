@@ -155,7 +155,14 @@ struct App {
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
     occluded: bool,
+    wakes: Arc<WakeGate>,
     perf: super::perf::WallPerf,
+}
+
+#[derive(Default)]
+struct WakeGate {
+    pending: std::sync::atomic::AtomicBool,
+    redraw_armed: std::sync::atomic::AtomicBool,
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -264,6 +271,9 @@ impl App {
 
     fn redraw(&self) {
         if let Some(g) = &self.gfx {
+            if !self.occluded {
+                self.wakes.redraw_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             g.window.request_redraw();
         }
     }
@@ -323,22 +333,35 @@ impl App {
         };
         let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
 
-        // The terminals.
-        let proxy = self.proxy.clone();
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            // The loop may be gone at shutdown; nothing is left to wake.
-            let _ = proxy.send_event(Wake);
+        // The terminals and control socket. Duplicate queued `Wake`s are
+        // coalesced, and terminal publishes do not re-wake the loop while a
+        // surface redraw is already armed (`draw` pumps before building).
+        let proxy_ctl = self.proxy.clone();
+        let gate_ctl = self.wakes.clone();
+        let control_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_ctl.pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = proxy_ctl.send_event(Wake);
+            }
         });
         // The door for `wallctl`: verbs arrive on a socket beside termd's.
         if let Some(ns) = &opts.namespace {
-            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake) {
                 Ok(server) => self.control = Some(server),
                 Err(e) => log::warn!("the wall's control socket is not open, so wallctl cannot reach this window: {e}"),
             }
         }
+        let proxy_sess = self.proxy.clone();
+        let gate_sess = self.wakes.clone();
+        let session_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_sess.redraw_armed.load(std::sync::atomic::Ordering::SeqCst)
+                && !gate_sess.pending.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = proxy_sess.send_event(Wake);
+            }
+        });
         let terms = match &opts.namespace {
             Some(ns) => {
-                let mut sessions = match Sessions::open(ns, wake) {
+                let mut sessions = match Sessions::open(ns, session_wake) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("error: the wall could not reach its terminals: {e}");
@@ -579,7 +602,7 @@ impl App {
     }
 
     /// Take in what the terminals' reader thread queued.
-    fn pump(&mut self) {
+    fn pump(&mut self, request_redraw: bool) {
         let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
         let (changed, news) = sessions.pump();
@@ -599,7 +622,7 @@ impl App {
         if heard {
             self.apply_effects();
         }
-        if changed || heard {
+        if request_redraw && (changed || heard) {
             self.redraw();
         }
     }
@@ -624,6 +647,8 @@ impl App {
     /// The wall's description of a frame as the renderer's draw lists.
     #[expect(clippy::too_many_lines, reason = "one arm per kind of thing the wall describes; splitting it scatters the mapping")]
     fn draw(&mut self, to_surface: bool) {
+        self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.pump(false);
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(1.0 / 30.0);
         self.last_tick = now;
@@ -1191,12 +1216,14 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _wake: Wake) {
+        self.wakes.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.perf.record_wake();
         if self.perf.should_exit_on_wake(self.quit) {
             event_loop.exit();
             return;
         }
         self.serve_control();
-        self.pump();
+        self.pump(true);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1227,7 +1254,9 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
-                if !occluded {
+                if occluded {
+                    self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                } else {
                     self.redraw();
                 }
             }
@@ -1331,6 +1360,7 @@ impl ApplicationHandler<Wake> for App {
                 if self.animating || counted {
                     let (perf_exit, cf) = self.perf.control_flow(
                         self.frames,
+                        self.animating,
                         Some(Instant::now() + std::time::Duration::from_millis(16)),
                     );
                     if perf_exit {
@@ -1344,13 +1374,20 @@ impl ApplicationHandler<Wake> for App {
         }
         let now = Instant::now();
         let mut next_repaint: Option<Instant> = None;
+        if self.wakes.redraw_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.last_tick.elapsed() >= COVERED_TICK {
+                self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                next_repaint = Some(now + COVERED_TICK);
+            }
+        }
         #[cfg(feature = "egui-ui")]
         if let Some(deadline) = self.ui_repaint_at {
             if now >= deadline {
                 self.ui_repaint_at = None;
                 self.redraw();
             } else {
-                next_repaint = Some(deadline);
+                next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
         if let Some(deadline) = self.blink_repaint_at {
@@ -1361,7 +1398,7 @@ impl ApplicationHandler<Wake> for App {
                 next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
-        let (perf_exit, cf) = self.perf.control_flow(self.frames, next_repaint);
+        let (perf_exit, cf) = self.perf.control_flow(self.frames, self.animating, next_repaint);
         if perf_exit {
             event_loop.exit();
         } else {
@@ -1402,6 +1439,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         ui_repaint_at: None,
         blink_repaint_at: None,
         occluded: false,
+        wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
     };
     event_loop.run_app(&mut app).expect("event loop error");
