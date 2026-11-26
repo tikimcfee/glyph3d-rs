@@ -6,6 +6,7 @@ description = "Fonts loaded at run time and encoded to Slug curves in the engine
 
 [dependencies]
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+term-cells = { path = "../term-cells" }
 ttf-parser = "0.25"
 
 [lints]

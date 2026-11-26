@@ -1,23 +1,26 @@
 //! Runtime font chain and growable Slug atlas.
 //!
 //! Combines `FontChain` routing (families, bold/italic/bold-italic faces, variable-font
-//! instances, shared fallback fonts, cell-generated terminal sprites, and combining-mark
-//! composite clusters) with on-demand Slug curve encoding into a growable [`SlugBuffer`].
+//! instances, shared fallback fonts, cell-generated terminal sprites, combining-mark composite
+//! clusters, and optional colour-emoji bitmaps) with on-demand Slug curve encoding into a
+//! growable [`SlugBuffer`].
 //!
 //! A [`Slot`] is a plain `u32` (slot 0 = blank). Cell sprites route before any font into
-//! glyph-map mode `3` (`GLYPH_MODE_SPRITE`). Other external glyph sources (such as colour
-//! emoji bitmaps) can allocate slots from the same atlas via [`FontAtlas::allocate_slot`] and
-//! write their curves or glyph-map entries directly into its buffer without colliding.
+//! glyph-map mode `3` (`GLYPH_MODE_SPRITE`). Colour emoji routed through an attached
+//! [`EmojiSource`] write `[0, 0, GLYPH_MODE_BITMAP (1), emoji_cell]` — the exact format
+//! `assets/atlas/glyphmap.bin` and `wall_cells.wgsl` expect.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use icu_normalizer::{ComposingNormalizer, DecomposingNormalizer};
+use term_cells::{attrs, Cell, Screen, CLUSTER_BASE};
 use ttf_parser::{Face as TtfFace, GlyphId, Rect, Tag};
 
 use crate::buffer::{DirtyUpdate, SlugBuffer, TextureBacking};
-use crate::constants::{BLANK_SLOT, GLYPH_MODE_OUTLINE, GLYPH_MODE_SPRITE};
+use crate::constants::{BLANK_SLOT, GLYPH_MODE_BITMAP, GLYPH_MODE_OUTLINE, GLYPH_MODE_SPRITE};
+use crate::emoji::EmojiSource;
 use crate::encode::{
     encode_composite_part_curves, encode_glyph, extract_raw_curves, CompositePart, Curve,
     PackedCurve,
@@ -67,6 +70,16 @@ impl Face {
     pub const fn as_index(self) -> usize {
         self as usize
     }
+}
+
+/// Result of resolving a [`term_cells::Cell`] for the cell renderer ([`FontAtlas::resolve_cell`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedCell {
+    /// Atlas slot id (`BLANK_SLOT` / `0` for blank, space, uncovered, or trailing wide cells).
+    pub slot: Slot,
+    /// Terminal columns spanned by this cell (`0` = trailing half of a wide character,
+    /// `1` = normal cell, `2` = wide character / wide emoji).
+    pub span_cols: u8,
 }
 
 /// Errors produced when loading or configuring a [`FontAtlas`].
@@ -140,6 +153,8 @@ pub enum SlotKind<'a> {
     Blank,
     /// Single font glyph outline (mode 0).
     Font(SlotInfo),
+    /// Colour-emoji bitmap slot (mode 1) referencing a cell in the host's emoji sheet.
+    Bitmap { cell: u32 },
     /// Generated cell sprite (mode 3), owned by `family`.
     Sprite { family: FamilyId, codepoint: u32 },
     /// Composite cluster outline (mode 0) built from a base and placed combining marks.
@@ -175,10 +190,14 @@ pub struct FontAtlas {
     families: Vec<Family>,
     buffer: SlugBuffer,
     next_slot: Slot,
+    /// Optional colour-emoji bitmap sheet index / callback.
+    emoji_source: Option<Arc<dyn EmojiSource>>,
     /// `(font_index, gid) -> Slot` for font-backed outline slots.
     slot_by_glyph: HashMap<(usize, u16), Slot>,
     /// `(family_idx, codepoint) -> Slot` for generated cell sprite slots (mode 3).
     sprite_by_key: HashMap<(usize, u32), Slot>,
+    /// `emoji_cell -> Slot` deduplication for colour-emoji bitmap slots (mode 1).
+    bitmap_by_cell: HashMap<u32, Slot>,
     /// `parts -> Slot` deduplication for composite clusters.
     composite_by_parts: HashMap<Vec<CompositePart>, Slot>,
     /// `(family_idx, face_bits, codepoint) -> Slot` fast cache (including `BLANK_SLOT` misses).
@@ -188,6 +207,7 @@ pub struct FontAtlas {
     /// Per-slot provenance tables.
     slot_sources: HashMap<Slot, (usize, u16)>,
     sprite_sources: HashMap<Slot, (usize, u32)>,
+    bitmap_sources: HashMap<Slot, u32>,
     composite_sources: HashMap<Slot, Vec<CompositePart>>,
 }
 
@@ -300,15 +320,34 @@ impl FontAtlas {
             families,
             buffer: SlugBuffer::with_initial_rows(curve_rows, map_rows),
             next_slot: 1,
+            emoji_source: None,
             slot_by_glyph: HashMap::new(),
             sprite_by_key: HashMap::new(),
+            bitmap_by_cell: HashMap::new(),
             composite_by_parts: HashMap::new(),
             lookup_cache: HashMap::new(),
             cluster_cache: HashMap::new(),
             slot_sources: HashMap::new(),
             sprite_sources: HashMap::new(),
+            bitmap_sources: HashMap::new(),
             composite_sources: HashMap::new(),
         })
+    }
+
+    /// Attach a colour-emoji bitmap source (builder style).
+    pub fn with_emoji_source(mut self, source: impl EmojiSource + 'static) -> Self {
+        self.set_emoji_source(Some(Arc::new(source)));
+        self
+    }
+
+    /// Replace or clear the attached colour-emoji bitmap source.
+    ///
+    /// Clears the per-codepoint/cluster routing caches so subsequent lookups reflect the new
+    /// source; already-allocated slots stay valid.
+    pub fn set_emoji_source(&mut self, source: Option<Arc<dyn EmojiSource>>) {
+        self.emoji_source = source;
+        self.lookup_cache.clear();
+        self.cluster_cache.clear();
     }
 
     /// Look up a family handle by its string id (e.g. `"cousine"`, `"monaspace-neon"`, `"monaspace-argon"`).
@@ -352,15 +391,59 @@ impl FontAtlas {
         self.families[family.0].metrics.sprites
     }
 
+    /// Single entry point for a terminal cell renderer (replaces `native/src/wall/cell.rs::resolve_cell_glyph`).
+    ///
+    /// Given `family`, `screen`, and `cell`:
+    /// - Trailing halves of wide characters (`cell.width == 0`) return `(BLANK_SLOT, 0)`.
+    /// - Empty cells (`content == 0`) and ASCII spaces (`0x20`) return `(BLANK_SLOT, span_cols)`
+    ///   so the shader skips the glyph-map texture load while still drawing style lines.
+    /// - Extracts bold/italic [`Face`] from `cell.attrs` (`term_cells::attrs::face`).
+    /// - Resolves scalars through [`Self::glyph_u32`] and clusters (`>= CLUSTER_BASE`) through
+    ///   [`Self::cluster`], covering sprites, outline glyphs, composites, and colour emoji.
+    pub fn resolve_cell(&mut self, family: FamilyId, screen: &Screen, cell: &Cell) -> ResolvedCell {
+        let span_cols = cell.width.min(2);
+        if span_cols == 0 || cell.content == 0 || cell.content == 0x20 {
+            return ResolvedCell {
+                slot: BLANK_SLOT,
+                span_cols,
+            };
+        }
+
+        let face = Face::from_bits(attrs::face(cell.attrs));
+        let slot = if cell.content < CLUSTER_BASE {
+            self.glyph_u32(family, face, cell.content)
+        } else {
+            let idx = (cell.content - CLUSTER_BASE) as usize;
+            let text = screen.clusters.get(idx).map(String::as_str).unwrap_or("");
+            if text.is_empty() || text == " " {
+                BLANK_SLOT
+            } else {
+                // Fast-path cache probe without allocating a String on hit.
+                let fam_idx = family.0;
+                if fam_idx < self.families.len() {
+                    self.cluster(family, face, text)
+                } else {
+                    BLANK_SLOT
+                }
+            }
+        };
+
+        ResolvedCell { slot, span_cols }
+    }
+
     /// Look up (and encode on first use) the atlas [`Slot`] for `(family, face, codepoint)`.
     ///
-    /// - Cell sprite codepoints (`is_sprite_codepoint`) route to a per-family sprite slot in
-    ///   glyph-map mode `3` (`GLYPH_MODE_SPRITE`) BEFORE any font (ignoring `face`).
-    /// - All other codepoints route through `family`'s primary font first, then the shared
-    ///   fallbacks. For non-regular faces, uses that font's matching face (falling back from
-    ///   `BoldItalic` to `Italic` then `Bold`, then upright if absent or uncovered). Fallback
-    ///   fonts stay upright.
-    /// - Returns [`BLANK_SLOT`] (`0`) when no font in the family's route covers `codepoint`.
+    /// Precedence (matching `FontChain.js` and the baked atlas's BMP text-vs-emoji split):
+    /// 1. **Cell sprites** (`is_sprite_codepoint`) route to a per-family mode-3 sprite slot
+    ///    BEFORE any font or emoji source (ignoring `face`).
+    /// 2. **Astral emoji planes (`cp >= 0x1F000`)** prefer colour emoji when an [`EmojiSource`]
+    ///    is attached and has a cell (mode-1 bitmap slot `[0, 0, 1, cell]`), falling back to
+    ///    outline fonts if the sheet has no cell.
+    /// 3. **BMP codepoints (`cp < 0x1F000`)** prefer outline fonts first (so digits, `#`, `*`,
+    ///    `©`, `®`, `❤`, `✓`, `★`, `☃` draw as crisp monochrome outlines in the terminal's fg
+    ///    colour), routing to a mode-1 colour-emoji bitmap slot only when no outline font in
+    ///    `family`'s route covers `cp`.
+    /// 4. Returns [`BLANK_SLOT`] (`0`) when nothing covers `cp`.
     pub fn glyph(&mut self, family: FamilyId, face: Face, codepoint: char) -> Slot {
         self.glyph_u32(family, face, codepoint as u32)
     }
@@ -376,10 +459,24 @@ impl FontAtlas {
         let slot = if is_sprite_codepoint(codepoint) {
             self.ensure_sprite(fam_idx, codepoint)
         } else {
-            match self.resolve_font_glyph(fam_idx, face, codepoint) {
-                None => BLANK_SLOT,
-                Some((font_idx, gid)) => self.ensure_font_glyph(font_idx, gid),
+            let prefer_color = self.emoji_source.is_some() && codepoint >= 0x1F000;
+            let mut resolved = BLANK_SLOT;
+            if prefer_color {
+                if let Some(cell) = self.emoji_cell_for_cp(codepoint) {
+                    resolved = self.ensure_bitmap_slot(cell);
+                }
             }
+            if resolved == BLANK_SLOT {
+                if let Some((font_idx, gid)) = self.resolve_font_glyph(fam_idx, face, codepoint) {
+                    resolved = self.ensure_font_glyph(font_idx, gid);
+                }
+            }
+            if resolved == BLANK_SLOT && !prefer_color {
+                if let Some(cell) = self.emoji_cell_for_cp(codepoint) {
+                    resolved = self.ensure_bitmap_slot(cell);
+                }
+            }
+            resolved
         };
         self.lookup_cache.insert(key, slot);
         slot
@@ -395,26 +492,32 @@ impl FontAtlas {
     }
 
     /// Look up (and encode on first use) a grapheme cluster — a base and its combining marks
-    /// (e.g. `"e\u{0301}"`, `"x\u{0301}"`, `"q\u{0308}\u{0304}"`) or an emoji/variation sequence.
+    /// (e.g. `"e\u{0301}"`, `"x\u{0301}"`, `"q\u{0308}\u{0304}"`) or an emoji / variation sequence
+    /// (e.g. `"👨‍👩‍👧"`, `"🇺🇸"`, `"👍🏽"`, `"1️⃣"`, `"❤️"`, `"❤\u{FE0E}"`).
     ///
-    /// Mirrors `FontChain.lookupCluster` and `slugData.encodeComposite`:
-    /// 1. Variation selectors (`U+FE00..=FE0F`, `U+E0100..=E01EF`) and joiners (`U+200C`,
-    ///    `U+200D`) are stripped.
-    /// 2. The remainder is NFC-normalised (`icu_normalizer`). If it composes to a single scalar
-    ///    covered by a sprite or font in `family`'s route, returns that single glyph's slot in
-    ///    `face`. If uncovered, NFD decomposition is tried so a decomposed base + marks can still
-    ///    be drawn as a composite.
-    /// 3. For a multi-scalar cluster whose base is a sprite or astral emoji (`>= U+1F000`) or
-    ///    uncovered, draws the base alone (`glyph(family, face, base)`).
-    /// 4. Otherwise builds a composite slot from the base (in `face` where available) and each
-    ///    combining mark (from the base's font if covered, else from `family`'s fallback fonts;
-    ///    uncovered marks are dropped). Marks are placed by ink bounding box (`MARK_GAP_EM = 1/16`
-    ///    above/below the accumulated ink stack, centred horizontally over the base's ink).
+    /// Precedence:
+    /// 1. If `text` has a single scalar (no selectors/marks), delegates directly to [`Self::glyph`].
+    /// 2. If `text` does NOT request explicit text presentation (`U+FE0E`) and an [`EmojiSource`]
+    ///    is attached, queries the emoji source first — so emoji presentation sequences (`U+FE0F`,
+    ///    ZWJ families, flags, skin-tone modifiers, keycaps) route to a mode-1 bitmap slot
+    ///    `[0, 0, 1, cell]`.
+    /// 3. Otherwise strips variation selectors (`U+FE00..=FE0F`, `U+E0100..=E01EF`) and joiners
+    ///    (`U+200C`, `U+200D`), NFC-normalises via `icu_normalizer`, and returns the precomposed
+    ///    glyph in `face` when covered (or decomposes via NFD and builds an ink-placed composite
+    ///    slot matching `FontChain.lookupCluster` and `slugData.encodeComposite`).
     pub fn cluster(&mut self, family: FamilyId, face: Face, text: &str) -> Slot {
         let fam_idx = family.0;
-        if fam_idx >= self.families.len() {
+        if fam_idx >= self.families.len() || text.is_empty() {
             return BLANK_SLOT;
         }
+        // Single-scalar fast path without allocating a String key for cluster_cache.
+        let mut iter = text.chars();
+        if let Some(first) = iter.next() {
+            if iter.next().is_none() {
+                return self.glyph(family, face, first);
+            }
+        }
+
         let cache_key = (fam_idx, face as u8, text.to_owned());
         if let Some(&slot) = self.cluster_cache.get(&cache_key) {
             return slot;
@@ -427,7 +530,19 @@ impl FontAtlas {
 
     fn resolve_cluster_uncached(&mut self, family: FamilyId, face: Face, text: &str) -> Slot {
         let fam_idx = family.0;
-        let stripped: String = text.chars().filter(|&ch| !is_ignorable_cluster_char(ch)).collect();
+
+        // Explicit text presentation selector (VS15 U+FE0E) forces monochrome outline rendering.
+        let force_text = text.contains('\u{FE0E}');
+        if !force_text {
+            if let Some(cell) = self.emoji_cell_for_str(text) {
+                return self.ensure_bitmap_slot(cell);
+            }
+        }
+
+        let stripped: String = text
+            .chars()
+            .filter(|&ch| !is_ignorable_cluster_char(ch))
+            .collect();
         if stripped.is_empty() {
             return BLANK_SLOT;
         }
@@ -440,8 +555,10 @@ impl FontAtlas {
         };
 
         if chars.next().is_none() {
-            // Single scalar after NFC: use the precomposed glyph/sprite if covered.
             let cp = base as u32;
+            if force_text {
+                return self.glyph_outline_or_sprite(fam_idx, face, cp);
+            }
             if is_sprite_codepoint(cp) || self.route_upright(fam_idx, cp).is_some() {
                 return self.glyph(family, face, base);
             }
@@ -458,12 +575,16 @@ impl FontAtlas {
         }
 
         let base_cp = base as u32;
-        let Some(upright_idx) = self.route_upright(fam_idx, base_cp) else {
-            return self.glyph(family, face, base);
-        };
-        if is_sprite_codepoint(base_cp) || base_cp >= 0x1F000 {
+        if is_sprite_codepoint(base_cp) || (!force_text && base_cp >= 0x1F000) {
             return self.glyph(family, face, base);
         }
+        let Some(upright_idx) = self.route_upright(fam_idx, base_cp) else {
+            return if force_text {
+                BLANK_SLOT
+            } else {
+                self.glyph(family, face, base)
+            };
+        };
 
         // Choose the face font for the base if available and covering `base`.
         let base_font_idx = if face != Face::Regular {
@@ -672,6 +793,41 @@ impl FontAtlas {
         slot
     }
 
+    fn glyph_outline_or_sprite(&mut self, fam_idx: usize, face: Face, codepoint: u32) -> Slot {
+        if is_sprite_codepoint(codepoint) {
+            self.ensure_sprite(fam_idx, codepoint)
+        } else {
+            match self.resolve_font_glyph(fam_idx, face, codepoint) {
+                Some((font_idx, gid)) => self.ensure_font_glyph(font_idx, gid),
+                None => BLANK_SLOT,
+            }
+        }
+    }
+
+    fn emoji_cell_for_cp(&self, codepoint: u32) -> Option<u32> {
+        let source = self.emoji_source.as_ref()?;
+        let ch = char::from_u32(codepoint)?;
+        let mut buf = [0u8; 4];
+        source.cell_for(ch.encode_utf8(&mut buf))
+    }
+
+    fn emoji_cell_for_str(&self, text: &str) -> Option<u32> {
+        self.emoji_source.as_ref()?.cell_for(text)
+    }
+
+    fn ensure_bitmap_slot(&mut self, cell: u32) -> Slot {
+        if let Some(&slot) = self.bitmap_by_cell.get(&cell) {
+            return slot;
+        }
+        let slot = self.allocate_slot();
+        // Exact layout of assets/atlas/glyphmap.bin: [curveStart=0, curveCount=0, mode=1, emojiCell].
+        self.buffer
+            .write_map_entry(slot, [0, 0, GLYPH_MODE_BITMAP, cell]);
+        self.bitmap_by_cell.insert(cell, slot);
+        self.bitmap_sources.insert(slot, cell);
+        slot
+    }
+
     fn route_upright(&self, fam_idx: usize, codepoint: u32) -> Option<usize> {
         let family = self.families.get(fam_idx)?;
         family
@@ -739,12 +895,9 @@ impl FontAtlas {
         slot
     }
 
-    // ── Extensibility for external glyph sources (emoji, etc.) ──────────────
+    // ── Extensibility for external glyph sources ────────────────────────────
 
     /// Allocate the next unused [`Slot`] id (`>= 1`).
-    ///
-    /// External glyph sources (e.g. colour emoji) use this to claim slots from the same id space
-    /// and populate them with [`Self::insert_outline_slot`] or [`Self::insert_map_entry`].
     pub fn allocate_slot(&mut self) -> Slot {
         let slot = self.next_slot;
         self.next_slot += 1;
@@ -763,8 +916,8 @@ impl FontAtlas {
         self.buffer.write_outline_slot(slot, curves, mode, arg);
     }
 
-    /// Write a map-only entry `[curve_start, curve_count, mode, arg]` (e.g. a mode-1 emoji slot)
-    /// for a slot previously obtained from [`Self::allocate_slot`].
+    /// Write a map-only entry `[curve_start, curve_count, mode, arg]` for a slot previously
+    /// obtained from [`Self::allocate_slot`].
     pub fn insert_map_entry(&mut self, slot: Slot, entry: [u32; 4]) {
         self.buffer.write_map_entry(slot, entry);
     }
@@ -821,6 +974,16 @@ impl FontAtlas {
             .map(|&(fam, cp)| (FamilyId(fam), cp))
     }
 
+    /// Returns true if `slot` is a colour-emoji bitmap slot (mode 1).
+    pub fn is_bitmap_slot(&self, slot: Slot) -> bool {
+        self.bitmap_sources.contains_key(&slot)
+    }
+
+    /// Returns the emoji-sheet cell index if `slot` is a colour-emoji bitmap slot.
+    pub fn bitmap_cell(&self, slot: Slot) -> Option<u32> {
+        self.bitmap_sources.get(&slot).copied()
+    }
+
     /// Returns true if `slot` is a composite cluster slot (base + combining marks).
     pub fn is_composite_slot(&self, slot: Slot) -> bool {
         self.composite_sources.contains_key(&slot)
@@ -831,13 +994,17 @@ impl FontAtlas {
         self.composite_sources.get(&slot).map(Vec::as_slice)
     }
 
-    /// Classify any allocated slot (blank, font glyph, cell sprite, composite cluster, or external).
+    /// Classify any allocated slot (blank, font glyph, colour emoji bitmap, cell sprite,
+    /// composite cluster, or external).
     pub fn slot_kind(&self, slot: Slot) -> SlotKind<'_> {
         if slot == BLANK_SLOT {
             return SlotKind::Blank;
         }
         if let Some(info) = self.describe_slot(slot) {
             return SlotKind::Font(info);
+        }
+        if let Some(&cell) = self.bitmap_sources.get(&slot) {
+            return SlotKind::Bitmap { cell };
         }
         if let Some(&(fam, cp)) = self.sprite_sources.get(&slot) {
             return SlotKind::Sprite {
@@ -851,8 +1018,8 @@ impl FontAtlas {
         SlotKind::External
     }
 
-    /// Inspect which font and per-font glyph id produced `slot` (`None` for blank, sprite,
-    /// composite, or external slots).
+    /// Inspect which font and per-font glyph id produced `slot` (`None` for blank, bitmap,
+    /// sprite, composite, or external slots).
     pub fn describe_slot(&self, slot: Slot) -> Option<SlotInfo> {
         let &(font_idx, gid) = self.slot_sources.get(&slot)?;
         let font = &self.fonts[font_idx];
