@@ -404,9 +404,15 @@ impl SessionHub {
         Ok(sessions)
     }
 
-    /// Kills terminal `id` in `g3d-termd`.
+    /// Kills terminal `id` in `g3d-termd` synchronously.
     pub fn kill(&self, id: &str) -> Result<(), Error> {
         self.inner.termd_handle().kill(id)
+    }
+
+    /// Queues a `kill` request for terminal `id` on the background IO thread so a slow process
+    /// shutdown (`kill_grace`) never stalls the window thread.
+    pub fn send_kill(&self, id: &str) {
+        self.inner.send_async(AsyncCmd::Kill { id: id.to_owned() });
     }
 
     /// Fetches the daemon status document once.

@@ -793,41 +793,9 @@ pub fn search_help(sections: &[HelpGroup], query: &str) -> Vec<HelpGroup> {
 
 // ── Pure keyboard dispatch (`WallKeys.js` + `keyEncoding.js`) ────────────────
 
-/// Values of the `optionAsAlt` knob (`OPTION_AS_ALT` in `keyEncoding.js`), carried on
-/// every terminal key event so `termd` can interpret macOS Option per press.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum OptionAsAlt {
-    /// Option that produced a character (`å`) sends the character; Alt that did not is Alt.
-    #[default]
-    Auto,
-    /// Option is always Alt (`Option+A` is `ESC a`, never `å`).
-    True,
-    /// Option is a character modifier (`Option+A` types `a` / `å`).
-    False,
-}
-
-impl OptionAsAlt {
-    pub const OPTIONS: &[&str] = &["auto", "true", "false"];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            OptionAsAlt::Auto => "auto",
-            OptionAsAlt::True => "true",
-            OptionAsAlt::False => "false",
-        }
-    }
-
-    /// Parse and check a knob value (`"auto"`, `"true"`, `"false"`), returning `Err` naming
-    /// `optionAsAlt` on any other string.
-    pub fn parse(value: &str) -> Result<OptionAsAlt, String> {
-        match value {
-            "auto" => Ok(OptionAsAlt::Auto),
-            "true" => Ok(OptionAsAlt::True),
-            "false" => Ok(OptionAsAlt::False),
-            _ => Err(format!("optionAsAlt is auto, true, false, not '{value}'")),
-        }
-    }
-}
+/// Values of the `optionAsAlt` knob (`OPTION_AS_ALT` in `keyEncoding.js`;
+/// unified with [`crate::config::OptionAsAlt`]).
+pub use crate::config::OptionAsAlt;
 
 /// Phase of a key event sent to `termd`'s `key` op (`press`, `repeat`, `release`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

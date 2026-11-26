@@ -1,8 +1,10 @@
 //! Integration tests exercising `glyph_vt` strictly through its public seam
 //! (`Theme`, `Vt`, and `term_cells::Screen`).
 
-use glyph_vt::{Theme, Vt};
-use term_cells::{attrs, rgb, CursorShape, Face, MouseTracking, Screen, CLUSTER_BASE};
+use glyph_vt::{Theme, Vt, VtEvent};
+use term_cells::{
+    attrs, rgb, CursorShape, Face, MouseFormat, MouseTracking, Screen, CLUSTER_BASE,
+};
 
 fn setup(cols: u16, rows: u16) -> (Vt, Screen, Theme) {
     let theme = Theme::default();
@@ -466,3 +468,118 @@ fn fill_tracks_changed_rows_precisely_and_unchanged_fill_is_a_noop() {
     assert_eq!(second_screen.title, "Quiet Title");
     assert_eq!(second_screen.content_str(&second_screen.row(2)[1]), "h");
 }
+
+#[test]
+fn host_events_bell_clipboard_pwd_hyperlinks_and_extended_modes() {
+    let (mut vt, mut screen, _theme) = setup(30, 6);
+
+    // 1. Bell, OSC 52 write ('c') + read ('p'), OSC 7 pwd, OSC 9 notification.
+    vt.feed(
+        b"\x07\x1b]52;c;d2VsbCBoZWxsbyB0aGVyZSE=\x07\x1b]52;p;?\x1b\\\
+          \x1b]7;file://laptop-2/Users/lugo/work\x07\x1b]9;build done\x07",
+    );
+    assert!(vt.has_events());
+    assert_eq!(vt.pwd(), "file://laptop-2/Users/lugo/work");
+    let events = vt.take_events();
+    assert_eq!(
+        events,
+        vec![
+            VtEvent::Bell,
+            VtEvent::ClipboardWrite {
+                selection: b'c',
+                text: "well hello there!".to_string(),
+            },
+            VtEvent::ClipboardRead { selection: b'p' },
+            VtEvent::PwdChanged("file://laptop-2/Users/lugo/work".to_string()),
+            VtEvent::Notification {
+                title: String::new(),
+                body: "build done".to_string(),
+            },
+        ]
+    );
+    assert!(!vt.has_events());
+
+    // Event ring is strictly bounded (<= 256) if never drained.
+    for _ in 0..600 {
+        vt.feed(b"\x07");
+    }
+    let capped = vt.take_events();
+    assert_eq!(capped.len(), 256);
+
+    // 2. OSC 8 hyperlinks on narrow and wide cells + GC across overwrites.
+    vt.feed("\x1b]8;;https://glyph3d.dev/docs\x07ab漢\x1b]8;;\x07z".as_bytes());
+    vt.fill(&mut screen);
+    assert_eq!(vt.hyperlink(0, 0), Some("https://glyph3d.dev/docs"));
+    assert_eq!(vt.hyperlink(1, 0), Some("https://glyph3d.dev/docs"));
+    // Both columns of wide '漢' (head at 2, tail at 3) resolve the hyperlink.
+    assert_eq!(vt.hyperlink(2, 0), Some("https://glyph3d.dev/docs"));
+    assert_eq!(vt.hyperlink(3, 0), Some("https://glyph3d.dev/docs"));
+    assert_eq!(vt.hyperlink(4, 0), None);
+    assert_eq!(vt.hyperlink(99, 99), None);
+
+    // Churn > 600 distinct transient hyperlinks overwritten at (0, 1) to exercise GC.
+    for idx in 0..650 {
+        vt.feed(format!("\x1b[2;1H\x1b]8;;https://example.com/{idx}\x07L\x1b]8;;\x07").as_bytes());
+    }
+    assert_eq!(vt.hyperlink(0, 1), Some("https://example.com/649"));
+    assert_eq!(vt.hyperlink(0, 0), Some("https://glyph3d.dev/docs"));
+
+    // 3. Synchronized output (?2026), mouse format (1005/1006/1015/1016), focus (?1004),
+    //    Kitty keyboard flags, and modifyOtherKeys.
+    vt.feed(b"\x1b[?2026h\x1b[?1006h\x1b[?1016h\x1b[?1004h\x1b[>11u\x1b[>4;2m");
+    assert!(vt.synchronized_output());
+    assert_eq!(vt.mouse_format(), MouseFormat::SgrPixels);
+    assert!(vt.focus_events());
+    assert_eq!(vt.kitty_keyboard(), 11);
+    assert_eq!(vt.modify_other_keys(), 2);
+
+    vt.fill(&mut screen);
+    assert!(screen.modes.synchronized_output);
+    assert_eq!(screen.modes.mouse_format, MouseFormat::SgrPixels);
+    assert!(screen.modes.focus_events);
+    assert_eq!(screen.modes.kitty_keyboard, 11);
+
+    // Disabling active mouse format (?1016l) returns to default X10; enabling ?1006h sets Sgr.
+    vt.feed(b"\x1b[?1016l\x1b[?1006h");
+    vt.fill(&mut screen);
+    assert_eq!(screen.modes.mouse_format, MouseFormat::Sgr);
+
+    // Resize ends an open synchronized-output hold (matching Ghostty).
+    vt.resize(32, 6);
+    assert!(!vt.synchronized_output());
+    vt.fill(&mut screen);
+    assert!(!screen.modes.synchronized_output);
+}
+
+#[test]
+fn cursor_only_controls_and_wide_char_reflow_preserve_invariants() {
+    let (mut vt, mut screen, _theme) = setup(10, 3);
+
+    vt.feed("漢x".as_bytes());
+    vt.fill(&mut screen);
+    assert_eq!(screen.cursor.col, 3);
+
+    // Backspace / CUB / CUF / HT without printing must mark Vt dirty and move screen.cursor.
+    vt.feed(b"\x08");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.cursor.col, 2);
+    vt.feed(b"\t");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.cursor.col, 8);
+
+    // Reflowing a wide character across width changes keeps it 2 cells wide (not 3)
+    // and survives shrinking to 1 column without dangling heads or orphan tails.
+    vt.resize(6, 3);
+    vt.fill(&mut screen);
+    assert_eq!(screen.row(0)[0].content, '漢' as u32);
+    assert_eq!(screen.row(0)[0].width, 2);
+    assert_eq!(screen.row(0)[1].width, 0);
+    assert_eq!(screen.row(0)[2].content, 'x' as u32);
+
+    vt.resize(1, 5);
+    vt.fill(&mut screen);
+    for r in 0..screen.rows {
+        assert_eq!(screen.row(r)[0].width, 1);
+    }
+}
+

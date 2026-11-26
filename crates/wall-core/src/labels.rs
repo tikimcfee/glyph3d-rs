@@ -82,31 +82,8 @@ pub const RELAXED_ORDER: [Candidate; 6] = [
 /// Default touch slack in CSS pixels for [`leader_for`] when called standalone.
 pub const DEFAULT_LEADER_SLACK: f64 = 1.5;
 
-/// Screen-space axis-aligned box in CSS pixels, y down (`top <= bottom`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ScreenBox {
-    pub left: f64,
-    pub top: f64,
-    pub right: f64,
-    pub bottom: f64,
-}
-
-impl ScreenBox {
-    /// Construct from explicit edges (`left`, `top`, `right`, `bottom`).
-    pub const fn new(left: f64, top: f64, right: f64, bottom: f64) -> Self {
-        Self { left, top, right, bottom }
-    }
-
-    /// Construct from top-left corner and size (`width`, `height`), y down.
-    pub fn from_top_left(left: f64, top: f64, width: f64, height: f64) -> Self {
-        Self {
-            left,
-            top,
-            right: left + width,
-            bottom: top + height,
-        }
-    }
-}
+/// Screen-space axis-aligned box in CSS pixels, y down (unified with [`crate::camera::ScreenBox`]).
+pub use crate::camera::ScreenBox;
 
 /// One label request, ordered highest priority first when passed to [`place_labels`].
 #[derive(Clone, Debug, PartialEq)]

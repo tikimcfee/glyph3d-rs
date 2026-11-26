@@ -119,18 +119,9 @@ fn main() {
         #[cfg(feature = "windowed")]
         CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
             let ctx = pollster::block_on(gpu::init(None));
-            let open: Box<dyn FnOnce(std::sync::Arc<dyn Fn() + Send + Sync>) -> Vec<Box<dyn wall::app::Terminal>>> = if pattern {
-                Box::new(|_wake| vec![Box::new(wall::app::StaticTerminal(wall::test_pattern::build_primary_screen())) as Box<dyn wall::app::Terminal>])
-            } else {
-                Box::new(move |wake| match wall::session::open(&namespace, wake) {
-                    Ok(terminals) => terminals,
-                    Err(e) => {
-                        eprintln!("error: the wall could not reach its terminals: {e}");
-                        std::process::exit(1);
-                    }
-                })
-            };
-            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, exit_after: frames.map(u64::from), open });
+            // The test pattern needs no daemon: one fixed screen.
+            let namespace = (!pattern).then_some(namespace);
+            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, namespace, exit_after: frames.map(u64::from) });
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {
@@ -152,13 +143,34 @@ fn main() {
             wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
         }
         #[cfg(feature = "wgpu")]
-        CliCommand::WallReplay { file, cols, rows, .. } => {
-            eprintln!(
-                "error: --wall-replay {} ({cols}x{rows}) is not built yet: crates/glyph-vt has not landed \
-                 (expected Vt::new / feed / fill per out/WALL-PLAN-2026-11-26.md section B)",
-                file.display()
+        CliCommand::WallReplay {
+            file,
+            cols,
+            rows,
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-replay requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let bytes = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("error: --wall-replay '{}': {e}", file.display());
+                std::process::exit(1);
+            });
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_replay_offscreen(
+                &ctx,
+                &bytes,
+                cols,
+                rows,
+                &emoji_sheet,
+                &path,
+                frames,
+                zoom,
             );
-            std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {

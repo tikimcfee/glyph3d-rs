@@ -42,7 +42,7 @@ fn all_wgsl_shaders_parse_and_validate() {
         // (glyph_scene/regions.rs). library_faces.wgsl (2026-10-10, the page
         // faces' compute pass) and library_regions.wgsl's compute half were
         // retired 2026-10-26: the host composes both now.
-        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_regions.wgsl", "mesh.wgsl", "quad_field.wgsl", "wall_cells.wgsl"],
+        ["composite.wgsl", "cull.wgsl", "environment.wgsl", "library_regions.wgsl", "mesh.wgsl", "quad_field.wgsl", "wall_cells.wgsl", "wall_paper.wgsl", "wall_shapes.wgsl"],
         "shader file set changed — update the test's expected list"
     );
 
@@ -74,10 +74,22 @@ fn all_wgsl_shaders_parse_and_validate() {
                         assert_eq!(span, 224, "WallFrameUniform WGSL struct size must match wall::renderer WallFrameUniform (224 B)");
                     }
                     if name == "TerminalUniform" {
-                        assert_eq!(span, 48, "TerminalUniform WGSL struct size must match wall::renderer TerminalUniform (48 B)");
+                        assert_eq!(span, 64, "TerminalUniform WGSL struct size must match wall::renderer TerminalUniform (64 B)");
                     }
                     if name == "CellGpu" {
                         assert_eq!(span, 16, "CellGpu WGSL struct size must match wall::cell CellGpu (16 B)");
+                    }
+                    if name == "LabelGlyphGpu" {
+                        assert_eq!(span, 48, "LabelGlyphGpu WGSL struct size must match wall::labels LabelGlyphGpu (48 B)");
+                    }
+                    if name == "WallPaperUniform" {
+                        assert_eq!(span, 80, "WallPaperUniform WGSL struct size must match wall::paper WallPaperUniform (80 B)");
+                    }
+                    if name == "ShapeFrameUniform" {
+                        assert_eq!(span, 80, "ShapeFrameUniform WGSL struct size must match wall::shapes ShapeFrameUniform (80 B)");
+                    }
+                    if name == "ShapeGpu" {
+                        assert_eq!(span, 80, "ShapeGpu WGSL struct size must match wall::shapes ShapeGpu (80 B)");
                     }
                 }
             }

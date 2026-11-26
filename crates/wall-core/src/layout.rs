@@ -108,13 +108,8 @@ impl ShoveDelta {
 }
 
 /// Camera placement returned by [`fit_rect`]: world centre `(x, y)` and `zoom`
-/// in CSS pixels per world unit.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CameraPose {
-    pub x: f64,
-    pub y: f64,
-    pub zoom: f64,
-}
+/// in CSS pixels per world unit (re-exported from [`crate::camera::CameraPose`]).
+pub use crate::camera::CameraPose;
 
 /// Which border edges of a rectangle a pointer is grabbing. Corners grab two
 /// adjacent edges; opposing edges on a tiny rectangle resolve in favour of

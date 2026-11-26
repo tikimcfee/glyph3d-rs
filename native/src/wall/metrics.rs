@@ -47,6 +47,28 @@ impl WorldRect {
             max: self.max.max(other.max),
         }
     }
+
+    /// Expand this rectangle outward by `margin` on all four sides (negative shrinks).
+    pub fn expand(&self, margin: f32) -> Self {
+        self.expand_xy(margin, margin)
+    }
+
+    /// Expand this rectangle outward by `dx` horizontally and `dy` vertically.
+    pub fn expand_xy(&self, dx: f32, dy: f32) -> Self {
+        Self {
+            min: Vec2::new(self.min.x - dx, self.min.y - dy),
+            max: Vec2::new(self.max.x + dx, self.max.y + dy),
+        }
+    }
+}
+
+/// Sanitize a per-terminal scale factor (`<= 0` or non-finite defaults to `1.0`).
+pub fn sanitize_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
 }
 
 /// Round a positive world-space cell dimension to 10 significant bits.
@@ -121,6 +143,28 @@ impl CellMetrics {
         )
     }
 
+    /// Return cell metrics scaled uniformly by `scale` (matching per-terminal `TerminalDraw::scale`).
+    pub fn scaled(self, scale: f32) -> Self {
+        let s = sanitize_scale(scale);
+        Self {
+            cell_width: self.cell_width * s,
+            cell_height: self.cell_height * s,
+        }
+    }
+
+    /// World-space extent of a terminal's background panel when drawn at `scale`.
+    pub fn terminal_panel_rect(
+        &self,
+        origin: Vec2,
+        cols: u16,
+        rows: u16,
+        padding: f32,
+        scale: f32,
+    ) -> WorldRect {
+        let s = sanitize_scale(scale);
+        self.scaled(s).panel_rect(origin, cols, rows, padding * s)
+    }
+
     /// Resolve a world point to its `(col, row)` cell if inside the cell grid.
     pub fn cell_at_world(
         &self,
@@ -192,5 +236,15 @@ mod tests {
         let grid = metrics.grid_rect(origin, 80, 24);
         assert!((panel.width() - (grid.width() + 0.6)).abs() < 1e-4);
         assert!((panel.height() - (grid.height() + 0.6)).abs() < 1e-4);
+
+        // Half-scale terminal: both grid and padding halve around origin.
+        let half_panel = metrics.terminal_panel_rect(origin, 80, 24, 0.3, 0.5);
+        assert!((half_panel.width() - panel.width() * 0.5).abs() < 1e-4);
+        assert!((half_panel.height() - panel.height() * 0.5).abs() < 1e-4);
+        let half_cell = metrics.scaled(0.5).cell_rect(origin, 3, 2, 1);
+        assert_eq!(metrics.scaled(0.5).cell_at_world(origin, 80, 24, half_cell.center()), Some((3, 2)));
+        assert_eq!(sanitize_scale(0.0), 1.0);
+        assert_eq!(sanitize_scale(-2.0), 1.0);
+        assert_eq!(sanitize_scale(f32::NAN), 1.0);
     }
 }

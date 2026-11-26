@@ -14,6 +14,7 @@ pub mod geom;
 pub mod input;
 
 pub mod agent_view;
+pub mod agent_views;
 pub mod bus;
 pub mod camera;
 pub mod chord;
@@ -40,3 +41,4 @@ pub mod snap;
 pub mod split;
 pub mod status;
 pub mod store;
+pub mod wall;

@@ -71,12 +71,19 @@ pub(crate) struct SessionShared {
 /// Non-blocking fire-and-forget commands dispatched from UI callbacks so the window thread
 /// never waits on socket round-trips or slow PTY readers.
 pub(crate) enum AsyncCmd {
-    Key { handle: u32, key: Key },
-    Mouse { handle: u32, mouse: Mouse },
-    Resize { handle: u32, cols: u16, rows: u16 },
-    Input { handle: u32, bytes: Vec<u8> },
-    View { handle: u32, view: View, shared: Arc<SessionShared>, wake: Arc<dyn Fn() + Send + Sync> },
-    Repaint { handle: u32 },
+    Key { handle: u32, id: String, key: Key },
+    Mouse { handle: u32, id: String, mouse: Mouse },
+    Resize { handle: u32, id: String, cols: u16, rows: u16 },
+    Input { handle: u32, id: String, bytes: Vec<u8> },
+    View {
+        handle: u32,
+        id: String,
+        view: View,
+        shared: Arc<SessionShared>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    },
+    Repaint { handle: u32, id: String },
+    Kill { id: String },
     Unsubscribe { handle: u32 },
 }
 
@@ -406,7 +413,11 @@ impl TerminalSession {
         if self.is_ended() {
             return;
         }
-        self.hub.send_async(AsyncCmd::Key { handle: self.handle, key });
+        self.hub.send_async(AsyncCmd::Key {
+            handle: self.handle,
+            id: self.id.clone(),
+            key,
+        });
     }
 
     /// Spawns a background paste (chunked with `more: true` at the program's pace) so even a
@@ -417,8 +428,11 @@ impl TerminalSession {
         }
         let termd = self.hub.termd_handle();
         let handle = self.handle;
+        let id = self.id.clone();
         let _ = thread::Builder::new().name("term-paste".into()).spawn(move || {
-            let _ = termd.paste(handle, &text);
+            if let Err(e) = termd.paste(handle, &text) {
+                log::warn!("terminal {id}: paste was not sent: {e}");
+            }
         });
     }
 
@@ -427,7 +441,11 @@ impl TerminalSession {
         if self.is_ended() {
             return;
         }
-        self.hub.send_async(AsyncCmd::Mouse { handle: self.handle, mouse });
+        self.hub.send_async(AsyncCmd::Mouse {
+            handle: self.handle,
+            id: self.id.clone(),
+            mouse,
+        });
     }
 
     /// Queues a terminal resize in FIFO order without blocking the window thread.
@@ -435,7 +453,12 @@ impl TerminalSession {
         if self.is_ended() {
             return;
         }
-        self.hub.send_async(AsyncCmd::Resize { handle: self.handle, cols, rows });
+        self.hub.send_async(AsyncCmd::Resize {
+            handle: self.handle,
+            id: self.id.clone(),
+            cols,
+            rows,
+        });
     }
 
     /// Queues a scrollback `view` step without blocking the window thread; updates `scrollback`
@@ -446,9 +469,21 @@ impl TerminalSession {
         }
         self.hub.send_async(AsyncCmd::View {
             handle: self.handle,
+            id: self.id.clone(),
             view,
             shared: Arc::clone(&self.shared),
             wake: self.hub.wake_fn(),
+        });
+    }
+
+    /// Queues an explicit `repaint` request without blocking the window thread.
+    pub fn send_repaint(&self) {
+        if self.is_ended() {
+            return;
+        }
+        self.hub.send_async(AsyncCmd::Repaint {
+            handle: self.handle,
+            id: self.id.clone(),
         });
     }
 
@@ -457,7 +492,11 @@ impl TerminalSession {
         if self.is_ended() || bytes.is_empty() {
             return;
         }
-        self.hub.send_async(AsyncCmd::Input { handle: self.handle, bytes });
+        self.hub.send_async(AsyncCmd::Input {
+            handle: self.handle,
+            id: self.id.clone(),
+            bytes,
+        });
     }
 }
 
@@ -557,7 +596,10 @@ fn session_worker_loop(
                         // pulled back out of daemon scrollback on a height increase reach our
                         // zero-scrollback viewer without spawning a thread per resize step.
                         if let Some(hub) = hub_weak.upgrade() {
-                            hub.send_async(AsyncCmd::Repaint { handle: h });
+                            hub.send_async(AsyncCmd::Repaint {
+                                handle: h,
+                                id: String::new(),
+                            });
                         }
                     }
                     Event::Title { title, .. } => {
@@ -856,20 +898,28 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
 pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncCmd>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            AsyncCmd::Key { handle, key } => {
-                let _ = termd.key(handle, &key);
+            AsyncCmd::Key { handle, id, key } => {
+                if let Err(e) = termd.key(handle, &key) {
+                    log::warn!("terminal {id}: key {:?} was not sent: {e}", key.code);
+                }
             }
-            AsyncCmd::Mouse { handle, mouse } => {
-                let _ = termd.mouse(handle, &mouse);
+            AsyncCmd::Mouse { handle, id, mouse } => {
+                if let Err(e) = termd.mouse(handle, &mouse) {
+                    log::warn!("terminal {id}: mouse event was not sent: {e}");
+                }
             }
-            AsyncCmd::Resize { handle, cols, rows } => {
-                let _ = termd.resize(handle, cols, rows);
+            AsyncCmd::Resize { handle, id, cols, rows } => {
+                if let Err(e) = termd.resize(handle, cols, rows) {
+                    log::warn!("terminal {id}: resize to {cols}x{rows} was refused: {e}");
+                }
             }
-            AsyncCmd::Input { handle, bytes } => {
-                let _ = termd.input(handle, &bytes);
+            AsyncCmd::Input { handle, id, bytes } => {
+                if let Err(e) = termd.input(handle, &bytes) {
+                    log::warn!("terminal {id}: input was not sent: {e}");
+                }
             }
-            AsyncCmd::View { handle, view, shared, wake } => {
-                if let Ok(reply) = termd.view(handle, view) {
+            AsyncCmd::View { handle, id, view, shared, wake } => match termd.view(handle, view) {
+                Ok(reply) => {
                     let mut guard = shared.published.lock().expect("published mutex poisoned");
                     guard.meta.scrollback.offset = reply.offset;
                     guard.meta.scrollback.max = reply.max;
@@ -881,9 +931,19 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, rx: mpsc::Receiver<AsyncC
                     shared.has_news.store(true, Ordering::Release);
                     wake();
                 }
+                Err(e) => log::debug!("terminal {id}: view did not move: {e}"),
+            },
+            AsyncCmd::Repaint { handle, id } => {
+                if let Err(e) = termd.repaint(handle) {
+                    if !id.is_empty() {
+                        log::warn!("terminal {id}: repaint was refused: {e}");
+                    }
+                }
             }
-            AsyncCmd::Repaint { handle } => {
-                let _ = termd.repaint(handle);
+            AsyncCmd::Kill { id } => {
+                if let Err(e) = termd.kill(&id) {
+                    log::warn!("terminal {id}: kill was refused: {e}");
+                }
             }
             AsyncCmd::Unsubscribe { handle } => {
                 let _ = termd.unsubscribe(handle);

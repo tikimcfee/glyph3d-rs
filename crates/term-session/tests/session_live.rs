@@ -932,3 +932,182 @@ fn daemon_restart_preserves_session_screens_and_stop_reports_gone() {
     assert!(saw_gone, "hub did not report DaemonEvent::Gone after stop");
     assert!(matches!(hub.daemon_state(), DaemonState::Gone { .. }));
 }
+
+#[test]
+fn sessions_wall_seam_end_to_end() {
+    use term_session::{News, Sessions};
+    use wall_core::input::Mods;
+    use wall_core::keymap::{OptionAsAlt as WallOptAlt, TerminalKey, TerminalKeyAction};
+    use wall_core::mouse::MouseAction as WallMouseAction;
+    use wall_core::pointer::{ProgramMouseButton, TerminalMouseEvent};
+
+    let scratch = ScratchDaemon::new("seam");
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions =
+        Sessions::open_target(&scratch.target(), wake.waker()).expect("open Sessions");
+    assert_eq!(sessions.list().expect("list empty"), Vec::<String>::new());
+
+    // Spawn t1 emitting 30 history lines, setting OSC 2 title, enabling bracketed paste, and
+    // echoing stdin lines so we can test key, paste, primary scrollback, alt-screen wheel, resize,
+    // and kill -> News::Ended.
+    let ready = scratch.dir.join("seam-ready");
+    let script = "\
+        stty raw -echo; \
+        i=1; while [ $i -le 30 ]; do printf 'SEAM-HIST-%02d\\r\\n' \"$i\"; i=$((i + 1)); done; \
+        printf '\\033]2;seam-shell\\007\\033[?2004hLIVE-BOTTOM>'; \
+        printf r > \"$1\"; \
+        exec cat";
+    let (id, cols, rows) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                ready.to_string_lossy().into_owned(),
+            ]),
+            60,
+            10,
+        )
+        .expect("spawn t1");
+    assert_eq!(id, "t1");
+    assert_eq!((cols, rows), (60, 10));
+    assert_eq!(sessions.ids().collect::<Vec<_>>(), vec!["t1"]);
+
+    let mut seen = wake.current();
+    let mut saw_title = false;
+    let mut saw_modes = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!ready.exists()
+        || !saw_title
+        || !saw_modes
+        || !sessions
+            .text("t1", 0, 0, 60, 9)
+            .unwrap_or_default()
+            .contains("LIVE-BOTTOM>"))
+        && Instant::now() < deadline
+    {
+        wake.wait_since(&mut seen, Duration::from_millis(10));
+        let (_changed, news) = sessions.pump();
+        for n in news {
+            match n {
+                News::Title { id: tid, title } if tid == "t1" && title == "seam-shell" => {
+                    saw_title = true;
+                }
+                News::Modes { id: tid, modes } if tid == "t1" && modes.bracketed_paste => {
+                    saw_modes = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_title, "Sessions::pump must emit News::Title");
+    assert!(saw_modes, "Sessions::pump must emit News::Modes");
+
+    // Verify `screen(id)` returns a stable `&Screen` reference held across a simulated frame.
+    {
+        let frame_screen = sessions.screen("t1").expect("screen for t1");
+        assert_eq!((frame_screen.cols, frame_screen.rows), (60, 10));
+        assert!(frame_screen.cursor.visible);
+    }
+
+    // Primary-screen `scroll` (-10 = 10 lines up into history) moves termd's view & hides cursor.
+    seen = wake.current();
+    sessions.scroll("t1", -10, 0.0, 0.0);
+    let scroll_deadline = Instant::now() + Duration::from_secs(3);
+    while sessions.screen("t1").expect("screen").cursor.visible && Instant::now() < scroll_deadline
+    {
+        wake.wait_since(&mut seen, Duration::from_millis(10));
+        let _ = sessions.pump();
+    }
+    assert!(!sessions.screen("t1").expect("screen").cursor.visible);
+    assert!(
+        sessions
+            .text("t1", 0, 0, 60, 9)
+            .expect("text")
+            .contains("SEAM-HIST-15")
+    );
+
+    // Scroll back down (+10) to live bottom.
+    seen = wake.current();
+    sessions.scroll("t1", 10, 0.0, 0.0);
+    let live_deadline = Instant::now() + Duration::from_secs(3);
+    while !sessions.screen("t1").expect("screen").cursor.visible && Instant::now() < live_deadline {
+        wake.wait_since(&mut seen, Duration::from_millis(10));
+        let _ = sessions.pump();
+    }
+
+    // Send `key` (&TerminalKey) and `paste` (which is bracketed because ?2004h is active!).
+    sessions.key(
+        "t1",
+        &TerminalKey {
+            code: "KeyZ".into(),
+            key: "z".into(),
+            mods: Vec::new(),
+            text: "z".into(),
+            action: TerminalKeyAction::Press,
+            option_as_alt: WallOptAlt::Auto,
+        },
+    );
+    sessions.paste("t1", "hello");
+    let echo_deadline = Instant::now() + Duration::from_secs(3);
+    while !sessions
+        .text("t1", 0, 0, 60, 9)
+        .expect("text")
+        .contains("LIVE-BOTTOM>z")
+        && Instant::now() < echo_deadline
+    {
+        wake.wait_since(&mut seen, Duration::from_millis(10));
+        let _ = sessions.pump();
+    }
+
+    // Resize -> `News::Resized`.
+    seen = wake.current();
+    sessions.resize("t1", 72, 14);
+    let mut saw_resized = false;
+    let rsz_deadline = Instant::now() + Duration::from_secs(3);
+    while !saw_resized && Instant::now() < rsz_deadline {
+        wake.wait_since(&mut seen, Duration::from_millis(10));
+        let (_, news) = sessions.pump();
+        if news.contains(&News::Resized {
+            id: "t1".into(),
+            cols: 72,
+            rows: 14,
+        }) {
+            saw_resized = true;
+        }
+    }
+    assert!(saw_resized, "Sessions::pump must emit News::Resized");
+    assert_eq!(
+        sessions
+            .screen("t1")
+            .map(|s| (s.cols, s.rows)),
+        Some((72, 14))
+    );
+
+    // Exercise `mouse` and `repaint` without error, then `kill` -> `News::Ended`.
+    sessions.mouse(
+        "t1",
+        &TerminalMouseEvent {
+            action: WallMouseAction::Move,
+            button: ProgramMouseButton::None,
+            col: 2.0,
+            row: 1.0,
+            mods: Mods::default(),
+        },
+    );
+    sessions.repaint("t1");
+    seen = wake.current();
+    sessions.kill("t1");
+    let mut saw_ended = false;
+    let end_deadline = Instant::now() + Duration::from_secs(5);
+    while !saw_ended && Instant::now() < end_deadline {
+        wake.wait_since(&mut seen, Duration::from_millis(15));
+        let (_, news) = sessions.pump();
+        if news.contains(&News::Ended { id: "t1".into() }) {
+            saw_ended = true;
+        }
+    }
+    assert!(saw_ended, "Sessions::pump must emit News::Ended after kill");
+    assert!(sessions.screen("t1").is_none());
+}

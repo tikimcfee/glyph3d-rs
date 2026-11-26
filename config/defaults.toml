@@ -413,3 +413,12 @@ strike_y = 0.42                                   # strikethrough centre from ce
 line_thickness = 0.05                             # decoration line thickness in cell heights
 curly_amplitude = 1.5                             # curly underline amplitude x thickness
 dim_alpha = 0.50                                  # SGR 2 faint ink/line opacity
+# Drafting paper behind terminals (matches wall-core WallConfig defaults).
+paper_show = true
+paper_background = [0.02745, 0.03137, 0.04314, 1.0]  # #07080b canvas colour
+paper_minor_color = [0.05882, 0.07059, 0.09804, 1.0] # #0f1219 minor grid lines
+paper_major_color = [0.09412, 0.10980, 0.14902, 1.0] # #181c26 major grid lines
+paper_minor_spacing = 4.0                            # world units between minor lines
+paper_major_every = 5                                # every Nth minor line is major
+paper_line_px = 1.0                                  # grid line width in screen pixels
+paper_min_px = 6.0                                   # hard-switch floor (screen px)

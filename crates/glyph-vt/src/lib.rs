@@ -5,8 +5,9 @@
 //! terminal queries itself. [`Vt`] is the passive viewer on the app side: it
 //! streams `REPAINT` and `OUTPUT` byte slices of arbitrary chunking through a
 //! vendored pure-Rust port of Ghostty's VT core (see `NOTICE`), discards any
-//! query replies or host side-channel events as they arrive, keeps only the
-//! visible screen (`max_scrollback = 0`), and resolves cells into final sRGB
+//! emulator query replies as they arrive, buffers host side-channel events in a
+//! small bounded ring ([`Vt::take_events`] / [`Vt::drain_events`]), keeps only
+//! the visible screen (`max_scrollback = 0`), and resolves cells into final sRGB
 //! colours on a [`term_cells::Screen`], touching only rows that changed.
 
 mod cell_width;
@@ -20,14 +21,54 @@ use term::page::CellContent;
 use term::screen::CursorStyle;
 use term::stream::Stream;
 use term::style::{Style, StyleColor, StyleFlags, Underline};
-use term::terminal::{ActiveScreen, Terminal};
-use term_cells::{attrs, rgb, Cell, Cursor, CursorShape, Modes, Screen, CLUSTER_BASE};
+use term::terminal::{ActiveScreen, TermEvent, Terminal};
+use term_cells::{
+    attrs, rgb, Cell, Cursor, CursorShape, Modes, MouseFormat, Screen, CLUSTER_BASE,
+};
 
 /// Upper bound on distinct multi-codepoint grapheme clusters interned per
 /// [`Vt`] instance (matching `core/cellClusters.js`'s `CLUSTER_LIMIT_DEFAULT`).
 /// Past this limit a cluster degrades gracefully to its base scalar rather than
 /// growing `Screen::clusters` without bound.
 const CLUSTER_LIMIT: usize = 65_536;
+
+/// Host-facing side-channel events produced by the terminal stream.
+///
+/// Buffered in a bounded ring inside [`Vt`] (evicting the oldest unread entry
+/// past 256 events, so a caller that ignores events never grows memory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VtEvent {
+    /// `BEL` (`0x07`).
+    Bell,
+    /// `OSC 52` clipboard write (`ESC ] 52 ; selection ; <base64> ST`),
+    /// decoded as UTF-8. `selection` is the target byte (`b'c'` clipboard,
+    /// `b'p'` primary, etc.).
+    ClipboardWrite { selection: u8, text: String },
+    /// `OSC 52` clipboard read request (`ESC ] 52 ; selection ; ? ST`).
+    ClipboardRead { selection: u8 },
+    /// `OSC 7` working-directory report (`ESC ] 7 ; <url> ST`).
+    PwdChanged(String),
+    /// `OSC 0` / `OSC 2` window title update.
+    TitleChanged(String),
+    /// `OSC 9` / `OSC 777` desktop notification.
+    Notification { title: String, body: String },
+}
+
+impl From<TermEvent> for VtEvent {
+    fn from(event: TermEvent) -> Self {
+        match event {
+            TermEvent::Bell => Self::Bell,
+            TermEvent::ClipboardSet { kind, text } => Self::ClipboardWrite {
+                selection: kind,
+                text,
+            },
+            TermEvent::ClipboardRead { kind } => Self::ClipboardRead { selection: kind },
+            TermEvent::PwdChanged(url) => Self::PwdChanged(url),
+            TermEvent::TitleChanged(title) => Self::TitleChanged(title),
+            TermEvent::Notification { title, body } => Self::Notification { title, body },
+        }
+    }
+}
 
 /// Colour policy for a [`Vt`] terminal: 16-colour ANSI palette, default
 /// foreground, background, and cursor colours, plus standard-palette bold
@@ -92,10 +133,11 @@ pub struct Vt {
     cluster_ids: HashMap<String, u32>,
     row_scratch: Vec<Cell>,
     cluster_scratch: String,
-    /// `Screen::generation` produced by the most recent [`Vt::fill`] call on
-    /// this instance, allowing an O(1) early exit when neither [`Vt`] nor the
-    /// caller's [`Screen`] changed since the last frame.
-    last_filled_gen: Option<u64>,
+    /// `(screen.cells.as_ptr() as usize, screen.generation)` produced by the
+    /// most recent [`Vt::fill`] call on this instance, enabling both an O(1)
+    /// idle fast path and safe per-row dirty skipping when filling the same
+    /// [`Screen`] incrementally.
+    last_filled: Option<(usize, u64)>,
 }
 
 impl Vt {
@@ -115,7 +157,7 @@ impl Vt {
             cluster_ids: HashMap::new(),
             row_scratch: Vec::with_capacity(cols_usize),
             cluster_scratch: String::new(),
-            last_filled_gen: None,
+            last_filled: None,
         }
     }
 
@@ -136,13 +178,6 @@ impl Vt {
         self.terminal.rows() as u16
     }
 
-    /// Whether DEC private mode 2026 (`CSI ? 2026 h`, synchronized output) is
-    /// currently active, indicating the program is mid-frame and screen
-    /// publication should wait for `CSI ? 2026 l` (or a safety timeout).
-    pub fn synchronized_output(&self) -> bool {
-        self.terminal.modes.get(Mode::SynchronizedOutput)
-    }
-
     /// Resolved cursor colour (`OSC 12` override if active, otherwise the
     /// theme's cursor colour). Exposed here because [`term_cells::Cursor`] does
     /// not carry a colour field.
@@ -155,12 +190,80 @@ impl Vt {
         pack_rgb(color)
     }
 
+    /// Latest working directory reported by the shell via `OSC 7` (empty if
+    /// none has been reported, or after `RIS` `ESC c`).
+    pub fn pwd(&self) -> &str {
+        &self.terminal.pwd
+    }
+
+    /// `OSC 8` hyperlink URI under cell `(col, row)` on the active screen, if
+    /// any. Landing on the right half of a wide character resolves its head.
+    pub fn hyperlink(&self, col: u16, row: u16) -> Option<&str> {
+        self.terminal
+            .cell_hyperlink(usize::from(col), usize::from(row))
+    }
+
+    /// Current live [`term_cells::Modes`] of the emulator (callable immediately
+    /// after [`Vt::feed`] before [`Vt::fill`] runs).
+    pub fn modes(&self) -> Modes {
+        Modes {
+            alt_screen: self.terminal.active == ActiveScreen::Alternate,
+            mouse: self.terminal.mouse_tracking,
+            mouse_format: self.terminal.mouse_format,
+            bracketed_paste: self.terminal.modes.get(Mode::BracketedPaste),
+            app_cursor: self.terminal.modes.get(Mode::CursorKeys),
+            focus_events: self.terminal.modes.get(Mode::FocusEvent),
+            kitty_keyboard: self.terminal.kitty_flags(),
+            synchronized_output: self.terminal.modes.get(Mode::SynchronizedOutput),
+        }
+    }
+
+    /// Whether synchronized output (`DECSET ?2026`) is currently open, asking
+    /// the host to hold frame presentation until `?2026l` (or a timeout/resize).
+    pub fn synchronized_output(&self) -> bool {
+        self.terminal.modes.get(Mode::SynchronizedOutput)
+    }
+
+    /// Active mouse coordinate encoding format (`DECSET 1005/1006/1015/1016`).
+    pub fn mouse_format(&self) -> MouseFormat {
+        self.terminal.mouse_format
+    }
+
+    /// Whether focus-in / focus-out reporting (`DECSET ?1004`) is active.
+    pub fn focus_events(&self) -> bool {
+        self.terminal.modes.get(Mode::FocusEvent)
+    }
+
+    /// Active screen's current Kitty keyboard protocol flags (`0..=31`).
+    pub fn kitty_keyboard(&self) -> u8 {
+        self.terminal.kitty_flags()
+    }
+
+    /// Active xterm `modifyOtherKeys` level (`0..=2`, `CSI > 4 ; Pv m`).
+    pub fn modify_other_keys(&self) -> u8 {
+        self.terminal.modify_other_keys
+    }
+
+    /// Whether any host side-channel events ([`VtEvent`]) are queued.
+    pub fn has_events(&self) -> bool {
+        !self.terminal.events.is_empty()
+    }
+
+    /// Drain all queued [`VtEvent`]s in arrival order without allocating a `Vec`.
+    pub fn drain_events(&mut self) -> impl Iterator<Item = VtEvent> + '_ {
+        self.terminal.events.drain(..).map(VtEvent::from)
+    }
+
+    /// Take all queued [`VtEvent`]s in arrival order.
+    pub fn take_events(&mut self) -> Vec<VtEvent> {
+        self.drain_events().collect()
+    }
+
     /// Feed raw terminal bytes (`REPAINT` or `OUTPUT`) in order. Escape and
     /// UTF-8 sequences split across calls are reassembled seamlessly.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.stream.process(bytes, &mut self.terminal);
         self.terminal.outbound.clear();
-        self.terminal.events.clear();
     }
 
     /// Resize the visible grid to `cols` by `rows` (each clamped to at least
@@ -170,7 +273,6 @@ impl Vt {
         self.terminal
             .resize(usize::from(cols.max(1)), usize::from(rows.max(1)));
         self.terminal.outbound.clear();
-        self.terminal.events.clear();
     }
 
     /// Bring `screen` up to date, rewriting and touching ([`Screen::touch_row`])
@@ -179,9 +281,10 @@ impl Vt {
     pub fn fill(&mut self, screen: &mut Screen) -> bool {
         let cols = self.cols();
         let rows = self.rows();
+        let screen_id = (screen.cells.as_ptr() as usize, screen.generation);
 
         if !self.terminal.dirty
-            && self.last_filled_gen == Some(screen.generation)
+            && self.last_filled == Some(screen_id)
             && screen.cols == cols
             && screen.rows == rows
         {
@@ -190,12 +293,16 @@ impl Vt {
 
         let mut any_changed = false;
         let mut generation_bumped = false;
+        let mut same_screen = self.last_filled == Some(screen_id);
 
         if screen.cols != cols || screen.rows != rows {
             screen.resize(cols, rows);
             any_changed = true;
             generation_bumped = true;
+            same_screen = false;
         }
+
+        let incremental_rows = same_screen && !self.terminal.all_rows_dirty;
 
         // Resolve panel defaults, honouring DECSCNM (`?5` reverse screen mode).
         let reverse_screen = self.terminal.modes.get(Mode::ReverseColors);
@@ -224,32 +331,13 @@ impl Vt {
 
         for row_idx in 0..rows {
             let y = usize::from(row_idx);
+            if incremental_rows && !self.terminal.screen().row(y).dirty {
+                continue;
+            }
+
             let wrapped = self.terminal.screen().row(y).wrapped;
-
-            self.row_scratch.clear();
-            let stored_len = self.terminal.screen().row(y).cells.len().min(cols_usize);
-            for x in 0..stored_len {
-                let resolved = self.resolve_cell(y, x, panel_fg, panel_bg, default_resolved_cell);
-                self.row_scratch.push(resolved);
-            }
-            if stored_len < cols_usize {
-                self.row_scratch
-                    .resize(cols_usize, default_resolved_cell);
-            }
-
-            // Guarantee the `term-cells` wide-tail invariant: a wide character's
-            // second column has `width = 0`, `content = 0`, and carries the same
-            // `bg` (and line colours/attrs) as its head column.
-            for x in 1..cols_usize {
-                if self.row_scratch[x].width == 0 && self.row_scratch[x - 1].width == 2 {
-                    let head = self.row_scratch[x - 1];
-                    self.row_scratch[x] = Cell {
-                        content: 0,
-                        width: 0,
-                        ..head
-                    };
-                }
-            }
+            self.resolve_row(y, cols_usize, panel_fg, panel_bg, default_resolved_cell);
+            self.terminal.screen_mut().row_mut(y).dirty = false;
 
             let row_differs =
                 self.row_scratch.as_slice() != screen.row(row_idx) || screen.wrapped[y] != wrapped;
@@ -296,13 +384,7 @@ impl Vt {
             any_changed = true;
         }
 
-        let next_modes = Modes {
-            alt_screen: self.terminal.active == ActiveScreen::Alternate,
-            mouse: self.terminal.mouse_tracking,
-            bracketed_paste: self.terminal.modes.get(Mode::BracketedPaste),
-            app_cursor: self.terminal.modes.get(Mode::CursorKeys),
-            focus_events: self.terminal.modes.get(Mode::FocusEvent),
-        };
+        let next_modes = self.modes();
         if screen.modes != next_modes {
             screen.modes = next_modes;
             any_changed = true;
@@ -319,7 +401,8 @@ impl Vt {
         }
 
         self.terminal.dirty = false;
-        self.last_filled_gen = Some(screen.generation);
+        self.terminal.all_rows_dirty = false;
+        self.last_filled = Some((screen.cells.as_ptr() as usize, screen.generation));
         any_changed
     }
 
@@ -453,104 +536,98 @@ impl Vt {
         out
     }
 
-    fn resolve_cell(
+    fn resolve_row(
         &mut self,
         y: usize,
-        x: usize,
+        cols_usize: usize,
         panel_fg: u32,
         panel_bg: u32,
         default_resolved_cell: Cell,
-    ) -> Cell {
-        let src = &self.terminal.screen().row(y).cells[x];
-        if src.content == CellContent::Empty && src.style.is_default() {
-            return default_resolved_cell;
-        }
+    ) {
+        let Self {
+            terminal,
+            bold_is_bright,
+            clusters,
+            cluster_ids,
+            row_scratch,
+            cluster_scratch,
+            ..
+        } = self;
 
-        let style = src.style;
-        let cell_attrs = resolve_attrs(style);
-        let conceal = cell_attrs & attrs::CONCEAL != 0;
+        row_scratch.clear();
+        let active = match terminal.active {
+            ActiveScreen::Primary => &terminal.primary,
+            ActiveScreen::Alternate => &terminal.alternate,
+        };
+        let row_cells = &active.active[y].cells;
+        let stored_len = row_cells.len().min(cols_usize);
+        let palette = &terminal.palette;
+        let bold_bright = *bold_is_bright;
+        let mut has_wide_tail = false;
 
-        let (content, width) = match &src.content {
-            CellContent::Empty => (0, 1),
-            CellContent::Char(ch) => (if conceal { 0 } else { *ch as u32 }, 1),
-            CellContent::WideChar(ch) => (if conceal { 0 } else { *ch as u32 }, 2),
-            CellContent::WideTail => (0, 0),
-            CellContent::WideSpacerHead => (0, 1),
-            CellContent::Cluster(cluster) => {
-                let cluster_width = cluster.width.clamp(1, 2);
-                if conceal || cluster.cps.is_empty() {
-                    (0, cluster_width)
-                } else if cluster.cps.len() == 1 {
-                    (cluster.cps[0] as u32, cluster_width)
-                } else {
-                    self.cluster_scratch.clear();
-                    self.cluster_scratch.extend(cluster.cps.iter().copied());
-                    let fallback = cluster.cps[0] as u32;
-                    let id = self.intern_cluster(fallback);
-                    (id, cluster_width)
+        for src in &row_cells[..stored_len] {
+            // Fast path (`TerminalEmulator.js` rule): most terminal cells carry
+            // the default style (no attributes, default fg, transparent bg).
+            if src.style.is_default() {
+                let fast = match &src.content {
+                    CellContent::Empty | CellContent::WideSpacerHead => Some(default_resolved_cell),
+                    CellContent::Char(ch) => Some(Cell {
+                        content: *ch as u32,
+                        ..default_resolved_cell
+                    }),
+                    CellContent::WideChar(ch) => Some(Cell {
+                        content: *ch as u32,
+                        width: 2,
+                        ..default_resolved_cell
+                    }),
+                    CellContent::WideTail => {
+                        has_wide_tail = true;
+                        Some(Cell {
+                            content: 0,
+                            width: 0,
+                            ..default_resolved_cell
+                        })
+                    }
+                    CellContent::Cluster(_) => None,
+                };
+                if let Some(cell) = fast {
+                    row_scratch.push(cell);
+                    continue;
                 }
             }
-        };
 
-        let bold = cell_attrs & attrs::BOLD != 0;
-        let mut fg = match style.fg_color {
-            StyleColor::Rgb(c) => pack_rgb(c),
-            StyleColor::Palette(idx) => {
-                let effective = if self.bold_is_bright && bold && idx < 8 {
-                    idx + 8
-                } else {
-                    idx
-                };
-                pack_rgb(self.terminal.palette[usize::from(effective)])
+            let resolved = resolve_styled_cell(
+                src,
+                palette,
+                bold_bright,
+                panel_fg,
+                panel_bg,
+                clusters,
+                cluster_ids,
+                cluster_scratch,
+            );
+            if resolved.width == 0 {
+                has_wide_tail = true;
             }
-            StyleColor::None => panel_fg,
-        };
+            row_scratch.push(resolved);
+        }
 
-        let mut bg = match style.bg_color {
-            StyleColor::Rgb(c) => pack_rgb(c),
-            StyleColor::Palette(idx) => pack_rgb(self.terminal.palette[usize::from(idx)]),
-            StyleColor::None => 0,
-        };
+        if stored_len < cols_usize {
+            row_scratch.resize(cols_usize, default_resolved_cell);
+        }
 
-        let ul = if cell_attrs & attrs::UNDERLINE_COLOR != 0 {
-            match style.underline_color {
-                StyleColor::Rgb(c) => pack_rgb(c),
-                StyleColor::Palette(idx) => pack_rgb(self.terminal.palette[usize::from(idx)]),
-                StyleColor::None => 0,
+        if has_wide_tail {
+            for x in 1..cols_usize {
+                if row_scratch[x].width == 0 && row_scratch[x - 1].width == 2 {
+                    let head = row_scratch[x - 1];
+                    row_scratch[x] = Cell {
+                        content: 0,
+                        width: 0,
+                        ..head
+                    };
+                }
             }
-        } else {
-            0
-        };
-
-        if cell_attrs & attrs::INVERSE != 0 {
-            let text_color = if bg != 0 { bg } else { panel_bg };
-            bg = fg;
-            fg = text_color;
         }
-
-        Cell {
-            content,
-            fg,
-            bg,
-            ul,
-            attrs: cell_attrs,
-            width,
-            _pad: 0,
-        }
-    }
-
-    fn intern_cluster(&mut self, fallback_cp: u32) -> u32 {
-        if let Some(&id) = self.cluster_ids.get(self.cluster_scratch.as_str()) {
-            return id;
-        }
-        if self.clusters.len() >= CLUSTER_LIMIT {
-            return fallback_cp;
-        }
-        let id = CLUSTER_BASE + self.clusters.len() as u32;
-        let owned = self.cluster_scratch.clone();
-        self.clusters.push(owned.clone());
-        self.cluster_ids.insert(owned, id);
-        id
     }
 
     fn sync_clusters(&self, dst: &mut Vec<String>) {
@@ -561,6 +638,109 @@ impl Vt {
             dst.extend(self.clusters[dst.len()..].iter().cloned());
         }
     }
+}
+
+#[expect(clippy::too_many_arguments, reason = "split-borrow fields of Vt keep row slice unaliased")]
+fn resolve_styled_cell(
+    src: &term::page::Cell,
+    palette: &term::color::Palette,
+    bold_is_bright: bool,
+    panel_fg: u32,
+    panel_bg: u32,
+    clusters: &mut Vec<String>,
+    cluster_ids: &mut HashMap<String, u32>,
+    cluster_scratch: &mut String,
+) -> Cell {
+    let style = src.style;
+    let cell_attrs = resolve_attrs(style);
+    let conceal = cell_attrs & attrs::CONCEAL != 0;
+
+    let (content, width) = match &src.content {
+        CellContent::Empty => (0, 1),
+        CellContent::Char(ch) => (if conceal { 0 } else { *ch as u32 }, 1),
+        CellContent::WideChar(ch) => (if conceal { 0 } else { *ch as u32 }, 2),
+        CellContent::WideTail => (0, 0),
+        CellContent::WideSpacerHead => (0, 1),
+        CellContent::Cluster(cluster) => {
+            let cluster_width = cluster.width.clamp(1, 2);
+            if conceal || cluster.cps.is_empty() {
+                (0, cluster_width)
+            } else if cluster.cps.len() == 1 {
+                (cluster.cps[0] as u32, cluster_width)
+            } else {
+                cluster_scratch.clear();
+                cluster_scratch.extend(cluster.cps.iter().copied());
+                let fallback = cluster.cps[0] as u32;
+                let id = intern_cluster(clusters, cluster_ids, cluster_scratch, fallback);
+                (id, cluster_width)
+            }
+        }
+    };
+
+    let bold = cell_attrs & attrs::BOLD != 0;
+    let mut fg = match style.fg_color {
+        StyleColor::Rgb(c) => pack_rgb(c),
+        StyleColor::Palette(idx) => {
+            let effective = if bold_is_bright && bold && idx < 8 {
+                idx + 8
+            } else {
+                idx
+            };
+            pack_rgb(palette[usize::from(effective)])
+        }
+        StyleColor::None => panel_fg,
+    };
+
+    let mut bg = match style.bg_color {
+        StyleColor::Rgb(c) => pack_rgb(c),
+        StyleColor::Palette(idx) => pack_rgb(palette[usize::from(idx)]),
+        StyleColor::None => 0,
+    };
+
+    let ul = if cell_attrs & attrs::UNDERLINE_COLOR != 0 {
+        match style.underline_color {
+            StyleColor::Rgb(c) => pack_rgb(c),
+            StyleColor::Palette(idx) => pack_rgb(palette[usize::from(idx)]),
+            StyleColor::None => 0,
+        }
+    } else {
+        0
+    };
+
+    if cell_attrs & attrs::INVERSE != 0 {
+        let text_color = if bg != 0 { bg } else { panel_bg };
+        bg = fg;
+        fg = text_color;
+    }
+
+    Cell {
+        content,
+        fg,
+        bg,
+        ul,
+        attrs: cell_attrs,
+        width,
+        _pad: 0,
+    }
+}
+
+fn intern_cluster(
+    clusters: &mut Vec<String>,
+    cluster_ids: &mut HashMap<String, u32>,
+    cluster_scratch: &str,
+    fallback_cp: u32,
+) -> u32 {
+    if let Some(&id) = cluster_ids.get(cluster_scratch) {
+        return id;
+    }
+    if clusters.len() >= CLUSTER_LIMIT {
+        return fallback_cp;
+    }
+    let id = CLUSTER_BASE + clusters.len() as u32;
+    let owned = cluster_scratch.to_owned();
+    clusters.push(owned.clone());
+    cluster_ids.insert(owned, id);
+    id
 }
 
 #[inline]
@@ -614,6 +794,7 @@ fn apply_theme_baseline(terminal: &mut Terminal, theme: &Theme, reset_overrides:
         }
     }
     terminal.dirty = true;
+    terminal.all_rows_dirty = true;
 }
 
 /// Map internal [`Style`] flags onto [`term_cells::attrs`] bit-for-bit.

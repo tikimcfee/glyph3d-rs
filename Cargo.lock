@@ -34,6 +34,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-feed"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1792,6 +1800,7 @@ dependencies = [
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "ash",
  "bevy_ecs",
  "bevy_transform",
@@ -1806,6 +1815,7 @@ dependencies = [
  "glam",
  "glyph-field",
  "glyph-field-derived",
+ "glyph-font",
  "glyph-scene-graph",
  "glyph-vt",
  "image",
@@ -4045,9 +4055,11 @@ name = "term-session"
 version = "0.1.0"
 dependencies = [
  "glyph-vt",
+ "log",
  "serde_json",
  "term-cells",
  "termd-client",
+ "wall-core",
 ]
 
 [[package]]
@@ -4516,6 +4528,10 @@ dependencies = [
  "same-file",
  "winapi-util",
 ]
+
+[[package]]
+name = "wall-control"
+version = "0.1.0"
 
 [[package]]
 name = "wall-core"

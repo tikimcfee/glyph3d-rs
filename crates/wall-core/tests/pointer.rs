@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use term_cells::Screen;
 use wall_core::geom::{Point, Rect};
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::layout::{
@@ -23,184 +24,8 @@ use wall_core::pointer::{
     WallPointer, WheelEvent, MIN_SIZE,
 };
 use wall_core::scroll::{DeltaMode, STREAM_IDLE_MS};
+use wall_core::selection::{screen_from_lines, TerminalSelection};
 use wall_core::split::{Axis, BranchSide};
-
-// ── Minimal text-selection model matching terminalSelection.js for stand-in grids ──
-
-const WORD_BOUNDARIES: &str = "'\"│`|:;,()[]{}<>$";
-
-fn is_space(ch: char) -> bool {
-    ch == '\0' || ch == ' ' || ch == '\t'
-}
-
-fn is_word_boundary(ch: char) -> bool {
-    is_space(ch) || WORD_BOUNDARIES.contains(ch)
-}
-
-fn js_round_non_neg(v: f64) -> u32 {
-    if v <= 0.0 || !v.is_finite() {
-        0
-    } else {
-        let f = v.floor();
-        if v - f < 0.5 {
-            f as u32
-        } else {
-            (f + 1.0) as u32
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct MockSelection {
-    active: bool,
-    mode: Option<SelectionMode>,
-    block: bool,
-    ax: f64,
-    ay: f64,
-    r0: u32,
-    c0: u32,
-    r1: u32,
-    c1: u32,
-}
-
-impl MockSelection {
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn is_empty(&self) -> bool {
-        if !self.active {
-            return true;
-        }
-        if self.block {
-            return self.c0 >= self.c1;
-        }
-        self.r0 > self.r1 || (self.r0 == self.r1 && self.c0 >= self.c1)
-    }
-
-    fn start(&mut self, grid: &MockTerminal, x: f64, y: f64, mode: SelectionMode, block: bool) {
-        self.active = true;
-        self.mode = Some(mode);
-        self.block = block && mode == SelectionMode::Cell;
-        self.ax = x;
-        self.ay = y;
-        self.extend(grid, x, y);
-    }
-
-    fn extend(&mut self, grid: &MockTerminal, x: f64, y: f64) {
-        if !self.active {
-            return;
-        }
-        match self.mode.unwrap_or(SelectionMode::Cell) {
-            SelectionMode::Cell => self.resolve_cells(grid.cols, grid.rows, x, y),
-            SelectionMode::Word => self.resolve_units(grid, x, y, false),
-            SelectionMode::Line => self.resolve_units(grid, x, y, true),
-        }
-    }
-
-    fn resolve_cells(&mut self, cols: u32, rows: u32, x: f64, y: f64) {
-        let (ar, ac) = if self.ay >= f64::from(rows) {
-            (rows - 1, cols)
-        } else {
-            (
-                (self.ay.floor().max(0.0) as u32).min(rows - 1),
-                js_round_non_neg(self.ax).min(cols),
-            )
-        };
-        let (hr, hc) = if y >= f64::from(rows) {
-            (rows - 1, cols)
-        } else {
-            (
-                (y.floor().max(0.0) as u32).min(rows - 1),
-                js_round_non_neg(x).min(cols),
-            )
-        };
-        if self.block {
-            self.r0 = ar.min(hr);
-            self.r1 = ar.max(hr);
-            self.c0 = ac.min(hc);
-            self.c1 = ac.max(hc);
-        } else if ar < hr || (ar == hr && ac <= hc) {
-            self.r0 = ar;
-            self.c0 = ac;
-            self.r1 = hr;
-            self.c1 = hc;
-        } else {
-            self.r0 = hr;
-            self.c0 = hc;
-            self.r1 = ar;
-            self.c1 = ac;
-        }
-    }
-
-    fn resolve_units(&mut self, grid: &MockTerminal, x: f64, y: f64, line_mode: bool) {
-        let ay = (self.ay.floor().max(0.0) as u32).min(grid.rows - 1);
-        let ax = (self.ax.floor().max(0.0) as u32).min(grid.cols - 1);
-        let hy = (y.floor().max(0.0) as u32).min(grid.rows - 1);
-        let hx = (x.floor().max(0.0) as u32).min(grid.cols - 1);
-        let (ar0, ac0, ar1, ac1) = if line_mode {
-            grid.line_span(ay)
-        } else {
-            grid.word_span(ax, ay)
-        };
-        self.r0 = ar0;
-        self.c0 = ac0;
-        self.r1 = ar1;
-        self.c1 = ac1;
-        if hy == ay && (line_mode || hx == ax) {
-            return;
-        }
-        let (hr0, hc0, hr1, hc1) = if line_mode {
-            grid.line_span(hy)
-        } else {
-            grid.word_span(hx, hy)
-        };
-        if hr0 < self.r0 || (hr0 == self.r0 && hc0 < self.c0) {
-            self.r0 = hr0;
-            self.c0 = hc0;
-        }
-        if hr1 > self.r1 || (hr1 == self.r1 && hc1 > self.c1) {
-            self.r1 = hr1;
-            self.c1 = hc1;
-        }
-    }
-
-    fn text(&self, grid: &MockTerminal) -> String {
-        if self.is_empty() {
-            return String::new();
-        }
-        let mut out = String::new();
-        for row in self.r0..=self.r1 {
-            let lo = if self.block || row == self.r0 {
-                self.c0
-            } else {
-                0
-            };
-            let hi = if self.block || row == self.r1 {
-                self.c1
-            } else {
-                grid.cols
-            };
-            let slice = if hi > lo {
-                grid.row_text(row, lo, hi)
-            } else {
-                String::new()
-            };
-            if self.block {
-                out.push_str(slice.trim_end());
-                if row < self.r1 {
-                    out.push('\n');
-                }
-            } else {
-                out.push_str(slice.trim_end_matches([' ', '\t']));
-                if row < self.r1 {
-                    out.push('\n');
-                }
-            }
-        }
-        out
-    }
-}
 
 // ── Unified stand-in wall & terminal test double ────────────────────────────
 
@@ -217,14 +42,13 @@ struct MockTerminal {
     title_height: f64,
     edge_tol: f64,
     tracking: MouseTracking,
-    cells: Vec<Vec<char>>,
-    selection: MockSelection,
+    screen: Screen,
+    selection: TerminalSelection,
     shown: bool,
 }
 
 impl MockTerminal {
     fn new(cols: u32, rows: u32, stride: Point) -> Self {
-        let cells = vec![vec!['\0'; cols as usize]; rows as usize];
         Self {
             cols,
             rows,
@@ -235,71 +59,16 @@ impl MockTerminal {
             title_height: 1.0,
             edge_tol: 0.0,
             tracking: MouseTracking::None,
-            cells,
-            selection: MockSelection::default(),
+            screen: Screen::new(cols as u16, rows as u16),
+            selection: TerminalSelection::new(),
             shown: true,
         }
     }
 
     fn set_lines(&mut self, raw: &str) {
-        self.cells = vec![vec!['\0'; self.cols as usize]; self.rows as usize];
-        for (row_idx, line) in raw.split("\r\n").enumerate() {
-            if row_idx >= self.rows as usize {
-                break;
-            }
-            for (col_idx, ch) in line.chars().enumerate() {
-                if col_idx >= self.cols as usize {
-                    break;
-                }
-                self.cells[row_idx][col_idx] = ch;
-            }
-        }
-    }
-
-    fn cell_char(&self, row: u32, col: u32) -> char {
-        self.cells
-            .get(row as usize)
-            .and_then(|r| r.get(col as usize).copied())
-            .unwrap_or('\0')
-    }
-
-    fn row_text(&self, row: u32, col0: u32, col1: u32) -> String {
-        let mut s = String::new();
-        for col in col0..col1.min(self.cols) {
-            let ch = self.cell_char(row, col);
-            s.push(if ch == '\0' { ' ' } else { ch });
-        }
-        s
-    }
-
-    fn word_span(&self, col: u32, row: u32) -> (u32, u32, u32, u32) {
-        let kind = is_word_boundary(self.cell_char(row, col));
-        let mut start_col = col;
-        while start_col > 0 && is_word_boundary(self.cell_char(row, start_col - 1)) == kind {
-            start_col -= 1;
-        }
-        let mut end_col = (col + 1).min(self.cols);
-        while end_col < self.cols && is_word_boundary(self.cell_char(row, end_col)) == kind {
-            end_col += 1;
-        }
-        (row, start_col, row, end_col)
-    }
-
-    fn line_span(&self, row: u32) -> (u32, u32, u32, u32) {
-        let mut first_non_space: Option<u32> = None;
-        let mut last_non_space: Option<u32> = None;
-        for col in 0..self.cols {
-            if !is_space(self.cell_char(row, col)) {
-                if first_non_space.is_none() {
-                    first_non_space = Some(col);
-                }
-                last_non_space = Some(col + 1);
-            }
-        }
-        match (first_non_space, last_non_space) {
-            (Some(c0), Some(c1)) => (row, c0, row, c1),
-            _ => (row, 0, row, 0),
-        }
+        let mut lines: Vec<&str> = raw.split("\r\n").collect();
+        lines.resize(self.rows as usize, "");
+        self.screen = screen_from_lines(&lines, self.cols as u16, &[], |_| false);
     }
 
     fn body_rect(&self) -> Rect {
@@ -428,7 +197,7 @@ impl StandInWall {
 
     fn selection_text(&self, id: &str) -> String {
         let term = &self.terminals[id];
-        term.selection.text(term)
+        term.selection.text(&term.screen)
     }
 }
 
@@ -698,15 +467,14 @@ impl PointerHost for StandInWall {
         block: bool,
     ) {
         if let Some(term) = self.terminals.get_mut(id) {
-            let snapshot = term.clone();
-            term.selection.start(&snapshot, cell_x, cell_y, mode, block);
+            term.selection
+                .start(&term.screen, cell_x, cell_y, mode, block);
         }
     }
 
     fn select_extend(&mut self, id: &str, cell_x: f64, cell_y: f64) {
         if let Some(term) = self.terminals.get_mut(id) {
-            let snapshot = term.clone();
-            term.selection.extend(&snapshot, cell_x, cell_y);
+            term.selection.extend(&term.screen, cell_x, cell_y);
         }
     }
 
