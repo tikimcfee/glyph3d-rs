@@ -1,7 +1,7 @@
 //! Integration tests exercising `glyph_vt` strictly through its public seam
 //! (`Theme`, `Vt`, and `term_cells::Screen`).
 
-use glyph_vt::{Theme, Vt, VtEvent};
+use glyph_vt::{ScrollScope, Theme, Vt, VtEvent};
 use term_cells::{
     attrs, rgb, CursorShape, Face, MouseFormat, MouseTracking, Screen, CLUSTER_BASE,
 };
@@ -581,5 +581,131 @@ fn cursor_only_controls_and_wide_char_reflow_preserve_invariants() {
     for r in 0..screen.rows {
         assert_eq!(screen.row(r)[0].width, 1);
     }
+}
+
+#[test]
+fn screen_cursor_color_tracks_theme_alpha_zero_and_osc_12_overrides() {
+    // 1. Default theme carries an opaque cursor colour: `fill()` writes it to `Screen::cursor_color`.
+    let (mut vt, mut screen, theme) = setup(16, 4);
+    assert_eq!(screen.cursor_color, 0);
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.cursor_color, theme.cursor);
+    assert_eq!(screen.cursor_color >> 24, 0xff);
+
+    // OSC 12 overrides `screen.cursor_color` and bumps `screen.generation` without touching rows.
+    let gen_before = screen.generation;
+    let row_gens_before = screen.row_gen.clone();
+    vt.feed(b"\x1b]12;#33aa77\x07");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.cursor_color, rgb(0x33, 0xaa, 0x77));
+    assert_eq!(vt.cursor_color(), rgb(0x33, 0xaa, 0x77));
+    assert!(screen.generation > gen_before);
+    assert_eq!(screen.row_gen, row_gens_before);
+
+    // DECSTR (`CSI ! p`, used by every termd REPAINT) preserves dynamic OSC 12 overrides.
+    vt.feed(b"\x1b[!p");
+    vt.fill(&mut screen);
+    assert_eq!(screen.cursor_color, rgb(0x33, 0xaa, 0x77));
+
+    // OSC 112 resets back to the theme's cursor colour.
+    vt.feed(b"\x1b]112\x07");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.cursor_color, theme.cursor);
+
+    // 2. Alpha 0 on `Theme::cursor` means the theme names none (`screen.cursor_color == 0`),
+    //    until the program explicitly sets OSC 12 (and returns to 0 on OSC 112 or RIS).
+    let unset_cursor_theme = Theme {
+        cursor: 0,
+        ..Theme::default()
+    };
+    let mut vt_unset = Vt::new(16, 4, &unset_cursor_theme);
+    let mut screen_unset = Screen::new(16, 4);
+    vt_unset.fill(&mut screen_unset);
+    assert_eq!(screen_unset.cursor_color, 0);
+    assert_eq!(vt_unset.cursor_color(), 0);
+
+    vt_unset.feed(b"\x1b]12;rgb:ff/80/20\x1b\\");
+    assert!(vt_unset.fill(&mut screen_unset));
+    assert_eq!(screen_unset.cursor_color, rgb(0xff, 0x80, 0x20));
+
+    vt_unset.feed(b"\x1b]112\x07");
+    assert!(vt_unset.fill(&mut screen_unset));
+    assert_eq!(screen_unset.cursor_color, 0);
+
+    vt_unset.feed(b"\x1b]12;#112233\x07");
+    assert!(vt_unset.fill(&mut screen_unset));
+    assert_eq!(screen_unset.cursor_color, rgb(0x11, 0x22, 0x33));
+
+    vt_unset.feed(b"\x1bc");
+    assert!(vt_unset.fill(&mut screen_unset));
+    assert_eq!(screen_unset.cursor_color, 0);
+}
+
+#[test]
+fn fill_delta_reports_whole_screen_vs_margin_scroll_and_rewritten_spans() {
+    let (mut vt, mut screen, _theme) = setup(16, 5);
+    vt.feed(b"row0\r\nrow1\r\nhello world\r\nrow3\r\nrow4");
+    vt.fill(&mut screen);
+
+    // Idle fill reports zero changes, zero scroll, and empty rewritten spans.
+    assert!(!vt.fill(&mut screen));
+    assert_eq!(vt.last_fill_delta().scrolled_top, 0);
+    assert_eq!(vt.last_fill_delta().scroll_scope, ScrollScope::None);
+    assert_eq!(vt.last_fill_delta().rewritten_cols(), &[(0, 0); 5]);
+
+    // Print 2 lines at the bottom -> whole screen scrolls up by 2.
+    // "hello world" moves from row 2 -> row 0 with ZERO in-place rewrites (`(0, 0)`).
+    vt.feed(b"\r\nrow5\r\nrow6");
+    let d = vt.fill_delta(&mut screen);
+    assert!(d.changed);
+    assert!(!d.resized);
+    assert_eq!(d.scrolled_top, 2);
+    assert_eq!(d.scroll_scope, ScrollScope::FullScreen);
+    assert!(d.is_whole_screen_scroll());
+    assert!(!d.within_margins());
+    assert_eq!(d.row_rewritten_cols(0), (0, 0));
+    assert_eq!(d.row_rewritten_cols(1), (0, 0));
+    assert_eq!(d.row_rewritten_cols(2), (0, 0));
+    assert_eq!(d.row_rewritten_cols(3), (0, 4));
+    assert_eq!(d.row_rewritten_cols(4), (0, 4));
+
+    // Overwrite columns 6..11 ("world" -> "earth") in place on row 0 without scrolling.
+    vt.feed(b"\x1b[1;7Hearth");
+    let d = vt.fill_delta(&mut screen);
+    assert_eq!(d.scrolled_top, 0);
+    assert_eq!(d.scroll_scope, ScrollScope::None);
+    assert_eq!(d.row_rewritten_cols(0), (6, 11));
+    assert_eq!(d.row_rewritten_cols(1), (0, 0));
+
+    // Margin scroll (`DECSTBM` rows 2..=4, 1-based `\x1b[2;4r`, i.e. 0-based 1..=3):
+    // row 0 and row 4 stay outside the scrolled region (`(0, 0)`), while rows 1..=3
+    // report `within_margins == true` and `(0, 16)` moved columns.
+    vt.feed(b"\x1b[2;4r\x1b[4;1H\n\x1b[r");
+    let d = vt.fill_delta(&mut screen);
+    assert_eq!(d.scrolled_top, 0);
+    assert_eq!(d.scroll_scope, ScrollScope::Margins);
+    assert!(d.within_margins());
+    assert_eq!(d.row_rewritten_cols(0), (0, 0));
+    assert_eq!(d.row_rewritten_cols(1), (0, 16));
+    assert_eq!(d.row_rewritten_cols(2), (0, 16));
+    assert_eq!(d.row_rewritten_cols(3), (0, 16));
+    assert_eq!(d.row_rewritten_cols(4), (0, 0));
+
+    // Top-anchored margin scroll (`\x1b[1;4r`, 0-based 0..=3) evicts 1 row off row 0
+    // (`scrolled_top == 1`) while still reporting `ScrollScope::Margins` (`within_margins`).
+    vt.feed(b"\x1b[1;4r\x1b[4;1H\n\x1b[r");
+    let d = vt.fill_delta(&mut screen);
+    assert_eq!(d.scrolled_top, 1);
+    assert_eq!(d.scroll_scope, ScrollScope::Margins);
+    assert!(d.within_margins());
+    assert_eq!(d.row_rewritten_cols(4), (0, 0));
+
+    // Resize sets `resized = true` and suppresses any prior pending scroll.
+    vt.feed(b"\x1b[5;1H\n");
+    vt.resize(20, 5);
+    let d = vt.fill_delta(&mut screen);
+    assert!(d.resized);
+    assert_eq!(d.scrolled_top, 0);
+    assert_eq!(d.scroll_scope, ScrollScope::None);
 }
 
