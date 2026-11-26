@@ -330,6 +330,28 @@ impl CellSelection {
     }
 }
 
+/// Expand a non-empty column span `[lo, hi)` on `row` so neither boundary cuts
+/// a 2-column wide character (`width == 2` head + `width == 0` tail) in half.
+///
+/// Mirrors terminal selection/underline rules (and `glyph_vt::Vt::text`): starting
+/// on a wide character's trailing cell widens `lo` left by 1; ending on a wide
+/// character's head cell widens `hi` right by 1 when its trailing cell is present.
+pub fn snap_row_span_to_wide(row: &[Cell], span: Range<u16>) -> Range<u16> {
+    let cols = row.len().min(usize::from(u16::MAX)) as u16;
+    let mut lo = span.start.min(cols);
+    let mut hi = span.end.min(cols);
+    if hi <= lo {
+        return 0..0;
+    }
+    if lo > 0 && row[lo as usize].width == 0 && row[lo as usize - 1].width == 2 {
+        lo -= 1;
+    }
+    if hi < cols && row[hi as usize - 1].width == 2 && row[hi as usize].width == 0 {
+        hi += 1;
+    }
+    lo..hi
+}
+
 /// Apply `selection`'s fill and optional text colour to a packed [`CellGpu`].
 pub fn apply_selection_to_cell(cell: &mut CellGpu, selection: &CellSelection) {
     let bg = if (selection.background >> 24) == 0 {
@@ -343,26 +365,129 @@ pub fn apply_selection_to_cell(cell: &mut CellGpu, selection: &CellSelection) {
     }
 }
 
-/// Coalesce rows that need GPU re-upload due to either screen mutations
-/// (`row_gen[r] > uploaded_gen` when `screen_gen != uploaded_gen`) or a change
-/// in the terminal's active [`CellSelection`] affecting that row.
-pub fn dirty_row_ranges_with_selection(
+/// Cell-coordinate hover-link highlight (OSC 8 hyperlink or plain URL) for one terminal
+/// (wall-core-free).
+///
+/// Covers a linear reading-order cell range from `(start_row, start_col)` through
+/// `(end_row, end_col)` (`end_col` exclusive), including full interior rows `0..cols`
+/// when a link soft-wraps across lines. Drawn as a single underline across the span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellLinkHover {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    /// Optional underline colour (packed sRGB RGBA8; alpha 0 promoted to opaque `0xFF`).
+    /// `None` underlines in each cell's own foreground colour.
+    pub color: Option<u32>,
+}
+
+impl CellLinkHover {
+    /// Construct a linear hover-link range from `(start_row, start_col)` to
+    /// `(end_row, end_col)` (end column exclusive), underlining in each cell's `fg`.
+    pub const fn new(start_row: u16, start_col: u16, end_row: u16, end_col: u16) -> Self {
+        Self {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            color: None,
+        }
+    }
+
+    /// Construct a single-row hover-link range `start_col..end_col` on `row`.
+    pub const fn single_row(row: u16, start_col: u16, end_col: u16) -> Self {
+        Self::new(row, start_col, row, end_col)
+    }
+
+    /// Override the hover underline colour (packed sRGB RGBA8).
+    pub const fn with_color(mut self, color: u32) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// True when this hover-link range covers zero cells.
+    pub const fn is_empty(&self) -> bool {
+        self.start_row > self.end_row
+            || (self.start_row == self.end_row && self.start_col >= self.end_col)
+    }
+
+    /// Covered column span `[lo, hi)` on `row` for a grid of `cols` columns
+    /// (`0..0` when `row` has no hovered link cells).
+    pub fn row_span(&self, row: u16, cols: u16) -> Range<u16> {
+        if self.is_empty() || row < self.start_row || row > self.end_row {
+            return 0..0;
+        }
+        let lo = if row == self.start_row {
+            self.start_col.min(cols)
+        } else {
+            0
+        };
+        let hi = if row == self.end_row {
+            self.end_col.min(cols)
+        } else {
+            cols
+        };
+        if hi <= lo { 0..0 } else { lo..hi }
+    }
+}
+
+/// Apply `link`'s hover underline to a packed [`CellGpu`].
+///
+/// Leaves wide-char trailing halves (`span_cols == 0`) untouched because the snapped
+/// wide head cell owns the full 2-column underline quad. Cells without an existing
+/// underline receive `UNDERLINE_SINGLE`; cells that already carry an underline style
+/// keep it.
+pub fn apply_hover_link_to_cell(cell: &mut CellGpu, link: &CellLinkHover) {
+    let span_cols = (cell.glyph_and_flags >> SPAN_COLS_SHIFT) & SPAN_COLS_MASK;
+    if span_cols == 0 {
+        return;
+    }
+    let mut style = (cell.glyph_and_flags >> STYLE_SHIFT) & 0x7F;
+    if (style & style_bits::UNDERLINE_MASK) == 0 {
+        style |= u32::from(attrs::UNDERLINE_SINGLE) << style_bits::UNDERLINE_SHIFT;
+    }
+    if let Some(color) = link.color {
+        style |= style_bits::UNDERLINE_COLOR;
+        cell.ul = if (color >> 24) == 0 {
+            color | 0xFF00_0000
+        } else {
+            color
+        };
+    }
+    cell.glyph_and_flags =
+        (cell.glyph_and_flags & !(0x7Fu32 << STYLE_SHIFT)) | (style << STYLE_SHIFT);
+}
+
+/// Coalesce rows that need GPU re-upload due to screen mutations, a changed
+/// [`CellSelection`], or a changed [`CellLinkHover`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pure row-diff helper comparing previous and next screen generation plus two optional overlays"
+)]
+pub fn dirty_row_ranges_with_overlays(
     row_gen: &[u64],
     cols: u16,
     screen_gen: u64,
     uploaded_gen: u64,
     old_sel: Option<CellSelection>,
     new_sel: Option<CellSelection>,
+    old_link: Option<CellLinkHover>,
+    new_link: Option<CellLinkHover>,
 ) -> Vec<Range<usize>> {
     let old_sel = old_sel.filter(|s| !s.is_empty());
     let new_sel = new_sel.filter(|s| !s.is_empty());
+    let old_link = old_link.filter(|l| !l.is_empty());
+    let new_link = new_link.filter(|l| !l.is_empty());
     let screen_dirty = screen_gen != uploaded_gen;
     let sel_dirty = old_sel != new_sel;
-    if !screen_dirty && !sel_dirty {
+    let link_dirty = old_link != new_link;
+    if !screen_dirty && !sel_dirty && !link_dirty {
         return Vec::new();
     }
-    let colors_changed = old_sel.map(|s| (s.background, s.foreground))
+    let sel_colors_changed = old_sel.map(|s| (s.background, s.foreground))
         != new_sel.map(|s| (s.background, s.foreground));
+    let link_color_changed = old_link.map(|l| l.color) != new_link.map(|l| l.color);
 
     let mut ranges = Vec::new();
     let mut start: Option<usize> = None;
@@ -372,11 +497,18 @@ pub fn dirty_row_ranges_with_selection(
         let row_sel_dirty = if sel_dirty {
             let old_span = old_sel.map_or(0..0, |s| s.row_span(r, cols));
             let new_span = new_sel.map_or(0..0, |s| s.row_span(r, cols));
-            old_span != new_span || (colors_changed && !new_span.is_empty())
+            old_span != new_span || (sel_colors_changed && !new_span.is_empty())
         } else {
             false
         };
-        if row_screen_dirty || row_sel_dirty {
+        let row_link_dirty = if link_dirty {
+            let old_span = old_link.map_or(0..0, |l| l.row_span(r, cols));
+            let new_span = new_link.map_or(0..0, |l| l.row_span(r, cols));
+            old_span != new_span || (link_color_changed && !new_span.is_empty())
+        } else {
+            false
+        };
+        if row_screen_dirty || row_sel_dirty || row_link_dirty {
             if start.is_none() {
                 start = Some(row_idx);
             }
@@ -388,6 +520,29 @@ pub fn dirty_row_ranges_with_selection(
         ranges.push(run_start..row_gen.len());
     }
     ranges
+}
+
+/// Coalesce rows that need GPU re-upload due to either screen mutations
+/// (`row_gen[r] > uploaded_gen` when `screen_gen != uploaded_gen`) or a change
+/// in the terminal's active [`CellSelection`] affecting that row.
+pub fn dirty_row_ranges_with_selection(
+    row_gen: &[u64],
+    cols: u16,
+    screen_gen: u64,
+    uploaded_gen: u64,
+    old_sel: Option<CellSelection>,
+    new_sel: Option<CellSelection>,
+) -> Vec<Range<usize>> {
+    dirty_row_ranges_with_overlays(
+        row_gen,
+        cols,
+        screen_gen,
+        uploaded_gen,
+        old_sel,
+        new_sel,
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -647,6 +802,106 @@ mod tests {
         assert_eq!(
             dirty_row_ranges_with_selection(&edited, cols, 2, 1, Some(s4), Some(s4)),
             vec![0..1]
+        );
+    }
+
+    #[test]
+    fn snap_row_span_to_wide_widens_split_wide_boundaries_and_preserves_clean_edges() {
+        // Row: [0:'a', 1:'漢'(w=2), 2:tail(w=0), 3:'b', 4:'🚀'(w=2), 5:tail(w=0), 6:'漢'(w=2, last col)]
+        let mut row = vec![Cell::BLANK; 7];
+        row[0] = Cell { content: 'a' as u32, width: 1, ..Cell::BLANK };
+        row[1] = Cell { content: '漢' as u32, width: 2, ..Cell::BLANK };
+        row[2] = Cell { content: 0, width: 0, ..Cell::BLANK };
+        row[3] = Cell { content: 'b' as u32, width: 1, ..Cell::BLANK };
+        row[4] = Cell { content: '🚀' as u32, width: 2, ..Cell::BLANK };
+        row[5] = Cell { content: 0, width: 0, ..Cell::BLANK };
+        row[6] = Cell { content: '漢' as u32, width: 2, ..Cell::BLANK };
+
+        // Empty stays empty.
+        assert_eq!(snap_row_span_to_wide(&row, 2..2), 0..0);
+        // Strictly narrow stays untouched.
+        assert_eq!(snap_row_span_to_wide(&row, 0..1), 0..1);
+        assert_eq!(snap_row_span_to_wide(&row, 3..4), 3..4);
+        // Ending on wide head (1..2) widens right to include tail (1..3).
+        assert_eq!(snap_row_span_to_wide(&row, 0..2), 0..3);
+        assert_eq!(snap_row_span_to_wide(&row, 1..2), 1..3);
+        // Starting on wide tail (2..4) widens left to include head (1..4).
+        assert_eq!(snap_row_span_to_wide(&row, 2..4), 1..4);
+        // Splitting wide cells on BOTH ends (2..5) widens both (1..6).
+        assert_eq!(snap_row_span_to_wide(&row, 2..5), 1..6);
+        // Already whole wide cell (1..3) stays exact.
+        assert_eq!(snap_row_span_to_wide(&row, 1..3), 1..3);
+        // Orphan wide cell in the last column (6..7) stays clamped within row length.
+        assert_eq!(snap_row_span_to_wide(&row, 6..7), 6..7);
+    }
+
+    #[test]
+    fn cell_link_hover_spans_style_and_minimal_dirty_rows() {
+        // Multi-row wrapped URL from (1, 10) to (3, 4).
+        let link = CellLinkHover::new(1, 10, 3, 4);
+        assert!(!link.is_empty());
+        assert_eq!(link.row_span(0, 20), 0..0);
+        assert_eq!(link.row_span(1, 20), 10..20);
+        assert_eq!(link.row_span(2, 20), 0..20);
+        assert_eq!(link.row_span(3, 20), 0..4);
+        assert_eq!(link.row_span(4, 20), 0..0);
+        assert!(CellLinkHover::single_row(2, 5, 5).is_empty());
+
+        // Applying default-fg hover link sets UNDERLINE_SINGLE without UNDERLINE_COLOR.
+        let mut cell = CellGpu {
+            glyph_and_flags: 42 | (1 << SPAN_COLS_SHIFT),
+            fg: rgb(0x82, 0xaa, 0xff),
+            bg: 0,
+            ul: 0,
+        };
+        apply_hover_link_to_cell(&mut cell, &link);
+        let st = (cell.glyph_and_flags >> STYLE_SHIFT) & 0x7F;
+        assert_eq!((st & style_bits::UNDERLINE_MASK) >> style_bits::UNDERLINE_SHIFT, u32::from(attrs::UNDERLINE_SINGLE));
+        assert_eq!(st & style_bits::UNDERLINE_COLOR, 0);
+
+        // Explicit colour sets UNDERLINE_COLOR and promotes alpha 0 -> 0xFF.
+        let tinted = link.with_color(0x00_ff_b0_60);
+        apply_hover_link_to_cell(&mut cell, &tinted);
+        let st2 = (cell.glyph_and_flags >> STYLE_SHIFT) & 0x7F;
+        assert_ne!(st2 & style_bits::UNDERLINE_COLOR, 0);
+        assert_eq!(cell.ul, 0xff_ff_b0_60);
+
+        // Existing curly underline is preserved (not downgraded to single).
+        let mut curly = CellGpu {
+            glyph_and_flags: 42 | ((u32::from(attrs::UNDERLINE_CURLY) << style_bits::UNDERLINE_SHIFT) << STYLE_SHIFT) | (1 << SPAN_COLS_SHIFT),
+            fg: rgb(0xcc, 0xcc, 0xcc),
+            bg: 0,
+            ul: 0,
+        };
+        apply_hover_link_to_cell(&mut curly, &link);
+        let st_c = (curly.glyph_and_flags >> STYLE_SHIFT) & 0x7F;
+        assert_eq!((st_c & style_bits::UNDERLINE_MASK) >> style_bits::UNDERLINE_SHIFT, u32::from(attrs::UNDERLINE_CURLY));
+
+        // Trailing wide half (`span_cols == 0`) stays untouched.
+        let mut tail = CellGpu { glyph_and_flags: 0, fg: 0, bg: 0, ul: 0 };
+        apply_hover_link_to_cell(&mut tail, &tinted);
+        assert_eq!(tail.glyph_and_flags, 0);
+        assert_eq!(tail.ul, 0);
+
+        // Dirty-row tracking touches ONLY rows whose hover link changed.
+        let row_gen = [1u64; 8];
+        let a = CellLinkHover::single_row(2, 4, 18);
+        let b = CellLinkHover::single_row(5, 0, 12);
+        assert_eq!(
+            dirty_row_ranges_with_overlays(&row_gen, 20, 1, 1, None, None, None, Some(a)),
+            vec![2..3]
+        );
+        assert_eq!(
+            dirty_row_ranges_with_overlays(&row_gen, 20, 1, 1, None, None, Some(a), Some(a)),
+            Vec::<Range<usize>>::new()
+        );
+        assert_eq!(
+            dirty_row_ranges_with_overlays(&row_gen, 20, 1, 1, None, None, Some(a), Some(b)),
+            vec![2..3, 5..6]
+        );
+        assert_eq!(
+            dirty_row_ranges_with_overlays(&row_gen, 20, 1, 1, None, None, Some(b), None),
+            vec![5..6]
         );
     }
 }

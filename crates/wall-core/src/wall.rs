@@ -4493,6 +4493,24 @@ impl Wall {
         self.sync_pointer_flags();
     }
 
+    /// Update cell stride/padding after a font family, size, or line-height change,
+    /// re-wrapping every terminal's grid to keep its panel footprint and re-laying out groups.
+    pub fn set_geometry_preserving_panels(&mut self, geometry: CellGeometry) {
+        let core = &mut self.router.context;
+        core.model.set_geometry_preserving_panels(geometry);
+        if core.fullscreen.active() {
+            core.with_fullscreen(|fs, host| {
+                fs.refit(host);
+            });
+        }
+    }
+
+    /// Show a timed notice line at the top of the wall (expires after `config.notice_ms`).
+    pub fn notify(&mut self, message: &str) {
+        let now_ms = self.router.context.now_ms;
+        self.router.context.model.notify(message, now_ms);
+    }
+
     /// Advance camera easing, wheel scroll glides, fullscreen refit settlement,
     /// hold-to-close timers, daemon restart grace timers, and timed notices.
     /// Returns `true` if another animation frame should be scheduled.
