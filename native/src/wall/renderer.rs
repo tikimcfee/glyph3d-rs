@@ -2372,7 +2372,7 @@ mod tests {
         let px_bold = render_char(&mut renderer, 'R', attrs::BOLD);
         let px_ital = render_char(&mut renderer, 'R', attrs::ITALIC);
         let px_bi = render_char(&mut renderer, 'R', attrs::BOLD | attrs::ITALIC);
-        let lit = |px: &[u8]| px.chunks_exact(4).filter(|p| p[0] > 80).count();
+        let lit = |px: &[u8]| px.as_chunks::<4>().0.iter().filter(|p| p[0] > 80).count();
         assert!(lit(&px_reg) > 50, "regular glyph should draw");
         assert!(lit(&px_bold) > lit(&px_reg), "bold should have more lit ink pixels than regular");
         assert_ne!(px_reg, px_ital, "italic face must differ from regular");
