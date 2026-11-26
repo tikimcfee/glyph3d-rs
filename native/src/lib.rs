@@ -103,6 +103,23 @@ pub fn default_emoji_sheet() -> PathBuf {
     atlas_dir().join("emoji-sheet.bin")
 }
 
+/// Display name set on `NSProcessInfo` before winit builds the macOS application menu.
+pub const WALL_MACOS_APP_NAME: &str = "Glyph3D Wall";
+
+/// Set macOS `NSProcessInfo.processName` so winit 0.30's default application menu
+/// (`About …`, `Hide …`, `Quit …`) and standard About panel show `name` rather
+/// than the binary filename (`glyph3d-native`). Must run before `EventLoop::build`.
+#[cfg(all(feature = "windowed", target_os = "macos"))]
+pub fn set_macos_process_name(name: &str) {
+    let ns_name = objc2_foundation::NSString::from_str(name);
+    // SAFETY: Foundation documents `setProcessName:` as unsynchronised against
+    // concurrent readers of `processName`; callers run this once at startup
+    // before spawning worker threads or creating winit's `EventLoop`.
+    unsafe {
+        objc2_foundation::NSProcessInfo::processInfo().setProcessName(&ns_name);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SceneCullOptions {
     pub cull: bool,

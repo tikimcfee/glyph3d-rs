@@ -3,9 +3,11 @@
 //! coverage.
 //!
 //! Run modes (`--help` has every flag; `cargo glyph run` builds first):
-//!   (no arguments, on a terminal) / `--launcher`
-//!                    the terminal launcher (`launcher/`): pick a scene and
-//!                    its options, Enter starts the renderer on them.
+//!   (no arguments) / `--wall`
+//!                    the wall (`wall/`): the infinite canvas of live
+//!                    terminals in `g3d-termd` (default namespace `rs-wall`).
+//!   `--launcher`     the terminal launcher (`launcher/`): pick the wall or a
+//!                    scene and its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
 //!                    `--field-mode derived`, the one field mode since
 //!                    2026-10-31).
@@ -119,6 +121,8 @@ fn main() {
         }
         #[cfg(feature = "windowed")]
         CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
+            #[cfg(target_os = "macos")]
+            set_macos_process_name(WALL_MACOS_APP_NAME);
             let ctx = pollster::block_on(gpu::init(None));
             // The test pattern needs no daemon: one fixed screen.
             let namespace = (!pattern).then_some(namespace);
@@ -126,7 +130,7 @@ fn main() {
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {
-            eprintln!("error: --wall: this build has no window (the `windowed` feature is off)");
+            eprintln!("error: the wall needs a window, and this build has none (the `windowed` feature is off); render a glyph scene offscreen with --screenshot PATH");
             std::process::exit(1);
         }
         #[cfg(feature = "wgpu")]

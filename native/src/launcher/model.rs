@@ -30,6 +30,7 @@ const REPO_PRESETS_MAX: usize = 16;
 /// Which scene a launch opens — the config's scene keys, one at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
+    Wall,
     Repo,
     File,
     Agent,
@@ -37,10 +38,11 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Target; 4] = [Target::Repo, Target::File, Target::Agent, Target::Demo];
+    pub const ALL: [Target; 5] = [Target::Wall, Target::Repo, Target::File, Target::Agent, Target::Demo];
 
     pub fn label(self) -> &'static str {
         match self {
+            Target::Wall => "Wall",
             Target::Repo => "Repo",
             Target::File => "File",
             Target::Agent => "Agent",
@@ -61,6 +63,7 @@ pub enum Section {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Target,
+    WallNamespace,
     RepoPath,
     FocusFile,
     FilePath,
@@ -83,6 +86,7 @@ pub enum Control {
 impl Control {
     pub const ALL: &'static [Control] = &[
         Control::Target,
+        Control::WallNamespace,
         Control::RepoPath,
         Control::FocusFile,
         Control::FilePath,
@@ -105,7 +109,7 @@ impl Control {
     pub fn section(self) -> Section {
         use Control::*;
         match self {
-            Target | RepoPath | FocusFile | FilePath | SessionPath => Section::Target,
+            Target | WallNamespace | RepoPath | FocusFile | FilePath | SessionPath => Section::Target,
             LayoutMode | WrapMode | ZWrapSpacing | RepoEngine | ClusterMode => Section::Layout,
             FieldMode | TextDetail | ShowGlyphs | Greeking | FileBackgrounds | Cull | UiOverlay
             | PresentMode => Section::Graphics,
@@ -116,6 +120,7 @@ impl Control {
         use Control::*;
         match self {
             Target => "Target",
+            WallNamespace => "Namespace",
             RepoPath => "Repo",
             FocusFile => "Focus",
             FilePath => "File",
@@ -137,7 +142,14 @@ impl Control {
     }
 
     pub fn is_text_input(self) -> bool {
-        matches!(self, Control::RepoPath | Control::FocusFile | Control::FilePath | Control::SessionPath)
+        matches!(
+            self,
+            Control::WallNamespace
+                | Control::RepoPath
+                | Control::FocusFile
+                | Control::FilePath
+                | Control::SessionPath
+        )
     }
 }
 
@@ -191,6 +203,7 @@ pub struct Launcher {
     /// `[lod]` as the renderer would resolve it under `cfg`'s sections.
     lod_defaults: (f64, f64),
     pub target: Target,
+    pub wall_ns: String,
     pub repo_path: String,
     pub file_path: String,
     pub session_path: String,
@@ -215,12 +228,14 @@ impl Launcher {
     /// Built-in defaults only: reads no file and scans no directory (tests).
     pub fn defaults() -> Self {
         let defaults = Cli::try_parse_from(["glyph3d-native"]).expect("the CLI parses with no arguments");
+        let wall_ns = defaults.wall_ns.clone();
         let mut l = Self {
             cfg: LaunchConfig::default(),
             baseline: LaunchConfig::default(),
             defaults,
             lod_defaults: (0.0, 0.0),
             target: Target::Repo,
+            wall_ns,
             repo_path: ".".to_string(),
             file_path: crate::cli::default_text_file().display().to_string(),
             session_path: String::new(),
@@ -285,7 +300,9 @@ impl Launcher {
     /// Take a loaded config as the launcher's state.
     pub fn adopt(&mut self, mut cfg: LaunchConfig) {
         self.baseline = cfg.clone();
-        self.target = if cfg.demo == Some(true) {
+        self.target = if cfg.wall == Some(true) {
+            Target::Wall
+        } else if cfg.demo == Some(true) {
             Target::Demo
         } else if cfg.agent_session.is_some() {
             Target::Agent
@@ -296,6 +313,9 @@ impl Launcher {
         } else {
             Target::Repo
         };
+        if let Some(ns) = cfg.wall_ns.take() {
+            self.wall_ns = ns;
+        }
         if let Some(p) = cfg.load_repo.take() {
             self.repo_path = p.display().to_string();
         }
@@ -306,6 +326,7 @@ impl Launcher {
             // As written (`~` and all): a save writes it back unchanged.
             self.session_path = p;
         }
+        cfg.wall = None;
         cfg.demo = None;
         self.cfg = cfg;
         self.resolve_lod_defaults();
@@ -319,7 +340,11 @@ impl Launcher {
     }
 
     pub fn is_applicable(&self, c: Control) -> bool {
+        if self.target == Target::Wall {
+            return matches!(c, Control::Target | Control::WallNamespace);
+        }
         match c {
+            Control::WallNamespace => false,
             Control::RepoPath | Control::FocusFile | Control::LayoutMode | Control::RepoEngine => {
                 self.target == Target::Repo
             }
@@ -355,6 +380,10 @@ impl Launcher {
                     .map(|t| Opt { name: t.label().to_string(), help: None, selected: *t == self.target })
                     .collect(),
             ),
+            Control::WallNamespace => View::Text {
+                value: self.wall_ns.clone(),
+                placeholder: "rs-wall",
+            },
             Control::RepoPath => View::Text { value: self.repo_path.clone(), placeholder: "." },
             Control::FocusFile => View::Text {
                 value: cfg.focus_file.clone().unwrap_or_default(),
@@ -398,7 +427,7 @@ impl Launcher {
         match self.focus {
             Control::Target => {
                 let i = Target::ALL.iter().position(|t| *t == self.target).unwrap_or(0) as i32;
-                self.target = Target::ALL[(i + dir).rem_euclid(4) as usize];
+                self.target = Target::ALL[(i + dir).rem_euclid(Target::ALL.len() as i32) as usize];
             }
             Control::RepoPath => {
                 let presets = self.repo_presets();
@@ -414,7 +443,7 @@ impl Launcher {
                 self.repo_path = presets[i as usize].clone();
             }
             Control::SessionPath => self.step_session(dir),
-            Control::FocusFile | Control::FilePath => {}
+            Control::WallNamespace | Control::FocusFile | Control::FilePath => {}
             Control::LayoutMode => cfg.layout_mode = Some(step_enum(&cfg.layout_mode.unwrap_or(d.layout_mode), dir)),
             Control::WrapMode => cfg.wrap_mode = Some(step_enum(&cfg.wrap_mode.unwrap_or(d.wrap_mode), dir)),
             Control::RepoEngine => cfg.repo_engine = Some(step_enum(&cfg.repo_engine.unwrap_or(d.repo_engine), dir)),
@@ -458,6 +487,7 @@ impl Launcher {
     /// The focused text field, for typing into.
     pub fn text_mut(&mut self) -> Option<&mut String> {
         match self.focus {
+            Control::WallNamespace => Some(&mut self.wall_ns),
             Control::RepoPath => Some(&mut self.repo_path),
             Control::FilePath => Some(&mut self.file_path),
             Control::SessionPath => Some(&mut self.session_path),
@@ -550,6 +580,13 @@ impl Launcher {
             cfg.focus_file = None;
         }
         match self.target {
+            Target::Wall => {
+                cfg.wall = Some(true);
+                let ns = self.wall_ns.trim();
+                if !ns.is_empty() && ns != self.defaults.wall_ns {
+                    cfg.wall_ns = Some(ns.to_string());
+                }
+            }
             Target::Repo => cfg.load_repo = Some(abs(&self.repo_path, ".")),
             Target::File => cfg.render_file = Some(abs(&self.file_path, &crate::cli::default_text_file().display().to_string())),
             Target::Agent => cfg.agent_session = Some(session_arg(&self.session_path, cwd)),
