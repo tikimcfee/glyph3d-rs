@@ -6,8 +6,12 @@
 //! `"wall.reveal t3"` or `"wall.sidebar float 24 40"`) without touching
 //! terminals, the store, or the daemon.
 
+// The settings panel and the status window arrived with a shared kit of
+// their own (docked.rs); they are re-exported here under their plain names.
+pub mod docked;
 pub mod palette;
 pub mod sidebar;
+pub use docked::{settings, status};
 
 use std::path::Path;
 
