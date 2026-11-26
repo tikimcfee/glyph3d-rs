@@ -15,6 +15,8 @@ pub mod cell;
 #[cfg(feature = "windowed")]
 pub mod keys;
 pub mod metrics;
+#[cfg(feature = "egui-ui")]
+pub mod panels;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
 #[cfg(feature = "windowed")]
