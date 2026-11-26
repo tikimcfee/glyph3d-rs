@@ -40,9 +40,10 @@ pub mod window;
 
 pub use camera::WallCamera;
 pub use cell::{
-    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges,
-    dirty_row_ranges_with_selection, pack_cell, pack_cell_resolved, pack_cell_style,
-    resolve_cell_glyph, resolve_str_glyphs,
+    CellGpu, CellLinkHover, CellSelection, apply_hover_link_to_cell, apply_selection_to_cell,
+    dirty_row_ranges, dirty_row_ranges_with_overlays, dirty_row_ranges_with_selection, pack_cell,
+    pack_cell_resolved, pack_cell_style, resolve_cell_glyph, resolve_str_glyphs,
+    snap_row_span_to_wide,
 };
 pub use glyphs::{EmojiSheetArchive, SparseEmojiSource};
 #[cfg(feature = "wgpu")]

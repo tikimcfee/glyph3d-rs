@@ -55,14 +55,22 @@ impl FontSource {
 #[derive(Clone, Debug)]
 pub struct FaceSpec {
     pub source: Option<FontSource>,
+    /// Face index inside a TrueType/OpenType collection (`.ttc`/`.otc`); `0` for standalone files.
+    pub face_index: u32,
     pub variations: Vec<Variation>,
 }
 
 impl FaceSpec {
     /// A face backed by its own static font file.
     pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self::file_face(path, 0)
+    }
+
+    /// A face backed by face `face_index` of a font file or `.ttc`/`.otc` collection.
+    pub fn file_face(path: impl Into<PathBuf>, face_index: u32) -> Self {
         Self {
             source: Some(FontSource::path(path)),
+            face_index,
             variations: Vec::new(),
         }
     }
@@ -71,6 +79,7 @@ impl FaceSpec {
     pub fn bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
         Self {
             source: Some(FontSource::bytes(bytes)),
+            face_index: 0,
             variations: Vec::new(),
         }
     }
@@ -79,8 +88,15 @@ impl FaceSpec {
     pub fn instance(variations: impl Into<Vec<Variation>>) -> Self {
         Self {
             source: None,
+            face_index: 0,
             variations: variations.into(),
         }
+    }
+
+    /// Attach variable-font axis settings to a file/bytes-backed face (e.g. a separate italic variable file).
+    pub fn with_variations(mut self, variations: impl Into<Vec<Variation>>) -> Self {
+        self.variations = variations.into();
+        self
     }
 }
 
@@ -93,9 +109,13 @@ pub struct FontSpec {
     pub name: String,
     pub family: Option<String>,
     pub source: FontSource,
+    /// Face index inside a TrueType/OpenType collection (`.ttc`/`.otc`); `0` for standalone files.
+    pub face_index: u32,
     pub variations: Vec<Variation>,
     /// Whether this font's cell includes its `hhea.line_gap` (half above, half below).
     pub include_line_gap: bool,
+    /// Vertical line-height multiplier (`1.0` = natural cell height; >1.0 adds symmetric leading).
+    pub line_height_scale: f64,
     pub bold: Option<FaceSpec>,
     pub italic: Option<FaceSpec>,
     pub bold_italic: Option<FaceSpec>,
@@ -108,12 +128,26 @@ impl FontSpec {
             name: name.into(),
             family: None,
             source,
+            face_index: 0,
             variations: Vec::new(),
             include_line_gap: false,
+            line_height_scale: 1.0,
             bold: None,
             italic: None,
             bold_italic: None,
         }
+    }
+
+    /// Select face index inside a `.ttc`/`.otc` collection.
+    pub fn with_face_index(mut self, face_index: u32) -> Self {
+        self.face_index = face_index;
+        self
+    }
+
+    /// Set the vertical line-height multiplier (`1.0` = default).
+    pub fn with_line_height_scale(mut self, scale: f64) -> Self {
+        self.line_height_scale = scale;
+        self
     }
 
     /// Mark this font as the primary of `family`.
@@ -193,6 +227,44 @@ pub fn cousine_family_spec(fonts_dir: &Path) -> FontSpec {
         )
 }
 
+/// Shared fallback fonts routed after every primary family (`MesloLGS NF Mono`, `DejaVu Sans`).
+pub fn fallback_font_chain(fonts_dir: &Path) -> Vec<FontSpec> {
+    vec![
+        FontSpec::new(
+            "MesloLGS NF Mono",
+            FontSource::path(fonts_dir.join("MesloLGS-NF-Mono.ttf")),
+        ),
+        FontSpec::new(
+            "DejaVu Sans",
+            FontSource::path(fonts_dir.join("DejaVuSans.ttf")),
+        ),
+    ]
+}
+
+/// Match one of the three bundled wall font families (`"cousine"`, `"monaspace-neon"`,
+/// `"monaspace-argon"`, or their spaced/title-cased names) from `fonts_dir`.
+pub fn bundled_family_spec(fonts_dir: &Path, name: &str) -> Option<FontSpec> {
+    let key: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    match key.as_str() {
+        "cousine" => Some(cousine_family_spec(fonts_dir)),
+        "monaspaceneon" => Some(monaspace_family_spec(
+            MONASPACE_NEON_FAMILY,
+            "Monaspace Neon",
+            fonts_dir.join("MonaspaceNeonVar.ttf"),
+        )),
+        "monaspaceargon" => Some(monaspace_family_spec(
+            MONASPACE_ARGON_FAMILY,
+            "Monaspace Argon",
+            fonts_dir.join("MonaspaceArgonVar.ttf"),
+        )),
+        _ => None,
+    }
+}
+
 /// Build the default wall font chain from `fonts_dir` (normally `assets/fonts/`):
 ///
 /// 1. Cousine (default family `"cousine"`, four static faces)
@@ -204,25 +276,17 @@ pub fn cousine_family_spec(fonts_dir: &Path) -> FontSpec {
 /// Matches the ordering rule of `fonts/families.js::fontChain()`: default family first,
 /// fallbacks next (so their indices are stable), then every additional family.
 pub fn default_font_chain(fonts_dir: &Path) -> Vec<FontSpec> {
-    vec![
-        cousine_family_spec(fonts_dir),
-        FontSpec::new(
-            "MesloLGS NF Mono",
-            FontSource::path(fonts_dir.join("MesloLGS-NF-Mono.ttf")),
-        ),
-        FontSpec::new(
-            "DejaVu Sans",
-            FontSource::path(fonts_dir.join("DejaVuSans.ttf")),
-        ),
-        monaspace_family_spec(
-            MONASPACE_NEON_FAMILY,
-            "Monaspace Neon",
-            fonts_dir.join("MonaspaceNeonVar.ttf"),
-        ),
-        monaspace_family_spec(
-            MONASPACE_ARGON_FAMILY,
-            "Monaspace Argon",
-            fonts_dir.join("MonaspaceArgonVar.ttf"),
-        ),
-    ]
+    let mut chain = vec![cousine_family_spec(fonts_dir)];
+    chain.extend(fallback_font_chain(fonts_dir));
+    chain.push(monaspace_family_spec(
+        MONASPACE_NEON_FAMILY,
+        "Monaspace Neon",
+        fonts_dir.join("MonaspaceNeonVar.ttf"),
+    ));
+    chain.push(monaspace_family_spec(
+        MONASPACE_ARGON_FAMILY,
+        "Monaspace Argon",
+        fonts_dir.join("MonaspaceArgonVar.ttf"),
+    ));
+    chain
 }
