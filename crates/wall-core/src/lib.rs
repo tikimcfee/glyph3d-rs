@@ -21,6 +21,7 @@ pub mod labels;
 pub mod layout;
 pub mod menu;
 pub mod mouse;
+pub mod pointer;
 pub mod scroll;
 pub mod settings;
 pub mod snap;

@@ -20,6 +20,7 @@
 //! zoom, and the major spacing otherwise so zoomed-out drags snap to visible lines.
 
 use crate::geom::{Point, Rect};
+pub use crate::layout::{Edges, GridSize as CellSize, MinGridSize as MinSize, ResizeResult};
 
 /// Floating-point slack added before flooring a room measurement to whole cells, so an
 /// edge that lands squarely on a grid line counts as fitting on that line.
@@ -58,66 +59,6 @@ pub struct GridLevels {
     pub minor_px: f64,
     /// Major line spacing on screen in pixels (`minor_px * grid_major_every`).
     pub major_px: f64,
-}
-
-/// Which borders of a rectangle a resize gesture is dragging.
-///
-/// Shared shape with `layout.rs` (`edgesAt` / `resizeFromDrag`); defined locally here
-/// while `layout.rs` is ported independently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Edges {
-    pub left: bool,
-    pub right: bool,
-    pub top: bool,
-    pub bottom: bool,
-}
-
-/// Dimensions of a terminal in character cells (`{ cols, rows }`).
-///
-/// Shared shape with `layout.rs`; defined locally here while `layout.rs` is ported
-/// independently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct CellSize {
-    pub cols: u32,
-    pub rows: u32,
-}
-
-impl CellSize {
-    /// Construct a cell size `(cols, rows)`.
-    pub const fn new(cols: u32, rows: u32) -> Self {
-        Self { cols, rows }
-    }
-}
-
-/// Floor on a terminal's cell dimensions during a resize drag (`{ minCols, minRows }`).
-///
-/// Shared shape with `layout.rs`; defined locally here while `layout.rs` is ported
-/// independently.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct MinSize {
-    pub min_cols: u32,
-    pub min_rows: u32,
-}
-
-impl MinSize {
-    /// Construct minimum cell bounds `(min_cols, min_rows)`.
-    pub const fn new(min_cols: u32, min_rows: u32) -> Self {
-        Self { min_cols, min_rows }
-    }
-}
-
-/// Outcome of a border-resize drag: new cell dimensions and the top-left origin shift
-/// needed to keep the opposite (un-dragged) edges stationary.
-///
-/// Shared return shape with `layout.rs`'s `resizeFromDrag`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ResizeResult {
-    pub cols: u32,
-    pub rows: u32,
-    /// World-space X shift applied to the terminal's origin (non-zero when dragging `left`).
-    pub shift_x: f64,
-    /// World-space Y shift applied to the terminal's origin (non-zero when dragging `top`).
-    pub shift_y: f64,
 }
 
 /// Round half-way values toward `+∞`, matching JavaScript's `Math.round`.
@@ -243,52 +184,10 @@ pub fn snap_resize(
     }
 }
 
-/// Private copy of `wallLayout.js`'s `resizeFromDrag` (unsnapped border resize),
-/// kept minimal here until `layout.rs` lands and provides the shared version.
-#[cfg(test)]
-fn resize_from_drag(
-    edges: Edges,
-    start: CellSize,
-    stride: Point,
-    dx: f64,
-    dy: f64,
-    min: MinSize,
-) -> ResizeResult {
-    let mut cols = f64::from(start.cols);
-    let mut rows = f64::from(start.rows);
-    if edges.right {
-        cols = f64::from(start.cols) + dx / stride.x;
-    }
-    if edges.left {
-        cols = f64::from(start.cols) - dx / stride.x;
-    }
-    if edges.bottom {
-        rows = f64::from(start.rows) - dy / stride.y;
-    }
-    if edges.top {
-        rows = f64::from(start.rows) + dy / stride.y;
-    }
-    let clamped_cols = js_round(cols).max(f64::from(min.min_cols)) as u32;
-    let clamped_rows = js_round(rows).max(f64::from(min.min_rows)) as u32;
-    ResizeResult {
-        cols: clamped_cols,
-        rows: clamped_rows,
-        shift_x: if edges.left {
-            (f64::from(start.cols) - f64::from(clamped_cols)) * stride.x
-        } else {
-            0.0
-        },
-        shift_y: if edges.top {
-            (f64::from(clamped_rows) - f64::from(start.rows)) * stride.y
-        } else {
-            0.0
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::resize_from_drag;
 
     const GRID: GridSpec = GridSpec::new(4.0, 5, 6.0);
 
