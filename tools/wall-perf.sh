@@ -31,10 +31,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-NS="${GLYPH_WALL_PERF_NS:-wall-perf}"
+NS="${GLYPH_WALL_PERF_NS:-wp-$$}"
 case "$NS" in
-  wall|agents|default)
-    echo "wall-perf.sh: refusing live namespace '$NS'" >&2
+  wall|agents|default|rs-wall|probe)
+    echo "wall-perf.sh: refusing shared/live namespace '$NS'" >&2
     exit 1
     ;;
 esac
@@ -106,7 +106,10 @@ kill_recorded_pids() {
   while read -r role pid _rest; do
     [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || continue
     if kill -0 "$pid" 2>/dev/null; then
-      pkill "-$sig" -P "$pid" >/dev/null 2>&1 || true
+      local cpid
+      for cpid in $(pgrep -P "$pid" 2>/dev/null || true); do
+        [[ "$cpid" =~ ^[0-9]+$ ]] && (( cpid > 1 )) && kill "-$sig" "$cpid" >/dev/null 2>&1 || true
+      done
       if [[ "$role" == "term" ]]; then
         kill "-$sig" -- "-$pid" >/dev/null 2>&1 || true
       fi
@@ -407,6 +410,46 @@ while True:
     i += 1
 '"
 
+run_mixed_case() {
+  ACTIVE_DIR="$SCRATCH_ROOT/mixed-10"
+  mkdir -m 0700 -p "$ACTIVE_DIR"
+
+  local mixed_frames=$(( FRAMES * 2 ))
+  local mixed_max_ms=$(( MAX_WALL_MS * 2 ))
+  local mixed_ttl=$(( FLOOD_TTL_SECS + 5 ))
+  local load_now
+  load_now="$(host_loadavg)"
+  echo "Running mixed flood (8 yes + 1 cat-src + 1 quiet focused): terminals=10 (${COLS}x${ROWS}) target_frames=$mixed_frames max_ms=$mixed_max_ms ttl=${mixed_ttl}s load=$load_now ..." >&2
+  "$CTL_BIN" start \
+    --dir "$ACTIVE_DIR" \
+    --ns "$NS" \
+    --count 10 \
+    --cols "$COLS" \
+    --rows "$ROWS" \
+    --warmup-ms 200 \
+    --ttl-secs "$mixed_ttl" \
+    -- /bin/sh -c "idx=1; while ! mkdir '$ACTIVE_DIR'/slot-\$idx 2>/dev/null; do idx=\$((idx + 1)); done; if [ \$idx -le 8 ]; then exec yes; elif [ \$idx -eq 9 ]; then while :; do /bin/cat '$CAT_FILE'; done; else printf 'quiet-focused-ready\n'; exec sleep 30; fi"
+
+  local out_file="$SCRATCH_ROOT/out-mixed-10.log"
+  GLYPH_WALL_PERF=1 \
+  GLYPH_WALL_PERF_MAX_MS="$mixed_max_ms" \
+  GLYPH_WALL_RUN="terminal.focus t10" \
+  G3D_TERMD_DIR="$ACTIVE_DIR" \
+  "$RENDERER" --wall --wall-ns "$NS" --frames "$mixed_frames" > "$out_file"
+
+  local perf_line
+  perf_line="$(grep '^wall-perf: ' "$out_file" | tail -n 1)"
+  if [[ -z "$perf_line" ]]; then
+    echo "wall-perf.sh: missing wall-perf summary line for mixed-10" >&2
+    cat "$out_file" >&2
+    exit 1
+  fi
+  printf '%s\t%s\t%s\t%s\n' "mixed-8yes-1cat-1quiet" "10" "$load_now" "$perf_line" >> "$RESULTS_TSV"
+
+  stop_scratch_dir "$ACTIVE_DIR"
+  ACTIVE_DIR=""
+}
+
 if [[ " $MODES " == *" flood "* ]]; then
   for workload in yes seq cat-src; do
     case "$workload" in
@@ -423,6 +466,7 @@ fi
 if [[ " $MODES " == *" extra "* ]]; then
   run_flood_case "fullscreen-tui" 1 "$FULLSCREEN_TUI_CMD"
   run_wheel_case 14
+  run_mixed_case
 fi
 
 if [[ " $MODES " == *" idle "* ]]; then
@@ -459,8 +503,8 @@ print()
 headers = [
     "Workload", "N", "Load", "Frames", "Wall (s)", "FPS",
     "Pump p50/p95/max (ms)", "Pump sum (ms) / Wakes",
-    "Draw p50/p95/max (ms)", "Wait p50 (ms)",
-    "Proc CPU (ms)", "Uploads (drawn/up/rows/writes)", "Status"
+    "Draw p50/p95/max (ms)", "Wait p50/max (ms)",
+    "Worst Frame (ms)", "Proc CPU (ms)", "Uploads (drawn/up/rows/writes)", "Status"
 ]
 print("| " + " | ".join(headers) + " |")
 print("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -475,9 +519,15 @@ with open(results_path, "r", encoding="utf-8") as f:
         pump = parse_sub(kv["pump_ms"])
         draw = parse_sub(kv["draw_ms"])
         wait = parse_sub(kv["wait_ms"])
+        worst = parse_sub(kv.get("worst_ms", ""))
         up = parse_sub(kv["uploads"])
         wall_s = float(kv["wall_ms"]) / 1000.0
         wake_hz = pump.get("wake_hz", f"{float(pump['wakes']) / wall_s:.1f}" if wall_s > 0 else "0.0")
+        wait_col = f"{wait['p50']} / {wait.get('max', wait['p50'])}"
+        if worst:
+            worst_col = f"{worst['total']} (#{worst['idx']}: acq {worst['acq']}, rnd {worst['render']}, sub {worst['submit']})"
+        else:
+            worst_col = "na"
         status = "stalled in pump" if kv.get("stalled") == "1" else "ok"
         if kv.get("occluded", "0") != "0":
             status += f" (occl:{kv['occluded']})"
@@ -491,7 +541,8 @@ with open(results_path, "r", encoding="utf-8") as f:
             f"{pump['p50']} / {pump['p95']} / {pump['max']}",
             f"{pump['sum']} ({pump['wakes']}w, {wake_hz}/s)",
             f"{draw['p50']} / {draw['p95']} / {draw['max']}",
-            wait["p50"],
+            wait_col,
+            worst_col,
             kv["proc_cpu_ms"],
             f"{up['drawn']}/{up['uploaded']}/{up['rows']}/{up['writes']}",
             status,
