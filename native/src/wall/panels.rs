@@ -11,8 +11,13 @@
 pub mod docked;
 // The right-click menu and the help panel, with their own kit (menus.rs).
 pub mod menus;
+// The Agent View companion card, anchored to its terminal in the world.
+pub mod agent_view;
+// The buttons on a terminal's title bar, and the bar across the top of the window.
+pub mod bar_buttons;
 pub mod palette;
 pub mod sidebar;
+pub mod topbar;
 pub use docked::{settings, status};
 pub use menus::{context_menu, help};
 

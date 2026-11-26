@@ -818,6 +818,16 @@ fn wall_test_pattern_and_replay_flags_parse_and_validate() {
         other => panic!("expected WallTestPattern, got {other:?}"),
     }
 
+    let cli = parse(&["--wall-chrome-pattern", "--screenshot", "chrome.png", "--zoom", "0.14"]);
+    match cli.action() {
+        CliCommand::WallChromePattern { screenshot, frames, zoom, .. } => {
+            assert_eq!(screenshot, Some(PathBuf::from("chrome.png")));
+            assert_eq!(frames, 1);
+            assert!((zoom - 0.14).abs() < 1e-5);
+        }
+        other => panic!("expected WallChromePattern, got {other:?}"),
+    }
+
     let cli = parse(&["--wall-replay", "session.vt"]);
     match cli.action() {
         CliCommand::WallReplay { file, cols, rows, .. } => {

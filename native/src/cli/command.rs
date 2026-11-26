@@ -43,6 +43,13 @@ pub enum CliCommand {
         frames: u32,
         zoom: f32,
     },
+    /// Render the wall chrome showcase pattern offscreen.
+    WallChromePattern {
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
     /// Replay a recorded terminal byte stream on the wall renderer offscreen.
     WallReplay {
         file: PathBuf,
@@ -175,6 +182,14 @@ impl Cli {
         }
         if self.wall_test_pattern {
             return CliCommand::WallTestPattern {
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
+        if self.wall_chrome_pattern {
+            return CliCommand::WallChromePattern {
                 emoji_sheet,
                 screenshot: self.screenshot.clone(),
                 frames: self.frames.unwrap_or(1),

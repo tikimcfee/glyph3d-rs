@@ -717,6 +717,19 @@ impl Terminal {
         };
         let sm = self.screen_mut();
         let cell = sm.row_mut(py).cell_mut(px);
+        // Ghostty (`Terminal.zig` `print` zero-width path when mode 2027 is off):
+        // variation selectors (`U+FE0E` / `U+FE0F`) are ignored on ASCII bases
+        // (`< 0x80`, e.g. `'1'`), since in non-2027 mode the cell stays width 1.
+        if matches!(cp, 0xfe0e | 0xfe0f) {
+            let ascii_base = match &cell.content {
+                CellContent::Char(c) | CellContent::WideChar(c) => (*c as u32) < 0x80,
+                CellContent::Cluster(cl) => cl.cps.first().is_some_and(|&c| (c as u32) < 0x80),
+                _ => false,
+            };
+            if ascii_base {
+                return;
+            }
+        }
         match &mut cell.content {
             CellContent::Char(c) => {
                 cell.content = CellContent::Cluster(Box::new(Cluster {
@@ -797,6 +810,7 @@ impl Terminal {
     // C0 controls
     // ==================================================================
 
+    #[inline]
     pub fn execute(&mut self, byte: u8) {
         match byte {
             0x05 => {} // ENQ: no answerback
