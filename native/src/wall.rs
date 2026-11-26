@@ -12,6 +12,7 @@
 pub mod app;
 pub mod camera;
 pub mod cell;
+pub mod chrome;
 pub mod glyphs;
 #[cfg(feature = "windowed")]
 pub mod keys;
@@ -44,7 +45,8 @@ pub use paper::PaperStyle;
 #[cfg(feature = "wgpu")]
 pub use renderer::{
     TerminalDraw, UploadStats, WALL_DEPTH_FORMAT, WallFrame, WallRenderer, WallStyle, WallTarget,
-    render_test_pattern_offscreen, render_wall_to_png, render_wall_to_png_with_overlay,
+    render_chrome_pattern_offscreen, render_test_pattern_offscreen, render_wall_to_png,
+    render_wall_to_png_with_overlay,
 };
 #[cfg(feature = "wgpu")]
 pub use replay::render_replay_offscreen;

@@ -1639,6 +1639,74 @@ pub fn render_test_pattern_offscreen(
     render_wall_to_png(ctx, &mut renderer, &camera, &frame, vp, frames, path);
 }
 
+/// CLI driver for `--wall-chrome-pattern --screenshot OUT.png` (exercises every
+/// builder and state in [`super::chrome`]).
+pub fn render_chrome_pattern_offscreen(
+    ctx: &GpuContext,
+    emoji_sheet: &Path,
+    path: &Path,
+    frames: u32,
+    zoom_multiplier: f32,
+) {
+    let atlas = Arc::new(Atlas::load(emoji_sheet));
+    let mut renderer = WallRenderer::new(
+        &ctx.device,
+        &ctx.queue,
+        atlas,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        WallStyle::default(),
+    );
+    let placed = super::chrome::build_chrome_pattern_terminals(renderer.metrics());
+    let draws: Vec<TerminalDraw<'_>> = placed
+        .iter()
+        .map(|t| TerminalDraw {
+            id: t.id,
+            screen: &t.screen,
+            position: t.position,
+            z: t.z,
+            scale: t.scale,
+            focused: t.focused,
+            panel_opacity: None,
+            border_color: t.border_color,
+        })
+        .collect();
+
+    let pad = renderer.style().panel_padding;
+    let metrics = renderer.metrics();
+    let vp = (crate::OFFSCREEN_WIDTH, crate::OFFSCREEN_HEIGHT);
+    let family = renderer.font_family();
+
+    let probe_cam = WallCamera::new(Vec2::ZERO, 20.0);
+    let probe = {
+        let mut fonts =
+            super::chrome::ChromeFonts::new(metrics, renderer.glyphs_mut().atlas_mut(), family);
+        super::chrome::build_chrome_pattern_scene(&mut fonts, pad, probe_cam, vp, 1.0, &placed)
+    };
+    let mut camera = WallCamera::frame_rect(probe.chrome_bounds, vp, 1.06);
+    let fitted = {
+        let mut fonts =
+            super::chrome::ChromeFonts::new(metrics, renderer.glyphs_mut().atlas_mut(), family);
+        super::chrome::build_chrome_pattern_scene(&mut fonts, pad, camera, vp, 1.0, &placed)
+    };
+    camera = WallCamera::frame_rect(fitted.chrome_bounds, vp, 1.06);
+    if zoom_multiplier > 0.0 && zoom_multiplier.is_finite() {
+        camera.zoom =
+            (camera.zoom * zoom_multiplier).clamp(super::camera::MIN_ZOOM, super::camera::MAX_ZOOM);
+    }
+    let chrome = {
+        let mut fonts =
+            super::chrome::ChromeFonts::new(metrics, renderer.glyphs_mut().atlas_mut(), family);
+        super::chrome::build_chrome_pattern_scene(&mut fonts, pad, camera, vp, 1.0, &placed)
+    };
+    let frame = WallFrame {
+        paper: Some(&chrome.paper),
+        terminals: &draws,
+        shapes: &chrome.shapes,
+        labels: &chrome.labels,
+    };
+    render_wall_to_png(ctx, &mut renderer, &camera, &frame, vp, frames, path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
