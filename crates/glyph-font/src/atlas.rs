@@ -89,6 +89,8 @@ pub enum FontError {
     EmptyChain,
     /// Duplicate family identifier in the chain.
     DuplicateFamily(String),
+    /// Requested font family is neither bundled nor installed on the system.
+    FamilyNotFound(String),
     /// Failed to read a font file from disk.
     Io { name: String, source: std::io::Error },
     /// Failed to parse font bytes with `ttf-parser`.
@@ -107,6 +109,9 @@ impl fmt::Display for FontError {
             Self::EmptyChain => write!(f, "font chain has no fonts"),
             Self::DuplicateFamily(id) => {
                 write!(f, "duplicate font family '{id}' (a family has one primary font)")
+            }
+            Self::FamilyNotFound(name) => {
+                write!(f, "font family '{name}' is not installed")
             }
             Self::Io { name, source } => write!(f, "failed to read font '{name}': {source}"),
             Self::Parse { name, error } => write!(f, "failed to parse font '{name}': {error}"),
@@ -166,6 +171,7 @@ pub enum SlotKind<'a> {
 struct LoadedFont {
     name: String,
     bytes: Arc<[u8]>,
+    face_index: u32,
     variations: Vec<Variation>,
     upem: u16,
     extents: FontExtents,
@@ -239,8 +245,10 @@ impl FontAtlas {
             let mut loaded = build_loaded_font(
                 spec.name.clone(),
                 bytes,
+                spec.face_index,
                 spec.variations.clone(),
                 spec.include_line_gap,
+                spec.line_height_scale,
                 None,
                 None,
             )?;
@@ -266,6 +274,7 @@ impl FontAtlas {
                     &face_name,
                     face_spec,
                     spec.include_line_gap,
+                    spec.line_height_scale,
                     upright_idx,
                     &fonts[upright_idx],
                 )?;
@@ -293,9 +302,10 @@ impl FontAtlas {
                     }
                 }
                 let font = &fonts[primary];
-                let face = parse_and_vary(&font.name, &font.bytes, &font.variations)?;
+                let face = parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)?;
                 let include_gap = specs[primary].include_line_gap;
-                let metrics = FamilyMetrics::from_face(&face, include_gap);
+                let line_height_scale = specs[primary].line_height_scale;
+                let metrics = FamilyMetrics::from_face_scaled(&face, include_gap, line_height_scale);
                 Ok(Family {
                     id,
                     route,
@@ -601,6 +611,7 @@ impl FontAtlas {
         let base_face_parsed = parse_and_vary(
             &self.fonts[base_font_idx].name,
             &self.fonts[base_font_idx].bytes,
+            self.fonts[base_font_idx].face_index,
             &self.fonts[base_font_idx].variations,
         )
         .expect("already-validated font bytes must re-parse");
@@ -668,6 +679,7 @@ impl FontAtlas {
                 let mf = parse_and_vary(
                     &self.fonts[m_font_idx].name,
                     &self.fonts[m_font_idx].bytes,
+                    self.fonts[m_font_idx].face_index,
                     &self.fonts[m_font_idx].variations,
                 )
                 .expect("already-validated font bytes must re-parse");
@@ -885,7 +897,7 @@ impl FontAtlas {
         }
         let slot = self.allocate_slot();
         let font = &self.fonts[font_idx];
-        let face = parse_and_vary(&font.name, &font.bytes, &font.variations)
+        let face = parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)
             .expect("already-validated font bytes must re-parse");
         let encoded = encode_glyph(&face, GlyphId(gid), font.extents);
         self.buffer
@@ -1023,7 +1035,7 @@ impl FontAtlas {
     pub fn describe_slot(&self, slot: Slot) -> Option<SlotInfo> {
         let &(font_idx, gid) = self.slot_sources.get(&slot)?;
         let font = &self.fonts[font_idx];
-        let glyph_name = TtfFace::parse(&font.bytes, 0)
+        let glyph_name = TtfFace::parse(&font.bytes, font.face_index)
             .ok()
             .and_then(|f| f.glyph_name(GlyphId(gid)).map(str::to_owned));
         Some(SlotInfo {
@@ -1082,6 +1094,7 @@ fn load_face_spec(
     name: &str,
     face_spec: &FaceSpec,
     include_line_gap: bool,
+    line_height_scale: f64,
     upright_idx: usize,
     upright: &LoadedFont,
 ) -> Result<LoadedFont, FontError> {
@@ -1090,8 +1103,10 @@ fn load_face_spec(
         build_loaded_font(
             name.to_owned(),
             bytes,
+            face_spec.face_index,
             face_spec.variations.clone(),
             include_line_gap,
+            line_height_scale,
             None,
             None,
         )
@@ -1100,8 +1115,10 @@ fn load_face_spec(
         build_loaded_font(
             name.to_owned(),
             Arc::clone(&upright.bytes),
+            upright.face_index,
             face_spec.variations.clone(),
             include_line_gap,
+            line_height_scale,
             Some(Arc::clone(&upright.cmap)),
             Some(base_idx),
         )
@@ -1112,17 +1129,24 @@ fn load_face_spec(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper constructing one validated LoadedFont with face index and line-height scale"
+)]
 fn build_loaded_font(
     name: String,
     bytes: Arc<[u8]>,
+    face_index: u32,
     variations: Vec<Variation>,
     include_line_gap: bool,
+    line_height_scale: f64,
     shared_cmap: Option<Arc<HashMap<u32, u16>>>,
     instance_of: Option<usize>,
 ) -> Result<LoadedFont, FontError> {
-    let face = parse_and_vary(&name, &bytes, &variations)?;
+    let face = parse_and_vary(&name, &bytes, face_index, &variations)?;
     let upem = face.units_per_em();
-    let extents = FontExtents::from_face(&face, include_line_gap);
+    let extents =
+        FontExtents::from_face(&face, include_line_gap).with_line_height(line_height_scale);
     let cmap = match shared_cmap {
         Some(existing) => existing,
         None => Arc::new(collect_cmap(&face)),
@@ -1130,6 +1154,7 @@ fn build_loaded_font(
     Ok(LoadedFont {
         name,
         bytes,
+        face_index,
         variations,
         upem,
         extents,
@@ -1142,9 +1167,10 @@ fn build_loaded_font(
 fn parse_and_vary<'a>(
     name: &str,
     bytes: &'a [u8],
+    face_index: u32,
     variations: &[Variation],
 ) -> Result<TtfFace<'a>, FontError> {
-    let mut face = TtfFace::parse(bytes, 0).map_err(|error| FontError::Parse {
+    let mut face = TtfFace::parse(bytes, face_index).map_err(|error| FontError::Parse {
         name: name.to_owned(),
         error,
     })?;
