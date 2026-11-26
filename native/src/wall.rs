@@ -13,6 +13,7 @@ pub mod app;
 pub mod camera;
 pub mod cell;
 pub mod chrome;
+pub mod describe;
 pub mod glyphs;
 #[cfg(feature = "windowed")]
 pub mod keys;

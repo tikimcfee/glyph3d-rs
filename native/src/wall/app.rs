@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use glam::Vec2;
 use term_cells::Screen;
-use wall_core::geom::{Point, Rect};
+use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::layout::{ResizeCursor, Size};
 use wall_core::menu::Verdict;
@@ -45,13 +45,10 @@ use winit::window::{Window, WindowId};
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
-use super::labels::{Label, LabelHeight};
-use super::metrics::WorldRect;
-use super::paper::PaperStyle;
+use super::labels::Label;
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 use super::session::{News, Sessions};
-use super::shapes::{DashStyle, LeaderShape, PolygonShape, RectShape, Shape};
-use super::srgb_hex;
+use super::shapes::Shape;
 #[cfg(feature = "egui-ui")]
 use super::ui::{show_debug_hud, DebugHudInput, HudTerminalInfo, UiEventOutcome, WallUi};
 
@@ -64,8 +61,6 @@ const PANEL_PAD: f32 = 0.3;
 /// Two presses this close in time and place are a double click.
 const DOUBLE_CLICK_MS: f64 = 500.0;
 const DOUBLE_CLICK_PX: f64 = 5.0;
-/// Depth of what always draws over the canvas (map labels, the notice).
-const Z_OVERLAY: f32 = 900.0;
 
 /// What a reader thread sends the event loop: something arrived, look.
 #[derive(Clone, Copy, Debug)]
@@ -151,24 +146,6 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
-}
-
-/// `#rrggbb` (or `#rgb`) as sRGB RGBA; anything else is magenta, loudly.
-fn css_color(s: &str, alpha: f32) -> [f32; 4] {
-    let h = s.trim().trim_start_matches('#');
-    let full = match h.len() {
-        3 => h.chars().flat_map(|c| [c, c]).collect::<String>(),
-        6 => h.to_string(),
-        _ => String::new(),
-    };
-    match u32::from_str_radix(&full, 16) {
-        Ok(v) if full.len() == 6 => srgb_hex(v, alpha),
-        _ => [1.0, 0.0, 1.0, alpha],
-    }
-}
-
-fn world_rect(r: Rect) -> WorldRect {
-    WorldRect::new(Vec2::new(r.min_x as f32, r.min_y as f32), Vec2::new(r.max_x as f32, r.max_y as f32))
 }
 
 fn v2(p: Point) -> Vec2 {
@@ -609,8 +586,6 @@ impl App {
         // renderer's is in physical ones.
         let camera = WallCamera::new(Vec2::new(described.camera.x as f32, described.camera.y as f32), described.camera.zoom as f32 * sf);
         let viewport = (g.config.width, g.config.height);
-        // A point in logical screen pixels as a world point.
-        let to_world = |x: f64, y: f64| camera.screen_to_world(Vec2::new(x as f32 * sf, y as f32 * sf), viewport);
 
         let mut draws: Vec<TerminalDraw<'_>> = Vec::with_capacity(described.terminals.len());
         for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
@@ -628,106 +603,12 @@ impl App {
         }
 
         let mut shapes: Vec<Shape> = Vec::new();
-        let mut labels: Vec<Label<'_>> = Vec::new();
-        let solid = |rect: WorldRect, z: f32, fill: [f32; 4]| Shape::Rect(RectShape { rect, z, fill: Some(fill), stroke: None, stroke_px: 0.0, dash: DashStyle::SOLID, corner_radius_px: 0.0 });
-        let outline = |rect: WorldRect, z: f32, stroke: [f32; 4], px: f32, dash: DashStyle| Shape::Rect(RectShape { rect, z, fill: None, stroke: Some(stroke), stroke_px: px, dash, corner_radius_px: 0.0 });
-
-        // Group frames sit behind their members; their headers carry the name.
-        for group in &described.groups {
-            let z = group.z as f32;
-            shapes.push(Shape::Rect(RectShape {
-                rect: world_rect(group.frame_rect),
-                z,
-                fill: Some(srgb_hex(0x0d1017, 1.0)),
-                stroke: Some(srgb_hex(if group.focused { 0x3b4352 } else { 0x232936 }, 1.0)),
-                stroke_px: sf,
-                dash: DashStyle::SOLID,
-                corner_radius_px: 0.0,
-            }));
-            let header = world_rect(group.header_rect);
-            shapes.push(solid(header, z, srgb_hex(group.fill_color, 1.0)));
-            let h = group.text_height as f32;
-            if h > 1e-4 {
-                labels.push(Label::new(group.name.clone(), Vec2::new(group.text_left as f32, header.center().y + 0.5 * h), LabelHeight::World(h), srgb_hex(group.text_color, 1.0), z).with_clip(header));
-            }
-        }
-
-        // A title bar above each terminal: a strip and its name.
-        for bar in &described.title_bars {
-            let strip = world_rect(bar.rect);
-            let z = bar.z as f32;
-            shapes.push(solid(strip, z, srgb_hex(bar.fill_color, 1.0)));
-            let h = bar.text_height as f32;
-            if bar.text_visible && h > 1e-4 {
-                labels.push(Label::new(bar.text.clone(), Vec2::new(bar.text_left as f32, strip.center().y + 0.5 * h), LabelHeight::World(h), srgb_hex(bar.text_color, 1.0), z).with_clip(strip));
-            }
-        }
-
-        for sel in &described.selection_outlines {
-            shapes.push(outline(world_rect(sel.rect), sel.z as f32 + 0.5, srgb_hex(0x4c8dff, 1.0), 2.0 * sf, DashStyle::SOLID));
-        }
-        if let Some(lasso) = &described.lasso {
-            if lasso.len() >= 2 {
-                shapes.push(Shape::Polygon(PolygonShape {
-                    points: lasso.iter().map(|p| v2(*p)).collect(),
-                    z: Z_OVERLAY,
-                    fill: Some(srgb_hex(0x4c8dff, 0.03)),
-                    stroke: srgb_hex(0x4c8dff, 0.9),
-                    stroke_px: 1.5 * sf,
-                    dash: DashStyle::new(6.0 * sf, 4.0 * sf),
-                }));
-            }
-        }
-        if let Some(drop) = &described.drop_preview {
-            let (color, dash) = if drop.ok { (srgb_hex(0x6ee7a0, 1.0), DashStyle::SOLID) } else { (srgb_hex(0xff5c5c, 1.0), DashStyle::new(6.0 * sf, 4.0 * sf)) };
-            shapes.push(outline(world_rect(drop.rect), Z_OVERLAY, color, 2.0 * sf, dash));
-        }
-
-        // A terminal fullscreen: everything else is dimmed behind it.
-        if let Some(veil) = &described.fullscreen_backdrop {
-            shapes.push(solid(camera.visible_world_rect(viewport), veil.z as f32, css_color(&veil.background, 0.92)));
-        }
-
-        // Map labels: a terminal too small on screen to carry its name gets a
-        // pill beside it, with a leader. They are placed in screen pixels.
-        for label in &described.map_labels {
-            let b = label.label_box;
-            let top_left = to_world(b.left, b.top);
-            let bottom_right = to_world(b.right, b.bottom);
-            let pill = WorldRect::new(Vec2::new(top_left.x, bottom_right.y), Vec2::new(bottom_right.x, top_left.y));
-            shapes.push(Shape::Rect(RectShape {
-                rect: pill,
-                z: Z_OVERLAY,
-                fill: Some(srgb_hex(0x121722, 0.95)),
-                stroke: Some(srgb_hex(if label.focused { 0x6ee7a0 } else { 0x3b4352 }, 1.0)),
-                stroke_px: sf,
-                dash: DashStyle::SOLID,
-                corner_radius_px: 4.0 * sf,
-            }));
-            let px = ((b.bottom - b.top) as f32 * 0.62 * sf).max(1.0);
-            let h_world = px / camera.zoom;
-            labels.push(Label::new(label.text.clone(), Vec2::new(pill.min.x + 6.0 * sf / camera.zoom, pill.center().y + 0.5 * h_world), LabelHeight::ScreenPx(px), srgb_hex(0xc4ccd8, 1.0), Z_OVERLAY).with_clip(pill));
-            if let Some(l) = label.leader {
-                shapes.push(Shape::Leader(LeaderShape { from: to_world(l.x1, l.y1), to: to_world(l.x2, l.y2), z: Z_OVERLAY, color: srgb_hex(0x5a6b86, 1.0), width_px: sf, dot_radius_px: 2.5 * sf, dash: DashStyle::SOLID }));
-            }
-        }
-
-        // The notice: one line at the top of the wall.
-        if let Some(text) = &described.notice {
-            let px = 14.0 * sf;
-            let at = to_world(16.0, 14.0);
-            labels.push(Label::new(text.clone(), at, LabelHeight::ScreenPx(px), srgb_hex(0xffc857, 1.0), Z_OVERLAY));
-        }
-
-        let paper = PaperStyle {
-            show: described.paper.grid_show,
-            background: css_color(&described.paper.background, 1.0),
-            minor_color: css_color(&described.paper.minor_color, 1.0),
-            major_color: css_color(&described.paper.major_color, 1.0),
-            minor_spacing: described.paper.grid.grid_minor as f32,
-            major_every: described.paper.grid.grid_major_every,
-            line_px: described.paper.line_px as f32 * sf,
-            min_px: described.paper.grid.grid_min_px as f32 * sf,
+        let mut labels: Vec<Label<'static>> = Vec::new();
+        let paper = {
+            let metrics = g.renderer.metrics();
+            let family = g.renderer.font_family();
+            let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
+            super::describe::describe_frame_chrome(&described, &camera, viewport, sf, &mut fonts, &mut shapes, &mut labels)
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
