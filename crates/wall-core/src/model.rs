@@ -559,6 +559,55 @@ impl WallModel {
         self.emit_change();
     }
 
+    /// Update cell stride/padding after a font family, size, or line-height change and
+    /// resize every terminal's `(cols, rows)` grid to keep its world panel footprint,
+    /// emitting [`WallEffect::ResizeTerminal`] for every terminal whose grid changed.
+    pub fn set_geometry_preserving_panels(&mut self, geometry: CellGeometry) {
+        if self.geometry == geometry {
+            return;
+        }
+        let old = self.geometry;
+        let split_members: std::collections::HashSet<String> = self
+            .store
+            .groups()
+            .values()
+            .filter(|g| g.layout == GroupLayout::Split)
+            .flat_map(|g| g.members.iter().cloned())
+            .collect();
+
+        let mut resizes: Vec<(String, u32, u32)> = Vec::new();
+        for (id, entry) in &mut self.terminals {
+            // Split panes are re-wrapped against their exact split rect in `relayout_all_groups`.
+            if split_members.contains(id) {
+                continue;
+            }
+            let panel_w = f64::from(entry.cols) * old.stride.x + 2.0 * old.padding.x;
+            let panel_h = f64::from(entry.rows) * old.stride.y + 2.0 * old.padding.y;
+            let new_cols = MIN_PANE_COLS.max(
+                ((panel_w - 2.0 * geometry.padding.x) / geometry.stride.x.max(1e-9)).round()
+                    as u32,
+            );
+            let new_rows = MIN_PANE_ROWS.max(
+                ((panel_h - 2.0 * geometry.padding.y) / geometry.stride.y.max(1e-9)).round()
+                    as u32,
+            );
+            if entry.cols != new_cols || entry.rows != new_rows {
+                entry.cols = new_cols;
+                entry.rows = new_rows;
+                resizes.push((id.clone(), new_cols, new_rows));
+            }
+        }
+
+        self.geometry = geometry;
+        for (id, cols, rows) in resizes {
+            self.effects
+                .push(WallEffect::ResizeTerminal { id, cols, rows });
+        }
+        self.relayout_all_groups();
+        self.apply_z_order();
+        self.emit_change();
+    }
+
     /// Record whether the `termd` connection is currently live.
     pub fn set_connected(&mut self, connected: bool) {
         if self.connected == connected {
@@ -3331,5 +3380,43 @@ mod tests {
 
         wall.ungroup(&gid).unwrap();
         assert!(wall.store().group(&gid).is_none());
+    }
+
+    #[test]
+    fn set_geometry_preserving_panels_resizes_terminals_and_emits_effects() {
+        let mut wall = make_wall();
+        wall.add_terminal(TerminalSpec::new("t1", 100, 30), true, None);
+        wall.drain_effects();
+        let old_rect = wall.terminal_rect("t1").unwrap();
+
+        // Doubling cell stride (e.g. fontSize 14 -> 28) halves cols & rows to keep panel footprint.
+        let old_geom = wall.geometry();
+        let bigger = CellGeometry {
+            stride: Point::new(old_geom.stride.x * 2.0, old_geom.stride.y * 2.0),
+            padding: old_geom.padding,
+            scale_z: old_geom.scale_z,
+        };
+        wall.set_geometry_preserving_panels(bigger);
+        let t1 = wall.terminal("t1").unwrap();
+        assert_eq!((t1.cols, t1.rows), (50, 15));
+        let new_rect = wall.terminal_rect("t1").unwrap();
+        assert!((new_rect.width() - old_rect.width()).abs() < 1e-6);
+        assert!((new_rect.height() - old_rect.height()).abs() < 1e-6);
+        let effects = wall.drain_effects();
+        assert!(effects.contains(&WallEffect::ResizeTerminal {
+            id: "t1".to_owned(),
+            cols: 50,
+            rows: 15,
+        }));
+
+        // Line-height increase (stride.y * 1.5, stride.x unchanged) keeps cols and trims rows.
+        let taller = CellGeometry {
+            stride: Point::new(old_geom.stride.x, old_geom.stride.y * 1.5),
+            padding: old_geom.padding,
+            scale_z: old_geom.scale_z,
+        };
+        wall.set_geometry_preserving_panels(taller);
+        let t1 = wall.terminal("t1").unwrap();
+        assert_eq!((t1.cols, t1.rows), (100, 20));
     }
 }
