@@ -171,6 +171,10 @@ struct App {
     perf: super::perf::WallPerf,
     /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
     ime_composing: bool,
+    /// True while `wallctl app.ime preedit` is active; kept separate from [`Self::ime_composing`]
+    /// because Wayland `zwp_text_input_v3.done` replies to earlier `set_ime_cursor_area` commits
+    /// make winit emit `Ime::Preedit("", None)` asynchronously.
+    script_ime_composing: bool,
     /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
@@ -626,7 +630,17 @@ impl App {
         }
     }
 
+    fn is_ime_composing(&self) -> bool {
+        self.ime_composing || self.script_ime_composing
+    }
+
     fn sync_ime_cursor_area(&mut self, described: &Described) {
+        // On Wayland (`zwp_text_input_v3`), `set_ime_cursor_area` sends `text_input.commit()`,
+        // whose `done` reply without a new `preedit_string` makes winit emit `Ime::Preedit("", None)`
+        // and abort an active composition. Defer cursor-rect updates until composition finishes.
+        if self.is_ime_composing() {
+            return;
+        }
         let (Some(g), Some(terms)) = (&self.gfx, &self.terms) else { return };
         #[cfg(feature = "egui-ui")]
         if g.ui.context().egui_wants_keyboard_input() {
@@ -1397,7 +1411,7 @@ impl App {
                 self.held_codes.remove(&key.code);
             }
         }
-        if self.ime_composing && key.pressed {
+        if self.is_ime_composing() && key.pressed {
             return;
         }
         let host_chord = wall_core::chord::chord_mods(Platform::host());
@@ -1530,6 +1544,7 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
+            self.script_ime_composing = false;
             let had_buttons = self.buttons != 0;
             self.buttons = 0;
             let now_ms = self.now_ms();
@@ -1731,17 +1746,16 @@ impl App {
                 use super::script::ScriptIme;
                 match ime_cmd {
                     ScriptIme::Preedit(text) => {
-                        let cursor = (!text.is_empty()).then_some((0, text.len()));
-                        self.ime(&Ime::Preedit(text, cursor));
+                        self.script_ime_composing = !text.is_empty();
                         "OK: ime preedit".to_string()
                     }
                     ScriptIme::Commit(text) => {
-                        self.ime(&Ime::Preedit(String::new(), None));
-                        self.ime(&Ime::Commit(text));
+                        self.script_ime_composing = false;
+                        self.ime_commit(&text);
                         "OK: ime commit".to_string()
                     }
                     ScriptIme::Disable => {
-                        self.ime(&Ime::Disabled);
+                        self.script_ime_composing = false;
                         "OK: ime disabled".to_string()
                     }
                 }
@@ -2094,6 +2108,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
         ime_composing: false,
+        script_ime_composing: false,
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
