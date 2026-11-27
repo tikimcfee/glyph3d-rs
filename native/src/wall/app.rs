@@ -353,6 +353,28 @@ fn adopt_returned_termd(
     true
 }
 
+/// A person asked for a terminal and the wall's namespace is gone (it was stopped, or
+/// lost): start a fresh termd for it, as the outage notice says a new terminal does, and
+/// take it over as any daemon that comes back. Does nothing while a daemon answers. Until
+/// 2026-11-27 the spawn that follows just failed on the dead connection, into the log.
+fn revive_gone_termd(
+    wall: &mut Wall,
+    sessions: &mut Sessions,
+    render_ids: &mut RenderIds,
+    renderer: Option<&mut WallRenderer>,
+) {
+    if !sessions.primary_gone() {
+        return;
+    }
+    match sessions.revive() {
+        Ok(_) => {
+            adopt_returned_termd(wall, sessions, render_ids, renderer);
+        }
+        // The spawn after this fails too, and says so on the wall.
+        Err(e) => log::error!("{e}"),
+    }
+}
+
 /// Maps terminal string ids to monotonic `u64` renderer keys so closed terminals can be
 /// freed from [`WallRenderer`] without ever colliding ids across spawn/close cycles.
 #[derive(Default)]
@@ -1390,27 +1412,9 @@ impl App {
             }
             other => {
                 let Terminals::Live(sessions) = terms else { return };
-                // A person asked for a terminal and the namespace is gone (it was stopped,
-                // or lost): start a fresh termd for it, as the outage notice says a new
-                // terminal does. Until 2026-11-27 the spawn below just failed on the dead
-                // connection, into the log.
-                if matches!(other, WallEffect::SpawnTerminal { .. } | WallEffect::ReattachTerminal { .. })
-                    && sessions.primary_gone()
-                {
-                    match sessions.revive() {
-                        Ok(_) => {
-                            adopt_returned_termd(
-                                wall,
-                                sessions,
-                                &mut self.render_ids,
-                                self.gfx.as_mut().map(|g| &mut g.renderer),
-                            );
-                        }
-                        Err(e) => log::error!("{e}"),
-                    }
-                }
                 match other {
                     WallEffect::SpawnTerminal { argv, cols, rows, .. } => {
+                        revive_gone_termd(wall, sessions, &mut self.render_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
                         match sessions.spawn(argv, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16) {
                             Ok((id, cols, rows)) => {
                                 wall.terminal_appeared(TerminalAppeared::new(id, u32::from(cols), u32::from(rows)));
@@ -1433,6 +1437,9 @@ impl App {
                             }
                             Err(e) => {
                                 log::info!("local reattach of {id} unavailable ({e}); falling back to attach shell wrapper");
+                                // Only here: a reattach that works is in the agents' own
+                                // namespace and needs no daemon in the wall's.
+                                revive_gone_termd(wall, sessions, &mut self.render_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
                                 match sessions.spawn(
                                     Some(fallback_argv),
                                     cols.min(u32::from(u16::MAX)) as u16,
