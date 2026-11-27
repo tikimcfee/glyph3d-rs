@@ -67,7 +67,7 @@ Both `resolve_emoji_sheet` / `default_emoji_sheet` (`atlas/emoji-sheet.bin`) and
 | :--- | :--- | :--- |
 | **Compiled into binary** | `config/defaults.toml`, `native/src/shaders/{wall_cells,wall_paper,wall_shapes}.wgsl` | Embedded via `include_str!`; zero disk reads at run time unless dev `GLYPH_WALL_SHADER_DIR` is set. |
 | **Colour-emoji sheet** | `Contents/Resources/atlas/emoji-sheet.bin` (10 MB) | Lazy `G3ES` v1 table + compressed PNG blob (`EmojiSheetArchive::load`); does **not** read `curves.bin`, `glyphmap.bin`, `glyphs.bin`, `codepoints.bin`, or the 361 MB `emoji-sheet.cache`. |
-| **Runtime Slug fonts (8 TTFs)** | `Contents/Resources/fonts/`: `Cousine-{Regular,Bold,Italic,BoldItalic}.ttf`, `MesloLGS-NF-Mono.ttf`, `DejaVuSans.ttf`, `MonaspaceNeonVar.ttf`, `MonaspaceArgonVar.ttf` | Loaded by `GlyphSource::new` (`glyph-font`). `WallUi` (`egui`) also loads `Cousine-Regular.ttf`, `MesloLGS-NF-Mono.ttf`, and `DejaVuSans.ttf` from the same resolved `fonts/` directory. |
+| **Runtime Slug fonts (8 TTFs + optional system fonts)** | `Contents/Resources/fonts/`: `Cousine-{Regular,Bold,Italic,BoldItalic}.ttf`, `MesloLGS-NF-Mono.ttf`, `DejaVuSans.ttf`, `MonaspaceNeonVar.ttf`, `MonaspaceArgonVar.ttf`; plus `/System/Library/Fonts`, `/Library/Fonts`, `~/Library/Fonts` (macOS) or `/usr/share/fonts`, `~/.local/share/fonts` (Linux) when a system `fontFamily` is selected | Loaded by `GlyphSource` (`glyph-font`). `WallUi` (`egui`) also loads `Cousine-Regular.ttf`, `MesloLGS-NF-Mono.ttf`, and `DejaVuSans.ttf` from the same resolved `fonts/` directory. |
 | **Optional launch config** | `--launch-config PATH`, else `./launch_config.toml` or `../launch_config.toml` | Checked relative to CWD (`/` under Finder, where neither exists, so compiled defaults apply). |
 | **Saved wall state (`WallStore`)** | macOS: `~/Library/Application Support/glyph3d/wall/wall-<ns>.json`<br>Linux: `${XDG_STATE_HOME:-~/.local/state}/glyph3d/wall/wall-<ns>.json`<br>Scratch: `$G3D_TERMD_DIR/wall-<ns>.json` | Created `0700` dir / `0600` file; holds terminal positions, groups/splits, panel placements, Agent View pairings, and dialled config knobs. |
 | **Live Unix sockets & log** | `termd-<ns>.sock` and `wall-<ns>.sock` under `$G3D_TERMD_DIR`, else `/run/user/<uid>/g3d` (Linux) or `/tmp/g3d-<uid>` (macOS); log at `${XDG_STATE_HOME:-~/.local/state}/g3d/termd-<ns>.log` | `0700` parent directory and same-UID peer credential check (`getpeereid` / `SO_PEERCRED`). |
@@ -135,13 +135,13 @@ When macOS Finder launches `Glyph3D Wall.app`, the process has no controlling TT
 
 ## 5. What Is Still Missing to Replace the Browser Wall for Daily Use
 
-*(Audited against `wall` at `34a6ed6`, which already mounts the topbar, hovered title-bar buttons, six chrome panels, single-owner namespace gate, and `termd` status updates.)*
+*(Audited against `wall` at `976a727`, which already mounts the topbar, hovered title-bar buttons, six chrome panels, single-owner namespace gate, `termd` status updates, scrolled-back indicator, hover-link underline, and live `fontFamily`/`fontSize`/`lineHeight` + text-style reload.)*
 
 1. **Agent View & live gomuxai `agent-feed` integration:**
    - **Agent View cards & badges (`panels::agent_view` + `wall_core::agent_views::AgentViews`)**: both the state coordinator and the egui card/badge renderer exist and pass unit/GPU tests, but are not yet mounted alongside terminals in `mount.rs` / `app.rs`.
    - **gomuxai `agent-feed` polling**: `crates/agent-feed` reads `agent fleet --json`, `agent sessions --json`, and `agent transcript`, but `mount.rs` still passes `BusSnapshot::default()` to the palette and sidebar, so live agents do not yet appear in the sidebar/palette or auto-pair with Agent Views.
-2. **Live renderer knob updates (`WallEffect::ConfigKnobChanged`):**
-   - Changing `fontFamily`, `panelOpacity`, `greekPx`, `lineThickness`, `underlineRaise`, or `cursorBlinkMs` in Settings updates `Wall` and persists to `wall-<ns>.json`, but `app.rs` currently logs `ConfigKnobChanged` without applying the updated values onto `WallRenderer` until restart.
+2. **Remaining non-text style knobs in `WallEffect::ConfigKnobChanged`:**
+   - `fontFamily`, `fontSize`, `lineHeight`, and text underline/line-thickness knobs reload live (`976a727`), while canvas/panel knobs such as `panelOpacity`, `greekPx`, and `cursorBlinkMs` still apply only after restart unless wired in `app.rs`.
 3. **Terminal text & desktop integration gaps:**
    - **Scrollback-spanning selection copy & `OSC 52`**: `app.rs` passes `screen_lookup` over the visible `front_screen` (`term_cells::Screen`), so copying a selection that scrolled back into history does not yet query `Sessions::text` / `block_text`, and `OSC 52` clipboard sequences from programs inside terminals are not forwarded to the OS clipboard.
    - **IME preedit display & URL opening**: `WindowEvent::Ime` preedit text is not drawn over the cursor cell for CJK/dead-key composition, and `Cmd+click` / `Ctrl+click` on URLs (`OSC 8` or plain-text links) is not implemented.
