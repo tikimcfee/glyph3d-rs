@@ -764,7 +764,14 @@ fn stop_while_subscribed(tag: &str, follow_status: bool) -> Option<StopOutcome> 
                 std::thread::sleep(Duration::from_micros(200));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                panic!("the client's event channel closed with no Disconnected event")
+                // The reader ends once it has sent `Disconnected`, so a closed channel after
+                // that event is the expected end. The socket can still be there then: the
+                // brain tells its connections while the holder, another process, removes it.
+                assert!(
+                    heard.is_some(),
+                    "the client's event channel closed with no Disconnected event"
+                );
+                std::thread::sleep(Duration::from_micros(200));
             }
         }
     }
