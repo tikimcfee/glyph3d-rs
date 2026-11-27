@@ -331,7 +331,7 @@ else
     record_fail "keyboard (panel vs terminal)" "got_live=$GOT_LIVE leaked_pal=$(grep -Fc LEAK_PALETTE_99 <<<"$T1_SNAPSHOT") leaked_set=$(grep -Fc LEAK_SETTINGS_99 <<<"$T1_SNAPSHOT")"
 fi
 
-# ── 5. Sidebar: terminal row click, dock left/float/right, group collapse ────
+# ── 5. Sidebar: row click, dock left/float/right, group collapse, group|host switch ─
 ctl wall.group t1 t2 >/dev/null
 ctl terminal.focus t2 >/dev/null
 ctl wall.sidebar right >/dev/null
@@ -362,6 +362,15 @@ read -r UNFOLD_X UNFOLD_Y < <(map_entry_center "panel sidebar " "folds" "g-1" "$
 ctl app.click "$UNFOLD_X" "$UNFOLD_Y" >/dev/null
 W_SB_UNFOLDED="$(ctl app.where)"
 
+# The header's `host` half lists the same rows under this machine (the stub bus calls it
+# `smoke`); the `group` half lists them under their group again.
+read -r MH_X MH_Y < <(rect_center "panel sidebar " "mode_host" "$W_SB_UNFOLDED")
+ctl app.click "$MH_X" "$MH_Y" >/dev/null
+W_SB_BYHOST="$(ctl app.where)"
+read -r MG_X MG_Y < <(rect_center "panel sidebar " "mode_group" "$W_SB_BYHOST")
+ctl app.click "$MG_X" "$MG_Y" >/dev/null
+W_SB_BYGROUP="$(ctl app.where)"
+
 read -r DC_X DC_Y < <(rect_center "panel sidebar " "dock_close" "$W_SB_UNFOLDED")
 ctl app.click "$DC_X" "$DC_Y" >/dev/null
 W_SB_CLOSED="$(ctl app.where)"
@@ -371,12 +380,23 @@ wait_settled >/dev/null
 
 SB_CHECK="$(python3 -c '
 import sys
-foc, l, f, r, folded, unfolded, closed = sys.argv[1:8]
+foc, l, f, r, folded, unfolded, by_host, by_group, closed = sys.argv[1:10]
 def sb(s):
     return next((x for x in s.splitlines() if x.startswith("panel sidebar ")), "")
+def tok(s, key):
+    return next((t[len(key) + 1:] for t in sb(s).split() if t.startswith(key + "=")), "")
 folded_hidden = "terms=none" in sb(folded)
 unfolded_shown = "t1:" in sb(unfolded) and "t2:" in sb(unfolded)
 is_closed = "open=false" in sb(closed)
+# One list, drawn top to bottom: the group and its members; folded, its header alone;
+# by host, the same rows under this machine.
+rows_ok = (
+    tok(unfolded, "rows") == "g:g-1[smoke=2];t:t1;t:t2"
+    and tok(folded, "rows") == "g:g-1[smoke=2]"
+    and tok(by_host, "rows") == "h:smoke[2];t:t1;t:t2"
+    and tok(by_group, "rows") == "g:g-1[smoke=2];t:t1;t:t2"
+)
+modes = "->".join(tok(s, "mode") for s in (unfolded, by_host, by_group))
 ok = (
     foc == "t1"
     and "side=left" in sb(l)
@@ -384,14 +404,15 @@ ok = (
     and "side=right" in sb(r)
     and "collapsed=g-1" in sb(folded) and folded_hidden
     and "collapsed=none" in sb(unfolded) and unfolded_shown
+    and rows_ok and modes == "group->host->group"
     and is_closed
 )
-print(f"{int(ok)} foc={foc} dock=left->float->right folded_hidden={folded_hidden} closed={is_closed}")
-' "$SB_FOC" "$W_SB_LEFT" "$W_SB_FLOAT" "$W_SB_RIGHT" "$W_SB_FOLDED" "$W_SB_UNFOLDED" "$W_SB_CLOSED")"
+print(f"{int(ok)} foc={foc} dock=left->float->right folded_hidden={folded_hidden} mode={modes} rows_ok={rows_ok} closed={is_closed}")
+' "$SB_FOC" "$W_SB_LEFT" "$W_SB_FLOAT" "$W_SB_RIGHT" "$W_SB_FOLDED" "$W_SB_UNFOLDED" "$W_SB_BYHOST" "$W_SB_BYGROUP" "$W_SB_CLOSED")"
 if [[ "${SB_CHECK%% *}" == "1" ]]; then
-    record_pass "sidebar (row, dock, collapse)" "${SB_CHECK#* }"
+    record_pass "sidebar (row, dock, fold, mode)" "${SB_CHECK#* }"
 else
-    record_fail "sidebar (row, dock, collapse)" "${SB_CHECK#* }"
+    record_fail "sidebar (row, dock, fold, mode)" "${SB_CHECK#* }"
 fi
 
 # ── 6. Settings: search filter, boolean toggle + frame change, number field ──

@@ -20,9 +20,16 @@
 #      plus unpinned unread count (`wall.agent.follow off`)
 #  10. `wall.agent.follow t1 tail` + `wall.agent.jump t1 live` returning `t1` to live tail
 #  11. `wall.bus`, Sidebar (`cmd+b`), and Command Palette (`cmd+k`) listing live fleet agents
+#  12. a loose neighbour shoved aside by an Agent View card, and restored
+#  13. an extra namespace's `gx-coder` terminal: paired, detached, reattached
+#  14. the sidebar's one list: an agent with no terminal attaches on a click and merges
+#      into its terminal's row; two groups and two hosts listed by group, then by host
+#      through the header switch, the mode kept in the store
 #
-# Saves `app.shot` PNGs under target/glyph-scratch/wall-smoke-agents/ and tears down only
-# the window PID started here plus the scratch daemon.
+# Saves `app.shot` PNGs under target/glyph-scratch/wall-smoke-agents/ (with `--shots`, one
+# per step; always the sidebar by group and by host, `sidebar-by-group.png` and
+# `sidebar-by-host.png`) and tears down only the window PID started here plus the scratch
+# daemon.
 
 set -uo pipefail
 
@@ -198,6 +205,22 @@ export_snap = {
             "attached": False,
             "status": "idle",
             "detail": "108 passed",
+            "dialect": "claude",
+        },
+        # Another host's agent that CAN be attached (a remote host reports no
+        # `attached`): listed bright where `linux-gate` is dimmed. Nothing here
+        # attaches it: that would run the real `agent` CLI (see #14).
+        {
+            "name": "bench",
+            "host": "workstation",
+            "store": "",
+            "backend": "claude",
+            "session": "bench",
+            "cwd": "/home/lugo/glyph3d-rs",
+            "created_at": "2026-11-26T17:55:00Z",
+            "live": True,
+            "status": "processing",
+            "detail": "cargo bench",
             "dialect": "claude",
         },
     ],
@@ -790,8 +813,8 @@ ctl app.key Escape >/dev/null
 ctl app.key "${CHORD}+b" >/dev/null
 wait_settled >/dev/null
 
-if [[ "$BUS_OUT" == *"laptop-2"* && "$BUS_OUT" == *"coder"* && "$BUS_OUT" == *"reviewer"* && "$BUS_OUT" == *"workstation"* && "$BUS_OUT" == *"linux-gate"* ]]; then
-    record_pass "bus snapshot in sidebar & palette" "hosts laptop-2 + workstation (4 live agents) populated"
+if [[ "$BUS_OUT" == *"laptop-2"* && "$BUS_OUT" == *"coder"* && "$BUS_OUT" == *"reviewer"* && "$BUS_OUT" == *"workstation"* && "$BUS_OUT" == *"linux-gate"* && "$BUS_OUT" == *"bench"* ]]; then
+    record_pass "bus snapshot in sidebar & palette" "hosts laptop-2 + workstation (5 live agents) populated"
 else
     record_fail "bus snapshot in sidebar & palette" "wall.bus output: $(tr '\n' ' ' <<<"$BUS_OUT")"
 fi
@@ -1026,6 +1049,200 @@ if [[ "$GX_MOUNTED" -eq 1 && "$GX_PAIRED_EXP" -ge 5 ]] \
     record_pass "extra-ns gx-coder detach & reattach" "mounted gx-coder, paired ($GX_PAIRED_EXP rows), detached cleanly, reattached via wall.attach without wrapper"
 else
     record_fail "extra-ns gx-coder detach & reattach" "mounted=$GX_MOUNTED exp=$GX_PAIRED_EXP alive=$STILL_IN_PROBE2 reattached=$GX_REATTACHED attach_reply='$R_REATTACH'"
+fi
+
+# ── 14. The sidebar's one list: click-to-attach, merged rows, group & host modes ──
+# `rows=` on app.where's `panel sidebar` line is the list as drawn, top to bottom:
+# `g:<group>[<host>=<n>,...]`, `s:none[...]`, `h:<host>[<n>]`, `t:<terminal>`,
+# `t:<terminal>+<agent>=<status>` (an agent in its terminal's row), `a:<agent>=<status>`.
+sb_tok() { # $1 = app.where text, $2 = key: the value of `key=` on the sidebar's line
+    python3 -c '
+import sys
+key = sys.argv[1]
+for line in sys.stdin:
+    if line.startswith("panel sidebar "):
+        for tok in line.split():
+            if tok.startswith(key + "="):
+                print(tok[len(key) + 1:])
+                sys.exit(0)
+print("")
+' "$2" <<<"$1"
+}
+
+sb_center() { # $1 = app.where text, $2 = key, [$3 = an entry of a `;`-joined map]: "cx cy"
+    python3 -c '
+import sys
+key, entry = sys.argv[1], sys.argv[2]
+for line in sys.stdin:
+    if line.startswith("panel sidebar "):
+        for tok in line.split():
+            if tok.startswith(key + "="):
+                raw = tok[len(key) + 1:]
+                if entry:
+                    raw = next(
+                        (i.rsplit(":", 1)[1] for i in raw.split(";") if i.rsplit(":", 1)[0] == entry),
+                        "none",
+                    )
+                if raw != "none":
+                    l, t, r, b = map(float, raw.split(","))
+                    print(f"{(l + r) / 2:.2f} {(t + b) / 2:.2f}")
+                    sys.exit(0)
+print("0 0")
+' "$2" "${3:-}" <<<"$1"
+}
+
+wait_sidebar_rows() { # poll until the sidebar's `rows=` holds $1; prints the last app.where
+    local w=""
+    for _ in $(seq 1 80); do
+        w="$(ctl app.where 2>/dev/null)" || { sleep 0.05; continue; }
+        if [[ "$(sb_tok "$w" rows)" == *"$1"* ]]; then
+            printf '%s\n' "$w"
+            return 0
+        fi
+        sleep 0.05
+    done
+    printf '%s\n' "$w"
+}
+
+term_ids() {
+    ctl app.where 2>/dev/null | awk '/^terminal / {print $2}' | sort | tr '\n' ' '
+}
+
+# Only `coder` is ever attached here. It lives in the extra namespace, so the wall
+# reattaches its termd session directly (#13). Any other agent's attach runs the
+# `agent attach` wrapper INSIDE a terminal, and termd gives its children a bare PATH
+# (`/usr/bin:/bin`): the wrapper then takes the login shell's PATH and finds the REAL
+# `agent`, not the stub above. So this never clicks `bench` or `linux-gate`.
+ctl wall.rename t1 shell >/dev/null
+ctl wall.close gx-coder >/dev/null
+ctl wall.sidebar left >/dev/null
+ctl wall.sidebar mode group >/dev/null
+W_OL_OPEN="$(wait_sidebar_rows "a:coder@laptop-2=processing")"
+ROWS_OPEN="$(sb_tok "$W_OL_OPEN" rows)"
+
+# (a) `coder` has no terminal on the wall now: a click on its row attaches it, and from
+#     then on it is listed in that terminal's row, with its status.
+read -r CODER_X CODER_Y < <(sb_center "$W_OL_OPEN" agents "coder@laptop-2")
+ctl app.click "$CODER_X" "$CODER_Y" >/dev/null
+W_OL_ATTACHED="$(wait_sidebar_rows "t:gx-coder+coder@laptop-2=processing")"
+ROWS_ATTACHED="$(sb_tok "$W_OL_ATTACHED" rows)"
+IDS_ATTACHED="$(term_ids)"
+
+# (b) Three more shells, and two groups.
+ctl wall.spawn >/dev/null
+ctl wall.spawn >/dev/null
+ctl wall.spawn >/dev/null
+NEW_IDS=""
+for _ in $(seq 1 80); do
+    NEW_IDS="$(python3 -c '
+import sys
+before, now = set(sys.argv[1].split()), sys.argv[2].split()
+print(" ".join(i for i in now if i not in before))
+' "$IDS_ATTACHED" "$(term_ids)")"
+    [[ "$(wc -w <<<"$NEW_IDS" | tr -d ' ')" -ge 3 ]] && break
+    sleep 0.05
+done
+read -r SH1 SH2 SH3 _ <<<"$NEW_IDS "
+ctl wall.rename "${SH1:-none}" logs >/dev/null
+ctl wall.rename "${SH2:-none}" watch >/dev/null
+ctl wall.rename "${SH3:-none}" scratch >/dev/null
+G_BUILD="$(ctl wall.group t1 gx-coder | sed -n 's/^OK: \(g-[0-9]*\) .*/\1/p')"
+G_OPS="$(ctl wall.group "${SH1:-none}" "${SH2:-none}" | sed -n 's/^OK: \(g-[0-9]*\) .*/\1/p')"
+ctl wall.group.rename "${G_BUILD:-none}" build >/dev/null
+ctl wall.group.rename "${G_OPS:-none}" ops >/dev/null
+ctl terminal.focus gx-coder >/dev/null
+ctl wall.fit >/dev/null
+wait_settled >/dev/null
+
+# (c) By group: each group's members and a count by host, then `no group` with this
+#     machine first, its agents with no terminal after its terminals.
+W_OL_GROUP="$(wait_sidebar_rows "s:none[laptop-2=3,workstation=2]")"
+ROWS_GROUP="$(sb_tok "$W_OL_GROUP" rows)"
+MODE_GROUP="$(sb_tok "$W_OL_GROUP" mode)"
+# Park the pointer in the sidebar's empty foot, so no row is drawn hovered in the shots.
+read -r PARK_X PARK_Y < <(python3 -c '
+import sys
+l, t, r, b = map(float, sys.argv[1].split(","))
+print(f"{(l + r) / 2:.2f} {b - 30.0:.2f}")
+' "$(sb_tok "$W_OL_GROUP" rect)")
+ctl app.move "$PARK_X" "$PARK_Y" >/dev/null
+ctl app.shot "$SHOT_DIR/sidebar-by-group.png" >/dev/null 2>&1 || true
+
+# (d) The header's `host` half: each host with its count, rows sorted by group.
+read -r MODE_X MODE_Y < <(sb_center "$W_OL_GROUP" mode_host)
+ctl app.click "$MODE_X" "$MODE_Y" >/dev/null
+W_OL_HOST="$(wait_sidebar_rows "h:workstation[2]")"
+ROWS_HOST="$(sb_tok "$W_OL_HOST" rows)"
+MODE_HOST="$(sb_tok "$W_OL_HOST" mode)"
+ctl app.move "$PARK_X" "$PARK_Y" >/dev/null
+ctl app.shot "$SHOT_DIR/sidebar-by-host.png" >/dev/null 2>&1 || true
+STORE_MODE="$(python3 -c '
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("sidebar", {}).get("mode", "missing"))
+except Exception as e:
+    print(f"unreadable: {e}")
+' "$D/wall-$NS.json")"
+
+# (e) The verb, back to group; then the sidebar closes.
+R_MODE_BACK="$(ctl wall.sidebar mode group)"
+W_OL_BACK="$(wait_sidebar_rows "g:${G_BUILD:-none}[")"
+MODE_BACK="$(sb_tok "$W_OL_BACK" mode)"
+ctl wall.sidebar close >/dev/null
+
+OL_CHECK="$(python3 -c '
+import sys
+
+(rows_open, rows_attached, rows_group, rows_host, ids_attached, sh1, sh2, sh3, g_build, g_ops,
+ mode_group, mode_host, store_mode, mode_back, r_back) = sys.argv[1:16]
+
+coder = "t:gx-coder+coder@laptop-2=processing"
+away = ["a:bench@workstation=processing", "a:linux-gate@workstation=idle"]
+
+# `coder` closed: an agent row of its own, between the others by urgency.
+want_open = ["s:none[laptop-2=4,workstation=2]", "t:t1", "a:perf-probe@laptop-2=waiting",
+             "a:coder@laptop-2=processing", "a:reviewer@laptop-2=idle", *away]
+# Clicked: one row, the terminal, with the status of the agent it shows.
+loose = ["a:perf-probe@laptop-2=waiting", "a:reviewer@laptop-2=idle"]
+want_attached = ["s:none[laptop-2=4,workstation=2]", "t:t1", coder, *loose, *away]
+
+members = {g_build: ["t:t1", coder], g_ops: [f"t:{sh1}", f"t:{sh2}"]}
+want_group = []
+for gid in sorted(members):
+    want_group += [f"g:{gid}[laptop-2=2]", *members[gid]]
+want_group += ["s:none[laptop-2=3,workstation=2]", f"t:{sh3}", *loose, *away]
+
+want_host = ["h:laptop-2[7]"] + [row for gid in sorted(members) for row in members[gid]]
+want_host += [f"t:{sh3}", *loose, "h:workstation[2]", *away]
+
+checks = {
+    "open": rows_open.split(";") == want_open,
+    # The click attached `coder` through its own termd session: no wrapper terminal.
+    "click-attaches": rows_attached.split(";") == want_attached
+    and ids_attached.split() == ["gx-coder", "t1"],
+    "by-group": rows_group.split(";") == want_group and mode_group == "group",
+    "by-host": rows_host.split(";") == want_host and mode_host == "host",
+    "stored": store_mode == "host",
+    "verb-back": mode_back == "group" and r_back == "OK: sidebar lists by group",
+    "ids": all([sh1, sh2, sh3, g_build, g_ops]) and g_build != g_ops,
+}
+bad = [name for name, ok in checks.items() if not ok]
+if bad:
+    print("0 failed=" + ",".join(bad)
+          + f" | open={rows_open} | attached={rows_attached} ids={ids_attached}"
+          + f" | group={rows_group} | host={rows_host} | store={store_mode}"
+          + f" | back={mode_back} {r_back!r}")
+else:
+    print(f"1 {len(want_group)} rows by group ({g_build}, {g_ops}), {len(want_host)} by host"
+          f" (laptop-2 7, workstation 2); coder attached on a click and merged into gx-coder;"
+          f" mode kept in the store")
+' "$ROWS_OPEN" "$ROWS_ATTACHED" "$ROWS_GROUP" "$ROWS_HOST" "$IDS_ATTACHED" \
+    "${SH1:-}" "${SH2:-}" "${SH3:-}" "${G_BUILD:-}" "${G_OPS:-}" \
+    "$MODE_GROUP" "$MODE_HOST" "$STORE_MODE" "$MODE_BACK" "$R_MODE_BACK")"
+if [[ "${OL_CHECK%% *}" == "1" ]]; then
+    record_pass "sidebar one list (group & host)" "${OL_CHECK#* }"
+else
+    record_fail "sidebar one list (group & host)" "${OL_CHECK#* }"
 fi
 
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"
