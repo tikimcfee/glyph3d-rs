@@ -1,0 +1,298 @@
+From da41926105fcfab8f5a564e7b8020daadd259fb3 Mon Sep 17 00:00:00 2001
+From: wall-vt <wall-vt@local>
+Date: Thu, 26 Nov 2026 17:49:10 -0600
+Subject: [PATCH 3/3] t3: pty child reset signals and mask
+
+Reset child signal dispositions across `1..NSIG_LIMIT` (`65` on Linux/Android
+including real-time signals `32..=64`, `32` on macOS/BSD) using async-signal-safe
+`sigaction(2)` with `sa_sigaction = SIG_DFL`, `sa_flags = 0`, and an empty
+`sa_mask`, then clear the process signal mask (`SIG_SETMASK`) in both `spawn`
+and `holder` fork paths.
+
+Includes `pty_child_gets_clean_default_signals_flags_and_empty_mask` in
+`crates/g3d-hold/src/spawn.rs` and extends `crates/g3d-termd/tests/env.rs`
+to test `SIGPIPE`, `SIGQUIT`, `SIGTSTP`, `SIGHUP`, and blocked signal masks.
+---
+ crates/g3d-hold/src/holder.rs |  18 +---
+ crates/g3d-hold/src/spawn.rs  | 153 +++++++++++++++++++++++++++++++---
+ crates/g3d-termd/tests/env.rs |  33 ++++++--
+ 3 files changed, 170 insertions(+), 34 deletions(-)
+
+diff --git a/crates/g3d-hold/src/holder.rs b/crates/g3d-hold/src/holder.rs
+index 503008c..5c90895 100644
+--- a/crates/g3d-hold/src/holder.rs
++++ b/crates/g3d-hold/src/holder.rs
+@@ -1143,14 +1143,7 @@ impl Holder {
+                     libc::_exit(127);
+                 }
+                 libc::fcntl(child_fd, libc::F_SETFD, 0);
+-                for sig in 1..32 {
+-                    if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+-                        libc::signal(sig, libc::SIG_DFL);
+-                    }
+-                }
+-                let mut set: libc::sigset_t = std::mem::zeroed();
+-                libc::sigemptyset(&mut set);
+-                libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
++                spawn::reset_signals_and_mask();
+                 let mut rl: libc::rlimit = std::mem::zeroed();
+                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                     rl.rlim_cur = nofile;
+@@ -1782,14 +1775,7 @@ impl Holder {
+                 for &fd in &keep {
+                     libc::fcntl(fd, libc::F_SETFD, 0);
+                 }
+-                for sig in 1..32 {
+-                    if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+-                        libc::signal(sig, libc::SIG_DFL);
+-                    }
+-                }
+-                let mut set: libc::sigset_t = std::mem::zeroed();
+-                libc::sigemptyset(&mut set);
+-                libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
++                spawn::reset_signals_and_mask();
+                 let mut rl: libc::rlimit = std::mem::zeroed();
+                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                     rl.rlim_cur = nofile;
+diff --git a/crates/g3d-hold/src/spawn.rs b/crates/g3d-hold/src/spawn.rs
+index 9dce6f3..e5a8361 100644
+--- a/crates/g3d-hold/src/spawn.rs
++++ b/crates/g3d-hold/src/spawn.rs
+@@ -143,16 +143,10 @@ pub fn spawn(plan: &Plan, nofile: libc::rlim_t, cgroup: Option<&std::ffi::CStr>)
+                 *errno_ptr() = e;
+                 fail(6);
+             }
+-            // Every disposition back to default and the mask cleared: an ignored signal stays
+-            // ignored across exec, and the holder ignores SIGINT.
+-            for sig in 1..32 {
+-                if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+-                    libc::signal(sig, libc::SIG_DFL);
+-                }
+-            }
+-            let mut set: libc::sigset_t = std::mem::zeroed();
+-            libc::sigemptyset(&mut set);
+-            libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
++            // Every disposition (including Linux real-time signals 32..64) back to default with
++            // zeroed `sa_flags` via `sigaction`, and the signal mask cleared: `libc::signal`
++            // leaves `SA_RESTART` set and `1..32` misses real-time signals on Linux.
++            reset_signals_and_mask();
+             // The holder raised its own fd limit; programs using select() break above 1024.
+             let mut rl: libc::rlimit = std::mem::zeroed();
+             if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+@@ -228,6 +222,48 @@ pub(crate) unsafe fn errno_ptr() -> *mut i32 {
+     unsafe { libc::__error() }
+ }
+ 
++/// Exclusive upper bound of valid signal numbers (`_NSIG`: 65 on Linux/Android covering standard
++/// 1..=31 and real-time 32..=64; 32 on macOS/BSD covering 1..=31).
++#[cfg(any(target_os = "linux", target_os = "android"))]
++pub const NSIG_LIMIT: i32 = 65;
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
++pub const NSIG_LIMIT: i32 = 32;
++
++/// Resets every catchable/ignorable signal disposition (`1..NSIG_LIMIT`, including `SIGPIPE`,
++/// `SIGINT`, `SIGQUIT`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `SIGCHLD`, `SIGHUP`, `SIGTERM`, and
++/// Linux real-time signals) to `SIG_DFL` with `sa_flags = 0` and an empty `sa_mask` via
++/// async-signal-safe `sigaction(2)`, then clears the process signal mask (`SIG_SETMASK`).
++///
++/// # Safety
++/// Async-signal-safe; intended for forked children prior to `execve`.
++pub unsafe fn reset_signals_and_mask() {
++    unsafe {
++        let mut sa: libc::sigaction = std::mem::zeroed();
++        sa.sa_sigaction = libc::SIG_DFL;
++        sa.sa_flags = 0;
++        libc::sigemptyset(&mut sa.sa_mask);
++        for sig in 1..NSIG_LIMIT {
++            if sig != libc::SIGKILL && sig != libc::SIGSTOP {
++                // Unusable internal signals (e.g. NPTL 32/33 on glibc) return EINVAL and are skipped.
++                libc::sigaction(sig, &sa, std::ptr::null_mut());
++            }
++        }
++        let mut set: libc::sigset_t = std::mem::zeroed();
++        libc::sigemptyset(&mut set);
++        libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
++    }
++}
++
++#[cfg(test)]
++unsafe fn reset_signals_for_test() {
++    unsafe { reset_signals_and_mask() }
++}
++
++#[cfg(test)]
++const fn max_sig_for_test() -> i32 {
++    NSIG_LIMIT
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -271,4 +307,101 @@ mod tests {
+         assert!(out.contains(&format!("fd {l} closed")), "{out:?}");
+         assert!(out.contains(&format!("fd {k} closed")), "{out:?}");
+     }
++
++    #[test]
++    fn pty_child_gets_clean_default_signals_flags_and_empty_mask() {
++        let _turn = crate::FORKS.lock().unwrap_or_else(|e| e.into_inner());
++        unsafe {
++            // Simulate holder + odd starter state in a forked subtest parent so libtest's own
++            // signal handlers are never mutated.
++            let sub = libc::fork();
++            assert!(sub >= 0);
++            if sub == 0 {
++                for sig in [libc::SIGPIPE, libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGHUP] {
++                    libc::signal(sig, libc::SIG_IGN);
++                }
++                let mut sa_chld: libc::sigaction = std::mem::zeroed();
++                sa_chld.sa_sigaction = libc::SIG_DFL;
++                sa_chld.sa_flags = libc::SA_NOCLDSTOP | libc::SA_RESTART;
++                libc::sigemptyset(&mut sa_chld.sa_mask);
++                libc::sigaction(libc::SIGCHLD, &sa_chld, std::ptr::null_mut());
++
++                let mut block: libc::sigset_t = std::mem::zeroed();
++                libc::sigemptyset(&mut block);
++                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP, libc::SIGPIPE, libc::SIGALRM] {
++                    libc::sigaddset(&mut block, sig);
++                }
++                libc::sigprocmask(libc::SIG_BLOCK, &block, std::ptr::null_mut());
++
++                super::reset_signals_for_test();
++                for sig in 1..super::max_sig_for_test() {
++                    if sig == libc::SIGKILL || sig == libc::SIGSTOP {
++                        continue;
++                    }
++                    let mut sa: libc::sigaction = std::mem::zeroed();
++                    if libc::sigaction(sig, std::ptr::null(), &mut sa) == 0 {
++                        if sa.sa_sigaction != libc::SIG_DFL || sa.sa_flags != 0 {
++                            libc::_exit(sig);
++                        }
++                    }
++                }
++                let mut cur: libc::sigset_t = std::mem::zeroed();
++                libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur);
++                for sig in 1..super::max_sig_for_test() {
++                    if libc::sigismember(&cur, sig) == 1 {
++                        libc::_exit(100 + sig);
++                    }
++                }
++                libc::_exit(0);
++            }
++            let mut st = 0;
++            let w = libc::waitpid(sub, &mut st, 0);
++            assert_eq!(w, sub);
++            assert!(
++                libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
++                "child signal check failed on sig/code={}",
++                libc::WEXITSTATUS(st)
++            );
++        }
++
++        // Check across actual PTY spawn + execve with bounded wait:
++        let argv = [
++            "sh".to_owned(),
++            "-c".to_owned(),
++            "yes | head -c 64 >/dev/null; echo PIPE_OK:$?; (exit 7) & p=$!; wait $p; echo WAIT_OK:$?".to_owned(),
++        ];
++        let plan = Plan::new("/bin/sh", &argv, &[("PATH".into(), "/usr/bin:/bin".into())], None, 80, 24).unwrap();
++        let (master, pid) = spawn(&plan, 1024, None).unwrap();
++        rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).unwrap();
++        let mut out = Vec::new();
++        let mut buf = [0u8; 4096];
++        let until = Instant::now() + Duration::from_secs(3);
++        let mut reaped = false;
++        while Instant::now() < until {
++            match rustix::io::read(&master, &mut buf) {
++                Ok(0) => break,
++                Ok(n) => out.extend_from_slice(&buf[..n]),
++                Err(rustix::io::Errno::AGAIN) => {
++                    let mut st = 0;
++                    if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } == pid {
++                        reaped = true;
++                        break;
++                    }
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                Err(_) => break,
++            }
++        }
++        if !reaped {
++            let mut st = 0;
++            if unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) } != pid {
++                unsafe { libc::kill(-pid, libc::SIGKILL) };
++                unsafe { libc::waitpid(pid, &mut st, 0) };
++                panic!("PTY pipeline hung (SIGPIPE likely ignored); output={:?}", String::from_utf8_lossy(&out));
++            }
++        }
++        let text = String::from_utf8_lossy(&out);
++        assert!(text.contains("PIPE_OK:0"), "{text:?}");
++        assert!(text.contains("WAIT_OK:7"), "{text:?}");
++    }
+ }
+diff --git a/crates/g3d-termd/tests/env.rs b/crates/g3d-termd/tests/env.rs
+index bf9f0b2..f4961d1 100644
+--- a/crates/g3d-termd/tests/env.rs
++++ b/crates/g3d-termd/tests/env.rs
+@@ -70,11 +70,19 @@ fn odd_daemon_with(args: &[&str], extra: &'static [(&'static str, &'static str)]
+     Daemon::start_cmd(args, move |cmd, _| {
+         use std::os::unix::process::CommandExt;
+         cmd.env_clear().envs(ODD.iter().copied()).envs(extra.iter().copied());
+-        // SAFETY: plain calls between fork and exec. The starter ignores SIGINT (as a shell's
+-        // background job does) and has a low soft fd limit; neither may reach a terminal.
++        // SAFETY: plain calls between fork and exec. The starter ignores SIGINT/SIGQUIT/SIGTSTP/
++        // SIGHUP/SIGPIPE, blocks SIGALRM/SIGUSR1, and has a low soft fd limit; none may reach a
++        // terminal's program.
+         unsafe {
+             cmd.pre_exec(|| {
+-                libc::signal(libc::SIGINT, libc::SIG_IGN);
++                for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGHUP, libc::SIGPIPE] {
++                    libc::signal(sig, libc::SIG_IGN);
++                }
++                let mut mask: libc::sigset_t = std::mem::zeroed();
++                libc::sigemptyset(&mut mask);
++                libc::sigaddset(&mut mask, libc::SIGALRM);
++                libc::sigaddset(&mut mask, libc::SIGUSR1);
++                libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
+                 let mut rl: libc::rlimit = std::mem::zeroed();
+                 libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl);
+                 rl.rlim_cur = 1000.min(rl.rlim_max);
+@@ -125,11 +133,12 @@ fn probe() {
+     }
+     // SAFETY: queries only, into structs we own.
+     let (blocked, ignored, nofile) = unsafe {
++        let nsig = g3d_hold::spawn::NSIG_LIMIT;
+         let mut set: libc::sigset_t = std::mem::zeroed();
+         libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set);
+-        let blocked: Vec<i32> = (1..32).filter(|&s| libc::sigismember(&set, s) == 1).collect();
+-        // Not SIGPIPE: Rust's runtime ignores it itself before main.
+-        let ignored: Vec<i32> = (1..32)
++        let blocked: Vec<i32> = (1..nsig).filter(|&s| libc::sigismember(&set, s) == 1).collect();
++        // Not SIGPIPE here (checked via non-Rust /bin/sh below): Rust's runtime ignores it before main.
++        let ignored: Vec<i32> = (1..nsig)
+             .filter(|&s| s != libc::SIGPIPE && s != libc::SIGKILL && s != libc::SIGSTOP)
+             .filter(|&s| {
+                 let mut sa: libc::sigaction = std::mem::zeroed();
+@@ -260,9 +269,17 @@ fn a_terminal_from_an_odd_starter_gets_the_policy_environment() {
+     assert_eq!(r.cwd, home);
+     assert_eq!(get("PWD"), Some(home.as_str()));
+     assert_eq!(cwd(r.pid).to_str(), Some(home.as_str()));
+-    // The starter's ignored SIGINT and the holder's raised fd limit stay out, and no signal is
+-    // blocked: the program's own report.
++    // The starter's ignored signals, blocked mask, and the holder's raised fd limit stay out:
++    // the program's own report, plus a non-Rust pipeline proving SIGPIPE is SIG_DFL.
+     assert_eq!(probe_report(&mut c, "e1"), "PROBE blocked=[] ignored=[] nofile=1000 END");
++    create_with(&mut c, "pipe", |cr| {
++        cr.argv = Some(["/bin/sh", "-c", "yes | head -c 64 >/dev/null; printf 'SIGPIPE_OK<%d>\\n' $?; exec sleep 60"].map(String::from).to_vec());
++    })
++    .unwrap();
++    let psub = subscribe(&mut c, "pipe", Role::Watch, None);
++    let mut pseen = Seen::default();
++    read_until(&mut c, &mut pseen, 10, |s| contains(&s.bytes, b"SIGPIPE_OK<0>"));
++    let _: Empty = c.request(Op::Unsubscribe(HandleOnly { handle: psub.handle })).unwrap();
+     // A bare name resolves in the program's own PATH (made last: the locale warning above names
+     // the latest terminal).
+     let s = create_with(&mut c, "s", |cr| cr.argv = Some(vec!["sleep".into(), "60".into()])).unwrap();
+-- 
+2.54.0 (Apple Git-157)
+
