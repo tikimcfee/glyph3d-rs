@@ -514,6 +514,10 @@ documentation.
 - `GLYPH_WALL_HUD=1` — windowed (`egui-ui`): opens the `F1` wall debug HUD on
   startup (any non-empty value other than `"0"`; `wallctl app.hud` toggles it
   live).
+- `GLYPH_WALL_STARTUP=1` (`wall/startup.rs`) — prints `[wall-startup]
+  t=+...ms dt=...ms phase=<name>` phase spans from `process_start` through
+  first-frame paper paint and background `termd` connect/adopt (`OnceLock`-gated,
+  zero syscalls when unset).
 - `GLYPH_WALL_PERF=1` (plus `GLYPH_WALL_PERF_MAX_MS`,
   `GLYPH_WALL_PERF_IDLE_MS`, `GLYPH_WALL_PERF_SETTLE_MS`, `wall/perf.rs`) —
   windowed: activates `WallPerf` per-frame `App::pump` vs `App::draw` CPU

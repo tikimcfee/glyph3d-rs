@@ -34,8 +34,8 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   infinite orthographic canvas of live `g3d-termd` terminals with no HTTP/WebSocket
   relay. Its CPU/host modules (`agents` background `agent-feed` coordinator,
   `camera`, `cell`, `chrome`, `describe`, `glyphs` sparse emoji archive,
-  `labels`, `metrics`, `paper`, `replay`, `shapes`, `test_pattern`) compile
-  under `--no-default-features`; `wgpu` adds `renderer` (`WallRenderer`,
+  `labels`, `metrics`, `paper`, `replay`, `shapes`, `startup`, `test_pattern`)
+  compile under `--no-default-features`; `wgpu` adds `renderer` (`WallRenderer`,
   `wall_{cells,paper,shapes}.wgsl`, runtime `GlyphSource` atlas textures,
   offscreen PNG capture); `windowed` adds `app` (winit event loop joining `Wall`,
   `Sessions`, `WallRenderer`, and `wall_control::Server`), `keys`, `perf`
