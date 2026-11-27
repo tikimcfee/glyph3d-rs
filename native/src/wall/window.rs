@@ -587,6 +587,11 @@ impl WindowLifecycle {
         self.window_focused
     }
 
+    /// Update the OS key-window focus flag (solid vs hollow cursor).
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.window_focused = focused;
+    }
+
     /// Current cursor icon requested by `wall-core`.
     pub fn wall_cursor(&self) -> CursorIcon {
         self.wall_cursor
