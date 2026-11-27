@@ -173,13 +173,36 @@ mod tests {
     use super::*;
 
     /// The suite runs the workspace's members and nothing else: the makepad
-    /// host beside them is `exclude`d, and running it under relax failed the
-    /// tree every time (2026-10-31).
+    /// host and experiments beside them are `exclude`d, and running makepad
+    /// under relax failed the tree every time (2026-10-31). Held against
+    /// `cargo metadata --no-deps` so workspace membership changes do not rot
+    /// a hand-copied list while still checking `workspace_packages`'s TOML and
+    /// glob expansion against cargo's own resolver.
     #[test]
     fn workspace_packages_are_the_members_alone() {
         let mut names: Vec<String> = workspace_packages().into_iter().map(|(n, _)| n).collect();
         names.sort();
-        assert_eq!(names, ["definition-engine", "glyph", "glyph-field", "glyph-field-derived", "glyph-scene-graph", "glyph3d-native"]);
+
+        let out = Command::new("cargo")
+            .args(["metadata", "--no-deps", "--offline", "--format-version", "1"])
+            .current_dir(root())
+            .stdin(Stdio::null())
+            .output()
+            .expect("cargo metadata runs");
+        assert!(out.status.success(), "cargo metadata failed: {}", String::from_utf8_lossy(&out.stderr));
+        let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo metadata JSON");
+        let mut expected: Vec<String> = meta["packages"]
+            .as_array()
+            .expect("packages array")
+            .iter()
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect();
+        expected.sort();
+
+        assert_eq!(names, expected);
+        assert!(names.contains(&"glyph3d-native".to_string()) && names.contains(&"wall-core".to_string()));
+        assert!(root().join("makepad/Cargo.toml").exists() && root().join("experiments/Cargo.toml").exists());
+        assert!(!names.iter().any(|n| n.contains("makepad") || n.contains("experiment")));
     }
 
     /// The suite's targets are cargo's: a bin-only package's bins, and each
