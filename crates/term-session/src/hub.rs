@@ -114,6 +114,7 @@ pub(crate) struct HubInner {
     async_worker: Mutex<Option<JoinHandle<()>>>,
     router_thread: Mutex<Option<JoinHandle<()>>>,
     closing: AtomicBool,
+    theme: Mutex<Theme>,
     options: HubOptions,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -157,6 +158,14 @@ impl HubInner {
 
     pub(crate) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn current_theme(&self) -> Theme {
+        self.theme.lock().expect("theme mutex poisoned").clone()
+    }
+
+    pub(crate) fn set_theme(&self, theme: Theme) {
+        *self.theme.lock().expect("theme mutex poisoned") = theme;
     }
 
     pub(crate) fn send_async(&self, cmd: AsyncCmd) {
@@ -271,6 +280,7 @@ impl SessionHub {
             async_worker: Mutex::new(Some(async_worker)),
             router_thread: Mutex::new(None),
             closing: AtomicBool::new(false),
+            theme: Mutex::new(options.theme.clone()),
             options,
             wake,
         });
@@ -289,6 +299,16 @@ impl SessionHub {
     /// Underlying `termd-client` request handle (e.g. for `upgrade` or custom RPCs).
     pub fn client(&self) -> TermdHandle {
         self.inner.termd_handle()
+    }
+
+    /// Current default [`Theme`] used for newly spawned or adopted terminals.
+    pub fn theme(&self) -> Theme {
+        self.inner.current_theme()
+    }
+
+    /// Updates the default [`Theme`] applied to newly spawned or adopted terminals.
+    pub fn set_theme(&self, theme: Theme) {
+        self.inner.set_theme(theme);
     }
 
     /// Latest `WELCOME` handshake from `g3d-termd`.
@@ -340,7 +360,7 @@ impl SessionHub {
             sub.role,
             sub.cols,
             sub.rows,
-            self.inner.options.theme.clone(),
+            self.inner.current_theme(),
             self.inner.options.coalesce,
             inbox,
             self.inner.wake_fn(),

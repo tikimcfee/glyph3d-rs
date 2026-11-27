@@ -179,6 +179,7 @@ impl Sessions {
             .expect("reconnected_hub mutex poisoned")
             .take()?;
         self.hub = next_hub;
+        self.hub.set_theme(self.options.theme.clone());
         self.external_appeared.clear();
         let ids = self.list().unwrap_or_default();
         Some(ids)
@@ -631,6 +632,25 @@ impl Sessions {
             return;
         };
         tracked.session.send_repaint();
+    }
+
+    /// Updates `bold_is_bright` on the active [`glyph_vt::Theme`] for every live terminal,
+    /// future spawns/adoptions, and future reconnects, triggering an immediate re-fill and repaint.
+    pub fn set_bold_is_bright(&mut self, bold_is_bright: bool) {
+        if self.options.theme.bold_is_bright == bold_is_bright {
+            return;
+        }
+        self.options.theme.bold_is_bright = bold_is_bright;
+        let theme = self.options.theme.clone();
+        self.hub.set_theme(theme.clone());
+        for tracked in self.live.values() {
+            tracked.session.set_theme(theme.clone());
+        }
+    }
+
+    /// Current `bold_is_bright` setting applied to terminal emulators.
+    pub fn bold_is_bright(&self) -> bool {
+        self.options.theme.bold_is_bright
     }
 }
 

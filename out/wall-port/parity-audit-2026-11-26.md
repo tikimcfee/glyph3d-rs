@@ -28,8 +28,7 @@
 4. **Floating selection action bar (`group (N)` + `×`) is missing**
    - *What Ivan sees*: Lasso-selecting or `Shift`-clicking terminals draws blue selection outlines (`describe.rs:201-211`), but no floating `"group (N)"` + `×` bar appears beneath the selection (`SelectionOverlay.js:39-50, 135-155`). Users must press `⌘G` or right-click instead.
 
-5. **`boldIsBright` setting has no effect on live terminals**
-   - *What Ivan sees*: Toggling `Bold uses bright colours` in Settings persists to `WallStore` (`config.rs:420`), and `glyph_vt::Theme::bold_is_bright` implements it (`crates/glyph-vt/src/lib.rs:92, 245, 881`), but `app.rs` never propagates `boldIsBright` into `term-session`/`glyph-vt`.
+5. ~~**`boldIsBright` setting has no effect on live terminals**~~ — **Closed**: `Sessions::set_bold_is_bright` propagates through `SessionHub`, `SessionInbox`, and each worker's `glyph_vt::Vt::set_theme` with immediate re-fill + repaint (and inherits across new spawns/reconnects); wired in `app.rs` on connect, browser import, and `ConfigKnobChanged` (`session_live::set_bold_is_bright_updates_live_and_new_sessions` + live pixel check).
 
 6. **IME preedit text is not drawn inline on the terminal canvas**
    - *What Ivan sees*: Typing CJK or dead keys (`Option+E`) correctly suppresses stray keys, positions the OS candidate popup (`app.rs:681-710`), and commits UTF-8 into the PTY (verified in `wall-smoke.sh` check 15), but `app.rs:1533-1535` discards the `Ime::Preedit(text, _)` string so no underlined composition preview is visible at the cursor before commit.
@@ -220,8 +219,7 @@ All 49 `WallConfig` knobs are defined in `crates/wall-core/src/config.rs` and `s
 | **Terminals (2)** | `closeHoldMs`, `barButtonsMinPx` | `config.rs`, `wall.rs` | `mount.rs:295, 369, 524` | **Ported & live** (no visual ring on `⌘X`, §1 #2) |
 | **Agent view (4)** | `agentViewSide`, `agentViewWidth`, `agentViewHeight`, `agentViewGap` | `config.rs`, `wall.rs`, `agent_views.rs` | Dormant (Agent View unmounted; `AgentViewsConfig::default()` differs `56×34` vs `76×44`) | **Dormant** (§1 #1) |
 | **Fullscreen (3)** | `fullscreenMinLinePx`, `fullscreenPad`, `fullscreenTextStep` | `config.rs`, `fullscreen.rs` | `app.rs` (via `ResizeTerminal` & camera) | **Ported & live** |
-| **Text (7 live)** | `fontFamily` *(widened to free-form)*, `fontSize` *(native)*, `lineHeight` *(native)*, `lineThickness`, `underlineRaise`, `curlyAmplitude`, `dimAlpha` | `config.rs`, `settings.rs`, `model.rs` | `app.rs:714-761` (`reload_font`, `set_geometry_preserving_panels`, `set_char_widths`), `renderer.rs:722, 1764` | **Ported & live** |
-| **Text (1 dead)** | `boldIsBright` | `config.rs:420` | **Unread** — `glyph_vt::Theme::bold_is_bright` never updated by `app.rs` | **Dead knob** (§1 #5) |
+| **Text (8 live)** | `fontFamily` *(widened to free-form)*, `fontSize` *(native)*, `lineHeight` *(native)*, `boldIsBright`, `lineThickness`, `underlineRaise`, `curlyAmplitude`, `dimAlpha` | `config.rs`, `settings.rs`, `model.rs` | `app.rs` (`reload_font`, `set_geometry_preserving_panels`, `set_char_widths`, `sessions.set_bold_is_bright`), `renderer.rs` | **Ported & live** |
 | **Groups (7)** | `groupLayout`, `groupColumns`, `groupGap`, `groupPad`, `splitGap`, `splitBarRows`, `splitBars` | `config.rs`, `groups.rs`, `split.rs` | `describe.rs`, `app.rs` | **Ported & live** |
 | **Status (2)** | `restartNoticeMs`, `errorsShown` | `config.rs`, `status.rs` | `wall.rs`, `mount.rs:340, 396` | **Ported & live** |
 | **Input (3 live)** | `optionAsAlt`, `zoomKeys`, `scrollMultiplier` | `config.rs`, `chord.rs`, `keymap.rs`, `pointer.rs` | `app.rs:654, 836, 1519`, `keys.rs`, `mount.rs:633, 792` | **Ported & live** |

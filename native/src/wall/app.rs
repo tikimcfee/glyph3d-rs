@@ -627,8 +627,11 @@ impl App {
         self.pending_termd = None;
         self.starting_termd = false;
         match res {
-            Ok(ready) => {
+            Ok(mut ready) => {
                 let welcome = ready.sessions.hub().welcome().clone();
+                if let Some(wall) = &self.wall {
+                    ready.sessions.set_bold_is_bright(wall.config().bold_is_bright);
+                }
                 self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
                 if let Some(wall) = &mut self.wall {
                     wall.on_termd_welcome(
@@ -866,6 +869,13 @@ impl App {
                 log::debug!("wall knob {key} is now {value:?}");
                 if key == "optionAsAlt" {
                     self.sync_macos_option_as_alt();
+                }
+                if key == "boldIsBright" {
+                    if let (Some(wall), Some(Terminals::Live(sessions))) =
+                        (&self.wall, &mut self.terms)
+                    {
+                        sessions.set_bold_is_bright(wall.config().bold_is_bright);
+                    }
                 }
                 self.sync_font_and_text_knobs(Some(&key));
                 self.redraw();
@@ -1135,6 +1145,9 @@ impl App {
                 wall.set_connected(was_connected);
             }
             self.wall = Some(wall);
+            if let (Some(wall), Some(Terminals::Live(sessions))) = (&self.wall, &mut self.terms) {
+                sessions.set_bold_is_bright(wall.config().bold_is_bright);
+            }
             self.sync_font_and_text_knobs(None);
             self.sync_macos_option_as_alt();
             self.apply_effects();

@@ -459,6 +459,12 @@ impl TerminalSession {
         &self.front_screen
     }
 
+    /// Updates this session's [`Theme`] (including `bold_is_bright`) on its worker thread and
+    /// schedules an immediate re-fill + publish so existing cells reflect the new theme right away.
+    pub fn set_theme(&self, theme: Theme) {
+        self.inbox.set_theme(theme);
+    }
+
     /// Resolved cursor colour (`0xAABBGGRR`).
     pub fn cursor_color(&self) -> u32 {
         self.meta.cursor_color
@@ -774,7 +780,7 @@ fn session_worker_loop(
     session_id: String,
     initial_cols: u16,
     initial_rows: u16,
-    theme: Theme,
+    mut theme: Theme,
     policy: CoalescePolicy,
     vt_mutex: Arc<Mutex<Vt>>,
     inbox: Arc<SessionInbox>,
@@ -807,6 +813,14 @@ fn session_worker_loop(
     let mut grow_repaint_due: Option<Instant> = None;
 
     loop {
+        if let Some(next_theme) = inbox.take_theme() {
+            theme = next_theme;
+            {
+                let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
+                vt.set_theme(&theme);
+            }
+            coalescer.mark_immediate();
+        }
         batch.clear();
         let alive = inbox.drain_batch(&mut batch, policy.feed_quantum_bytes);
 

@@ -1359,3 +1359,92 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         burst_stats.resizes_sent
     );
 }
+
+#[test]
+fn set_bold_is_bright_updates_live_and_new_sessions() {
+    let scratch = ScratchDaemon::new("boldbright");
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions = term_session::Sessions::open_target(&scratch.target(), wake.waker())
+        .expect("open scratch sessions");
+    assert!(!sessions.bold_is_bright());
+
+    let std_red = glyph_vt::Theme::default().palette[1];
+    let bright_red = glyph_vt::Theme::default().palette[9];
+    assert_ne!(std_red, bright_red);
+
+    let (id1, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '\\033[1;31mX\\033[0m'; exec sleep 30".into(),
+            ]),
+            40,
+            10,
+        )
+        .expect("spawn bold red terminal");
+
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions
+                .screen(&id1)
+                .is_some_and(|s| s.cells[0].content == 'X' as u32)
+        }),
+        "initial bold-red 'X' never appeared"
+    );
+    assert_eq!(
+        sessions.screen(&id1).unwrap().cells[0].fg,
+        std_red,
+        "bold_is_bright=false must draw standard ANSI red"
+    );
+
+    // Flip bold_is_bright live -> existing screen updates to bright red immediately with no new PTY bytes.
+    seen = wake.current();
+    sessions.set_bold_is_bright(true);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            let _ = sessions.pump();
+            sessions
+                .screen(&id1)
+                .is_some_and(|s| s.cells[0].fg == bright_red)
+        }),
+        "bold_is_bright=true did not re-resolve existing bold cell to bright red"
+    );
+
+    // Newly spawned terminal inherits bold_is_bright=true.
+    let (id2, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '\\033[1;31mY\\033[0m'; exec sleep 30".into(),
+            ]),
+            40,
+            10,
+        )
+        .expect("spawn second bold red terminal");
+    seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let _ = sessions.pump();
+            sessions.screen(&id2).is_some_and(|s| {
+                s.cells[0].content == 'Y' as u32 && s.cells[0].fg == bright_red
+            })
+        }),
+        "newly spawned terminal did not inherit bold_is_bright=true"
+    );
+
+    // Flip back to false -> both terminals return to standard red.
+    seen = wake.current();
+    sessions.set_bold_is_bright(false);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            let _ = sessions.pump();
+            sessions.screen(&id1).is_some_and(|s| s.cells[0].fg == std_red)
+                && sessions.screen(&id2).is_some_and(|s| s.cells[0].fg == std_red)
+        }),
+        "bold_is_bright=false did not restore standard red on live terminals"
+    );
+}
