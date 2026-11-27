@@ -459,26 +459,29 @@ pub fn render_panel_to_png(
 
     // Warm-up passes size dynamic floating Areas and measured content widths; final pass tessellates.
     let mut deferred_free = Vec::new();
+    // Each pass's texture deltas are DRAINED into the renderer: epaint's `TexturesDelta`
+    // asserts in debug builds that none is left when it drops, and reading them by
+    // reference (as this did until 2026-11-27) left every one in place.
     for _ in 0..2 {
-        let warm = egui_ctx.run_ui(make_input(), |root_ui| {
+        let mut warm = egui_ctx.run_ui(make_input(), |root_ui| {
             build_ui(root_ui.ctx());
         });
-        for (id, image_deltas) in &warm.textures_delta.set {
-            for image_delta in image_deltas {
-                egui_renderer.update_texture(device, queue, *id, image_delta);
+        for (id, image_deltas) in warm.textures_delta.set.drain() {
+            for image_delta in &image_deltas {
+                egui_renderer.update_texture(device, queue, id, image_delta);
             }
         }
-        deferred_free.extend(warm.textures_delta.free.iter().copied());
+        deferred_free.extend(warm.textures_delta.free.drain());
     }
-    let pass2 = egui_ctx.run_ui(make_input(), |root_ui| {
+    let mut pass2 = egui_ctx.run_ui(make_input(), |root_ui| {
         build_ui(root_ui.ctx());
     });
-    for (id, image_deltas) in &pass2.textures_delta.set {
-        for image_delta in image_deltas {
-            egui_renderer.update_texture(device, queue, *id, image_delta);
+    for (id, image_deltas) in pass2.textures_delta.set.drain() {
+        for image_delta in &image_deltas {
+            egui_renderer.update_texture(device, queue, id, image_delta);
         }
     }
-    deferred_free.extend(pass2.textures_delta.free.iter().copied());
+    deferred_free.extend(pass2.textures_delta.free.drain());
 
     let clipped = egui_ctx.tessellate(pass2.shapes, pass2.pixels_per_point);
     let screen = egui_wgpu::ScreenDescriptor {

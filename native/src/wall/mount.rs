@@ -1207,7 +1207,7 @@ mod tests {
             ..Default::default()
         };
         let mut verbs = Vec::new();
-        let out = ctx.run_ui(raw, |ui| {
+        let out = crate::wall::ui::headless_pass(ctx, raw, |ui| {
             verbs = panels.show(ui.ctx(), wall, &described);
         });
         let shapes = out.shapes.len();
@@ -1258,7 +1258,7 @@ mod tests {
                 time: Some(1.0 + f64::from(step) * 0.1),
                 ..Default::default()
             };
-            let out = ctx.run_ui(raw, |ui| {
+            let out = crate::wall::ui::headless_pass(&ctx, raw, |ui| {
                 let _ = panels.show(ui.ctx(), &wall, &described);
             });
             last_delay = out
@@ -1607,7 +1607,7 @@ mod tests {
         assert!(hold_p > 0.4 && hold_p < 0.7, "expected mid-hold progress, got {hold_p}");
 
         let want = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(0xe5, 0x53, 0x4b));
-        let full = ctx.run_ui(
+        let full = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),

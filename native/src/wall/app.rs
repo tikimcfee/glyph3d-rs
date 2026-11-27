@@ -3717,7 +3717,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        let full = ctx.run_ui(raw, |root_ui| {
+        let full = crate::wall::ui::headless_pass(ctx, raw, |root_ui| {
             egui::Area::new(egui::Id::new("test_panel"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(952.0, 0.0))

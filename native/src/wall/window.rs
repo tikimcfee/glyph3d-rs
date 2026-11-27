@@ -1084,7 +1084,7 @@ mod tests {
                     .entry(egui::ViewportId::ROOT)
                     .or_default()
                     .native_pixels_per_point = Some(expected_ppp);
-                let out = ctx.run_ui(raw, |_ui| {});
+                let out = crate::wall::ui::headless_pass(&ctx, raw, |_ui| {});
                 assert!((out.pixels_per_point - expected_ppp).abs() < 1e-6);
                 assert!((ctx.pixels_per_point() - expected_ppp).abs() < 1e-6);
             }

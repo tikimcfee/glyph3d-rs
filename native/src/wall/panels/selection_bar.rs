@@ -217,7 +217,7 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            let _ = ctx.run_ui(raw, |ui| show(ui.ctx(), state, input, &mut verbs));
+            let _ = crate::wall::ui::headless_pass(ctx, raw, |ui| show(ui.ctx(), state, input, &mut verbs));
         }
         verbs
     }
@@ -229,7 +229,7 @@ mod tests {
         let mut verbs = Vec::new();
 
         // Hidden when count == 0.
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -250,7 +250,7 @@ mod tests {
             lassoing: true,
             platform: Platform::Mac,
         };
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -270,7 +270,7 @@ mod tests {
             platform: Platform::Mac,
         };
         for _ in 0..2 {
-            let _ = ctx.run_ui(
+            let _ = crate::wall::ui::headless_pass(&ctx, 
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,

@@ -431,6 +431,28 @@ impl WallUi {
     }
 }
 
+/// One headless egui pass for a test that draws to no GPU.
+///
+/// A pass hands back the textures it changed (`FullOutput::textures_delta`: the whole font
+/// atlas on a context's first pass, and again whenever a new glyph lands in it). A renderer
+/// uploads them. A test that only lays out and reads rects has nowhere to put them, and
+/// epaint 0.36's `TexturesDelta` asserts in debug builds that every delta was applied or
+/// cleared before it drops: `cargo test` without `--release` died there in every test that
+/// let a pass's output fall out of scope (2026-11-27; the release profile, which the gates
+/// run, compiles the assertion out, which is how it went unseen). So the deltas are cleared
+/// here, on purpose and in one place. A test that DOES paint (the offscreen panel proofs)
+/// calls `Context::run_ui` itself and drains them into its renderer.
+#[cfg(test)]
+pub(crate) fn headless_pass(
+    ctx: &egui::Context,
+    raw: egui::RawInput,
+    run_ui: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut full = ctx.run_ui(raw, run_ui);
+    full.textures_delta.clear();
+    full
+}
+
 /// Convert normalized sRGB `[r, g, b, a]` (`0.0..=1.0`, from `[wall]` config) into [`egui::Color32`].
 pub fn color32_from_srgb(rgba: [f32; 4]) -> egui::Color32 {
     let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -886,7 +908,7 @@ mod tests {
 
         // Closed HUD emits zero shapes and surfaces no repaint request.
         let mut closed = false;
-        let out_closed = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let out_closed = crate::wall::ui::headless_pass(&ctx, egui::RawInput::default(), |ui| {
             show_debug_hud(ui.ctx(), &mut closed, &input);
         });
         assert!(out_closed.shapes.is_empty(), "closed HUD must emit zero shapes");
@@ -908,7 +930,7 @@ mod tests {
         };
         let mut last_out = None;
         for step in 0..4 {
-            last_out = Some(ctx.run_ui(make_raw(f64::from(step) * 0.5), |ui| {
+            last_out = Some(crate::wall::ui::headless_pass(&ctx, make_raw(f64::from(step) * 0.5), |ui| {
                 show_debug_hud(ui.ctx(), &mut open, &input);
             }));
         }
@@ -922,7 +944,7 @@ mod tests {
         );
 
         // A panel requesting a timed repaint (e.g. blinking caret) surfaces `Some(delay)`.
-        let out_blink = ctx.run_ui(make_raw(2.5), |ui| {
+        let out_blink = crate::wall::ui::headless_pass(&ctx, make_raw(2.5), |ui| {
             show_debug_hud(ui.ctx(), &mut open, &input);
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         });

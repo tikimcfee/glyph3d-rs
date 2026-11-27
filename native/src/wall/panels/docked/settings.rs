@@ -1047,7 +1047,7 @@ mod tests {
             egui::vec2(viewport.0, viewport.1),
         ));
         let had_no_events = events.is_empty();
-        let mut full = ctx.run_ui(
+        let mut full = crate::wall::ui::headless_pass(ctx, 
             egui::RawInput {
                 screen_rect,
                 events,
@@ -1059,7 +1059,7 @@ mod tests {
         );
         // Brand-new `egui::Area`s run a sizing pass on their first frame; settle it on zero-event inspection frames.
         if had_no_events && input.placement.open {
-            full = ctx.run_ui(
+            full = crate::wall::ui::headless_pass(ctx, 
                 egui::RawInput {
                     screen_rect,
                     ..Default::default()
@@ -1313,7 +1313,7 @@ mod tests {
         assert_eq!(right_out, vec!["wall.settings right"]);
 
         // Locate the `"Canvas"` section title (the first section in `SECTIONS`) and click it to fold.
-        let full = ctx.run_ui(
+        let full = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,

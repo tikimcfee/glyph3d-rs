@@ -1411,7 +1411,7 @@ mod tests {
         out: &mut Vec<String>,
     ) {
         let rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(ctx, 
             egui::RawInput {
                 screen_rect: rect,
                 time: Some(time),
@@ -1428,7 +1428,7 @@ mod tests {
             },
             |ui| show(ui.ctx(), state, input, out),
         );
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(ctx, 
             egui::RawInput {
                 screen_rect: rect,
                 time: Some(time + 0.016),
@@ -1538,7 +1538,7 @@ mod tests {
         out: &mut Vec<String>,
     ) {
         for k in 0..2 {
-            let _ = ctx.run_ui(
+            let _ = crate::wall::ui::headless_pass(ctx, 
                 egui::RawInput {
                     screen_rect: Some(vp),
                     time: Some(time + f64::from(k) * 0.016),
@@ -1561,7 +1561,7 @@ mod tests {
             egui::vec2(800.0, 600.0),
             egui::vec2(1600.0, 1000.0),
         ] {
-            let full = ctx.run_ui(
+            let full = crate::wall::ui::headless_pass(&ctx, 
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                     ..egui::RawInput::default()
@@ -1647,7 +1647,7 @@ mod tests {
         //    NOT fire at 1.2 s (200 ms < 400 ms) and must at 1.5 s.
         out.clear();
         let close_pos = egui::pos2(232.0, t2_y);
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(vp),
                 time: Some(1.0),
@@ -1666,7 +1666,7 @@ mod tests {
         );
         assert!(out.is_empty(), "hold-close must not fire immediately on press");
 
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(vp),
                 time: Some(1.2),
@@ -1677,7 +1677,7 @@ mod tests {
         );
         assert!(out.is_empty(), "hold-close must wait full close_hold_ms");
 
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(vp),
                 time: Some(1.5),
@@ -1689,7 +1689,7 @@ mod tests {
         assert_eq!(out, vec!["wall.close t2"]);
 
         // Release mouse button cleanly.
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(vp),
                 time: Some(1.6),

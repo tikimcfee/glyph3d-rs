@@ -563,7 +563,7 @@ mod tests {
             egui::vec2(800.0, 600.0),
             egui::vec2(1920.0, 1080.0),
         ] {
-            let full = ctx.run_ui(raw_with_events(size, Vec::new()), |ui| {
+            let full = crate::wall::ui::headless_pass(&ctx, raw_with_events(size, Vec::new()), |ui| {
                 show(ui.ctx(), &mut state, &empty_input, &mut out);
             });
             assert!(state.wants_keyboard());
@@ -575,7 +575,7 @@ mod tests {
 
         // Unmatched query renders the "no match" row rather than nothing.
         state.palette.set_query("zzzz-nonexistent-query");
-        let full = ctx.run_ui(raw_with_events(egui::vec2(800.0, 600.0), Vec::new()), |ui| {
+        let full = crate::wall::ui::headless_pass(&ctx, raw_with_events(egui::vec2(800.0, 600.0), Vec::new()), |ui| {
             show(ui.ctx(), &mut state, &empty_input, &mut out);
         });
         assert!(!full.shapes.is_empty());
@@ -591,7 +591,7 @@ mod tests {
         let mut out = Vec::new();
 
         // Type "bg-worker" and press Enter in a single frame -> reveals hidden terminal t2 and closes!
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             raw_with_events(
                 egui::vec2(1024.0, 768.0),
                 vec![
@@ -607,7 +607,7 @@ mod tests {
         // Re-open: ArrowDown from index 0 ("Backend" group) to index 1 ("t1"), then Enter -> reveals t1.
         out.clear();
         state.open_find();
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             raw_with_events(
                 egui::vec2(1024.0, 768.0),
                 vec![key_press(egui::Key::ArrowDown), key_press(egui::Key::Enter)],
@@ -621,7 +621,7 @@ mod tests {
         // second Escape closes the palette!
         out.clear();
         state.open_find();
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             raw_with_events(
                 egui::vec2(1024.0, 768.0),
                 vec![egui::Event::Text("lead".to_string())],
@@ -631,14 +631,14 @@ mod tests {
         assert_eq!(state.palette.query, "lead");
         assert!(state.open);
 
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             raw_with_events(egui::vec2(1024.0, 768.0), vec![key_press(egui::Key::Escape)]),
             |ui| show(ui.ctx(), &mut state, &input, &mut out),
         );
         assert_eq!(state.palette.query, "");
         assert!(state.open, "first Escape clears non-empty search");
 
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(&ctx, 
             raw_with_events(egui::vec2(1024.0, 768.0), vec![key_press(egui::Key::Escape)]),
             |ui| show(ui.ctx(), &mut state, &input, &mut out),
         );
@@ -654,7 +654,7 @@ mod tests {
         input: &PaletteInput,
         out: &mut Vec<String>,
     ) {
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(ctx, 
             raw_with_events(
                 vp,
                 vec![
@@ -669,7 +669,7 @@ mod tests {
             ),
             |ui| show(ui.ctx(), state, input, out),
         );
-        let _ = ctx.run_ui(
+        let _ = crate::wall::ui::headless_pass(ctx, 
             raw_with_events(
                 vp,
                 vec![egui::Event::PointerButton {
@@ -694,7 +694,7 @@ mod tests {
 
         // Two warm passes settle Area's first-frame sizing pass and populate WidgetRects.
         for _ in 0..2 {
-            let _ = ctx.run_ui(raw_with_events(vp, Vec::new()), |ui| {
+            let _ = crate::wall::ui::headless_pass(&ctx, raw_with_events(vp, Vec::new()), |ui| {
                 show(ui.ctx(), &mut state, &input, &mut out);
             });
         }
@@ -708,7 +708,7 @@ mod tests {
         out.clear();
         state.open_find();
         for _ in 0..2 {
-            let _ = ctx.run_ui(raw_with_events(vp, Vec::new()), |ui| {
+            let _ = crate::wall::ui::headless_pass(&ctx, raw_with_events(vp, Vec::new()), |ui| {
                 show(ui.ctx(), &mut state, &input, &mut out);
             });
         }

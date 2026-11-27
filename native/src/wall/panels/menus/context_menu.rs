@@ -1620,7 +1620,7 @@ mod tests {
     ) -> (bool, Vec<String>, egui::FullOutput) {
         let mut out = Vec::new();
         let mut wants_keys = false;
-        let full = ctx.run_ui(raw, |root_ui| {
+        let full = crate::wall::ui::headless_pass(ctx, raw, |root_ui| {
             wants_keys = show(root_ui.ctx(), state, input, &mut out);
         });
         (wants_keys, out, full)
