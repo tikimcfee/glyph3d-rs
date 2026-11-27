@@ -22,7 +22,7 @@
 //! decoder is the `image` crate's PNG path and nothing else, the filter is
 //! integer arithmetic, and a unit test pins both on a known 2×2 image.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 
@@ -1398,7 +1398,7 @@ impl Atlas {
     /// with the emoji sheet at `emoji_sheet` (the `--emoji-sheet` flag; the
     /// default is the committed one beside the other bins).
     pub fn load(emoji_sheet: &Path) -> Self {
-        Self::load_from(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas"), emoji_sheet)
+        Self::load_from(&crate::atlas_dir(), emoji_sheet)
     }
 
     pub fn load_from(dir: &Path, emoji_sheet: &Path) -> Self {
