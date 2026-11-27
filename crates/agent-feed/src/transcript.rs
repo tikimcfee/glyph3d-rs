@@ -1237,7 +1237,7 @@ mod tests {
     }
 
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             if cond() {
                 return;

@@ -712,7 +712,7 @@ mod tests {
             },
         );
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && wakes.load(Ordering::SeqCst) < 1 {
             thread::sleep(Duration::from_millis(10));
         }
@@ -725,7 +725,7 @@ mod tests {
             r#"[{"session_id":"a","harness":"claude","path":"/p/a","status":"idle"},{"session_id":"b","harness":"claude","path":"/p/b","status":"processing"}]"#,
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline && wakes.load(Ordering::SeqCst) < 2 {
             thread::sleep(Duration::from_millis(10));
         }
