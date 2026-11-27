@@ -85,6 +85,9 @@ pub struct SettingsState {
     focus_field: Option<String>,
     /// Last active key scrolled into view via keyboard navigation.
     last_scrolled_key: Option<String>,
+    /// True after the user clicks on the wall canvas outside Settings, allowing terminal typing
+    /// while Settings stays docked or floating open (`SettingsPanel.jsx` input blur).
+    blurred: bool,
 }
 
 /// Alias matching `SettingsPanel` naming.
@@ -94,6 +97,14 @@ impl SettingsState {
     /// Whether the panel wants keyboard events routed to egui instead of the focused terminal.
     pub const fn wants_keyboard(&self) -> bool {
         self.wants_keyboard
+    }
+
+    /// Surrender keyboard capture so the focused terminal receives keys while Settings remains open.
+    pub fn blur(&mut self) {
+        self.blurred = true;
+        self.wants_keyboard = false;
+        self.focus_search = false;
+        self.focus_field = None;
     }
 
     /// Record the router's reply to `wall.config <key> …` (`SettingsPanel.jsx` lines 138–140):
@@ -200,6 +211,7 @@ pub fn show(
     if !input.placement.open {
         state.was_open = false;
         state.wants_keyboard = false;
+        state.blurred = false;
         state.head_drag.drag_at = None;
         state.focus_field = None;
         state.focus_search = false;
@@ -209,8 +221,12 @@ pub fn show(
     if !state.was_open {
         state.was_open = true;
         state.focus_search = true;
+        state.blurred = false;
     }
-    state.wants_keyboard = true;
+    if state.focus_search || state.focus_field.is_some() {
+        state.blurred = false;
+    }
+    state.wants_keyboard = !state.blurred;
 
     // Close chord (`⌘,` on macOS, `Ctrl+Alt+,` on Linux/Windows) closes from anywhere in the panel.
     if ctx.input(|i| is_close_settings_chord(i, input.platform)) {
@@ -352,8 +368,12 @@ pub fn show(
                 let mut pressed_up = false;
                 let mut pressed_enter = false;
                 let mut pressed_escape = false;
-                if !any_field_focused {
-                    // Keep search focused while open when no knob field is being edited.
+                if ui.memory(|m| m.has_focus(search_id)) || any_field_focused {
+                    state.blurred = false;
+                    state.wants_keyboard = true;
+                }
+                if !any_field_focused && !state.blurred {
+                    // Keep search focused while active when no knob field is being edited.
                     if !ui.memory(|m| m.has_focus(search_id)) {
                         ui.memory_mut(|m| m.request_focus(search_id));
                     }
@@ -1105,19 +1125,19 @@ mod tests {
         assert_eq!(state.query, "snap crossing");
         assert_eq!(out, vec!["wall.config snap false"]);
 
-        // Clear and search "fontFamily", then press Enter to step from default `monaspace-neon` to `monaspace-argon`.
+        // Clear and search "groupLayout", then press Enter to step from default `tile` to `freeform`.
         state.query.clear();
         let (out_enum, _) = run_frame(
             &ctx,
             vec![
-                egui::Event::Text("fontFamily".to_string()),
+                egui::Event::Text("groupLayout".to_string()),
                 key_press(egui::Key::Enter),
             ],
             (1280.0, 800.0),
             &mut state,
             &input,
         );
-        assert_eq!(out_enum, vec!["wall.config fontFamily monaspace-argon"]);
+        assert_eq!(out_enum, vec!["wall.config groupLayout freeform"]);
 
         // ArrowDown navigation across matching knobs ("major" matches gridMajorEvery, gridMinPx, gridMajorColor).
         state.query.clear();

@@ -155,6 +155,14 @@ impl WallUi {
         &self.ctx
     }
 
+    /// Surrender focus from any currently focused egui widget (e.g. when the user
+    /// clicks on the wall canvas or a global navigation chord blurs panel search).
+    pub fn surrender_focus(&self) {
+        if let Some(id) = self.ctx.memory(|m| m.focused()) {
+            self.ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+
     /// The system clipboard's text, through the window's own clipboard
     /// (`smithay-clipboard` on Wayland, where a fresh `arboard` speaks only
     /// X11 and fails; `arboard` elsewhere).
@@ -214,6 +222,11 @@ impl WallUi {
         } = full_output;
 
         self.state.handle_platform_output(window, platform_output);
+        if !self.state.allow_ime() {
+            // Keep window IME enabled for terminals even after an egui `TextEdit`
+            // surrenders focus and `egui-winit` toggles `set_ime_allowed(false)`.
+            window.set_ime_allowed(true);
+        }
 
         let has_shapes = !shapes.is_empty();
         self.active = has_shapes;
@@ -322,15 +335,15 @@ pub fn color32_from_srgb(rgba: [f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(ch(rgba[0]), ch(rgba[1]), ch(rgba[2]), ch(rgba[3]))
 }
 
-/// Path to the bundled fonts directory under `assets/fonts/`.
+/// Directory holding the bundled UI and fallback fonts (`Contents/Resources/fonts`
+/// inside a macOS `.app` bundle, `<prefix>/share/glyph3d-wall/fonts` on Linux, else
+/// `<repo>/assets/fonts`).
 fn wall_fonts_dir() -> PathBuf {
-    crate::atlas_dir()
-        .parent()
-        .map(|assets| assets.join("fonts"))
-        .unwrap_or_else(|| PathBuf::from("assets/fonts"))
+    super::glyphs::default_fonts_dir()
 }
 
-/// Path to the bundled monospace UI font under `assets/fonts/`.
+/// Path to the bundled monospace UI font (`fonts/Cousine-Regular.ttf`), resolved
+/// through the same bundle -> repo lookup order as [`super::glyphs::default_fonts_dir`].
 pub fn wall_ui_font_path() -> PathBuf {
     wall_fonts_dir().join("Cousine-Regular.ttf")
 }
