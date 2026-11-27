@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use wall_core::geom::Point;
+use wall_core::input::Platform;
 use wall_core::menu::MenuTarget;
 use wall_core::router::CommandRouter;
 use wall_core::wall::WallFrame;
@@ -1392,9 +1393,9 @@ fn ascii_punct_keycode(ch: char) -> Option<(KeyCode, bool)> {
 }
 
 /// Format `app.where`: each terminal's body and title-bar rects in logical screen pixels
-/// from the window's top-left, plus viewport, camera pose, focused id, wall selection,
-/// group frames/headers, and open menu state.
-pub fn format_where(described: &WallFrame, cursor: Point) -> String {
+/// from the window's top-left, plus viewport, platform chord set, camera pose, focused id,
+/// wall selection, group frames/headers, and open menu state.
+pub fn format_where(described: &WallFrame, cursor: Point, platform: Platform) -> String {
     let vw = described.viewport.w;
     let vh = described.viewport.h;
     let cam = described.camera;
@@ -1433,6 +1434,13 @@ pub fn format_where(described: &WallFrame, cursor: Point) -> String {
     lines.push(format!(
         "viewport w={vw:.2} h={vh:.2} scale={:.2}",
         described.scale_factor
+    ));
+    let (platform_name, chord, copy_chord, paste_chord, ctrl_click_menu) = match platform {
+        Platform::Mac => ("mac", "cmd", "cmd+c", "cmd+v", true),
+        Platform::Other => ("other", "ctrl+alt", "ctrl+shift+c", "ctrl+shift+v", false),
+    };
+    lines.push(format!(
+        "platform {platform_name} chord={chord} copy={copy_chord} paste={paste_chord} ctrl_click_menu={ctrl_click_menu}"
     ));
     lines.push(format!(
         "camera x={:.4} y={:.4} zoom={:.4} animating={}",
@@ -1773,14 +1781,20 @@ mod tests {
         for i in 1..=60 {
             wall.tick(1.0 / 60.0, f64::from(i) * 16.67);
         }
-        let report = format_where(&wall.frame(), Point::new(800.0, 500.0));
+        let report = format_where(&wall.frame(), Point::new(800.0, 500.0), Platform::Mac);
         assert!(report.contains("viewport w=1600.00 h=1000.00 scale=2.00"));
+        assert!(report.contains("platform mac chord=cmd copy=cmd+c paste=cmd+v ctrl_click_menu=true"));
         assert!(report.contains("focused t1"));
         assert!(report.contains("panels sidebar=false status=false settings=false help=false palette=false"));
         assert!(report.contains("fullscreen none"));
         assert!(report.contains("terminal t1 cols=100 rows=30 focused=true"));
         assert!(report.contains("close_hold=none"));
         assert!(report.contains("titlebar t1 rect="));
+
+        let other_report = format_where(&wall.frame(), Point::new(800.0, 500.0), Platform::Other);
+        assert!(other_report.contains(
+            "platform other chord=ctrl+alt copy=ctrl+shift+c paste=ctrl+shift+v ctrl_click_menu=false"
+        ));
     }
 
     #[test]

@@ -2,12 +2,13 @@
 # tools/wall-smoke-text.sh — live selection-lifetime smoke check for the native wall window.
 #
 # Starts an isolated scratch g3d-termd + glyph3d-native --wall in namespace `probe`
-# (G3D_TERMD_DIR=/tmp/g3d-root-$$; never touching `wall`, `agents`, `default`, or `rs-wall`),
-# drives text selection via `wallctl app.drag`, feeds live PTY output through a FIFO so
-# output arrives without keyboard input, and verifies:
-#   1. drag selection highlights and Cmd+C copies the exact token
+# (G3D_TERMD_DIR=/tmp/g3d-root-$$; never touching `wall`, `agents`, `default`, or `rs-wall`)
+# with an in-memory clipboard (`GLYPH_WALL_CLIPBOARD=memory`), queries the wall's active
+# copy chord via `app.where`, drives text selection via `wallctl app.drag`, feeds live PTY
+# output through a FIFO so output arrives without keyboard input, and verifies:
+#   1. drag selection highlights and the copy chord copies the exact token
 #   2. unrelated output on another row preserves the highlight
-#   3. scrolling output shifts the highlight upward with the text (Cmd+C still copies it)
+#   3. scrolling output shifts the highlight upward with the text (copy chord still copies it)
 #   4. rewriting cells inside the highlighted span clears the highlight
 #   5. resizing the terminal clears the highlight
 #   6. typing into the focused terminal clears the highlight (`selectionClearOnTyping`)
@@ -34,6 +35,7 @@ fi
 D="/tmp/g3d-root-$$"
 mkdir -m 700 "$D"
 export G3D_TERMD_DIR="$D"
+export GLYPH_WALL_CLIPBOARD="memory"
 
 SHOT_DIR="$REPO_ROOT/target/glyph-scratch/wall-smoke-text"
 mkdir -p "$SHOT_DIR"
@@ -44,19 +46,9 @@ mkfifo "$FIFO"
 # Hold the write end open on fd 3 so `cat "$FIFO"` stays alive across writes.
 exec 3<>"$FIFO"
 
-CLIP_BACKUP="$D/clipboard.bak"
-HAS_CLIP=0
-if command -v pbpaste >/dev/null 2>&1 && command -v pbcopy >/dev/null 2>&1; then
-    pbpaste >"$CLIP_BACKUP" 2>/dev/null || true
-    HAS_CLIP=1
-fi
-
 WALL_PID=""
 cleanup() {
     exec 3>&- 2>/dev/null || true
-    if [[ "$HAS_CLIP" -eq 1 && -f "$CLIP_BACKUP" ]]; then
-        pbcopy <"$CLIP_BACKUP" 2>/dev/null || true
-    fi
     "$WALLCTL" --ns "$NS" app.quit >/dev/null 2>&1 || true
     if [[ -n "$WALL_PID" ]]; then
         for _ in $(seq 1 20); do
@@ -200,6 +192,11 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 ctl wall.fit >/dev/null
 W="$(wait_settled)"
+COPY_CHORD="$(awk '$1 == "platform" { for (i = 3; i <= NF; i++) if ($i ~ /^copy=/) print substr($i, 6) }' <<<"$W")"
+if [[ -z "$COPY_CHORD" ]]; then
+    echo "FAIL  startup: app.where did not report copy chord" >&2
+    exit 1
+fi
 
 # Start a FIFO reader inside `t1` so PTY output arrives without sending keys to the wall.
 ctl app.type "cat $FIFO" >/dev/null
@@ -220,18 +217,14 @@ W="$(wait_settled)"
 SEL1="$(text_sel_of t1 <<<"$W")"
 ctl app.shot "$SHOT_DIR/01-selected.png" >/dev/null 2>&1 || true
 
-CLIP1=""
-if [[ "$HAS_CLIP" -eq 1 ]]; then
-    printf '' | pbcopy
-    ctl app.key cmd+c >/dev/null
-    sleep 0.15
-    CLIP1="$(pbpaste 2>/dev/null || true)"
-fi
+ctl app.clipboard clear >/dev/null
+ctl app.key "$COPY_CHORD" >/dev/null
+CLIP1="$(ctl app.clipboard)"
 
-if [[ "$SEL1" == 5:*..5:* && ( "$HAS_CLIP" -eq 0 || "$CLIP1" == *"KEEP_TOKEN_42"* ) ]]; then
-    record_pass "drag select & copy" "text_sel=$SEL1 clipboard=$CLIP1"
+if [[ "$SEL1" == 5:*..5:* && "$CLIP1" == *"KEEP_TOKEN_42"* ]]; then
+    record_pass "drag select & copy ($COPY_CHORD)" "text_sel=$SEL1 clipboard=$CLIP1"
 else
-    record_fail "drag select & copy" "text_sel=$SEL1 clipboard=$CLIP1"
+    record_fail "drag select & copy ($COPY_CHORD)" "text_sel=$SEL1 clipboard=$CLIP1"
 fi
 
 # ── 2. Unrelated output preserves selection ──────────────────────────────────
@@ -254,15 +247,11 @@ EXPECTED_SHIFTED="${EXPECTED_SHIFTED/..5:/..2:}"
 SEL3="$(wait_for_sel t1 "$EXPECTED_SHIFTED" 40)" || true
 ctl app.shot "$SHOT_DIR/02-scrolled.png" >/dev/null 2>&1 || true
 
-CLIP3=""
-if [[ "$HAS_CLIP" -eq 1 ]]; then
-    printf '' | pbcopy
-    ctl app.key cmd+c >/dev/null
-    sleep 0.15
-    CLIP3="$(pbpaste 2>/dev/null || true)"
-fi
+ctl app.clipboard clear >/dev/null
+ctl app.key "$COPY_CHORD" >/dev/null
+CLIP3="$(ctl app.clipboard)"
 
-if [[ "$SEL3" == "$EXPECTED_SHIFTED" && ( "$HAS_CLIP" -eq 0 || "$CLIP3" == *"KEEP_TOKEN_42"* ) ]]; then
+if [[ "$SEL3" == "$EXPECTED_SHIFTED" && "$CLIP3" == *"KEEP_TOKEN_42"* ]]; then
     record_pass "scroll shifts selection upward" "text_sel=$SEL1 -> $SEL3 clipboard=$CLIP3"
 else
     record_fail "scroll shifts selection upward" "expected=$EXPECTED_SHIFTED got=$SEL3 clipboard=$CLIP3"
