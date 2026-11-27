@@ -19,12 +19,6 @@ WALLCTL="$REPO_ROOT/target/release/wallctl"
 G3D="${HOME}/.local/bin/g3d"
 NS="probe"
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    CHORD="cmd"
-else
-    CHORD="ctrl+alt"
-fi
-
 if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
     echo "ERR: missing $BIN or $WALLCTL (build --release -p glyph3d-native -p wall-control first)" >&2
     exit 1
@@ -208,7 +202,24 @@ if [[ "$READY" -ne 1 ]]; then
     echo "FAIL  startup: control socket or t1 never appeared (see $SHOT_DIR/wall.log)" >&2
     exit 1
 fi
-wait_settled >/dev/null
+W_BOOT="$(wait_settled)"
+read -r CHORD COPY_CHORD PASTE_CHORD CTRL_CLICK_MENU < <(awk '
+    $1 == "platform" {
+        c = ""; cp = ""; ps = ""; cm = "false";
+        for (i = 3; i <= NF; i++) {
+            if ($i ~ /^chord=/) c = substr($i, 7);
+            else if ($i ~ /^copy=/) cp = substr($i, 6);
+            else if ($i ~ /^paste=/) ps = substr($i, 7);
+            else if ($i ~ /^ctrl_click_menu=/) cm = substr($i, 17);
+        }
+        print c, cp, ps, cm;
+    }
+' <<<"$W_BOOT")
+if [[ -z "${CHORD:-}" || -z "${COPY_CHORD:-}" || -z "${PASTE_CHORD:-}" ]]; then
+    echo "FAIL  startup: app.where did not report platform chords" >&2
+    exit 1
+fi
+IFS='+' read -r -a CHORD_MODS <<<"$CHORD"
 
 # Confirm t1's shell is ready to execute commands.
 ctl app.type $'printf "BOOT_%s\\n" READY\n' >/dev/null
@@ -228,9 +239,9 @@ done
 W="$(wait_settled)"
 FOCUSED_NOW="$(awk '/^focused / {print $2}' <<<"$W")"
 if [[ "$SPAWN_OK" -eq 1 && "$FOCUSED_NOW" == "t2" ]]; then
-    record_pass "cmd+backslash spawn" "spawned t2 and focused it"
+    record_pass "${CHORD}+backslash spawn" "spawned t2 and focused it"
 else
-    record_fail "cmd+backslash spawn" "spawn_ok=$SPAWN_OK focused=$FOCUSED_NOW"
+    record_fail "${CHORD}+backslash spawn" "spawn_ok=$SPAWN_OK focused=$FOCUSED_NOW"
 fi
 
 # Confirm t2's shell is ready as well.
@@ -503,13 +514,6 @@ W_SEL="$(ctl app.where)"
 # writes the selected text to the wall's clipboard (rather than copyOnSelect).
 ctl app.clipboard clear >/dev/null
 BEFORE_CLIP="$(ctl app.clipboard)"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    COPY_CHORD="cmd+c"
-    PASTE_CHORD="cmd+v"
-else
-    COPY_CHORD="ctrl+shift+c"
-    PASTE_CHORD="ctrl+shift+v"
-fi
 ctl app.key "$COPY_CHORD" >/dev/null
 COPIED="$(ctl app.clipboard)"
 SEL_SPAN="$(python3 -c '
@@ -615,9 +619,9 @@ W_S2="$(wait_settled)"
 N_S2="$(grep -c '^terminal ' <<<"$W_S2")"
 SPLIT_GROUP="$(grep '^group ' <<<"$W_S2" | grep 'layout=split' || true)"
 if [[ "$N_S1" -eq $((N_S0 + 1)) && "$N_S2" -eq $((N_S0 + 2)) && -n "$SPLIT_GROUP" ]]; then
-    record_pass "cmd+d / cmd+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} in split group"
+    record_pass "${CHORD}+d / ${CHORD}+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} in split group"
 else
-    record_fail "cmd+d / cmd+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} split_group='${SPLIT_GROUP}'"
+    record_fail "${CHORD}+d / ${CHORD}+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} split_group='${SPLIT_GROUP}'"
 fi
 
 # ── 13. Right-click + 14. Escape ─────────────────────────────────────────────
@@ -632,18 +636,18 @@ ctl app.key Escape >/dev/null
 W_ESC1="$(ctl app.where)"
 MENU_AFTER_ESC="$(awk '/^menu / {print $2}' <<<"$W_ESC1")"
 
-CTRL_CLICK_MENU="skipped"
-if [[ "$(uname -s)" == "Darwin" ]]; then
+CTRL_CLICK_MENU_GOT="skipped"
+if [[ "$CTRL_CLICK_MENU" == "true" ]]; then
     ctl app.click "$RC_X" "$RC_Y" left ctrl >/dev/null
     W_RC2="$(ctl app.where)"
-    CTRL_CLICK_MENU="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC2")"
+    CTRL_CLICK_MENU_GOT="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC2")"
     ctl app.key Escape >/dev/null
 fi
 
-if [[ "$MENU_OPEN" == terminal:t1* && ( "$CTRL_CLICK_MENU" == "skipped" || "$CTRL_CLICK_MENU" == terminal:t1* ) ]]; then
-    record_pass "right-click" "opened context menu ($MENU_OPEN, ctrl+click=${CTRL_CLICK_MENU%% *})"
+if [[ "$MENU_OPEN" == terminal:t1* && ( "$CTRL_CLICK_MENU_GOT" == "skipped" || "$CTRL_CLICK_MENU_GOT" == terminal:t1* ) ]]; then
+    record_pass "right-click" "opened context menu ($MENU_OPEN, ctrl+click=${CTRL_CLICK_MENU_GOT%% *})"
 else
-    record_fail "right-click" "menu='$MENU_OPEN' ctrl_click='$CTRL_CLICK_MENU'"
+    record_fail "right-click" "menu='$MENU_OPEN' ctrl_click='$CTRL_CLICK_MENU_GOT'"
 fi
 
 ctl app.click 18 18 >/dev/null
@@ -888,28 +892,22 @@ fi
 
 # ── 20. Window focus blur clears held modifiers & cancels close-hold ─────────
 N_BEFORE_BLUR="$(ctl app.where | grep -c '^terminal ')"
-# Hold chord modifier (`Cmd` on Mac), lose window focus (`Cmd+Tab` away), regain focus,
-# then press plain `d`: must type `d` (0x64) into t2 rather than splitting (`cmd+d`)!
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    ctl app.key --down cmd >/dev/null
-else
-    ctl app.key --down ctrl >/dev/null
-    ctl app.key --down alt >/dev/null
-fi
+# Hold the wall's chord modifier(s), lose window focus, regain focus, then press
+# plain `d`: must type `d` (0x64) into t2 rather than splitting (`${CHORD}+d`)!
+for mod in "${CHORD_MODS[@]}"; do
+    ctl app.key --down "$mod" >/dev/null
+done
 ctl app.focus off >/dev/null
 ctl app.focus on >/dev/null
 ctl app.key d >/dev/null
 wait_for_text t2 "K:64" 60 || true
 N_AFTER_D="$(ctl app.where | grep -c '^terminal ')"
 
-# Also verify holding `chord+x` starts `close_hold=active`, and losing focus (`app.focus off`)
+# Also verify holding `${CHORD}+x` starts `close_hold=active`, and losing focus (`app.focus off`)
 # cancels `close_hold` so the terminal is not closed while unfocused.
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    ctl app.key --down cmd >/dev/null
-else
-    ctl app.key --down ctrl >/dev/null
-    ctl app.key --down alt >/dev/null
-fi
+for mod in "${CHORD_MODS[@]}"; do
+    ctl app.key --down "$mod" >/dev/null
+done
 ctl app.key --down x >/dev/null
 HOLD_ON="$(ctl app.where | awk '$1=="terminal" && $2=="t2" {for(i=3;i<=NF;i++) if($i~/^close_hold=/) print substr($i,12)}')"
 ctl app.focus off >/dev/null
@@ -921,7 +919,7 @@ ctl app.type "QUITRAW" >/dev/null
 wait_for_text t2 "RAW_EXIT" 60 || true
 
 if [[ "$N_AFTER_D" -eq "$N_BEFORE_BLUR" && "$HOLD_ON" == "active" && "$HOLD_AFTER_BLUR" == "none" ]]; then
-    record_pass "window blur resets mods & hold" "Cmd+Tab cleared held Cmd ('d' typed, no split) and cancelled close-hold"
+    record_pass "window blur resets mods & hold" "blur cleared held ${CHORD} ('d' typed, no split) and cancelled close-hold"
 else
     record_fail "window blur resets mods & hold" "terms=${N_BEFORE_BLUR}->${N_AFTER_D} hold=${HOLD_ON}->${HOLD_AFTER_BLUR}"
 fi
