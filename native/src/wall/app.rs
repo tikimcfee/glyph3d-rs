@@ -76,6 +76,8 @@ pub struct WallOptions {
     /// The termd namespace whose terminals the wall shows. None: no daemon,
     /// one fixed test screen instead.
     pub namespace: Option<String>,
+    /// Extra termd namespaces to attach alongside `namespace` (off by default).
+    pub extra_namespaces: Vec<String>,
     /// Draw this many frames, one after another, then exit (`--frames`): how
     /// a script checks the window came up and drew.
     pub exit_after: Option<u64>,
@@ -485,10 +487,13 @@ impl App {
         });
         // Start `g3d-termd` connect/spawn/list/adopt off the window thread right away so it
         // overlaps macOS AppKit window creation and never blocks Frame 1.
-        let pending_termd = opts
-            .namespace
-            .as_ref()
-            .map(|ns| super::startup::PendingTermd::spawn(ns.clone(), session_wake));
+        let pending_termd = opts.namespace.as_ref().map(|ns| {
+            super::startup::PendingTermd::spawn_with_extra(
+                ns.clone(),
+                opts.extra_namespaces.clone(),
+                session_wake,
+            )
+        });
 
         let store = store_dir();
         let window = {
@@ -604,6 +609,15 @@ impl App {
         match res {
             Ok(ready) => {
                 let welcome = ready.sessions.hub().welcome().clone();
+                let mut appeared_list = Vec::with_capacity(ready.adopted.len());
+                for (id, cols, rows) in ready.adopted {
+                    let mut appeared =
+                        TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                    if let Some(title) = ready.sessions.default_title_for(&id) {
+                        appeared = appeared.with_title(title);
+                    }
+                    appeared_list.push(appeared);
+                }
                 self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
                 if let Some(wall) = &mut self.wall {
                     wall.on_termd_welcome(
@@ -612,8 +626,8 @@ impl App {
                         epoch_now_ms(),
                     );
                     wall.set_live_terminals(&ready.live_ids);
-                    for (id, cols, rows) in ready.adopted {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    for appeared in appeared_list {
+                        wall.terminal_appeared(appeared);
                     }
                     wall.set_connected(true);
                     if ready.live_ids.is_empty() {
@@ -1203,7 +1217,11 @@ impl App {
             for id in &live_ids {
                 match sessions.adopt(id) {
                     Ok((cols, rows)) => {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                        let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                        if let Some(title) = sessions.default_title_for(id) {
+                            appeared = appeared.with_title(title);
+                        }
+                        wall.terminal_appeared(appeared);
                     }
                     Err(e) => log::error!("{e}"),
                 }
@@ -1215,7 +1233,11 @@ impl App {
         for id in sessions.take_external_appeared() {
             match sessions.adopt(&id) {
                 Ok((cols, rows)) => {
-                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                    if let Some(title) = sessions.default_title_for(&id) {
+                        appeared = appeared.with_title(title);
+                    }
+                    wall.terminal_appeared(appeared);
                     heard = true;
                 }
                 Err(e) => log::error!("{e}"),
