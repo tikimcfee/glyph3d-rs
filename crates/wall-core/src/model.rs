@@ -295,6 +295,8 @@ pub enum WallEffect {
     WriteClipboard { text: String },
     /// Ask the host to read the OS system clipboard and call `Wall::deliver_clipboard(target, text)`.
     ReadClipboard { target: String },
+    /// Ask the host OS to open a scheme-checked external URL (`http`, `https`, or `mailto`).
+    OpenUrl { url: String },
     /// Ask the window to set the pointer's cursor shape.
     SetCursor { cursor: CursorIcon },
     /// A configuration knob changed or reset; renderer/emulator state may sync to it.

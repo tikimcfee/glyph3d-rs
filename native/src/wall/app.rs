@@ -18,7 +18,7 @@
 //! sleeps until input arrives, a terminal's reader thread sends [`Wake`], or
 //! the wall says something is still moving.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -48,7 +48,7 @@ use winit::window::{Window, WindowId};
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
-use super::cell::CellSelection;
+use super::cell::{CellLinkHover, CellSelection};
 use super::labels::Label;
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 use super::session::{News, Sessions};
@@ -137,6 +137,7 @@ struct App {
     gfx: Option<Gfx>,
     ctx: GpuContext,
     opts: Option<WallOptions>,
+    persistent_ns: Option<String>,
     proxy: EventLoopProxy<Wake>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
@@ -184,8 +185,6 @@ struct App {
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
     macos_option_as_alt: Option<winit::platform::macos::OptionAsAlt>,
-    /// Physical `code`s whose press reached `key_input` and have not yet been released.
-    held_codes: HashSet<String>,
     /// Last text written by `WallEffect::WriteClipboard` (inspected via `app.clipboard`).
     last_copied: Option<String>,
     /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
@@ -325,6 +324,29 @@ fn epoch_now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Launch a scheme-checked external URL (`http`, `https`, `mailto`) via the OS handler
+/// (`open` on macOS, `xdg-open` on other Unix platforms) without blocking the event loop.
+fn open_external_url(url: &str) {
+    if !wall_core::links::is_allowed_url_scheme(url) {
+        log::warn!("refused to open URL with disallowed scheme: {url:?}");
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => log::debug!("opened external URL via {program}: {url}"),
+        Err(err) => log::warn!("could not launch {program} for {url}: {err}"),
+    }
+}
+
 /// A screen as text, a line a row, trailing blanks and blank rows dropped.
 fn screen_text(s: &Screen) -> String {
     let mut out = String::new();
@@ -339,19 +361,9 @@ fn screen_text(s: &Screen) -> String {
     out
 }
 
-/// Where the wall keeps its state between runs. A scratch daemon directory
-/// (`G3D_TERMD_DIR`, as tests and probes set) keeps a scratch store beside
-/// it, so a probe never touches a person's saved wall.
+/// Where the wall keeps its state between runs (`wall_core::store::default_store_dir`).
 fn store_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("G3D_TERMD_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/glyph3d/wall")
-    } else {
-        std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("glyph3d/wall")
-    }
+    wall_core::store::default_store_dir()
 }
 
 impl App {
@@ -444,6 +456,7 @@ impl App {
     fn open(&mut self, event_loop: &ActiveEventLoop) {
         let opts = self.opts.take().expect("the window opens once");
         self.exit_after = opts.exit_after;
+        self.persistent_ns.clone_from(&opts.namespace);
 
         let proxy_ctl = self.proxy.clone();
         let gate_ctl = self.wakes.clone();
@@ -727,7 +740,9 @@ impl App {
     /// Apply font family, size, line-height, and text-style knobs from `wall.config()` to the
     /// renderer and cell geometry, re-wrapping terminals to preserve panel footprints.
     fn sync_font_and_text_knobs(&mut self, changed_key: Option<&str>) {
+        let now_ms = self.now_ms();
         let (Some(g), Some(wall)) = (&mut self.gfx, &mut self.wall) else { return };
+        wall.set_now_ms(now_ms);
         let cfg = wall.config();
         let family = cfg.font_family.clone();
         let font_size = cfg.font_size;
@@ -833,9 +848,15 @@ impl App {
                 return;
             }
             WallEffect::ReadClipboard { target } => {
+                let now_ms = self.now_ms();
                 if let (Some(text), Some(wall)) = (self.read_clipboard(), &mut self.wall) {
+                    wall.set_now_ms(now_ms);
                     wall.deliver_clipboard(&target, &text);
                 }
+                return;
+            }
+            WallEffect::OpenUrl { url } => {
+                open_external_url(&url);
                 return;
             }
             WallEffect::ConfigKnobChanged { key, value } => {
@@ -1007,6 +1028,12 @@ impl App {
                     ran = true;
                     continue;
                 }
+                Some("wall.import") => {
+                    let reply = self.handle_wall_import(&argv);
+                    responder.send(reply);
+                    ran = true;
+                    continue;
+                }
                 _ => {}
             }
             if let Some(parsed) = super::script::parse_script_line(&line) {
@@ -1018,8 +1045,12 @@ impl App {
                 ran = true;
                 continue;
             }
+            let now_ms = self.now_ms();
             let reply = match (&mut self.wall, &self.terms) {
-                (Some(wall), Some(terms)) => wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text,
+                (Some(wall), Some(terms)) => {
+                    wall.set_now_ms(now_ms);
+                    wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text
+                }
                 _ => "ERR: the wall is not open yet".to_string(),
             };
             responder.send(reply);
@@ -1029,6 +1060,91 @@ impl App {
             self.apply_effects();
             self.redraw();
         }
+    }
+
+    /// Import a browser-wall JSON export into this namespace's native [`WallStore`]
+    /// and re-adopt live terminals against the imported layout, groups, splits, names,
+    /// panels, and config knobs.
+    fn handle_wall_import(&mut self, argv: &[String]) -> String {
+        if !(2..=3).contains(&argv.len()) {
+            return "ERR: usage: wall.import <browser-export.json> [browser-scope]".to_string();
+        }
+        let Some(ns) = self.persistent_ns.clone() else {
+            return "ERR: wall.import requires a namespace-backed wall (not --wall-test-pattern)"
+                .to_string();
+        };
+        let dir = store_dir();
+        let export_path = std::path::Path::new(&argv[1]);
+        let source_scope = argv.get(2).map(String::as_str);
+        let report = match wall_core::import::import_browser_file(export_path, source_scope, &dir, &ns) {
+            Ok(r) => r,
+            Err(msg) => return format!("ERR: {msg}"),
+        };
+        if let Some(g) = &self.gfx {
+            let was_connected = self
+                .wall
+                .as_ref()
+                .is_none_or(|w| w.model().snapshot().connected);
+            let metrics = g.renderer.metrics();
+            let sf = g.window.scale_factor();
+            let rules = RulesOptions {
+                geometry: CellGeometry::with_padding(
+                    f64::from(metrics.cell_width * g.cell_scale),
+                    f64::from(metrics.cell_height * g.cell_scale),
+                    f64::from(PANEL_PAD),
+                    f64::from(PANEL_PAD),
+                ),
+                platform: Platform::host(),
+                viewport: Size::new(
+                    f64::from(g.config.width) / sf,
+                    f64::from(g.config.height) / sf,
+                ),
+                scale_factor: sf,
+                namespace: ns.clone(),
+                ..RulesOptions::default()
+            };
+            let mut wall = Wall::open(dir, ns, rules);
+            if let Some(Terminals::Live(sessions)) = &self.terms {
+                let welcome = sessions.hub().welcome();
+                wall.on_termd_welcome(
+                    welcome.instance.as_deref().unwrap_or(""),
+                    &welcome.features,
+                    epoch_now_ms(),
+                );
+                let live_ids: Vec<String> = sessions.ids().map(str::to_string).collect();
+                if !live_ids.is_empty() {
+                    wall.set_live_terminals(&live_ids);
+                }
+                for id in &live_ids {
+                    let (cols, rows, title, modes) = sessions.screen(id).map_or(
+                        (
+                            wall_core::wall::DEFAULT_SPAWN_COLS,
+                            wall_core::wall::DEFAULT_SPAWN_ROWS,
+                            String::new(),
+                            term_cells::Modes::default(),
+                        ),
+                        |s| (u32::from(s.cols), u32::from(s.rows), s.title.clone(), s.modes),
+                    );
+                    wall.terminal_appeared(
+                        TerminalAppeared::adopted(id.clone(), cols, rows)
+                            .with_title(title)
+                            .with_modes(modes),
+                    );
+                }
+                wall.set_connected(was_connected);
+            }
+            self.wall = Some(wall);
+            self.sync_font_and_text_knobs(None);
+            self.sync_macos_option_as_alt();
+            self.apply_effects();
+            self.refresh_termd_status();
+            if let Some(wall) = &mut self.wall {
+                if wall.frame().fullscreen_backdrop.is_none() {
+                    wall.run("wall.fit");
+                }
+            }
+        }
+        report.summary_text()
     }
 
     /// Take in what the terminals' reader thread queued.
@@ -1242,7 +1358,14 @@ impl App {
                         foreground: fg,
                     }
                 }),
-                hover_link: None,
+                hover_link: t.hovered_link.as_ref().map(|link| {
+                    CellLinkHover::new(
+                        link.start_row.min(usize::from(u16::MAX)) as u16,
+                        link.start_col.min(usize::from(u16::MAX)) as u16,
+                        link.end_row.min(usize::from(u16::MAX)) as u16,
+                        link.end_col.min(usize::from(u16::MAX)) as u16,
+                    )
+                }),
             });
         }
 
@@ -1490,13 +1613,6 @@ impl App {
     }
 
     fn key_input(&mut self, key: KeyEvent) {
-        if !key.code.is_empty() {
-            if key.pressed {
-                self.held_codes.insert(key.code.clone());
-            } else {
-                self.held_codes.remove(&key.code);
-            }
-        }
         if self.ime_composing && key.pressed {
             return;
         }
@@ -1512,7 +1628,9 @@ impl App {
             self.redraw();
             return;
         }
+        let now_ms = self.now_ms();
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+        wall.set_now_ms(now_ms);
         #[cfg(feature = "egui-ui")]
         if key.pressed && key.code == "Escape" && !key.mods.ctrl && !key.mods.alt && !key.mods.meta {
             if self.panels.close_open_on_escape(wall) {
@@ -1630,52 +1748,9 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
-            let had_buttons = self.buttons != 0;
             self.buttons = 0;
-            let now_ms = self.now_ms();
-            let cursor = self.cursor;
-            let held: Vec<String> = self.held_codes.drain().collect();
-            if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
-                if had_buttons {
-                    let ev = PointerEvent {
-                        pointer_id: 1,
-                        x: cursor.x,
-                        y: cursor.y,
-                        button: None,
-                        buttons: Buttons(0),
-                        mods: Mods::default(),
-                        time_ms: now_ms,
-                    };
-                    wall.pointer_cancel(&ev);
-                }
-                let lookup = screen_lookup(|id| terms.screen(id));
-                for code in &held {
-                    let key_name = match code.as_str() {
-                        "MetaLeft" | "MetaRight" => "Meta",
-                        "ControlLeft" | "ControlRight" => "Control",
-                        "AltLeft" | "AltRight" => "Alt",
-                        "ShiftLeft" | "ShiftRight" => "Shift",
-                        _ => "a",
-                    };
-                    let up = KeyEvent {
-                        code: code.clone(),
-                        key: key_name.to_string(),
-                        text: None,
-                        mods: Mods::default(),
-                        repeat: false,
-                        pressed: false,
-                    };
-                    let _ = wall.key(&up, &lookup);
-                }
-                let meta_up = KeyEvent {
-                    code: "MetaLeft".to_string(),
-                    key: "Meta".to_string(),
-                    text: None,
-                    mods: Mods::default(),
-                    repeat: false,
-                    pressed: false,
-                };
-                let _ = wall.key(&meta_up, &lookup);
+            if let Some(wall) = &mut self.wall {
+                wall.blur();
             }
             self.apply_effects();
             self.redraw();
@@ -2011,7 +2086,15 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(true),
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                let mods = self.mods();
+                if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    wall.modifiers_changed(mods, &lookup);
+                }
+                self.apply_effects();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.scale_factor();
                 let (x, y) = (position.x / sf, position.y / sf);
@@ -2174,6 +2257,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         gfx: None,
         ctx,
         opts: Some(opts),
+        persistent_ns: None,
         proxy: event_loop.create_proxy(),
         wall: None,
         terms: None,
@@ -2207,7 +2291,6 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
-        held_codes: HashSet::new(),
         last_copied: None,
         memory_clipboard: None,
         use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
