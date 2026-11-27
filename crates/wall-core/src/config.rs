@@ -268,6 +268,10 @@ pub const PANEL_OPACITY_DEFAULT: f64 = 1.0;
 pub const CURSOR_BLINK_MS_DEFAULT: f64 = 530.0;
 /// Default `greekPx` (`config/defaults.toml` `[wall] greek_px`).
 pub const GREEK_PX_DEFAULT: f64 = 8.0;
+/// Default `newTerminalSize`: the 100 columns by 30 rows every new terminal
+/// had before the size was a knob (2026-11-27), when it was two constants
+/// in `wall.rs` passed through `WallOptions`.
+pub const NEW_TERMINAL_SIZE_DEFAULT: &str = "100x30";
 
 /// Knob keys that drive the glyph shader's cell line style (`wallConfig.LINE_STYLE_KNOBS`).
 pub const LINE_STYLE_KNOBS: &[&str] = &[
@@ -279,6 +283,7 @@ pub const LINE_STYLE_KNOBS: &[&str] = &[
 
 /// Every knob key of [`WallConfig`], in `wallConfig.WALL_CONFIG`'s declaration order.
 pub const WALL_CONFIG_KEYS: &[&str] = &[
+    "newTerminalSize",
     "closeHoldMs",
     "barButtonsMinPx",
     "panelOpacity",
@@ -337,6 +342,10 @@ pub const WALL_CONFIG_KEYS: &[&str] = &[
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WallConfig {
+    /// The size a new terminal opens at, as `COLSxROWS` (`"100x30"`): what
+    /// `wall.spawn`, the `+` button, a split's new pane and an attach ask
+    /// termd for. Read through [`WallConfig::new_terminal_cells`].
+    pub new_terminal_size: String,
     /// Hold duration in ms before the close button or close chord kills a terminal.
     pub close_hold_ms: f64,
     /// Minimum title-bar height in CSS px before its button cluster is shown.
@@ -446,6 +455,7 @@ pub struct WallConfig {
 impl Default for WallConfig {
     fn default() -> Self {
         WallConfig {
+            new_terminal_size: NEW_TERMINAL_SIZE_DEFAULT.to_string(),
             close_hold_ms: 650.0,
             bar_buttons_min_px: 14.0,
             panel_opacity: PANEL_OPACITY_DEFAULT,
@@ -503,9 +513,35 @@ impl Default for WallConfig {
 }
 
 impl WallConfig {
+    /// The `newTerminalSize` knob as `(cols, rows)`. The knob's check keeps
+    /// it a valid `COLSxROWS`; a value that got past it (a field set by
+    /// hand) reads as the default.
+    pub fn new_terminal_cells(&self) -> (u32, u32) {
+        let size = crate::menu::parse_size(&self.new_terminal_size)
+            .or_else(|_| crate::menu::parse_size(NEW_TERMINAL_SIZE_DEFAULT))
+            .expect("the default new terminal size parses");
+        (size.cols, size.rows)
+    }
+
+    /// The sizes the settings offer for a new terminal, a click each: the
+    /// default (`100x30`), then the `menuSizes` knob's (the sizes a terminal's
+    /// right-click menu resizes to), each once and written with a plain `x`.
+    /// Any other size is typed.
+    pub fn new_terminal_size_presets(&self) -> Vec<String> {
+        let mut out = vec![NEW_TERMINAL_SIZE_DEFAULT.to_string()];
+        for size in crate::menu::parse_sizes(&self.menu_sizes).unwrap_or_default() {
+            let text = format!("{}x{}", size.cols, size.rows);
+            if !out.contains(&text) {
+                out.push(text);
+            }
+        }
+        out
+    }
+
     /// Read a knob's current value by its camelCase JS key name.
     pub fn get(&self, key: &str) -> Option<KnobValue> {
         Some(match key {
+            "newTerminalSize" => KnobValue::Text(self.new_terminal_size.clone()),
             "closeHoldMs" => KnobValue::Number(self.close_hold_ms),
             "barButtonsMinPx" => KnobValue::Number(self.bar_buttons_min_px),
             "panelOpacity" => KnobValue::Number(self.panel_opacity),
@@ -609,6 +645,7 @@ impl WallConfig {
         }
 
         match key {
+            "newTerminalSize" => self.new_terminal_size = text(checked).to_string(),
             "closeHoldMs" => self.close_hold_ms = num(checked),
             "barButtonsMinPx" => self.bar_buttons_min_px = num(checked),
             "panelOpacity" => self.panel_opacity = num(checked),
@@ -728,8 +765,8 @@ mod tests {
     #[test]
     fn wall_config_and_knobs_bijection_and_line_style_knobs() {
         assert_config_matches_knobs();
-        assert_eq!(WALL_CONFIG_KEYS.len(), 52);
-        assert_eq!(KNOBS.len(), 52);
+        assert_eq!(WALL_CONFIG_KEYS.len(), 53);
+        assert_eq!(KNOBS.len(), 53);
         for &k in LINE_STYLE_KNOBS {
             assert!(WALL_CONFIG_KEYS.contains(&k), "missing line style knob {k}");
         }
@@ -765,5 +802,49 @@ mod tests {
         assert!(!reloaded.snap);
         let rejected_keys: Vec<&str> = rejected.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(rejected_keys, vec!["gone", "gridMinor"]);
+    }
+
+    #[test]
+    fn new_terminal_size_is_one_cols_by_rows_and_reads_as_cells() {
+        let mut cfg = WallConfig::default();
+        assert_eq!(cfg.new_terminal_size, "100x30");
+        assert_eq!(cfg.new_terminal_cells(), (100, 30));
+
+        // Written back with a plain x, whatever was typed.
+        assert_eq!(
+            cfg.set("newTerminalSize", " 132×43 ").unwrap(),
+            KnobValue::Text("132x43".to_string())
+        );
+        assert_eq!(cfg.new_terminal_cells(), (132, 43));
+        assert_eq!(
+            cfg.set("newTerminalSize", "80X24").unwrap(),
+            KnobValue::Text("80x24".to_string())
+        );
+
+        // Refused naming the knob, and the size stays what it was.
+        for bad in ["", "80", "80x", "x24", "0x24", "80x0", "80x24 120x36", "wide", "70000x24"] {
+            let err = cfg.set("newTerminalSize", bad).unwrap_err();
+            assert!(err.starts_with("newTerminalSize: "), "{bad:?} -> {err}");
+        }
+        assert_eq!(cfg.new_terminal_cells(), (80, 24));
+
+        // The presets: the default, then the menu's sizes, each once.
+        assert_eq!(
+            cfg.new_terminal_size_presets(),
+            vec!["100x30", "80x24", "120x36", "160x48"]
+        );
+        cfg.menu_sizes = "100×30 200x50 200x50".to_string();
+        assert_eq!(cfg.new_terminal_size_presets(), vec!["100x30", "200x50"]);
+        cfg.menu_sizes = String::new();
+        assert_eq!(cfg.new_terminal_size_presets(), vec!["100x30"]);
+
+        // A value that never went through the check reads as the default.
+        cfg.new_terminal_size = "nonsense".to_string();
+        assert_eq!(cfg.new_terminal_cells(), (100, 30));
+
+        assert_eq!(
+            cfg.reset_from("newTerminalSize", &WallConfig::default()).unwrap(),
+            KnobValue::Text("100x30".to_string())
+        );
     }
 }

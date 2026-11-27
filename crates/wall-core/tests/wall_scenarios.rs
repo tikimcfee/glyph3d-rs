@@ -4071,6 +4071,81 @@ fn loose_agent_view_shoves_restores_side_switches_resizes_and_spawn_steps_past_c
     }
 }
 
+// ── The size a new terminal gets (`newTerminalSize`) ─────────────────────────
 
+/// Run `cmd` and return the `(cols, rows)` of each terminal it asked for,
+/// without starting them (the asks are dropped, not applied).
+fn sizes_asked_by(h: &mut Harness, cmd: &str) -> Vec<(u32, u32)> {
+    let reply = h.wall.run(cmd);
+    assert!(!reply.is_err(), "{cmd:?} failed: {}", reply.text);
+    h.wall
+        .drain_effects()
+        .into_iter()
+        .filter_map(|e| match e {
+            WallEffect::SpawnTerminal { cols, rows, .. } => Some((cols, rows)),
+            _ => None,
+        })
+        .collect()
+}
 
+fn cells_of(h: &Harness, id: &str) -> (u32, u32) {
+    let snap = h.wall.snapshot();
+    let t = snap.terminals.iter().find(|t| t.id == id).expect("terminal in snapshot");
+    (t.cols, t.rows)
+}
 
+#[test]
+fn new_terminal_size_is_what_spawn_and_split_ask_for_and_survives_a_restart() {
+    let storage = SharedStorage::default();
+    let opts = WallOptions {
+        platform: Platform::Mac,
+        geometry: CellGeometry {
+            stride: Point::new(0.6, 1.2),
+            padding: Point::new(0.4, 0.4),
+            scale_z: 1.0,
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut h = Harness::with_storage(storage.clone(), "size-scope", opts.clone());
+
+        // Undialled, a new terminal is 100 by 30.
+        assert_eq!(h.wall.config().new_terminal_cells(), (100, 30));
+        let first = h.spawn();
+        assert_eq!(cells_of(&h, &first), (100, 30));
+
+        // Dialled, the next one opens at the new size, and the one already
+        // open keeps its own.
+        h.run_ok("wall.config newTerminalSize 132x43");
+        let second = h.spawn();
+        assert_eq!(cells_of(&h, &second), (132, 43));
+        assert_eq!(cells_of(&h, &first), (100, 30));
+        h.run_ok("wall.config newTerminalSize 90x20");
+        assert_eq!(cells_of(&h, &second), (132, 43));
+
+        // Every way of making a terminal asks for it.
+        assert_eq!(sizes_asked_by(&mut h, "wall.spawn"), vec![(90, 20)]);
+        assert_eq!(sizes_asked_by(&mut h, "terminal.spawn"), vec![(90, 20)]);
+        assert_eq!(
+            sizes_asked_by(&mut h, &format!("wall.split right {second}")),
+            vec![(90, 20)]
+        );
+
+        // A size that is not one is refused naming the knob, and changes nothing.
+        let refused = h.wall.run("wall.config newTerminalSize 90");
+        assert!(
+            refused.is_err() && refused.text.contains("newTerminalSize"),
+            "{}",
+            refused.text
+        );
+        assert_eq!(h.wall.config().new_terminal_cells(), (90, 20));
+    }
+
+    // The size is in the store with the other dialled knobs.
+    let mut again = Harness::with_storage(storage, "size-scope", opts);
+    assert_eq!(again.wall.config().new_terminal_cells(), (90, 20));
+    assert_eq!(sizes_asked_by(&mut again, "wall.spawn"), vec![(90, 20)]);
+    again.run_ok("wall.config newTerminalSize default");
+    assert_eq!(sizes_asked_by(&mut again, "wall.spawn"), vec![(100, 30)]);
+}

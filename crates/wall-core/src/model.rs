@@ -1473,11 +1473,12 @@ impl WallModel {
     /// Ask the host to spawn a new terminal (optionally placing its window's
     /// top-left corner at `window_top_left` once it arrives).
     pub fn request_spawn(&mut self, window_top_left: Option<Point>) {
+        let (cols, rows) = self.config.new_terminal_cells();
         self.effects.push(WallEffect::SpawnTerminal {
             window_top_left,
             argv: None,
-            cols: 100,
-            rows: 30,
+            cols,
+            rows,
         });
     }
 
@@ -2521,11 +2522,12 @@ impl WallModel {
             at: target_id,
             axis,
         });
+        let (cols, rows) = self.config.new_terminal_cells();
         self.effects.push(WallEffect::SpawnTerminal {
             window_top_left: None,
             argv: None,
-            cols: 100,
-            rows: 30,
+            cols,
+            rows,
         });
         Ok(())
     }

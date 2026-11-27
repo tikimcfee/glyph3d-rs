@@ -690,6 +690,18 @@ pub fn show(
                                             DESC_TEXT,
                                         ));
 
+                                        // The sizes on offer, a click each; the
+                                        // field above takes any other.
+                                        if item.key == "newTerminalSize" {
+                                            render_size_presets(
+                                                ui,
+                                                &input.config,
+                                                &current_val,
+                                                state,
+                                                out,
+                                            );
+                                        }
+
                                         // Key identifier
                                         ui.label(marked_layout_job(
                                             item.key,
@@ -918,6 +930,70 @@ fn render_knob_control(
             render_commit_field(ui, key, &val_str, 64.0, None, true, state, out);
         }
     }
+}
+
+/// The `newTerminalSize` knob's presets as a row of chips
+/// ([`WallConfig::new_terminal_size_presets`]): the lit one is the size in
+/// force, a click on another emits `wall.config newTerminalSize <it>`. Each
+/// chip's rectangle is recorded as `newTerminalSize@<size>`.
+fn render_size_presets(
+    ui: &mut egui::Ui,
+    config: &WallConfig,
+    value: &KnobValue,
+    state: &mut SettingsState,
+    out: &mut Vec<String>,
+) {
+    const KEY: &str = "newTerminalSize";
+    let current = value.as_str().unwrap_or("");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
+        for size in config.new_terminal_size_presets() {
+            let is_on = size == current;
+            let galley = ui.painter().layout_no_wrap(
+                size.clone(),
+                egui::FontId::monospace(11.5),
+                if is_on { BRIGHT } else { DESC_TEXT },
+            );
+            let (_id, rect) =
+                ui.allocate_space(egui::vec2((galley.size().x + 12.0).max(24.0), 18.0));
+            state.control_rects.insert(format!("{KEY}@{size}"), rect);
+            let resp = ui
+                .interact(
+                    rect,
+                    ui.make_persistent_id(("wall_settings_size_preset", size.as_str())),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if ui.is_rect_visible(rect) {
+                if is_on {
+                    ui.painter()
+                        .rect_filled(rect, egui::CornerRadius::same(4), BTN_ON_BG);
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, egui::CornerRadius::same(4), HOVER_ROW_BG);
+                } else {
+                    ui.painter().rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(4),
+                        egui::Stroke::new(1.0, BORDER),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                ui.painter().galley(
+                    egui::pos2(
+                        rect.center().x - galley.size().x * 0.5,
+                        rect.center().y - galley.size().y * 0.5,
+                    ),
+                    galley,
+                    if is_on || resp.hovered() { BRIGHT } else { DESC_TEXT },
+                );
+            }
+            if resp.clicked() && !is_on {
+                state.drafts.remove(KEY);
+                emit_config_edit(KEY, &size, state, out);
+            }
+        }
+    });
 }
 
 #[expect(
@@ -1372,6 +1448,91 @@ mod tests {
             "expected refusal for closeHoldMs, got {:?}",
             state.refused
         );
+    }
+
+    #[test]
+    fn new_terminal_size_offers_its_presets_and_a_click_dials_one() {
+        let ctx = egui::Context::default();
+        let mut state = SettingsState::default();
+        let mut input = open_input();
+        input.placement.side = PanelSide::Left;
+        input.dock_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(380.0, 900.0),
+        ));
+        state.query = "newTerminalSize".to_string();
+        run_frame(&ctx, Vec::new(), (1280.0, 900.0), &mut state, &input);
+        run_frame(&ctx, Vec::new(), (1280.0, 900.0), &mut state, &input);
+        assert_eq!(state.visible_count, 1);
+
+        // The default, then the menu's sizes, each a chip; and the field.
+        for size in ["100x30", "80x24", "120x36", "160x48"] {
+            assert!(
+                state.control_rects.contains_key(&format!("newTerminalSize@{size}")),
+                "no chip for {size}: {:?}",
+                state.control_rects.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(state.control_rects.contains_key("newTerminalSize"));
+
+        let click = |ctx: &egui::Context,
+                     pos: egui::Pos2,
+                     st: &mut SettingsState,
+                     inp: &SettingsInput| {
+            let (mut out, _) = run_frame(
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                (1280.0, 900.0),
+                st,
+                inp,
+            );
+            let (mut released, _) = run_frame(
+                ctx,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                (1280.0, 900.0),
+                st,
+                inp,
+            );
+            out.append(&mut released);
+            out
+        };
+
+        let chip = state.control_rects["newTerminalSize@120x36"].center();
+        assert_eq!(
+            click(&ctx, chip, &mut state, &input),
+            vec!["wall.config newTerminalSize 120x36"]
+        );
+
+        // The size in force is lit, and a click on it asks for nothing.
+        input.config.new_terminal_size = "120x36".to_string();
+        run_frame(&ctx, Vec::new(), (1280.0, 900.0), &mut state, &input);
+        let lit = state.control_rects["newTerminalSize@120x36"].center();
+        assert!(click(&ctx, lit, &mut state, &input).is_empty());
+
+        // A size that is no preset has no chip of its own: it is the field's.
+        input.config.new_terminal_size = "132x43".to_string();
+        input.config.menu_sizes = "80x24".to_string();
+        run_frame(&ctx, Vec::new(), (1280.0, 900.0), &mut state, &input);
+        let mut chips: Vec<&str> = state
+            .control_rects
+            .keys()
+            .filter_map(|k| k.strip_prefix("newTerminalSize@"))
+            .collect();
+        chips.sort_unstable();
+        assert_eq!(chips, vec!["100x30", "80x24"]);
     }
 
     #[test]

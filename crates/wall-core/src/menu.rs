@@ -194,6 +194,19 @@ pub fn check_size(cols: &str, rows: &str) -> Result<CellSize, String> {
     })
 }
 
+/// Parse one terminal size written `COLSxROWS` (or `COLS×ROWS`), each side a
+/// whole number in `1..=MAX_CELLS`: the `newTerminalSize` knob's form
+/// (2026-11-27). The refusal names what was wrong with it.
+pub fn parse_size(input: &str) -> Result<CellSize, String> {
+    let trimmed = input.trim();
+    let Some((cols, rows)) = trimmed.split_once(['x', 'X', '×']) else {
+        return Err(format!(
+            "a size is COLSxROWS (like \"100x30\"), not '{trimmed}'"
+        ));
+    };
+    check_size(cols, rows)
+}
+
 /// Parse the `menuSizes` knob: space-separated `COLSxROWS` (or `COLS×ROWS`)
 /// entries (`parseSizes` in `wall/contextMenu.js`).
 pub fn parse_sizes(input: &str) -> Result<Vec<CellSize>, String> {

@@ -100,9 +100,12 @@ use crate::store::{
     StatusWindowState, WallGroup, WallStore,
 };
 
-/// Default column count for newly spawned terminals (`session::NEW_COLS`).
+/// The column count taken for a terminal whose screen has not arrived yet
+/// (`session::NEW_COLS`). A NEW terminal's size is the `newTerminalSize` knob
+/// ([`crate::config::NEW_TERMINAL_SIZE_DEFAULT`], the same 100x30).
 pub const DEFAULT_SPAWN_COLS: u32 = 100;
-/// Default row count for newly spawned terminals (`session::NEW_ROWS`).
+/// The row count taken for a terminal whose screen has not arrived yet
+/// (`session::NEW_ROWS`).
 pub const DEFAULT_SPAWN_ROWS: u32 = 30;
 /// Default logical viewport width when none has been reported yet.
 pub const DEFAULT_VIEWPORT_W: f64 = 1400.0;
@@ -260,10 +263,6 @@ pub struct WallOptions {
     pub char_widths: CharWidths,
     /// Host platform conventions (chord key, block-select modifier, copy/paste chords).
     pub platform: Platform,
-    /// Initial column count requested on [`WallEffect::SpawnTerminal`].
-    pub default_cols: u32,
-    /// Initial row count requested on [`WallEffect::SpawnTerminal`].
-    pub default_rows: u32,
     /// Initial logical viewport dimensions in px.
     pub viewport: Size,
     /// Initial display scale factor (physical px per logical px).
@@ -281,8 +280,6 @@ impl Default for WallOptions {
             geometry: CellGeometry::default(),
             char_widths: CharWidths::default(),
             platform: Platform::host(),
-            default_cols: DEFAULT_SPAWN_COLS,
-            default_rows: DEFAULT_SPAWN_ROWS,
             viewport: Size::new(DEFAULT_VIEWPORT_W, DEFAULT_VIEWPORT_H),
             scale_factor: 1.0,
             namespace: "rs-wall".to_owned(),
@@ -637,8 +634,6 @@ struct WallCore {
     agents_extra_connected: bool,
     platform: Platform,
     char_widths: CharWidths,
-    default_cols: u32,
-    default_rows: u32,
     scale_factor: f64,
     now_ms: f64,
     base_cursor: CursorIcon,
@@ -1420,8 +1415,6 @@ impl WallCore {
             agents_extra_connected: false,
             platform: opts.platform,
             char_widths: opts.char_widths.sanitized(),
-            default_cols: opts.default_cols,
-            default_rows: opts.default_rows,
             scale_factor: opts.scale_factor.max(0.1),
             now_ms: 0.0,
             base_cursor: CursorIcon::Default,
@@ -1925,6 +1918,13 @@ impl WallCore {
         }
         self.model.notify_changed();
         true
+    }
+
+    /// The `(cols, rows)` every new terminal is asked for: the
+    /// `newTerminalSize` knob (`wall.spawn`, the `+` button, `wall.split`,
+    /// `wall.attach`, `terminal.spawn`).
+    fn new_terminal_cells(&self) -> (u32, u32) {
+        self.model.config().new_terminal_cells()
     }
 
     fn dock_edges(&self) -> crate::dock::EdgeWidths {
@@ -3344,8 +3344,8 @@ impl WallApi for WallCore {
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: at,
             argv: None,
-            cols: self.default_cols,
-            rows: self.default_rows,
+            cols: self.new_terminal_cells().0,
+            rows: self.new_terminal_cells().1,
         });
         self.model.notify_changed();
         Ok("pending".to_owned())
@@ -3646,8 +3646,8 @@ impl WallApi for WallCore {
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: None,
             argv: None,
-            cols: self.default_cols,
-            rows: self.default_rows,
+            cols: self.new_terminal_cells().0,
+            rows: self.new_terminal_cells().1,
         });
         self.model.notify_changed();
         Ok("pending".to_owned())
@@ -3957,8 +3957,8 @@ impl WallApi for WallCore {
                 self.model.push_effect(WallEffect::ReattachTerminal {
                     id: gx_id.clone(),
                     fallback_argv: argv,
-                    cols: self.default_cols,
-                    rows: self.default_rows,
+                    cols: self.new_terminal_cells().0,
+                    rows: self.new_terminal_cells().1,
                 });
                 self.termd.dismiss_lost();
                 self.model.notify_changed();
@@ -3971,8 +3971,8 @@ impl WallApi for WallCore {
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: None,
             argv: Some(argv),
-            cols: self.default_cols,
-            rows: self.default_rows,
+            cols: self.new_terminal_cells().0,
+            rows: self.new_terminal_cells().1,
         });
         self.termd.dismiss_lost();
         self.model.notify_changed();
@@ -4306,8 +4306,8 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
             core.model.push_effect(WallEffect::SpawnTerminal {
                 window_top_left: None,
                 argv: argv.clone(),
-                cols: core.default_cols,
-                rows: core.default_rows,
+                cols: core.new_terminal_cells().0,
+                rows: core.new_terminal_cells().1,
             });
             core.model.notify_changed();
             Ok(CommandReply::ok(

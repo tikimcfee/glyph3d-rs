@@ -107,6 +107,8 @@ pub enum TextParser {
     SelectionWordChars,
     /// Space-separated `COLSxROWS` pairs (`80x24 120x36`), empty allowed.
     MenuSizes,
+    /// Exactly one `COLSxROWS` pair (`100x30`), written back with a plain `x`.
+    TerminalSize,
 }
 
 impl TextParser {
@@ -136,6 +138,10 @@ impl TextParser {
             TextParser::MenuSizes => {
                 crate::menu::parse_sizes(input)?;
                 Ok(input.split_whitespace().collect::<Vec<_>>().join(" "))
+            }
+            TextParser::TerminalSize => {
+                let size = crate::menu::parse_size(input)?;
+                Ok(format!("{}x{}", size.cols, size.rows))
             }
         }
     }
@@ -317,6 +323,15 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
             label: "Snap to grid",
             kind: KnobKind::Bool,
             description: "Moving a terminal puts its top-left corner on a grid crossing; resizing lands the dragged edge on or just inside a line. Hold Ctrl (⌃) while dragging to do the opposite.",
+        },
+    ),
+    (
+        "newTerminalSize",
+        KnobDef {
+            section: "terminals",
+            label: "New terminal size",
+            kind: KnobKind::Text { parser: TextParser::TerminalSize },
+            description: "The size a new terminal opens at, as COLSxROWS (like 100x30): the + button, wall.spawn, a split's new pane and an attached agent's terminal. A terminal that is already open keeps its size.",
         },
     ),
     (
