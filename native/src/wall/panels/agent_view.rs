@@ -140,9 +140,12 @@ pub struct CardUiState {
     pub stick_bottom: bool,
     /// Unread live rows accumulated locally while `!stick_bottom`.
     pub local_unread: usize,
+    last_host_stick_bottom: Option<bool>,
     last_session_id: Option<String>,
     last_row_count: usize,
+    last_total_count: usize,
     last_tail_id: Option<String>,
+    last_content_h: f32,
     scroll_to_tail_next: bool,
 }
 
@@ -153,9 +156,12 @@ impl Default for CardUiState {
             folded_groups: BTreeSet::new(),
             stick_bottom: true,
             local_unread: 0,
+            last_host_stick_bottom: None,
             last_session_id: None,
             last_row_count: 0,
+            last_total_count: 0,
             last_tail_id: None,
+            last_content_h: 0.0,
             scroll_to_tail_next: false,
         }
     }
@@ -891,24 +897,30 @@ fn render_full_card(
         let session_changed = cs.last_session_id != view.session_id;
         if session_changed {
             cs.stick_bottom = view.stick_bottom;
+            cs.last_host_stick_bottom = Some(view.stick_bottom);
             cs.local_unread = 0;
             if cs.stick_bottom {
                 cs.scroll_to_tail_next = true;
             }
-        } else if !view.stick_bottom && cs.stick_bottom && view.unread_count > 0 {
-            // Host explicitly marked view scrolled up with unread items.
-            cs.stick_bottom = false;
+        } else if cs.last_host_stick_bottom != Some(view.stick_bottom) {
+            cs.stick_bottom = view.stick_bottom;
+            cs.last_host_stick_bottom = Some(view.stick_bottom);
+            if cs.stick_bottom {
+                cs.local_unread = 0;
+                cs.scroll_to_tail_next = true;
+            }
         }
-        let grew = view.rows.len() > cs.last_row_count || tail_id != cs.last_tail_id;
-        if !session_changed && grew {
+        let new_tail = tail_id != cs.last_tail_id && view.total_count > cs.last_total_count;
+        if !session_changed && new_tail {
             if cs.stick_bottom {
                 cs.scroll_to_tail_next = true;
-            } else if view.rows.len() > cs.last_row_count {
-                cs.local_unread += view.rows.len() - cs.last_row_count;
+            } else {
+                cs.local_unread += view.total_count - cs.last_total_count;
             }
         }
         cs.last_session_id = view.session_id.clone();
         cs.last_row_count = view.rows.len();
+        cs.last_total_count = view.total_count;
         cs.last_tail_id = tail_id;
         let force = std::mem::replace(&mut cs.scroll_to_tail_next, false);
         let unread = if cs.stick_bottom {
@@ -1051,6 +1063,7 @@ fn render_full_card(
     let scroll_out = egui::ScrollArea::vertical()
         .id_salt(("wall_agent_stream", &view.id))
         .auto_shrink([false, false])
+        .stick_to_bottom(stick_bottom)
         .max_height(list_rect.height())
         .show(&mut list_ui, |ui| {
             ui.set_min_width(list_rect.width());
@@ -1070,15 +1083,20 @@ fn render_full_card(
             }
         });
 
-    // Update `stick_bottom` from user scroll position when content overflows viewport.
+    // Update `stick_bottom` from user scroll position when content overflows viewport
+    // (ignoring frames where expanding rows grew `content_h` without a user scroll).
     let content_h = scroll_out.content_size.y;
     let view_h = scroll_out.inner_rect.height();
-    if content_h > view_h + 2.0 {
-        let dist_from_bottom = content_h - (scroll_out.state.offset.y + view_h);
-        let now_at_bottom = dist_from_bottom <= (24.0 * m.s).max(12.0);
-        if let Some(cs) = state.cards.get_mut(&view.id) {
-            if now_at_bottom != cs.stick_bottom && !force_scroll_tail {
+    if let Some(cs) = state.cards.get_mut(&view.id) {
+        let content_grew = content_h > cs.last_content_h + 1.0;
+        cs.last_content_h = content_h;
+        if content_h > view_h + 2.0 {
+            let dist_from_bottom = content_h - (scroll_out.state.offset.y + view_h);
+            let now_at_bottom = dist_from_bottom <= (24.0 * m.s).max(12.0);
+            let allow_transition = now_at_bottom || !content_grew;
+            if now_at_bottom != cs.stick_bottom && !force_scroll_tail && allow_transition {
                 cs.stick_bottom = now_at_bottom;
+                cs.last_host_stick_bottom = Some(now_at_bottom);
                 if now_at_bottom {
                     cs.local_unread = 0;
                 }
@@ -2792,6 +2810,7 @@ fn scroll_card_to_tail(state: &mut AgentViewPanelState, id: &str) {
     let cs = state.cards.entry(id.to_string()).or_default();
     let changed = !cs.stick_bottom || cs.local_unread > 0;
     cs.stick_bottom = true;
+    cs.last_host_stick_bottom = Some(true);
     cs.local_unread = 0;
     cs.scroll_to_tail_next = true;
     if changed {

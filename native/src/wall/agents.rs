@@ -304,9 +304,8 @@ impl AgentViewsHost for WallHostAdapter<'_> {
         let live = self.live_meta.get(id);
         let status_term = self.wall.termd().terminal(id);
         let scrolled_rows = live
-            .map(|m| m.scrollback_rows)
-            .or_else(|| status_term.map(|t| t.scrollback_rows))
-            .unwrap_or(0);
+            .map_or(0, |m| m.scrollback_rows)
+            .max(status_term.map_or(0, |t| t.scrollback_rows));
         let cursor_row = live.map_or(0, |m| m.cursor_row);
         let alt_screen = entry.modes.alt_screen
             || live.is_some_and(|m| m.alt_screen)
@@ -394,6 +393,7 @@ pub struct WallAgents {
     synced_store_views: BTreeMap<String, AgentViewState>,
     synced_termd_rows: Vec<TermdTerminalStatus>,
     synced_stick_bottom: HashMap<String, bool>,
+    scrolled_rows: HashMap<String, u64>,
     live_meta: HashMap<String, LiveTerminalMeta>,
     last_fleet: Option<FleetSnapshot>,
     last_bus_gen: u64,
@@ -445,6 +445,7 @@ impl WallAgents {
             synced_store_views: BTreeMap::new(),
             synced_termd_rows: Vec::new(),
             synced_stick_bottom: HashMap::new(),
+            scrolled_rows: HashMap::new(),
             live_meta: HashMap::new(),
             last_fleet: None,
             last_bus_gen: 0,
@@ -506,12 +507,39 @@ impl WallAgents {
         self.bus_requested = true;
     }
 
+    /// Accumulate primary-screen rows scrolled off the top of `id` (`term_session::News::Filled`),
+    /// keeping write-time jump anchors accurate while `id` stays at live tail without issuing a
+    /// scrollback RPC.
+    pub fn note_terminal_scrolled(
+        &mut self,
+        id: &str,
+        scrolled_top: u32,
+        resized: bool,
+        within_margins: bool,
+        alt_screen: bool,
+    ) {
+        if !resized && !within_margins && !alt_screen && scrolled_top > 0 {
+            let next = {
+                let entry = self.scrolled_rows.entry(id.to_owned()).or_insert(0);
+                *entry = entry.saturating_add(u64::from(scrolled_top));
+                *entry
+            };
+            let meta = self.live_meta.entry(id.to_owned()).or_default();
+            meta.scrollback_rows = meta.scrollback_rows.max(next);
+        }
+    }
+
     /// Snapshot live per-terminal `pwd`, `scrollback`, `alt_screen`, and `cursor.row` from
     /// [`term_session::Sessions`] on the window thread before calling [`Self::pump`].
     pub fn sync_sessions(&mut self, sessions: &term_session::Sessions) {
         self.live_meta.clear();
         for id in sessions.ids() {
             let sb = sessions.scrollback(id).unwrap_or_default();
+            let acc = self.scrolled_rows.entry(id.to_string()).or_insert(0);
+            if sb.max > *acc {
+                *acc = sb.max;
+            }
+            let scrollback_rows = sb.max.max(*acc);
             let modes = sessions.modes(id).unwrap_or_default();
             let (cursor_row, title) = match sessions.screen(id) {
                 Some(s) => (u32::from(s.cursor.row), s.title.clone()),
@@ -521,7 +549,7 @@ impl WallAgents {
             self.live_meta.insert(
                 id.to_string(),
                 LiveTerminalMeta {
-                    scrollback_rows: sb.max,
+                    scrollback_rows,
                     view: sb.offset,
                     cursor_row,
                     alt_screen: modes.alt_screen,
@@ -534,7 +562,12 @@ impl WallAgents {
 
     /// Inject live terminal metadata directly in headless tests without a `g3d-termd` daemon.
     pub fn set_live_terminal_meta(&mut self, id: impl Into<String>, meta: LiveTerminalMeta) {
-        self.live_meta.insert(id.into(), meta);
+        let id = id.into();
+        let acc = self.scrolled_rows.entry(id.clone()).or_insert(0);
+        if meta.scrollback_rows > *acc {
+            *acc = meta.scrollback_rows;
+        }
+        self.live_meta.insert(id, meta);
     }
 
     /// Pump all pending `gomuxai` fleet, session-list, and transcript updates onto `wall` and
@@ -548,8 +581,19 @@ impl WallAgents {
         let mut wall_mutated = false;
 
         // 1. Prune departed terminals from AgentViews & cached live metadata.
+        self.scrolled_rows
+            .retain(|id, _| wall.terminal(id).is_some());
         self.live_meta
             .retain(|id, _| wall.terminal(id).is_some());
+        for st in wall.termd().terminals() {
+            let acc = self.scrolled_rows.entry(st.id.clone()).or_insert(0);
+            if st.scrollback_rows > *acc {
+                *acc = st.scrollback_rows;
+            }
+            if let Some(meta) = self.live_meta.get_mut(&st.id) {
+                meta.scrollback_rows = meta.scrollback_rows.max(*acc);
+            }
+        }
         self.synced_stick_bottom
             .retain(|id, _| wall.terminal(id).is_some());
         {
@@ -2148,6 +2192,30 @@ mod tests {
             );
         }
 
+        agents.shutdown();
+    }
+
+    #[test]
+    fn note_terminal_scrolled_accumulates_primary_rows_only() {
+        let mut wall = Wall::in_memory(RulesOptions::default());
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        let _ = wall.drain_effects();
+
+        let mut agents = WallAgents::with_options(
+            WallAgentsOptions {
+                cli: AgentCli::new(PathBuf::from("/nonexistent/agent")),
+                ..WallAgentsOptions::default()
+            },
+            Arc::new(|| {}),
+        );
+
+        agents.note_terminal_scrolled("t1", 18, false, false, false);
+        agents.note_terminal_scrolled("t1", 5, true, false, false); // resize: ignored
+        agents.note_terminal_scrolled("t1", 7, false, true, false); // scroll region: ignored
+        agents.note_terminal_scrolled("t1", 9, false, false, true); // alt screen: ignored
+        agents.note_terminal_scrolled("t1", 12, false, false, false);
+
+        assert_eq!(agents.live_meta.get("t1").map(|m| m.scrollback_rows), Some(30));
         agents.shutdown();
     }
 

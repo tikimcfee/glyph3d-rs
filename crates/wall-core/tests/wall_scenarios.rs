@@ -155,6 +155,12 @@ impl Harness {
                         self.wall
                             .terminal_appeared(TerminalAppeared::new(id, cols, rows));
                     }
+                    WallEffect::ReattachTerminal { id, cols, rows, .. } => {
+                        self.screens
+                            .insert(id.clone(), Screen::new(cols as u16, rows as u16));
+                        self.wall
+                            .terminal_appeared(TerminalAppeared::new(id, cols, rows));
+                    }
                     WallEffect::ResizeTerminal { id, cols, rows } => {
                         self.resizes.push((id.clone(), cols, rows));
                         if let Some(screen) = self.screens.get_mut(&id) {
@@ -3793,6 +3799,127 @@ fn pointer_leave_clears_hover_and_link_without_canceling_active_drag() {
     );
     assert!(!h.wall.pointer_leave(), "pointer_leave must not interfere with an active drag");
     assert!(h.wall.pointer().busy());
+}
+
+#[test]
+fn attach_agent_prefers_local_reattach_when_agents_extra_ns_connected() {
+    use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+
+    let mut h = Harness::new();
+    h.wall.set_bus_snapshot(
+        Some(GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                GomuxAgent {
+                    name: "coder".into(),
+                    host: Some("laptop-2".into()),
+                    live: true,
+                    attached: Some(true),
+                    status: Some("processing".into()),
+                    ..GomuxAgent::default()
+                },
+                GomuxAgent {
+                    name: "linux-gate".into(),
+                    host: Some("workstation".into()),
+                    live: true,
+                    attached: Some(false).map(|_| true),
+                    status: Some("idle".into()),
+                    ..GomuxAgent::default()
+                },
+            ],
+        }),
+        "",
+    );
+
+    // 1. With extra `agents` namespace disconnected (default), local attach spawns a shell wrapper.
+    assert!(!h.wall.agents_extra_connected());
+    let r_wrap = h.wall.run("wall.attach coder@laptop-2");
+    assert!(!r_wrap.is_err(), "{}", r_wrap.text);
+    let effs_wrap = h.wall.drain_effects();
+    assert!(
+        effs_wrap
+            .iter()
+            .any(|e| matches!(e, WallEffect::SpawnTerminal { argv: Some(_), .. })),
+        "expected SpawnTerminal when extra agents namespace is disconnected: {effs_wrap:?}"
+    );
+
+    // 2. With extra `agents` namespace connected, local attach emits `ReattachTerminal` for `gx-coder`,
+    //    while remote `linux-gate@workstation` still uses the `SpawnTerminal` shell-wrapper path.
+    let mut h2 = Harness::new();
+    h2.wall.set_bus_snapshot(
+        Some(GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                GomuxAgent {
+                    name: "coder".into(),
+                    host: Some("laptop-2".into()),
+                    live: true,
+                    attached: Some(true),
+                    status: Some("processing".into()),
+                    ..GomuxAgent::default()
+                },
+                GomuxAgent {
+                    name: "linux-gate".into(),
+                    host: Some("workstation".into()),
+                    live: true,
+                    attached: Some(true),
+                    status: Some("idle".into()),
+                    ..GomuxAgent::default()
+                },
+            ],
+        }),
+        "",
+    );
+    h2.wall.set_agents_extra_connected(true);
+
+    let r_local = h2.wall.run("wall.attach coder@laptop-2");
+    assert!(!r_local.is_err(), "{}", r_local.text);
+    let effs_local = h2.wall.drain_effects();
+    assert!(
+        effs_local
+            .iter()
+            .any(|e| matches!(e, WallEffect::ReattachTerminal { id, .. } if id == "gx-coder")),
+        "expected ReattachTerminal(gx-coder) when extra agents ns is connected: {effs_local:?}"
+    );
+    assert!(
+        !effs_local
+            .iter()
+            .any(|e| matches!(e, WallEffect::SpawnTerminal { .. })),
+        "must not emit SpawnTerminal before ReattachTerminal runs: {effs_local:?}"
+    );
+
+    // Simulate `Sessions::reattach("gx-coder")` succeeding with default title `coder`.
+    h2.screens.insert("gx-coder".into(), Screen::new(80, 24));
+    h2.wall.terminal_appeared(
+        TerminalAppeared::new("gx-coder", 80, 24).with_title("coder"),
+    );
+    h2.pump();
+    assert_eq!(h2.wall.focused_id(), Some("gx-coder"));
+    let frame = h2.frame();
+    let bar = frame
+        .title_bars
+        .iter()
+        .find(|b| b.terminal_id == "gx-coder")
+        .expect("gx-coder title bar");
+    assert!(
+        bar.text.contains("coder") && bar.text.contains("processing"),
+        "expected gx-coder title bar to carry live bus status: {:?}",
+        bar.text
+    );
+
+    let r_remote = h2.wall.run("wall.attach linux-gate@workstation");
+    assert!(!r_remote.is_err(), "{}", r_remote.text);
+    let effs_remote = h2.wall.drain_effects();
+    assert!(
+        effs_remote
+            .iter()
+            .any(|e| matches!(e, WallEffect::SpawnTerminal { argv: Some(_), .. })),
+        "remote host attach must still emit SpawnTerminal shell wrapper: {effs_remote:?}"
+    );
 }
 
 
