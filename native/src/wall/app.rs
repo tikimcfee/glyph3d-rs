@@ -39,7 +39,7 @@ use wall_core::scroll::DeltaMode;
 use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -64,6 +64,13 @@ const PANEL_PAD: f32 = 0.3;
 /// Two presses this close in time and place are a double click.
 const DOUBLE_CLICK_MS: f64 = 500.0;
 const DOUBLE_CLICK_PX: f64 = 5.0;
+/// Lines scrolled per discrete physical mouse-wheel detent (`MouseScrollDelta::LineDelta`),
+/// matching Firefox's 3-line `deltaMode = 1` notch and Chrome's ~100 CSS px notch (`~3.3` rows).
+const LINES_PER_WHEEL_NOTCH: f64 = 3.0;
+/// Logical pixel delta per discrete physical mouse-wheel detent when a `zoomKeys` modifier is
+/// held (`WallCamera.js` `WHEEL_ZOOM.pixelsPerNotch = 100`), so a physical `Ctrl+wheel` notch
+/// exceeds `WallPointer`'s `PINCH_MAX_DELTA` (`50.0`) and glides by `stepFactor = 1.12`.
+const WHEEL_ZOOM_NOTCH_PX: f64 = 100.0;
 
 /// What a reader thread sends the event loop: something arrived, look.
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +180,8 @@ struct App {
     macos_option_as_alt: Option<winit::platform::macos::OptionAsAlt>,
     /// Physical `code`s whose press reached `key_input` and have not yet been released.
     held_codes: HashSet<String>,
+    /// Monotonic synthetic clock advance (`ms`) applied by timed scripted sequences (`app.wheel_seq`).
+    clock_offset_ms: f64,
     /// Last text written by `WallEffect::WriteClipboard` (inspected via `app.clipboard`).
     last_copied: Option<String>,
     /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
@@ -390,13 +399,130 @@ fn store_dir() -> PathBuf {
     }
 }
 
+/// Convert a winit [`MouseScrollDelta`] + [`TouchPhase`] into the browser DOM wheel convention
+/// `(delta_x, delta_y, DeltaMode)` expected by `wall_core::pointer::WallPointer`.
+///
+/// - **Sign & Natural Scrolling**: On macOS (`macos/view.rs`), Wayland (`libinput`), and X11,
+///   winit already incorporates the OS natural-scrolling setting and reports positive deltas when
+///   content moves right/down (scrolling up/left). DOM `WheelEvent` uses the opposite sign
+///   (`+deltaY` scrolls down, moving content up), so both axes negate.
+/// - **1:1 Trackpad Pan**: `PixelDelta` is in physical pixels (`scrollingDelta * scale_factor`),
+///   so dividing by `scale_factor` produces exact 1:1 logical pixel travel at every camera zoom.
+/// - **Mouse Wheel Detents (`LineDelta`)**: winit reports `±1.0` per physical wheel detent on
+///   Wayland (`discrete`), X11 (`Button4/5` / `XInput2`), and macOS non-precise mice. Plain
+///   scroll scales by [`LINES_PER_WHEEL_NOTCH`] (`3.0` lines in `DeltaMode::Line`, keeping
+///   `TerminalScroller.trackpad = false`); wheel-zoom scales by [`WHEEL_ZOOM_NOTCH_PX`]
+///   (`100.0` px in `DeltaMode::Pixel`) so one detent glides by `WHEEL_ZOOM.step_factor` (`1.12x`)
+///   instead of falling under `WallPointer`'s `50 px` trackpad-pinch heuristic.
+/// - **TouchPhase & Momentum**: Zero-delta bookends (`MayBegin`, `Ended`, Wayland `axis_stop`)
+///   and `TouchPhase::Cancelled` return `None` so they do not extend `WheelStreamGate`'s `140 ms`
+///   quiet window after a gesture ends. `TouchPhase::Started` / `Ended` deliberately do **not**
+///   reset `WheelStreamGate`, because macOS emits `Ended` (finger lift) followed ~8 ms later by
+///   `Started` (`momentumPhase == Began`); keeping the latch intact across that transition stops
+///   a canvas pan flick from hijacking a focused terminal that slides under a stationary cursor.
+fn convert_scroll_delta(
+    delta: MouseScrollDelta,
+    phase: TouchPhase,
+    scale_factor: f64,
+    mods: Mods,
+    zoom_keys: &str,
+) -> Option<(f64, f64, DeltaMode)> {
+    if phase == TouchPhase::Cancelled {
+        return None;
+    }
+    let sf = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let (dx, dy, mode) = match delta {
+        MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+            (-x / sf, -y / sf, DeltaMode::Pixel)
+        }
+        MouseScrollDelta::LineDelta(x, y) => {
+            let (lx, ly) = (f64::from(x), f64::from(y));
+            let zooming = wall_core::chord::zooms_wheel(mods, zoom_keys).unwrap_or(false);
+            if zooming {
+                (
+                    -lx * WHEEL_ZOOM_NOTCH_PX,
+                    -ly * WHEEL_ZOOM_NOTCH_PX,
+                    DeltaMode::Pixel,
+                )
+            } else {
+                (
+                    -lx * LINES_PER_WHEEL_NOTCH,
+                    -ly * LINES_PER_WHEEL_NOTCH,
+                    DeltaMode::Line,
+                )
+            }
+        }
+    };
+    if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+        return None;
+    }
+    Some((dx, dy, mode))
+}
+
+/// Convert a winit [`WindowEvent::PinchGesture`] `delta` (`NSEvent.magnification`) into the
+/// multiplicative zoom factor passed to `Wall::pinch`.
+///
+/// Browsers map `magnification` to `WheelEvent { ctrlKey: true, deltaY: -100 * delta }`, which
+/// `WallPointer.js` turns into `Math.exp(-dy * 0.01) = Math.exp(delta)`. `delta.exp()` matches
+/// that exact rate, stays strictly positive for every finite `delta`, and composes exact across
+/// frame subdivisions (`exp(a) * exp(b) == exp(a + b)`).
+fn pinch_zoom_factor(delta: f64, phase: TouchPhase) -> Option<f64> {
+    if phase == TouchPhase::Cancelled || !delta.is_finite() || delta == 0.0 {
+        return None;
+    }
+    Some(delta.exp())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SmartZoomTarget {
+    Terminal(String),
+    Group(String),
+    Canvas,
+}
+
+fn smart_zoom_target_at(described: &Described, pt: Point) -> SmartZoomTarget {
+    let vw = described.viewport.w;
+    let vh = described.viewport.h;
+    let cam = described.camera;
+
+    let mut best_term: Option<(f64, &str)> = None;
+    for t in &described.terminals {
+        let sb = cam.to_screen_box(t.body_rect, vw, vh);
+        let in_body = pt.x >= sb.left && pt.x <= sb.right && pt.y >= sb.top && pt.y <= sb.bottom;
+        let in_bar = described.title_bars.iter().any(|b| {
+            if b.terminal_id != t.id {
+                return false;
+            }
+            let bb = cam.to_screen_box(b.rect, vw, vh);
+            pt.x >= bb.left && pt.x <= bb.right && pt.y >= bb.top && pt.y <= bb.bottom
+        });
+        if (in_body || in_bar) && best_term.is_none_or(|(z, _)| t.z >= z) {
+            best_term = Some((t.z, t.id.as_str()));
+        }
+    }
+    if let Some((_, id)) = best_term {
+        return SmartZoomTarget::Terminal(id.to_string());
+    }
+    for g in &described.groups {
+        let hb = cam.to_screen_box(g.header_rect, vw, vh);
+        if pt.x >= hb.left && pt.x <= hb.right && pt.y >= hb.top && pt.y <= hb.bottom {
+            return SmartZoomTarget::Group(g.id.clone());
+        }
+    }
+    SmartZoomTarget::Canvas
+}
+
 impl App {
     fn scale_factor(&self) -> f64 {
         self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor())
     }
 
     fn now_ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
+        self.start.elapsed().as_secs_f64() * 1000.0 + self.clock_offset_ms
     }
 
     fn mods(&self) -> Mods {
@@ -1351,29 +1477,98 @@ impl App {
         self.apply_effects();
     }
 
-    fn pinch(&mut self, delta: f64) {
+    fn pinch(&mut self, delta: f64, phase: TouchPhase) {
+        let factor = pinch_zoom_factor(delta, phase);
         if let Some(wall) = &mut self.wall {
-            wall.pinch(self.cursor.x, self.cursor.y, 1.0 + delta);
+            if (phase == TouchPhase::Started || factor.is_some()) && wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            if wall.fullscreen().active() {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            if let Some(f) = factor {
+                wall.pinch(self.cursor.x, self.cursor.y, f);
+            }
         }
         self.apply_effects();
         self.redraw();
     }
 
-    fn wheel(&mut self, delta: MouseScrollDelta) {
+    fn smart_zoom(&mut self) {
+        if let Some(wall) = &mut self.wall {
+            if wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            if wall.fullscreen().active() {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            let described = wall.frame();
+            match smart_zoom_target_at(&described, self.cursor) {
+                SmartZoomTarget::Terminal(id) => {
+                    let pre = wall.camera().clone();
+                    let _ = wall.run(format!("wall.reveal {id}"));
+                    if wall.camera().target().is_some_and(|t| pre.is_at(t)) {
+                        let _ = wall.run("wall.fit");
+                    }
+                }
+                SmartZoomTarget::Group(gid) => {
+                    let pre = wall.camera().clone();
+                    let _ = wall.run(format!("wall.group.frame {gid}"));
+                    if wall.camera().target().is_some_and(|t| pre.is_at(t)) {
+                        let _ = wall.run("wall.fit");
+                    }
+                }
+                SmartZoomTarget::Canvas => {
+                    let _ = wall.run("wall.fit");
+                }
+            }
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
+    fn wheel_at(&mut self, delta: MouseScrollDelta, phase: TouchPhase, time_ms: f64) {
         let sf = self.scale_factor();
-        // winit: positive means the content moves right and down. The web's
-        // wheel, which the wall's rules speak: positive deltaY scrolls down,
-        // moving the content up. So the sign flips.
-        let (dx, dy, mode) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (-f64::from(x), -f64::from(y), DeltaMode::Line),
-            MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => (-x / sf, -y / sf, DeltaMode::Pixel),
+        let mods = self.mods();
+        let zoom_keys = self
+            .wall
+            .as_ref()
+            .map_or("ctrl alt meta", |w| w.config().zoom_keys.as_str());
+        let Some((dx, dy, mode)) = convert_scroll_delta(delta, phase, sf, mods, zoom_keys) else {
+            if phase == TouchPhase::Started {
+                if let Some(wall) = &mut self.wall {
+                    if wall.menu().is_some() {
+                        let _ = wall.run("wall.menu close");
+                        self.apply_effects();
+                        self.redraw();
+                    }
+                }
+            }
+            return;
         };
-        let ev = WheelEvent { x: self.cursor.x, y: self.cursor.y, delta_x: dx, delta_y: dy, delta_mode: mode, mods: self.mods(), time_ms: self.now_ms() };
+        let ev = WheelEvent {
+            x: self.cursor.x,
+            y: self.cursor.y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods,
+            time_ms,
+        };
         if let Some(wall) = &mut self.wall {
             wall.wheel(&ev);
         }
         self.apply_effects();
         self.redraw();
+    }
+
+    fn wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let time_ms = self.now_ms();
+        self.wheel_at(delta, phase, time_ms);
     }
 
     fn key_input(&mut self, key: KeyEvent) {
@@ -1627,6 +1822,16 @@ impl App {
                 self.mouse(ElementState::Released, MouseButton::Left);
                 format!("OK: dblclick at ({x:.2}, {y:.2})")
             }
+            ScriptCommand::TplClick { x, y } => {
+                self.last_release = None;
+                self.move_cursor(x, y);
+                for _ in 0..3 {
+                    self.mouse(ElementState::Pressed, MouseButton::Left);
+                    self.mouse(ElementState::Released, MouseButton::Left);
+                }
+                self.last_release = None;
+                format!("OK: tplclick at ({x:.2}, {y:.2})")
+            }
             ScriptCommand::Drag { x0, y0, x1, y1, steps, button, mods } => {
                 let prev = self.modifiers;
                 self.modifiers = mods;
@@ -1641,19 +1846,68 @@ impl App {
                 self.modifiers = prev;
                 format!("OK: dragged {} ({x0:.2}, {y0:.2}) -> ({x1:.2}, {y1:.2}) in {steps} steps", button_label(button))
             }
-            ScriptCommand::Wheel { x, y, dx, dy, mods } => {
+            ScriptCommand::Wheel { x, y, dx, dy, unit, phase, dt_ms, mods } => {
+                use super::script::ScriptScrollUnit;
+                if let Some(dt) = dt_ms {
+                    self.clock_offset_ms += dt;
+                }
+                let prev = self.modifiers;
+                self.modifiers = mods;
+                self.move_cursor(x, y);
+                let delta = match unit {
+                    ScriptScrollUnit::Pixel => {
+                        let sf = self.scale_factor();
+                        MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf))
+                    }
+                    ScriptScrollUnit::Line => MouseScrollDelta::LineDelta(dx as f32, dy as f32),
+                };
+                self.wheel(delta, phase);
+                self.modifiers = prev;
+                format!("OK: wheel ({dx:.2}, {dy:.2}) at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::WheelSeq { x, y, mods, steps } => {
+                use super::script::ScriptScrollUnit;
                 let prev = self.modifiers;
                 self.modifiers = mods;
                 self.move_cursor(x, y);
                 let sf = self.scale_factor();
-                self.wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf)));
+                let mut t_ms = self.now_ms();
+                let n = steps.len();
+                for step in steps {
+                    t_ms += step.dt_ms;
+                    let delta = match step.unit {
+                        ScriptScrollUnit::Pixel => MouseScrollDelta::PixelDelta(
+                            PhysicalPosition::new(step.dx * sf, step.dy * sf),
+                        ),
+                        ScriptScrollUnit::Line => {
+                            MouseScrollDelta::LineDelta(step.dx as f32, step.dy as f32)
+                        }
+                    };
+                    self.wheel_at(delta, step.phase, t_ms);
+                }
+                let live_now = self.start.elapsed().as_secs_f64() * 1000.0;
+                if t_ms > live_now + self.clock_offset_ms {
+                    self.clock_offset_ms = t_ms - live_now;
+                }
                 self.modifiers = prev;
-                format!("OK: wheel ({dx:.2}, {dy:.2}) at ({x:.2}, {y:.2})")
+                format!("OK: wheel_seq {n} step(s) at ({x:.2}, {y:.2})")
             }
-            ScriptCommand::Pinch { x, y, factor } => {
+            ScriptCommand::Pinch { x, y, amount, phase } => {
+                use super::script::ScriptPinchAmount;
                 self.move_cursor(x, y);
-                self.pinch(factor - 1.0);
-                format!("OK: pinch {factor:.4} at ({x:.2}, {y:.2})")
+                let delta = match amount {
+                    ScriptPinchAmount::Factor(factor) => factor.ln(),
+                    ScriptPinchAmount::Delta(d) => d,
+                };
+                self.pinch(delta, phase);
+                format!("OK: pinch delta={delta:.4} at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::DoubleTap { at } => {
+                if let Some((x, y)) = at {
+                    self.move_cursor(x, y);
+                }
+                self.smart_zoom();
+                format!("OK: doubletap at ({:.2}, {:.2})", self.cursor.x, self.cursor.y)
             }
             ScriptCommand::Key(k) => {
                 use super::script::{modifier_bit_of_physical, ScriptKeyPhase};
@@ -1901,8 +2155,11 @@ impl ApplicationHandler<Wake> for App {
                     self.mouse(state, button);
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !ui_pointer => self.wheel(delta),
-            WindowEvent::PinchGesture { delta, .. } if !ui_pointer => self.pinch(delta),
+            WindowEvent::MouseWheel { delta, phase, .. } if !ui_pointer => self.wheel(delta, phase),
+            WindowEvent::PinchGesture { delta, phase, .. } if !ui_pointer => self.pinch(delta, phase),
+            WindowEvent::DoubleTapGesture { .. } if !ui_pointer => self.smart_zoom(),
+            // Terminals on the wall sit strictly axis-aligned; two-finger rotation is a no-op.
+            WindowEvent::RotationGesture { .. } => {}
             WindowEvent::Ime(ime) if !ui_keys => self.ime(&ime),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if !ui_keys => {
                 self.key(&event, event_loop);
@@ -2021,6 +2278,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
         held_codes: HashSet::new(),
+        clock_offset_ms: 0.0,
         last_copied: None,
         memory_clipboard: None,
         use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
@@ -2154,5 +2412,307 @@ mod tests {
             pointer_target(true, &ctx, Point::new(1050.0, 200.0), Buttons::LEFT.0),
             PointerTarget::Wall
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_fidelity_tests {
+    use super::*;
+
+    fn drain_scroll_lines(wall: &mut Wall) -> i32 {
+        wall.drain_effects()
+            .into_iter()
+            .filter_map(|e| match e {
+                WallEffect::ScrollTerminal { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn trackpad_pixel_delta_pans_one_to_one_at_every_zoom_and_respects_natural_sign() {
+        for &zoom in &[0.45_f64, 1.0, 3.75, 20.0] {
+            let mut wall = Wall::in_memory(RulesOptions {
+                viewport: Size::new(1600.0, 1000.0),
+                scale_factor: 2.0,
+                ..RulesOptions::default()
+            });
+            let cur_z = wall.camera().zoom();
+            wall.pinch(800.0, 500.0, zoom / cur_z);
+            assert!((wall.camera().zoom() - zoom).abs() < 1e-6);
+            let anchor_world = Point::new(12.0, -8.0);
+            let before_px = wall.camera().to_screen(anchor_world);
+
+            // Recorded macOS two-finger swipe right (+42 pt) & down (+18 pt) on a 2x Retina
+            // display: winit delivers `PhysicalPosition(84.0, 36.0)` across Started -> Moved -> Ended.
+            let recorded = [
+                (TouchPhase::Started, 0.0, 0.0, 0.0),
+                (TouchPhase::Moved, 50.0, 20.0, 8.0),
+                (TouchPhase::Moved, 34.0, 16.0, 16.0),
+                (TouchPhase::Ended, 0.0, 0.0, 24.0),
+            ];
+            for (phase, px_x, px_y, t_ms) in recorded {
+                if let Some((dx, dy, mode)) = convert_scroll_delta(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(px_x, px_y)),
+                    phase,
+                    2.0,
+                    Mods::default(),
+                    "ctrl alt meta",
+                ) {
+                    wall.wheel(&WheelEvent {
+                        x: 800.0,
+                        y: 500.0,
+                        delta_x: dx,
+                        delta_y: dy,
+                        delta_mode: mode,
+                        mods: Mods::default(),
+                        time_ms: t_ms,
+                    });
+                }
+            }
+
+            let after_px = wall.camera().to_screen(anchor_world);
+            assert!(
+                (after_px.x - (before_px.x + 42.0)).abs() < 1e-6
+                    && (after_px.y - (before_px.y + 18.0)).abs() < 1e-6,
+                "zoom={zoom}: world content moved ({:.4}, {:.4}) logical px instead of (+42, +18)",
+                after_px.x - before_px.x,
+                after_px.y - before_px.y,
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_pan_flick_with_macos_momentum_never_hijacks_sliding_terminal_until_pointer_moves() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 2.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let _ = wall.drain_effects();
+
+        let described = wall.frame();
+        let t1_box = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        // Place stationary cursor 80 px to the left of focused `t1` (empty paper), then flick
+        // left (`scrollingDeltaX < 0`) so `t1` slides directly underneath `(cursor_x, cursor_y)`
+        // right as macOS switches from finger lift (`Ended`) to `momentumPhase::Began` (`Started`).
+        let cursor_x = t1_box.left - 80.0;
+        let cursor_y = 0.5 * (t1_box.top + t1_box.bottom);
+        assert!(cursor_x > 20.0);
+
+        let flick_and_momentum = [
+            (TouchPhase::Started, 0.0, 0.0, 1000.0),
+            (TouchPhase::Moved, -60.0, -10.0, 1008.0),
+            (TouchPhase::Moved, -60.0, -10.0, 1016.0),
+            (TouchPhase::Ended, 0.0, 0.0, 1024.0),       // fingers lift
+            (TouchPhase::Started, -50.0, -24.0, 1032.0), // macOS momentumPhase == Began!
+            (TouchPhase::Moved, -40.0, -30.0, 1040.0),   // t1 is now squarely under cursor!
+            (TouchPhase::Moved, -20.0, -30.0, 1048.0),
+            (TouchPhase::Ended, 0.0, 0.0, 1056.0),       // momentum ends
+        ];
+        for (phase, pt_x, pt_y, t_ms) in flick_and_momentum {
+            if let Some((dx, dy, mode)) = convert_scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(pt_x * 2.0, pt_y * 2.0)),
+                phase,
+                2.0,
+                Mods::default(),
+                "ctrl alt meta",
+            ) {
+                wall.wheel(&WheelEvent {
+                    x: cursor_x,
+                    y: cursor_y,
+                    delta_x: dx,
+                    delta_y: dy,
+                    delta_mode: mode,
+                    mods: Mods::default(),
+                    time_ms: t_ms,
+                });
+            }
+        }
+        // Confirm `t1` really slid under `(cursor_x, cursor_y)` yet received 0 scroll lines.
+        let after = wall.frame();
+        let slid_box = after.camera.to_screen_box(
+            after.terminals[0].body_rect,
+            after.viewport.w,
+            after.viewport.h,
+        );
+        assert!(
+            cursor_x >= slid_box.left && cursor_x <= slid_box.right,
+            "expected t1 ({:.1}..{:.1}) to slide under cursor_x={cursor_x:.1}",
+            slid_box.left,
+            slid_box.right
+        );
+        assert_eq!(drain_scroll_lines(&mut wall), 0);
+
+        // Moving the pointer > LATCH_SLOP_PX (24 px) inside `t1` breaks the canvas latch so the
+        // user can immediately scroll `t1` without waiting 140 ms; then moving the pointer > 24 px
+        // off `t1` mid-momentum stops scrolling `t1`.
+        let inside_x = cursor_x + 40.0;
+        let (dx, dy, mode) = convert_scroll_delta(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 120.0)),
+            TouchPhase::Moved,
+            2.0,
+            Mods::default(),
+            "ctrl alt meta",
+        )
+        .unwrap();
+        wall.wheel(&WheelEvent {
+            x: inside_x,
+            y: cursor_y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 1064.0,
+        });
+        assert!(
+            drain_scroll_lines(&mut wall) > 0,
+            "moving >24px onto focused t1 should scroll t1"
+        );
+
+        let outside_x = slid_box.left - 40.0;
+        wall.wheel(&WheelEvent {
+            x: outside_x,
+            y: cursor_y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 1072.0,
+        });
+        assert_eq!(
+            drain_scroll_lines(&mut wall),
+            0,
+            "momentum must stop scrolling t1 once pointer moves >24px off it"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_line_delta_scrolls_three_lines_per_notch_and_zooms_by_step_factor() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 1.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let _ = wall.drain_effects();
+        let described = wall.frame();
+        let sb = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        let (cx, cy) = (0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom));
+
+        // One upward wheel detent (`LineDelta(0, 1)`): 1 immediate lead line + 2 glided = 3 lines.
+        let (dx, dy, mode) = convert_scroll_delta(
+            MouseScrollDelta::LineDelta(0.0, 1.0),
+            TouchPhase::Moved,
+            1.0,
+            Mods::default(),
+            "ctrl alt meta",
+        )
+        .unwrap();
+        assert_eq!(mode, DeltaMode::Line);
+        assert_eq!(dy, -3.0);
+        wall.wheel(&WheelEvent {
+            x: cx,
+            y: cy,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 2000.0,
+        });
+        let mut total_lines = drain_scroll_lines(&mut wall);
+        for i in 1..=30 {
+            wall.tick(1.0 / 60.0, 2000.0 + f64::from(i) * 16.0);
+            total_lines += drain_scroll_lines(&mut wall);
+        }
+        assert_eq!(total_lines, 3);
+
+        // `Ctrl + LineDelta(0, 1)` glides camera zoom by exact `WHEEL_ZOOM.step_factor` (`1.12x`).
+        let z0 = wall.camera().zoom();
+        let anchor_before = wall.camera().to_world(Point::new(420.0, 310.0));
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let (zdx, zdy, zmode) = convert_scroll_delta(
+            MouseScrollDelta::LineDelta(0.0, 1.0),
+            TouchPhase::Moved,
+            1.0,
+            ctrl,
+            "ctrl alt meta",
+        )
+        .unwrap();
+        assert_eq!(zmode, DeltaMode::Pixel);
+        assert_eq!(zdy, -100.0);
+        wall.wheel(&WheelEvent {
+            x: 420.0,
+            y: 310.0,
+            delta_x: zdx,
+            delta_y: zdy,
+            delta_mode: zmode,
+            mods: ctrl,
+            time_ms: 3000.0,
+        });
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, 3000.0 + f64::from(i) * 16.0);
+        }
+        let z1 = wall.camera().zoom();
+        let anchor_after = wall.camera().to_world(Point::new(420.0, 310.0));
+        assert!(
+            ((z1 / z0) - 1.12).abs() < 1e-4,
+            "expected 1.12x zoom step per mouse notch, got {:.6}",
+            z1 / z0
+        );
+        assert!(
+            (anchor_after.x - anchor_before.x).hypot(anchor_after.y - anchor_before.y) < 1e-4
+        );
+    }
+
+    #[test]
+    fn pinch_uses_exponential_browser_rate_keeps_anchor_and_stays_positive_on_large_outward_deltas() {
+        assert_eq!(pinch_zoom_factor(0.0, TouchPhase::Started), None);
+        assert_eq!(pinch_zoom_factor(0.2, TouchPhase::Cancelled), None);
+
+        // Symmetric round-trip (`+0.35` then `-0.35`) returns to exact 1.0x, unlike `1 + delta`.
+        let f_in = pinch_zoom_factor(0.35, TouchPhase::Moved).unwrap();
+        let f_out = pinch_zoom_factor(-0.35, TouchPhase::Moved).unwrap();
+        assert!((f_in * f_out - 1.0).abs() < 1e-12);
+        assert!(pinch_zoom_factor(-1.5, TouchPhase::Moved).unwrap() > 0.0);
+
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 2.0,
+            ..RulesOptions::default()
+        });
+        let cur_z = wall.camera().zoom();
+        wall.pinch(800.0, 500.0, 4.0 / cur_z);
+        assert!((wall.camera().zoom() - 4.0).abs() < 1e-6);
+        let pt = Point::new(510.0, 290.0);
+        let world_before = wall.camera().to_world(pt);
+        for d in [0.08, 0.12, 0.05] {
+            wall.pinch(pt.x, pt.y, pinch_zoom_factor(d, TouchPhase::Moved).unwrap());
+        }
+        let world_after = wall.camera().to_world(pt);
+        assert!((wall.camera().zoom() - 4.0 * (0.25_f64).exp()).abs() < 1e-6);
+        assert!((world_after.x - world_before.x).hypot(world_after.y - world_before.y) < 1e-6);
     }
 }
