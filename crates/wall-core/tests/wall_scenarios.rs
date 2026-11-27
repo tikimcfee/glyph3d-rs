@@ -3764,6 +3764,127 @@ fn attach_agent_prefers_local_reattach_when_agents_extra_ns_connected() {
     );
 }
 
+#[test]
+fn loose_agent_view_shoves_restores_side_switches_resizes_and_spawn_steps_past_card() {
+    use wall_core::agent_view::{agent_view_rect, AgentViewDims};
+    use wall_core::config::AgentSide;
+    use wall_core::layout::overlaps;
+
+    let card_rect_of = |h: &mut Harness, id: &str, side: AgentSide| -> Rect {
+        let f = h.frame();
+        let body = h.wall.terminal_rect(id).expect("terminal body");
+        let bar_h = f
+            .title_bars
+            .iter()
+            .find(|b| b.terminal_id == id)
+            .map_or(0.0, |b| b.rect.height());
+        let cfg = h.wall.config();
+        let dims = AgentViewDims::new(
+            cfg.agent_view_width,
+            cfg.agent_view_height,
+            cfg.agent_view_gap,
+        );
+        agent_view_rect(body, bar_h, side, dims)
+    };
+
+    // ── Part A: Loose neighbours shove aside on open, side-switch, card resize & restore on close ──
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok("wall.fit");
+    h.settle();
+
+    let t1_start = h.wall.terminal_rect(&t1).expect("t1 start");
+    let t2_start = h.wall.terminal_rect(&t2).expect("t2 start");
+    assert!(
+        t2_start.min_x > t1_start.max_x,
+        "t2 should start to the right of t1: {t1_start:?} vs {t2_start:?}"
+    );
+
+    // 1. Open t1's Agent View on `right` (`⌘A` / `wall.agent t1 open`): `t2` shoves right clear of card.
+    h.run_ok(&format!("wall.agent {t1} open"));
+    let card_r = card_rect_of(&mut h, &t1, AgentSide::Right);
+    let t2_shoved = h.wall.terminal_rect(&t2).expect("t2 shoved");
+    assert!(
+        !overlaps(card_r, t2_shoved) && t2_shoved.min_x >= card_r.max_x + h.wall.config().group_gap - 1e-6,
+        "t2 must shove clear past t1's right Agent View + groupGap: card={card_r:?}, t2={t2_shoved:?}"
+    );
+    assert_eq!(h.wall.terminal_rect(&t1).unwrap(), t1_start);
+
+    // 2. Switch side to `left`: right-hand room is given back (`t2` returns to `t2_start`).
+    h.run_ok(&format!("wall.agent.side {t1} left"));
+    assert_eq!(
+        h.wall.terminal_rect(&t2).unwrap(),
+        t2_start,
+        "switching Agent View from right to left must give right-hand room back to t2"
+    );
+
+    // 3. Switch back to `right`, then widen the card (`wall.config agentViewWidth 130`): `t2` shoves further right.
+    h.run_ok(&format!("wall.agent.side {t1} right"));
+    let t2_shoved_76 = h.wall.terminal_rect(&t2).unwrap();
+    assert_eq!(t2_shoved_76, t2_shoved);
+    h.run_ok("wall.config agentViewWidth 130");
+    let wide_card = card_rect_of(&mut h, &t1, AgentSide::Right);
+    let t2_shoved_130 = h.wall.terminal_rect(&t2).unwrap();
+    assert!(
+        t2_shoved_130.min_x > t2_shoved_76.min_x && !overlaps(wide_card, t2_shoved_130),
+        "growing agentViewWidth must shove t2 clear of wider card: card={wide_card:?}, t2={t2_shoved_130:?}"
+    );
+
+    // Reset width, close, re- verify exact restore from single open -> close.
+    h.run_ok(&format!("wall.agent {t1} close"));
+    h.run_ok("wall.config agentViewWidth default");
+    let t2_base = h.wall.terminal_rect(&t2).unwrap();
+    // Place `t2` back at `t2_start` cleanly and test open -> close exact return + manual-move preservation.
+    h.run_ok(&format!("terminal.move {t2} {} {}", t2_start.min_x, t2_start.max_y));
+    let _ = t2_base;
+    assert_eq!(h.wall.terminal_rect(&t2).unwrap(), t2_start);
+
+    h.run_ok(&format!("wall.agent {t1} open"));
+    assert_eq!(h.wall.terminal_rect(&t2).unwrap(), t2_shoved);
+    h.run_ok(&format!("wall.agent {t1} close"));
+    assert_eq!(
+        h.wall.terminal_rect(&t2).unwrap(),
+        t2_start,
+        "closing t1's Agent View must restore t2 to its exact pre-shove spot"
+    );
+
+    // 4. If the user manually moves `t2` while shoved, closing `t1`'s Agent View leaves `t2` put.
+    h.run_ok(&format!("wall.agent {t1} open"));
+    let manual_x = h.wall.terminal_rect(&t2).unwrap().min_x + 12.0;
+    let manual_y = h.wall.terminal_rect(&t2).unwrap().max_y;
+    h.run_ok(&format!("terminal.move {t2} {manual_x} {manual_y}"));
+    let t2_manual = h.wall.terminal_rect(&t2).unwrap();
+    h.run_ok(&format!("wall.agent {t1} close"));
+    assert_eq!(
+        h.wall.terminal_rect(&t2).unwrap(),
+        t2_manual,
+        "manually moved neighbour must stay where placed when Agent View closes"
+    );
+
+    // ── Part B: Spawning a new loose terminal steps past `terminal + open card` ──
+    for reframe_first in [false, true] {
+        let mut hs = Harness::new();
+        let a1 = hs.spawn();
+        hs.settle();
+        hs.run_ok(&format!("wall.agent {a1} open"));
+        if reframe_first {
+            hs.run_ok(&format!("wall.reveal {a1}"));
+            hs.settle();
+        }
+        let a2 = hs.spawn();
+        hs.settle();
+        let a1_card = card_rect_of(&mut hs, &a1, AgentSide::Right);
+        let a1_body = hs.wall.terminal_rect(&a1).unwrap();
+        let a2_body = hs.wall.terminal_rect(&a2).unwrap();
+        assert!(
+            !overlaps(a1_body, a2_body) && !overlaps(a1_card, a2_body) && a2_body.min_x > a1_card.max_x,
+            "reframe_first={reframe_first}: newly spawned {a2} must step past {a1} + open card: a1_card={a1_card:?}, a2={a2_body:?}"
+        );
+    }
+}
+
+
 
 
 
