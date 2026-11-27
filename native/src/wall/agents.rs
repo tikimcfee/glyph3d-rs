@@ -1696,6 +1696,13 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// How long a test waits for the stub `agent` CLI to be run and read. It returns as soon
+    /// as the answer is there, so the room costs nothing on a quiet machine. At three seconds
+    /// (until 2026-11-27) one of these failed under a load average of 8 to 11, with nothing
+    /// wrong but the wait: a subprocess start can take that long beside other builds. (The
+    /// same class agent-feed's own tests gave a minute for.)
+    const STUB_WAIT: Duration = Duration::from_secs(60);
+
     fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -1977,7 +1984,7 @@ mod tests {
         // `Wall::set_bus_snapshot`.
         let _ = agents.pump(&mut wall);
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(STUB_WAIT, || {
                 let _ = agents.pump(&mut wall);
                 wall.run("wall.bus").text.contains("coder")
             }),
@@ -1991,7 +1998,7 @@ mod tests {
         assert!(open_reply.text.contains("open"), "reply: {}", open_reply.text);
 
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(STUB_WAIT, || {
                 let _ = agents.pump(&mut wall);
                 let host = WallHostAdapter {
                     wall: &wall,
@@ -2051,7 +2058,7 @@ mod tests {
         fs::write(&follow_extra, live_events).unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(STUB_WAIT, || {
                 let _ = agents.pump(&mut wall);
                 let host = WallHostAdapter {
                     wall: &wall,
@@ -2077,7 +2084,7 @@ mod tests {
         );
 
         assert!(
-            wait_until(Duration::from_secs(3), || {
+            wait_until(STUB_WAIT, || {
                 let _ = agents.pump(&mut wall);
                 agents.describe(&wall, "gx-coder").is_some_and(|d| {
                     d.rows.len() == 3
@@ -2298,7 +2305,7 @@ mod tests {
 
         // Open Agent View on t1 while title is still shell default -> falls through to /Users/user.
         let _ = agents.run_verb(&mut wall, "wall.agent t1 open");
-        assert!(wait_until(Duration::from_secs(3), || {
+        assert!(wait_until(STUB_WAIT, || {
             let _ = agents.pump(&mut wall);
             !agents.views().sessions().is_empty()
         }));
