@@ -14,8 +14,9 @@ use super::metrics::WorldRect;
 pub const DEFAULT_Z_MIN: f32 = -1000.0;
 pub const DEFAULT_Z_MAX: f32 = 1000.0;
 
-/// Minimum and maximum allowed camera zoom (pixels per world unit).
-pub const MIN_ZOOM: f32 = 0.25;
+/// Minimum and maximum allowed camera zoom (pixels per world unit; `MIN_ZOOM`
+/// matches `wall_core::camera::ZOOM_MIN` so renderer and rules agree at far zoom).
+pub const MIN_ZOOM: f32 = 0.05;
 pub const MAX_ZOOM: f32 = 512.0;
 
 /// Orthographic camera for the wall canvas.
