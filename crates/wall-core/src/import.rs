@@ -808,11 +808,13 @@ fn import_sidebar(val: &Value, store: &mut WallStore, unmapped: &mut Vec<Unmappe
                 .collect::<Vec<_>>()
         })
     });
+    // The JS wall's sidebar had one layout, so an export names no mode.
     store.set_sidebar(SidebarPatch {
         open,
         side,
         float,
         collapsed,
+        mode: None,
     });
     true
 }

@@ -1,16 +1,21 @@
-//! Native `egui` sidebar panel (`wall/Sidebar.jsx` + `wall/Panel.jsx` +
-//! `wall/holdPress.js`), backed by [`wall_core::sidebar`] and
-//! [`wall_core::dock`].
+//! Native `egui` sidebar panel (`wall/Panel.jsx` + `wall/holdPress.js`),
+//! backed by [`wall_core::sidebar`] and [`wall_core::dock`].
 //!
 //! Contract (`out/wall-port/briefs/P-panels.md`):
 //! `pub fn show(ctx: &egui::Context, state: &mut SidebarState, input: &SidebarInput, out: &mut Vec<String>)`
 //!
-//! - Lists groups first (foldable, with column `−`/`+`, `tile`/`free` toggle,
-//!   and ungroup tools), their members indented beneath them, then ungrouped
-//!   terminals, with hidden terminals dimmed and marked `"hidden"`.
-//! - Below the terminals tree, renders the `agents` section grouped by host,
-//!   showing status dots, `"on wall"` badges, hover details, and `wall.attach`
-//!   clicks (or the empty-state explanation when no live agents exist).
+//! - Draws ONE list (2026-11-27; `wall/Sidebar.jsx` drew the terminals and
+//!   then the agents): every terminal on the wall and every live agent, an
+//!   agent that a terminal shows drawn in that terminal's row. A row carries
+//!   its group's chip, a status dot when it has an agent (filled when the
+//!   agent is on the wall, a ring when it is not: a click attaches it), the
+//!   agent's status, and on hover the terminal's tools and the agent's
+//!   details. Hidden terminals are dimmed and marked `"hidden"`.
+//! - The header's `group | host` switch (`wall.sidebar mode group|host`)
+//!   sections the list: by group (each foldable, with column `−`/`+`,
+//!   `tile`/`free` toggle and ungroup tools, then `no group`), or by host.
+//!   Every rule about what is listed where is [`wall_core::sidebar::build_sidebar`]'s;
+//!   this file draws its rows.
 //! - Docks on the left or right viewport edge (using `input.dock_rect` from
 //!   [`wall_core::dock::dock_layout`]) or floats freely with draggable header
 //!   persistence (`wall.sidebar float x y`).
@@ -24,8 +29,8 @@ use wall_core::chord::chord_label;
 use wall_core::dock::{DockLayout, DockSide, DOCK_WIDTHS};
 use wall_core::input::Platform;
 use wall_core::sidebar::{
-    build_sidebar, AgentRow, GroupRow, SidebarInput as CoreSidebarInput, SidebarModel, SidebarRow,
-    TerminalRow,
+    build_sidebar, EntryRow, GroupRow, SectionKind, SectionRow, SidebarInput as CoreSidebarInput,
+    SidebarMode, SidebarModel, SidebarRow,
 };
 
 use super::{
@@ -82,7 +87,7 @@ fn fallback_dock_rect(viewport: egui::Rect, side: DockSide) -> egui::Rect {
 /// Plain-data input read by [`show`].
 #[derive(Clone, Debug)]
 pub struct SidebarInput {
-    /// Rows and agent host sections produced by [`wall_core::sidebar::build_sidebar`].
+    /// The list's rows and mode, from [`wall_core::sidebar::build_sidebar`].
     pub model: SidebarModel,
     /// Docked rectangle from [`sidebar_dock_rect`] when `side` is `Left` or `Right`.
     /// When `None` while docked, falls back to the outer `Left`/`Right` viewport edge.
@@ -145,6 +150,16 @@ pub struct SidebarState {
     pub group_fold_rects: HashMap<String, egui::Rect>,
     /// Terminal row click rectangles keyed by terminal id.
     pub term_row_rects: HashMap<String, egui::Rect>,
+    /// Click rectangles of the agents with no terminal on the wall, keyed by target.
+    pub agent_row_rects: HashMap<String, egui::Rect>,
+    /// The header's mode switch halves `[group, host]`.
+    pub mode_btn_rects: [Option<egui::Rect>; 2],
+    /// Whether the header had room for its title beside the switch.
+    pub title_shown: bool,
+    /// Every row drawn last frame, top to bottom, as `app.where` prints it:
+    /// `g:<group>[<host>=<n>,...]`, `s:none[...]`, `h:<host>[<n>]`,
+    /// `t:<terminal>`, `t:<terminal>+<agent>=<status>`, `a:<agent>=<status>`.
+    pub rows_drawn: Vec<String>,
 }
 
 impl Default for SidebarState {
@@ -169,6 +184,10 @@ impl SidebarState {
             dock_btn_rects: [None; 4],
             group_fold_rects: HashMap::new(),
             term_row_rects: HashMap::new(),
+            agent_row_rects: HashMap::new(),
+            mode_btn_rects: [None; 2],
+            title_shown: false,
+            rows_drawn: Vec::new(),
         }
     }
 
@@ -350,6 +369,132 @@ fn hold_close_btn(
     (interacted, fired)
 }
 
+const ROW_H: f32 = 22.0;
+/// Air above every header but the list's first row.
+const SECTION_GAP: f32 = 4.0;
+/// Where an entry's name starts: past the group chip and the status marker.
+const NAME_X: f32 = 31.0;
+/// The name keeps this much (or all of it, when shorter) before a status
+/// word, group pill or host tag is allowed beside it.
+const NAME_MIN_W: f32 = 80.0;
+
+const FG_TEXT: egui::Color32 = egui::Color32::from_rgb(0xd4, 0xd9, 0xe2);
+const FG_HEAD: egui::Color32 = egui::Color32::from_rgb(0xae, 0xb7, 0xc6);
+const FG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x8e, 0xf0, 0xb8);
+const FG_DIM: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x73, 0x83);
+const FG_FAINT: egui::Color32 = egui::Color32::from_rgb(0x5d, 0x65, 0x74);
+const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(0x15, 0x1a, 0x24);
+const BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x16, 0x25, 0x1e);
+
+fn pointer_in(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.ctx()
+        .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
+        .is_some_and(|p| rect.contains(p))
+}
+
+/// A group's chip: a short bar in its colour, on its header and on every
+/// member row.
+fn paint_group_chip(painter: &egui::Painter, x: f32, center_y: f32, color: egui::Color32) {
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(x, center_y - 6.0),
+            egui::pos2(x + 3.0, center_y + 6.0),
+        ),
+        egui::CornerRadius::same(1),
+        color,
+    );
+}
+
+/// What `app.where` prints for a drawn row: [`SidebarRow::token`], then a
+/// header's count by host (`g:g-1[laptop-2=2,workstation=1]`, `h:workstation[3]`)
+/// or an agent's status (`t:gx-lead+lead@laptop-2=processing`).
+fn report_token(row: &SidebarRow) -> String {
+    let by_host = |hosts: &[wall_core::sidebar::HostCount]| -> String {
+        hosts
+            .iter()
+            .map(|h| {
+                let host = if h.host.is_empty() { "local" } else { h.host.as_str() };
+                format!("{host}={}", h.count)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let token = match row {
+        SidebarRow::Group(g) => format!("{}[{}]", row.token(), by_host(&g.hosts)),
+        SidebarRow::Section(s) => match s.kind {
+            SectionKind::NoGroup => format!("{}[{}]", row.token(), by_host(&s.hosts)),
+            SectionKind::Host => format!("{}[{}]", row.token(), s.count),
+        },
+        SidebarRow::Entry(e) => match &e.agent {
+            Some(a) => format!("{}={}", row.token(), a.status.word()),
+            None => row.token(),
+        },
+    };
+    token
+        .chars()
+        .map(|c| if c.is_whitespace() || c == ';' { '_' } else { c })
+        .collect()
+}
+
+/// A header's label: the name, then its count by host, dimmer and smaller.
+/// `counts` are the forms of the count, longest first
+/// (`"3 (laptop-2 2, workstation 1)"`, then `"laptop-2 2, workstation 1"`).
+/// The first of these that fits beside the name is drawn: each form after a
+/// `·`, then the last with no `·`; when none fits, that is cut with `…` (the
+/// header's hover text has all of it). 248 px does not hold the long form
+/// for two hosts with nine-letter names, and holds the short one for a group
+/// name of up to seven letters.
+fn paint_header_label(
+    painter: &egui::Painter,
+    left: f32,
+    center_y: f32,
+    max_w: f32,
+    name: &str,
+    name_color: egui::Color32,
+    counts: &[&str],
+) {
+    let name_galley = layout_elided(
+        painter,
+        name,
+        egui::FontId::monospace(12.5),
+        name_color,
+        max_w.max(16.0),
+    );
+    let name_w = name_galley.size().x;
+    painter.galley(
+        egui::pos2(left, center_y - name_galley.size().y * 0.5),
+        name_galley,
+        name_color,
+    );
+    let rest = max_w - name_w - 5.0;
+    if rest >= 24.0 {
+        let font = egui::FontId::monospace(10.0);
+        let shortest = counts.last().copied().unwrap_or_default();
+        let forms = counts
+            .iter()
+            .map(|count| format!("· {count}"))
+            .chain(std::iter::once(shortest.to_string()));
+        let mut whole = None;
+        for form in forms {
+            let galley = painter.layout_no_wrap(form, font.clone(), FG_FAINT);
+            if galley.size().x <= rest {
+                whole = Some(galley);
+                break;
+            }
+        }
+        let count_galley =
+            whole.unwrap_or_else(|| layout_elided(painter, shortest, font, FG_FAINT, rest));
+        painter.galley(
+            egui::pos2(
+                left + name_w + 5.0,
+                center_y - count_galley.size().y * 0.5 + 0.5,
+            ),
+            count_galley,
+            FG_FAINT,
+        );
+    }
+}
+
 fn draw_group_row(
     ui: &mut egui::Ui,
     panel_w: f32,
@@ -359,19 +504,12 @@ fn draw_group_row(
     state: &mut SidebarState,
     out: &mut Vec<String>,
 ) {
-    let row_h = 22.0;
-    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(panel_w, row_h), egui::Sense::hover());
-    let pointer_in_row = ui
-        .ctx()
-        .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
-        .is_some_and(|p| row_rect.contains(p));
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(panel_w, ROW_H), egui::Sense::hover());
+    let pointer_in_row = pointer_in(ui, row_rect);
 
     if ui.is_rect_visible(row_rect) && pointer_in_row {
-        ui.painter().rect_filled(
-            row_rect,
-            egui::CornerRadius::ZERO,
-            egui::Color32::from_rgb(0x15, 0x1a, 0x24),
-        );
+        ui.painter()
+            .rect_filled(row_rect, egui::CornerRadius::ZERO, BG_HOVER);
     }
 
     let mut tool_interacted = false;
@@ -409,31 +547,19 @@ fn draw_group_row(
         34.0 + 18.0 + 8.0
     };
     let visual_tools_w = if pointer_in_row { tools_hit_w } else { 6.0 };
-    let count_text = g.member_count.to_string();
-    let count_w = 18.0;
-    let avail_name_w =
-        (row_rect.right() - visual_tools_w - count_w - row_ui.cursor().min.x - 4.0).max(24.0);
     if ui.is_rect_visible(row_rect) {
-        let name_x = row_ui.cursor().min.x;
-        let galley = layout_elided(
+        let chip_x = row_ui.cursor().min.x + 2.0;
+        let color = parse_hex_color(g.color).unwrap_or(FG_FAINT);
+        paint_group_chip(row_ui.painter(), chip_x, row_rect.center().y, color);
+        let name_x = chip_x + 8.0;
+        paint_header_label(
             row_ui.painter(),
+            name_x,
+            row_rect.center().y,
+            row_rect.right() - visual_tools_w - name_x,
             &g.name,
-            egui::FontId::monospace(12.5),
-            egui::Color32::from_rgb(0xae, 0xb7, 0xc6),
-            (avail_name_w - 2.0).max(16.0),
-        );
-        row_ui.painter().galley(
-            egui::pos2(name_x + 2.0, row_rect.center().y - galley.size().y * 0.5),
-            galley,
-            egui::Color32::from_rgb(0xae, 0xb7, 0xc6),
-        );
-        let count_right = row_rect.right() - visual_tools_w - 2.0;
-        row_ui.painter().text(
-            egui::pos2(count_right, row_rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            count_text,
-            egui::FontId::monospace(11.0),
-            egui::Color32::from_rgb(0x5d, 0x65, 0x74),
+            FG_HEAD,
+            &[&g.count_label, &g.count_short],
         );
     }
 
@@ -529,255 +655,418 @@ fn draw_group_row(
     if body_hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    // The label is cut to the row; the hover text is all of it.
+    let body_hit = body_hit.on_hover_text(sanitize_egui_text(&format!(
+        "{} · {}",
+        g.name, g.count_label
+    )));
     if body_hit.clicked() && !tool_interacted {
         push_cmd(out, &g.click_cmd);
     }
 }
 
-fn draw_terminal_row(
+/// A plain header: `no group` in group mode, a host in host mode.
+fn draw_section_row(ui: &mut egui::Ui, panel_w: f32, s: &SectionRow) {
+    let (row_rect, resp) =
+        ui.allocate_exact_size(egui::vec2(panel_w, ROW_H), egui::Sense::hover());
+    if ui.is_rect_visible(row_rect) {
+        let name_color = match s.kind {
+            SectionKind::Host => FG_HEAD,
+            SectionKind::NoGroup => egui::Color32::from_rgb(0x7c, 0x85, 0x96),
+        };
+        let left = row_rect.left() + 10.0;
+        paint_header_label(
+            ui.painter(),
+            left,
+            row_rect.center().y,
+            row_rect.right() - 6.0 - left,
+            &s.label,
+            name_color,
+            &[&s.count_label, &s.count_short],
+        );
+    }
+    let tip = match s.kind {
+        SectionKind::Host if s.local => format!("{} · {} · this machine", s.label, s.count_label),
+        _ => format!("{} · {}", s.label, s.count_label),
+    };
+    let _ = resp.on_hover_text(sanitize_egui_text(&tip));
+}
+
+/// The mark before a row's name. An agent's is a dot in its status colour,
+/// filled when a terminal on the wall shows it and a ring when none does (the
+/// old "on wall" tag); a terminal with no agent gets a faint prompt.
+fn paint_row_marker(painter: &egui::Painter, center: egui::Pos2, e: &EntryRow, fade: f32) {
+    match &e.agent {
+        Some(a) => {
+            let color = parse_hex_color(a.status.color())
+                .unwrap_or(egui::Color32::from_rgb(0x8b, 0x95, 0xa7))
+                .gamma_multiply(fade);
+            if a.on_wall.is_some() {
+                painter.circle_filled(center, 3.5, color);
+            } else {
+                painter.circle_stroke(center, 3.0, egui::Stroke::new(1.3, color));
+            }
+        }
+        None => {
+            let stroke = egui::Stroke::new(1.3, FG_FAINT.gamma_multiply(fade));
+            let tip = egui::pos2(center.x + 1.8, center.y);
+            painter.line_segment([egui::pos2(center.x - 1.8, center.y - 3.0), tip], stroke);
+            painter.line_segment([egui::pos2(center.x - 1.8, center.y + 3.0), tip], stroke);
+        }
+    }
+}
+
+/// One row of the list: a terminal (with its tools on hover, and its agent's
+/// status when it shows one) or an agent with no terminal on the wall.
+fn draw_entry_row(
     ui: &mut egui::Ui,
     panel_w: f32,
-    t: &TerminalRow,
+    e: &EntryRow,
     platform: Platform,
     close_hold_ms: u64,
     state: &mut SidebarState,
     out: &mut Vec<String>,
 ) {
-    let row_h = 22.0;
-    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(panel_w, row_h), egui::Sense::hover());
-    let pointer_in_row = ui
-        .ctx()
-        .input(|i| i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()))
-        .is_some_and(|p| row_rect.contains(p));
+    let (row_rect, _) = ui.allocate_exact_size(egui::vec2(panel_w, ROW_H), egui::Sense::hover());
+    let pointer_in_row = pointer_in(ui, row_rect);
+    let center_y = row_rect.center().y;
 
-    if ui.is_rect_visible(row_rect) {
-        if t.focused {
-            ui.painter().rect_filled(
-                row_rect,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgb(0x16, 0x25, 0x1e),
-            );
-        } else if pointer_in_row {
-            ui.painter().rect_filled(
-                row_rect,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgb(0x15, 0x1a, 0x24),
-            );
-        }
-    }
-
-    let pad_left = 10.0 + f32::from(t.depth) * 16.0;
-    let tools_count = if t.leave_group_cmd.is_some() { 4.0 } else { 3.0 };
-    let tools_hit_w = tools_count * 19.0 + 8.0;
-    let visual_tools_w = if pointer_in_row { tools_hit_w } else { 6.0 };
-    let hidden_tag_w = if t.hidden { 42.0 } else { 0.0 };
-
-    if ui.is_rect_visible(row_rect) {
-        let name_x = row_rect.left() + pad_left;
-        let name_max_w =
-            (row_rect.right() - visual_tools_w - hidden_tag_w - 4.0 - name_x).max(20.0);
-        let fg = if t.hidden {
-            egui::Color32::from_rgb(0x6b, 0x73, 0x83)
-        } else if t.focused {
-            egui::Color32::from_rgb(0x8e, 0xf0, 0xb8)
-        } else {
-            egui::Color32::from_rgb(0xd4, 0xd9, 0xe2)
-        };
-        let galley = layout_elided(
-            ui.painter(),
-            &t.name,
-            egui::FontId::monospace(12.5),
-            fg,
-            name_max_w,
-        );
-        ui.painter().galley(
-            egui::pos2(name_x, row_rect.center().y - galley.size().y * 0.5),
-            galley,
-            fg,
-        );
-
-        if t.hidden {
-            let tag_right = row_rect.right() - visual_tools_w - 2.0;
-            ui.painter().text(
-                egui::pos2(tag_right - hidden_tag_w * 0.5, row_rect.center().y),
-                egui::Align2::CENTER_CENTER,
-                "hidden",
-                egui::FontId::monospace(10.5),
-                egui::Color32::from_rgb(0x5d, 0x65, 0x74),
-            );
-        }
-    }
-
-    let mut tool_interacted = false;
-    let mut row_ui = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(row_rect)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-    );
-    row_ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
-    row_ui.add_space(6.0);
-
-    let (held_active, close_fired) = hold_close_btn(
-        &mut row_ui,
-        &t.id,
-        close_hold_ms,
-        pointer_in_row,
-        &mut state.hold_close,
-    );
-    if held_active {
-        tool_interacted = true;
-    }
-    if close_fired {
-        push_cmd(out, &t.close_cmd);
-    }
-
-    let (vis_icon, vis_tip) = if t.hidden {
-        (
-            ChromeIcon::ShowCircle,
-            "show it, at its own spot".to_string(),
-        )
-    } else {
-        (
-            ChromeIcon::HideDash,
-            format!(
-                "hide it (it keeps running) — {}",
-                chord_label(platform, &["-"], false)
-            ),
-        )
+    let tools_hit_w = match &e.terminal {
+        Some(t) if t.leave_group_cmd.is_some() => 4.0 * 19.0 + 8.0,
+        Some(_) => 3.0 * 19.0 + 8.0,
+        None => 0.0,
     };
-    if row_tool_btn(&mut row_ui, vis_icon, &vis_tip, false, pointer_in_row).clicked() {
-        tool_interacted = true;
-        push_cmd(out, &t.visibility_cmd);
-    }
-
-    if let Some(leave_cmd) = &t.leave_group_cmd {
-        if row_tool_btn(
-            &mut row_ui,
-            ChromeIcon::LeaveGroup,
-            "take it out of its group",
-            false,
-            pointer_in_row,
-        )
-        .clicked()
-        {
-            tool_interacted = true;
-            push_cmd(out, leave_cmd);
-        }
-    }
-
-    let agent_tip = format!("agent view ({})", chord_label(platform, &["A"], false));
-    if row_tool_btn(
-        &mut row_ui,
-        ChromeIcon::AgentView,
-        &agent_tip,
-        t.agent_view_open,
-        pointer_in_row,
-    )
-    .clicked()
-    {
-        tool_interacted = true;
-        push_cmd(out, &t.agent_toggle_cmd);
-    }
-
-    let click_right = (row_rect.right() - tools_hit_w).max(row_rect.left() + 20.0);
-    let row_hit = ui.interact(
-        egui::Rect::from_min_max(row_rect.min, egui::pos2(click_right, row_rect.bottom())),
-        ui.make_persistent_id(("wall_sb_term_row", &t.id)),
-        egui::Sense::click(),
-    );
-    state.term_row_rects.insert(t.id.clone(), row_hit.rect);
-    if row_hit.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if row_hit.clicked() && !tool_interacted {
-        push_cmd(out, &t.click_cmd);
-    }
-}
-
-fn draw_agent_row(ui: &mut egui::Ui, panel_w: f32, a: &AgentRow, out: &mut Vec<String>) {
-    let row_h = 22.0;
-    let (row_rect, resp) =
-        ui.allocate_exact_size(egui::vec2(panel_w, row_h), egui::Sense::click());
-    if a.interactive && resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let resp = resp.on_hover_text(&a.tooltip);
-    let clicked = resp.clicked();
+    let tools_shown = e.terminal.is_some() && pointer_in_row;
 
     if ui.is_rect_visible(row_rect) {
-        if a.focused {
-            ui.painter().rect_filled(
-                row_rect,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgb(0x16, 0x25, 0x1e),
-            );
-        } else if resp.hovered() {
-            ui.painter().rect_filled(
-                row_rect,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgb(0x15, 0x1a, 0x24),
-            );
-        }
-
-        let status_color = parse_hex_color(a.status.color())
-            .unwrap_or(egui::Color32::from_rgb(0x8b, 0x95, 0xa7));
-        let dot_center = egui::pos2(row_rect.left() + 19.5, row_rect.center().y);
-        ui.painter().circle_filled(dot_center, 3.5, status_color);
-
-        // Right-aligned status word and optional "on wall" badge.
-        let status_galley = ui.painter().layout_no_wrap(
-            a.status.word().to_string(),
-            egui::FontId::monospace(10.5),
-            status_color,
-        );
-        let status_x = row_rect.right() - 8.0 - status_galley.size().x;
-        ui.painter().galley(
-            egui::pos2(status_x, row_rect.center().y - status_galley.size().y * 0.5),
-            status_galley,
-            status_color,
-        );
-
-        let mut right_bound = status_x - 6.0;
-        if a.on_wall.is_some() {
-            let on_galley = ui.painter().layout_no_wrap(
-                "on wall".to_string(),
-                egui::FontId::monospace(10.5),
-                egui::Color32::from_rgb(0x5d, 0x65, 0x74),
-            );
-            let on_x = right_bound - on_galley.size().x;
-            ui.painter().galley(
-                egui::pos2(on_x, row_rect.center().y - on_galley.size().y * 0.5),
-                on_galley,
-                egui::Color32::from_rgb(0x5d, 0x65, 0x74),
-            );
-            right_bound = on_x - 6.0;
-        }
-
-        let name_x = row_rect.left() + 28.0;
-        let name_fg = if !a.interactive {
-            egui::Color32::from_rgb(0x6b, 0x73, 0x83)
-        } else if a.focused {
-            egui::Color32::from_rgb(0x8e, 0xf0, 0xb8)
-        } else {
-            egui::Color32::from_rgb(0xd4, 0xd9, 0xe2)
-        };
-        let clip = egui::Rect::from_min_max(
-            egui::pos2(name_x, row_rect.top()),
-            egui::pos2(right_bound.max(name_x + 16.0), row_rect.bottom()),
-        );
-        let name_galley =
+        if e.focused {
             ui.painter()
-                .layout_no_wrap(a.name.clone(), egui::FontId::monospace(12.5), name_fg);
-        ui.painter().with_clip_rect(clip).galley(
-            egui::pos2(name_x, row_rect.center().y - name_galley.size().y * 0.5),
+                .rect_filled(row_rect, egui::CornerRadius::ZERO, BG_FOCUS);
+        } else if pointer_in_row {
+            ui.painter()
+                .rect_filled(row_rect, egui::CornerRadius::ZERO, BG_HOVER);
+        }
+
+        // A hidden terminal's row is dimmed whole.
+        let fade = if e.hidden { 0.5 } else { 1.0 };
+        if let Some(chip) = &e.chip {
+            let color = parse_hex_color(chip.color).unwrap_or(FG_FAINT);
+            paint_group_chip(
+                ui.painter(),
+                row_rect.left() + 10.0,
+                center_y,
+                color.gamma_multiply(fade),
+            );
+        }
+        paint_row_marker(
+            ui.painter(),
+            egui::pos2(row_rect.left() + 22.0, center_y),
+            e,
+            fade,
+        );
+
+        let name_x = row_rect.left() + NAME_X;
+        let name_fg = if e.hidden || !e.interactive {
+            FG_DIM
+        } else if e.focused {
+            FG_FOCUS
+        } else {
+            FG_TEXT
+        };
+        let small = egui::FontId::monospace(10.5);
+        let name_full =
+            ui.painter()
+                .layout_no_wrap(sanitize_egui_text(&e.name), egui::FontId::monospace(12.5), name_fg);
+        let name_need = name_full.size().x.min(NAME_MIN_W);
+
+        // What sits right of the name, by what it is worth when the row is
+        // too narrow for all of it: `hidden`, the agent's status, then the
+        // group's name (host mode) or the host's (group mode). The row's
+        // tools take the place of the last two while the pointer is on it.
+        let right_edge = row_rect.right() - if tools_shown { tools_hit_w } else { 8.0 };
+        let mut room = right_edge - name_x;
+        let mut take = |galley: &std::sync::Arc<egui::Galley>, pad: f32| -> bool {
+            let w = galley.size().x + pad + 6.0;
+            if room - w >= name_need {
+                room -= w;
+                true
+            } else {
+                false
+            }
+        };
+
+        let hidden_galley = e.hidden.then(|| {
+            ui.painter()
+                .layout_no_wrap("hidden".to_string(), small.clone(), FG_FAINT)
+        });
+        let hidden_galley = hidden_galley.filter(|g| take(g, 0.0));
+
+        let status_galley = match (&e.agent, tools_shown) {
+            (Some(a), false) => {
+                let color = parse_hex_color(a.status.color())
+                    .unwrap_or(egui::Color32::from_rgb(0x8b, 0x95, 0xa7))
+                    .gamma_multiply(fade);
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(a.status.word().to_string(), small.clone(), color);
+                take(&galley, 0.0).then_some((galley, color))
+            }
+            _ => None,
+        };
+
+        // (galley, colour, drawn as a pill)
+        let side_galley = if tools_shown {
+            None
+        } else if let Some(chip) = e.chip.as_ref().filter(|c| c.show_name) {
+            let color = parse_hex_color(chip.color)
+                .unwrap_or(FG_FAINT)
+                .gamma_multiply(fade);
+            let galley = layout_elided(ui.painter(), &chip.name, small.clone(), color, 72.0);
+            take(&galley, 8.0).then_some((galley, color, true))
+        } else if let Some(host) = &e.host_tag {
+            let galley = layout_elided(
+                ui.painter(),
+                &format!("@{host}"),
+                small.clone(),
+                FG_FAINT,
+                84.0,
+            );
+            take(&galley, 0.0).then_some((galley, FG_FAINT, false))
+        } else {
+            None
+        };
+
+        let mut x = right_edge;
+        if let Some((galley, color)) = status_galley {
+            x -= galley.size().x;
+            ui.painter().galley(
+                egui::pos2(x, center_y - galley.size().y * 0.5),
+                galley,
+                color,
+            );
+            x -= 6.0;
+        }
+        if let Some(galley) = hidden_galley {
+            x -= galley.size().x;
+            ui.painter().galley(
+                egui::pos2(x, center_y - galley.size().y * 0.5),
+                galley,
+                FG_FAINT,
+            );
+            x -= 6.0;
+        }
+        if let Some((galley, color, pill)) = side_galley {
+            let pad = if pill { 4.0 } else { 0.0 };
+            x -= galley.size().x + pad;
+            if pill {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x - pad, center_y - 7.5),
+                        egui::pos2(x + galley.size().x + pad, center_y + 7.5),
+                    ),
+                    egui::CornerRadius::same(4),
+                    color.gamma_multiply(0.16),
+                );
+            }
+            ui.painter().galley(
+                egui::pos2(x, center_y - galley.size().y * 0.5),
+                galley,
+                color,
+            );
+        }
+
+        let name_galley = layout_elided(
+            ui.painter(),
+            &e.name,
+            egui::FontId::monospace(12.5),
+            name_fg,
+            room.max(20.0),
+        );
+        ui.painter().galley(
+            egui::pos2(name_x, center_y - name_galley.size().y * 0.5),
             name_galley,
             name_fg,
         );
     }
 
-    if clicked {
-        push_cmd(out, &a.click_cmd);
+    let mut tool_interacted = false;
+    if let Some(t) = &e.terminal {
+        let mut row_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        row_ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+        row_ui.add_space(6.0);
+
+        let (held_active, close_fired) = hold_close_btn(
+            &mut row_ui,
+            &t.id,
+            close_hold_ms,
+            pointer_in_row,
+            &mut state.hold_close,
+        );
+        if held_active {
+            tool_interacted = true;
+        }
+        if close_fired {
+            push_cmd(out, &t.close_cmd);
+        }
+
+        let (vis_icon, vis_tip) = if e.hidden {
+            (
+                ChromeIcon::ShowCircle,
+                "show it, at its own spot".to_string(),
+            )
+        } else {
+            (
+                ChromeIcon::HideDash,
+                format!(
+                    "hide it (it keeps running) — {}",
+                    chord_label(platform, &["-"], false)
+                ),
+            )
+        };
+        if row_tool_btn(&mut row_ui, vis_icon, &vis_tip, false, pointer_in_row).clicked() {
+            tool_interacted = true;
+            push_cmd(out, &t.visibility_cmd);
+        }
+
+        if let Some(leave_cmd) = &t.leave_group_cmd {
+            if row_tool_btn(
+                &mut row_ui,
+                ChromeIcon::LeaveGroup,
+                "take it out of its group",
+                false,
+                pointer_in_row,
+            )
+            .clicked()
+            {
+                tool_interacted = true;
+                push_cmd(out, leave_cmd);
+            }
+        }
+
+        let agent_tip = format!("agent view ({})", chord_label(platform, &["A"], false));
+        if row_tool_btn(
+            &mut row_ui,
+            ChromeIcon::AgentView,
+            &agent_tip,
+            t.agent_view_open,
+            pointer_in_row,
+        )
+        .clicked()
+        {
+            tool_interacted = true;
+            push_cmd(out, &t.agent_toggle_cmd);
+        }
     }
+
+    // The row outside its tools: a terminal's reveals it, an agent's attaches.
+    let click_right = (row_rect.right() - tools_hit_w).max(row_rect.left() + 20.0);
+    let row_id = match (&e.terminal, &e.agent) {
+        (Some(t), _) => ui.make_persistent_id(("wall_sb_term_row", &t.id)),
+        (None, Some(a)) => ui.make_persistent_id(("wall_sb_agent_row", &a.target)),
+        (None, None) => ui.make_persistent_id(("wall_sb_row", &e.name)),
+    };
+    let row_hit = ui.interact(
+        egui::Rect::from_min_max(row_rect.min, egui::pos2(click_right, row_rect.bottom())),
+        row_id,
+        egui::Sense::click(),
+    );
+    match (&e.terminal, &e.agent) {
+        (Some(t), _) => {
+            state.term_row_rects.insert(t.id.clone(), row_hit.rect);
+        }
+        (None, Some(a)) => {
+            state.agent_row_rects.insert(a.target.clone(), row_hit.rect);
+        }
+        (None, None) => {}
+    }
+    if e.interactive && row_hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let row_hit = if e.tooltip.is_empty() {
+        row_hit
+    } else {
+        row_hit.on_hover_text(sanitize_egui_text(&e.tooltip))
+    };
+    if row_hit.clicked() && !tool_interacted {
+        push_cmd(out, &e.click_cmd);
+    }
+}
+
+/// The header's `group | host` switch: the lit half is how the list is
+/// sectioned, and a click on the other runs `wall.sidebar mode <it>`.
+fn draw_mode_toggle(
+    ui: &mut egui::Ui,
+    right: f32,
+    center_y: f32,
+    mode: SidebarMode,
+    state: &mut SidebarState,
+    out: &mut Vec<String>,
+) -> f32 {
+    // Small enough that the title beside it is drawn whole at the docked
+    // width: 248 px holds the title, this switch and four dock buttons.
+    let font = egui::FontId::monospace(10.5);
+    let halves = [SidebarMode::Group, SidebarMode::Host];
+    let widths = halves.map(|m| {
+        ui.painter()
+            .layout_no_wrap(m.as_str().to_string(), font.clone(), FG_TEXT)
+            .size()
+            .x
+            + 8.0
+    });
+    let left = right - widths[0] - widths[1];
+    let mut x = left;
+    for (k, half) in halves.into_iter().enumerate() {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x, center_y - 9.0),
+            egui::pos2(x + widths[k], center_y + 9.0),
+        );
+        x += widths[k];
+        state.mode_btn_rects[k] = Some(rect);
+        let resp = ui.interact(
+            rect,
+            ui.make_persistent_id(("wall_sidebar_mode", half.as_str())),
+            egui::Sense::click(),
+        );
+        let active = half == mode;
+        if ui.is_rect_visible(rect) {
+            if active || resp.hovered() {
+                let bg = if active {
+                    egui::Color32::from_rgb(0x1d, 0x23, 0x30)
+                } else {
+                    egui::Color32::from_rgb(0x23, 0x2a, 0x3a)
+                };
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(4), bg);
+            }
+            let fg = if active || resp.hovered() {
+                egui::Color32::from_rgb(0xe6, 0xe9, 0xef)
+            } else {
+                egui::Color32::from_rgb(0x8b, 0x95, 0xa7)
+            };
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                half.as_str(),
+                font.clone(),
+                fg,
+            );
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = match half {
+            SidebarMode::Group => "list by group: each group's members, then the rest",
+            SidebarMode::Host => "list by host: each machine's terminals and agents",
+        };
+        if resp.on_hover_text(tip).clicked() && !active {
+            push_cmd(out, &half.verb());
+        }
+    }
+    left
 }
 
 /// Draw the sidebar panel if `state.open` is true, appending any triggered
@@ -791,6 +1080,9 @@ pub fn show(
     state.wants_keyboard = false;
     state.group_fold_rects.clear();
     state.term_row_rects.clear();
+    state.agent_row_rects.clear();
+    state.rows_drawn.clear();
+    state.mode_btn_rects = [None; 2];
     if !state.open {
         state.drag_offset = None;
         state.hold_close = None;
@@ -920,50 +1212,64 @@ pub fn show(
                         state.drag_offset = None;
                     }
 
-                    let mut head_ui = ui.new_child(
+                    // Right to left: the dock buttons, the mode switch, and
+                    // the title in what is left.
+                    let strip_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            head_rect.right() - 6.0 - (4.0 * 18.0 + 6.0),
+                            head_rect.center().y - 9.0,
+                        ),
+                        egui::vec2(4.0 * 18.0 + 6.0, 18.0),
+                    );
+                    for idx in 0..4 {
+                        let x0 = strip_rect.left() + idx as f32 * 20.0;
+                        state.dock_btn_rects[idx] = Some(egui::Rect::from_min_size(
+                            egui::pos2(x0, strip_rect.top()),
+                            egui::vec2(18.0, 18.0),
+                        ));
+                    }
+                    let mut strip_ui = ui.new_child(
                         egui::UiBuilder::new()
-                            .max_rect(head_rect)
+                            .max_rect(strip_rect)
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     );
-                    head_ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                    head_ui.add_space(10.0);
-                    head_ui.label(
-                        egui::RichText::new("terminals")
-                            .monospace()
-                            .size(12.5)
-                            .color(egui::Color32::from_rgb(0x7c, 0x85, 0x96)),
+                    strip_ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                    let close_tip =
+                        format!("close ({})", chord_label(input.platform, &["B"], false));
+                    dock_buttons(
+                        &mut strip_ui,
+                        "wall.sidebar",
+                        &mut state.side,
+                        &mut state.open,
+                        &close_tip,
+                        out,
                     );
-                    head_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        // Render dock buttons left-to-right inside the right-aligned box.
-                        let (strip_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(4.0 * 18.0 + 6.0, 18.0),
-                            egui::Sense::hover(),
+
+                    let toggle_left = draw_mode_toggle(
+                        ui,
+                        strip_rect.left() - 6.0,
+                        head_rect.center().y,
+                        input.model.mode,
+                        state,
+                        out,
+                    );
+                    // The title is drawn whole or not at all: the switch
+                    // and the dock buttons are what the header is for.
+                    let title_left = head_rect.left() + 10.0;
+                    let title_color = egui::Color32::from_rgb(0x7c, 0x85, 0x96);
+                    let title = ui.painter().layout_no_wrap(
+                        "terminals".to_string(),
+                        egui::FontId::monospace(12.5),
+                        title_color,
+                    );
+                    state.title_shown = title_left + title.size().x + 4.0 <= toggle_left;
+                    if state.title_shown {
+                        ui.painter().galley(
+                            egui::pos2(title_left, head_rect.center().y - title.size().y * 0.5),
+                            title,
+                            title_color,
                         );
-                        for idx in 0..4 {
-                            let x0 = strip_rect.left() + idx as f32 * 20.0;
-                            state.dock_btn_rects[idx] = Some(egui::Rect::from_min_size(
-                                egui::pos2(x0, strip_rect.top()),
-                                egui::vec2(18.0, 18.0),
-                            ));
-                        }
-                        let mut strip_ui = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(strip_rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        strip_ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                        let close_tip =
-                            format!("close ({})", chord_label(input.platform, &["B"], false));
-                        dock_buttons(
-                            &mut strip_ui,
-                            "wall.sidebar",
-                            &mut state.side,
-                            &mut state.open,
-                            &close_tip,
-                            out,
-                        );
-                    });
+                    }
 
                     // Header bottom divider (`1px solid #1e2430`).
                     let (div_rect, _) =
@@ -974,7 +1280,7 @@ pub fn show(
                         egui::Color32::from_rgb(0x1e, 0x24, 0x30),
                     );
 
-                    // Scrollable body (`Sidebar.jsx:145-160`).
+                    // Scrollable body: the one list.
                     let body_max_h = (max_h - head_h - 1.0).max(40.0);
                     egui::ScrollArea::vertical()
                         .id_salt("wall_sidebar_body")
@@ -985,10 +1291,31 @@ pub fn show(
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                             ui.add_space(4.0);
 
-                            let mut skip_grouped_members = false;
+                            if input.model.terminals_empty {
+                                let (empty_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(panel_w, ROW_H),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    egui::pos2(empty_rect.left() + 10.0, empty_rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    "no terminals",
+                                    egui::FontId::monospace(12.5),
+                                    FG_DIM,
+                                );
+                            }
+
+                            // A folded group's members are skipped here as
+                            // well as left out by the model, so a fold shows
+                            // on the click's own frame.
+                            let mut in_folded_group = false;
+                            let mut first = !input.model.terminals_empty;
                             for row in &input.model.rows {
                                 match row {
                                     SidebarRow::Group(g) => {
+                                        if !first {
+                                            ui.add_space(SECTION_GAP);
+                                        }
                                         let collapsed =
                                             state.is_group_collapsed(&g.id, g.collapsed);
                                         draw_group_row(
@@ -1000,20 +1327,24 @@ pub fn show(
                                             state,
                                             out,
                                         );
-                                        skip_grouped_members =
+                                        in_folded_group =
                                             state.is_group_collapsed(&g.id, g.collapsed);
                                     }
-                                    SidebarRow::Terminal(t) => {
-                                        if t.depth > 0 && skip_grouped_members {
+                                    SidebarRow::Section(s) => {
+                                        if !first {
+                                            ui.add_space(SECTION_GAP);
+                                        }
+                                        draw_section_row(ui, panel_w, s);
+                                        in_folded_group = false;
+                                    }
+                                    SidebarRow::Entry(e) => {
+                                        if in_folded_group {
                                             continue;
                                         }
-                                        if t.depth == 0 {
-                                            skip_grouped_members = false;
-                                        }
-                                        draw_terminal_row(
+                                        draw_entry_row(
                                             ui,
                                             panel_w,
-                                            t,
+                                            e,
                                             input.platform,
                                             input.close_hold_ms,
                                             state,
@@ -1021,74 +1352,13 @@ pub fn show(
                                         );
                                     }
                                 }
+                                first = false;
+                                state.rows_drawn.push(report_token(row));
                             }
 
-                            if input.model.terminals_empty {
-                                let (empty_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(panel_w, 22.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().text(
-                                    egui::pos2(empty_rect.left() + 10.0, empty_rect.center().y),
-                                    egui::Align2::LEFT_CENTER,
-                                    "no terminals",
-                                    egui::FontId::monospace(12.5),
-                                    egui::Color32::from_rgb(0x6b, 0x73, 0x83),
-                                );
-                            }
-
-                            // Agents section (`AgentsSection` in `Sidebar.jsx:86-113`).
-                            ui.add_space(6.0);
-                            let (sec_line, _) = ui.allocate_exact_size(
-                                egui::vec2(panel_w, 1.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(
-                                sec_line,
-                                egui::CornerRadius::ZERO,
-                                egui::Color32::from_rgb(0x1e, 0x24, 0x30),
-                            );
-                            let (sec_head, _) = ui.allocate_exact_size(
-                                egui::vec2(panel_w, 24.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                egui::pos2(sec_head.left() + 10.0, sec_head.center().y + 2.0),
-                                egui::Align2::LEFT_CENTER,
-                                "agents",
-                                egui::FontId::monospace(12.5),
-                                egui::Color32::from_rgb(0x7c, 0x85, 0x96),
-                            );
-
-                            for host in &input.model.agents.hosts {
-                                let (h_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(panel_w, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                if ui.is_rect_visible(h_rect) {
-                                    ui.painter().text(
-                                        egui::pos2(h_rect.left() + 8.0, h_rect.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &host.label,
-                                        egui::FontId::monospace(12.0),
-                                        egui::Color32::from_rgb(0xae, 0xb7, 0xc6),
-                                    );
-                                    ui.painter().text(
-                                        egui::pos2(h_rect.right() - 8.0, h_rect.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        host.count.to_string(),
-                                        egui::FontId::monospace(11.0),
-                                        egui::Color32::from_rgb(0x5d, 0x65, 0x74),
-                                    );
-                                }
-                                for agent in &host.agents {
-                                    draw_agent_row(ui, panel_w, agent, out);
-                                }
-                            }
-
-                            if let Some(empty) = &input.model.agents.empty {
+                            if let Some(empty) = &input.model.agents_empty {
                                 let (erect, eresp) = ui.allocate_exact_size(
-                                    egui::vec2(panel_w, 22.0),
+                                    egui::vec2(panel_w, ROW_H),
                                     egui::Sense::hover(),
                                 );
                                 ui.painter().text(
@@ -1096,7 +1366,7 @@ pub fn show(
                                     egui::Align2::LEFT_CENTER,
                                     empty.text,
                                     egui::FontId::monospace(12.0),
-                                    egui::Color32::from_rgb(0x6b, 0x73, 0x83),
+                                    FG_DIM,
                                 );
                                 if let Some(reason) = &empty.reason {
                                     let _ = eresp.on_hover_text(reason);
@@ -1174,7 +1444,9 @@ mod tests {
         );
     }
 
-    fn sample_sidebar_input(viewport: egui::Rect) -> SidebarInput {
+    /// One group (`g1`: `t1`, focused), a hidden loose terminal, a local
+    /// agent in its `gx-` terminal, and one with no terminal on the wall.
+    fn sample_sidebar_input(viewport: egui::Rect, mode: SidebarMode) -> SidebarInput {
         let raw = CoreSidebarInput {
             terminals: vec![
                 SidebarTerminal {
@@ -1193,6 +1465,14 @@ mod tests {
                     attached: None,
                     agent_view_open: false,
                 },
+                SidebarTerminal {
+                    id: "gx-coder".to_string(),
+                    name: "coder".to_string(),
+                    group: None,
+                    hidden: false,
+                    attached: None,
+                    agent_view_open: false,
+                },
             ],
             groups: vec![SidebarGroup {
                 id: "g1".to_string(),
@@ -1206,15 +1486,34 @@ mod tests {
             bus: BusSnapshot {
                 host: "mac".to_string(),
                 reason: String::new(),
-                agents: vec![BusAgentInput {
-                    name: "lead".to_string(),
-                    host: "mac".to_string(),
-                    live: true,
-                    status: "idle".to_string(),
-                    attached: Some(true),
-                    ..BusAgentInput::default()
-                }],
+                agents: vec![
+                    BusAgentInput {
+                        name: "lead".to_string(),
+                        host: "mac".to_string(),
+                        live: true,
+                        status: "idle".to_string(),
+                        attached: Some(true),
+                        ..BusAgentInput::default()
+                    },
+                    BusAgentInput {
+                        name: "coder".to_string(),
+                        host: "mac".to_string(),
+                        live: true,
+                        status: "processing".to_string(),
+                        attached: Some(true),
+                        ..BusAgentInput::default()
+                    },
+                    BusAgentInput {
+                        name: "gate".to_string(),
+                        host: "linux".to_string(),
+                        live: true,
+                        status: "waiting".to_string(),
+                        attached: None,
+                        ..BusAgentInput::default()
+                    },
+                ],
             },
+            mode,
         };
         let dock = dock_layout(&DockState {
             sidebar: DockPanel::new(true, DockSide::Left),
@@ -1225,6 +1524,28 @@ mod tests {
             dock_rect: sidebar_dock_rect(viewport, DockSide::Left, &dock),
             platform: Platform::Mac,
             close_hold_ms: 400,
+        }
+    }
+
+    /// Two passes with no input: the first sizes the `Area`, the second
+    /// records every rect at the left dock (x: 0..248).
+    fn settle(
+        ctx: &egui::Context,
+        vp: egui::Rect,
+        time: f64,
+        state: &mut SidebarState,
+        input: &SidebarInput,
+        out: &mut Vec<String>,
+    ) {
+        for k in 0..2 {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    time: Some(time + f64::from(k) * 0.016),
+                    ..egui::RawInput::default()
+                },
+                |ui| show(ui.ctx(), state, input, out),
+            );
         }
     }
 
@@ -1260,44 +1581,72 @@ mod tests {
         let ctx = egui::Context::default();
         let vp_size = egui::vec2(1000.0, 700.0);
         let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, vp_size);
-        let input = sample_sidebar_input(vp);
+        let input = sample_sidebar_input(vp, SidebarMode::Group);
         let mut state = SidebarState::new(true, DockSide::Left);
         let mut out = Vec::new();
+        settle(&ctx, vp, 0.0, &mut state, &input, &mut out);
 
-        // Two warm passes settle Area's sizing pass and populate WidgetRects at left dock (x: 0..248).
-        for k in 0..2 {
-            let _ = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(vp),
-                    time: Some(f64::from(k) * 0.016),
-                    ..egui::RawInput::default()
-                },
-                |ui| show(ui.ctx(), &mut state, &input, &mut out),
-            );
-        }
+        // One list: the group and its member, then the rest by host. The
+        // agent whose terminal is on the wall is that terminal's row.
+        assert_eq!(
+            state.rows_drawn,
+            vec![
+                "g:g1[mac=1]",
+                "t:t1",
+                "s:none[mac=3,linux=1]",
+                "t:t2",
+                "t:gx-coder+coder@mac=processing",
+                "a:lead@mac=idle",
+                "a:gate@linux=waiting",
+            ]
+        );
+        // The header is 30 + a 1 px divider + 4 px of air, and a row is 22:
+        // g1 is 35..57 and t1 57..79. The next header sits 4 px lower.
+        let t1 = state.term_row_rects["t1"];
+        assert_eq!((t1.top(), t1.bottom()), (57.0, 79.0));
+        let t2 = state.term_row_rects["t2"];
+        assert_eq!((t2.top(), t2.bottom()), (105.0, 127.0));
+        assert!(!state.term_row_rects.contains_key("lead@mac"));
+        assert_eq!(state.agent_row_rects.len(), 2);
 
-        // Header height = 30 + 1 divider + 4 top pad = 35..57 is GroupRow g1;
-        // 57..79 is TerminalRow t1; 79..101 is loose TerminalRow t2.
-        // 1) Click t1 row body -> `wall.reveal t1`.
-        click_at(&ctx, vp_size, egui::pos2(80.0, 68.0), 0.1, &mut state, &input, &mut out);
+        // 1) A terminal's row reveals it, with or without an agent in it.
+        click_at(&ctx, vp_size, t1.center(), 0.1, &mut state, &input, &mut out);
         assert_eq!(out, vec!["wall.reveal t1"]);
-
-        // 2) Click g1 fold chevron (x = 4..22, y = 46) -> `wall.sidebar.collapse g1` and folds t1!
         out.clear();
-        click_at(&ctx, vp_size, egui::pos2(13.0, 46.0), 0.2, &mut state, &input, &mut out);
+        let coder = state.term_row_rects["gx-coder"].center();
+        click_at(&ctx, vp_size, coder, 0.15, &mut state, &input, &mut out);
+        assert_eq!(out, vec!["wall.reveal gx-coder"]);
+
+        // 2) An agent with no terminal on the wall: a click attaches it.
+        out.clear();
+        let lead = state.agent_row_rects["lead@mac"].center();
+        click_at(&ctx, vp_size, lead, 0.2, &mut state, &input, &mut out);
+        assert_eq!(out, vec!["wall.attach lead@mac"]);
+
+        // 3) The fold chevron folds g1 at once: t1's row goes, the rest move up.
+        out.clear();
+        let fold = state.group_fold_rects["g1"].center();
+        click_at(&ctx, vp_size, fold, 0.3, &mut state, &input, &mut out);
         assert_eq!(out, vec!["wall.sidebar.collapse g1"]);
         assert!(state.is_group_collapsed("g1", false));
-
-        // Now t1 is folded away, so y = 57..79 is loose hidden terminal t2!
-        // Clicking t2's show button (second tool from right: close is 223..241, show is 204..222) -> `wall.show t2`.
         out.clear();
-        click_at(&ctx, vp_size, egui::pos2(213.0, 68.0), 0.3, &mut state, &input, &mut out);
+        settle(&ctx, vp, 0.4, &mut state, &input, &mut out);
+        assert!(!state.term_row_rects.contains_key("t1"));
+        assert_eq!(state.rows_drawn[..3], ["g:g1[mac=1]", "s:none[mac=3,linux=1]", "t:t2"]);
+        let t2 = state.term_row_rects["t2"];
+        assert_eq!((t2.top(), t2.bottom()), (83.0, 105.0));
+
+        // 4) The hidden terminal's show button, second tool from the right
+        //    (close is 224..242, show 205..223) -> `wall.show t2`.
+        out.clear();
+        let t2_y = t2.center().y;
+        click_at(&ctx, vp_size, egui::pos2(213.0, t2_y), 0.5, &mut state, &input, &mut out);
         assert_eq!(out, vec!["wall.show t2"]);
 
-        // 3) Hold-to-close on t2's `×` button (x = 232, y = 68):
-        // Press at t = 1.0 s -> should NOT fire at t = 1.2 s (200 ms < 400 ms), SHOULD fire at t = 1.5 s (500 ms >= 400 ms)!
+        // 5) Hold-to-close on t2's `×` (x = 232): pressed at t = 1.0 s it must
+        //    NOT fire at 1.2 s (200 ms < 400 ms) and must at 1.5 s.
         out.clear();
-        let close_pos = egui::pos2(232.0, 68.0);
+        let close_pos = egui::pos2(232.0, t2_y);
         let _ = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(vp),
@@ -1355,15 +1704,70 @@ mod tests {
             |ui| show(ui.ctx(), &mut state, &input, &mut out),
         );
 
-        // 4) Agent row click: with g1 folded, rows are g1 (35..57), t2 (57..79), space(6)+line(1)+agents_head(24) = 79..110, host_head(20) = 110..130, agent row = 130..152.
+        // 6) An agent's row has no tools: where a terminal's `×` would be,
+        //    a click still attaches.
         out.clear();
-        click_at(&ctx, vp_size, egui::pos2(80.0, 141.0), 1.7, &mut state, &input, &mut out);
+        let lead_y = state.agent_row_rects["lead@mac"].center().y;
+        click_at(&ctx, vp_size, egui::pos2(232.0, lead_y), 1.7, &mut state, &input, &mut out);
         assert_eq!(out, vec!["wall.attach lead@mac"]);
 
-        // 5) Header close button (`×`, rightmost in 4-button strip at x = 231, y = 15) -> `wall.sidebar close` and sets `open = false`.
+        // 7) Header close button (`×`, rightmost in 4-button strip at x = 231, y = 15) -> `wall.sidebar close` and sets `open = false`.
         out.clear();
         click_at(&ctx, vp_size, egui::pos2(231.0, 15.0), 1.8, &mut state, &input, &mut out);
         assert_eq!(out, vec!["wall.sidebar close"]);
         assert!(!state.open);
+    }
+
+    #[test]
+    fn header_switch_emits_the_mode_verb_and_host_mode_draws_host_sections() {
+        let ctx = egui::Context::default();
+        let vp_size = egui::vec2(1000.0, 700.0);
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, vp_size);
+        let by_group = sample_sidebar_input(vp, SidebarMode::Group);
+        let mut state = SidebarState::new(true, DockSide::Left);
+        let mut out = Vec::new();
+        settle(&ctx, vp, 0.0, &mut state, &by_group, &mut out);
+
+        // Both halves sit in the header, left of the dock buttons and clear
+        // of the title.
+        let [Some(group_btn), Some(host_btn)] = state.mode_btn_rects else {
+            panic!("the header draws both halves of the switch");
+        };
+        let dock_left = state.dock_btn_rects[0].expect("dock buttons drawn");
+        assert!(group_btn.right() <= host_btn.left() + 0.01);
+        assert!(host_btn.right() < dock_left.left());
+        assert!(state.title_shown, "room for the title: {group_btn:?}");
+        assert!(group_btn.top() >= 0.0 && group_btn.bottom() <= 30.0);
+
+        // The lit half does nothing; the other asks for its mode.
+        click_at(&ctx, vp_size, group_btn.center(), 0.1, &mut state, &by_group, &mut out);
+        assert!(out.is_empty(), "already by group: {out:?}");
+        click_at(&ctx, vp_size, host_btn.center(), 0.2, &mut state, &by_group, &mut out);
+        assert_eq!(out, vec!["wall.sidebar mode host"]);
+
+        // The wall answers with a host-mode model: each host, its rows by group.
+        out.clear();
+        let by_host = sample_sidebar_input(vp, SidebarMode::Host);
+        settle(&ctx, vp, 0.3, &mut state, &by_host, &mut out);
+        assert_eq!(
+            state.rows_drawn,
+            vec![
+                "h:mac[4]",
+                "t:t1",
+                "t:t2",
+                "t:gx-coder+coder@mac=processing",
+                "a:lead@mac=idle",
+                "h:linux[1]",
+                "a:gate@linux=waiting",
+            ]
+        );
+        assert!(state.group_fold_rects.is_empty(), "no group headers by host");
+        let gate = state.agent_row_rects["gate@linux"].center();
+        click_at(&ctx, vp_size, gate, 0.4, &mut state, &by_host, &mut out);
+        assert_eq!(out, vec!["wall.attach gate@linux"]);
+        out.clear();
+        let group_btn = state.mode_btn_rects[0].unwrap().center();
+        click_at(&ctx, vp_size, group_btn, 0.5, &mut state, &by_host, &mut out);
+        assert_eq!(out, vec!["wall.sidebar mode group"]);
     }
 }

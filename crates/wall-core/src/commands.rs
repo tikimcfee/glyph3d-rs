@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 
 use crate::geom::Point;
 use crate::router::{is_token_chars, CommandReply, CommandRouter, RegisterMeta};
+use crate::sidebar::SidebarMode;
 
 /// Validated settings panel section ids (`SECTIONS` in `wall/wallSettings.js`).
 pub const SETTINGS_SECTION_IDS: &[&str] = &[
@@ -494,6 +495,10 @@ pub struct PanelPlacement {
     pub float: Option<PointPayload>,
     #[serde(default)]
     pub collapsed: Vec<String>,
+    /// The sidebar's list mode, `"group"` or `"host"` (`wall.sidebar mode`).
+    /// `None` for the panels that have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl Default for PanelPlacement {
@@ -503,6 +508,7 @@ impl Default for PanelPlacement {
             side: "float".to_string(),
             float: None,
             collapsed: Vec::new(),
+            mode: None,
         }
     }
 }
@@ -527,6 +533,8 @@ pub struct PanelPatch {
     pub side: Option<String>,
     pub float: Option<Point>,
     pub collapsed: Option<Vec<String>>,
+    /// The sidebar's list mode, `"group"` or `"host"`.
+    pub mode: Option<String>,
 }
 
 /// Which panel a panel-placement verb operates on.
@@ -886,7 +894,7 @@ fn place_panel<W: WallApi>(
                     open: Some(true),
                     side: Some("float".to_string()),
                     float,
-                    collapsed: None,
+                    ..PanelPatch::default()
                 },
             );
             Ok(())
@@ -1747,9 +1755,37 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.sidebar",
-        "[toggle|open|close|left|right|float [x y]]",
-        "Open, close or place the sidebar",
+        "[toggle|open|close|left|right|float [x y]|mode [group|host|toggle]]",
+        "Open, close or place the sidebar, or list it by group or by host",
         |args, wall| {
+            if args.first().map(String::as_str) == Some("mode") {
+                let current = wall
+                    .panel(PanelKind::Sidebar)
+                    .mode
+                    .as_deref()
+                    .and_then(SidebarMode::parse)
+                    .unwrap_or_default();
+                let next = match args.get(1).map(String::as_str) {
+                    None => current,
+                    Some("toggle") => current.other(),
+                    Some(word) => SidebarMode::parse(word).ok_or_else(|| {
+                        format!("the sidebar lists by group|host (or toggle), not '{word}'")
+                    })?,
+                };
+                if next != current {
+                    wall.set_panel(
+                        PanelKind::Sidebar,
+                        PanelPatch {
+                            mode: Some(next.as_str().to_string()),
+                            ..PanelPatch::default()
+                        },
+                    );
+                }
+                return Ok(CommandReply::ok(
+                    format!("sidebar lists by {}", next.as_str()),
+                    Some(json!({ "sidebar": wall.panel(PanelKind::Sidebar) })),
+                ));
+            }
             place_panel(wall, PanelKind::Sidebar, "sidebar", args)?;
             let now = wall.panel(PanelKind::Sidebar);
             let state = if now.open {
@@ -3097,6 +3133,9 @@ mod tests {
             if let Some(col) = patch.collapsed {
                 cur.collapsed = col;
             }
+            if let Some(mode) = patch.mode {
+                cur.mode = Some(mode);
+            }
             self.panels.insert(Self::panel_key(kind).to_string(), cur);
         }
 
@@ -3747,5 +3786,52 @@ mod tests {
         let list = r.execute(["wall.list"]);
         assert!(list.text.contains("g-1 \"group 1\""));
         assert!(list.text.contains("ungrouped\n  c (hidden) \"c\""));
+    }
+
+    #[test]
+    fn sidebar_mode_is_a_verb_that_leaves_the_placement_alone() {
+        let mut r = wall_router();
+        assert_eq!(r.execute(["wall.sidebar", "left"]).text, "OK: sidebar open, left");
+
+        // Asked with no word, it reports; a store with no mode lists by group.
+        let asked = r.execute(["wall.sidebar", "mode"]);
+        assert_eq!(asked.text, "OK: sidebar lists by group");
+
+        let host = r.execute(["wall.sidebar", "mode", "host"]);
+        assert_eq!(host.text, "OK: sidebar lists by host");
+        assert_eq!(host.data.as_ref().unwrap()["sidebar"]["mode"], "host");
+        let now = r.context.panel(PanelKind::Sidebar);
+        assert_eq!(now.mode.as_deref(), Some("host"));
+        assert!(now.open, "choosing a mode neither opens nor closes it");
+        assert_eq!(now.side, "left");
+
+        assert_eq!(
+            r.execute(["wall.sidebar", "mode", "toggle"]).text,
+            "OK: sidebar lists by group"
+        );
+        assert_eq!(
+            r.execute(["wall.sidebar", "mode", "toggle"]).text,
+            "OK: sidebar lists by host"
+        );
+        assert_eq!(
+            r.execute(["wall.sidebar", "mode", "group"]).text,
+            "OK: sidebar lists by group"
+        );
+        assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("group"));
+
+        let bad = r.execute(["wall.sidebar", "mode", "colour"]);
+        assert!(
+            bad.text
+                .contains("the sidebar lists by group|host (or toggle), not 'colour'"),
+            "{}",
+            bad.text
+        );
+        assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("group"));
+
+        // Closing and reopening keeps it.
+        r.execute(["wall.sidebar", "mode", "host"]);
+        r.execute(["wall.sidebar", "close"]);
+        r.execute(["wall.sidebar", "open"]);
+        assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("host"));
     }
 }

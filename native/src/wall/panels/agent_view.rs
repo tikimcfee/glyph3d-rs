@@ -3272,6 +3272,7 @@ mod tests {
                 side: "right".to_string(),
                 float: None,
                 collapsed: Vec::new(),
+                mode: None,
             }
         }
         fn set_panel(&mut self, _: PanelKind, _: PanelPatch) {}

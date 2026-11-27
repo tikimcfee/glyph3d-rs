@@ -90,7 +90,7 @@ use crate::pointer::{
 use crate::router::{CommandInput, CommandMeta, CommandReply, CommandRouter, RegisterMeta};
 use crate::selection::TerminalSelection;
 use crate::settings::{KnobInput, KnobValue};
-use crate::sidebar::AgentStatus;
+use crate::sidebar::{AgentStatus, SidebarMode};
 use crate::snap::{grid_levels, snap_step, snap_to, GridLevels, GridSpec};
 use crate::split::{self, BranchSide, Direction, PaneMap};
 use crate::status::{self, StatusNotice, TermdStatus, DEFAULT_RESTART_GRACE_MS};
@@ -3681,6 +3681,7 @@ impl WallApi for WallCore {
                     side: s.side.as_str().to_owned(),
                     float: Some(PointPayload::from(s.float)),
                     collapsed: s.collapsed.clone(),
+                    mode: Some(s.mode.as_str().to_owned()),
                 }
             }
             PanelKind::Status => {
@@ -3690,6 +3691,7 @@ impl WallApi for WallCore {
                     side: s.side.as_str().to_owned(),
                     float: s.float.map(PointPayload::from),
                     collapsed: Vec::new(),
+                    mode: None,
                 }
             }
             PanelKind::Settings => {
@@ -3699,6 +3701,7 @@ impl WallApi for WallCore {
                     side: s.side.as_str().to_owned(),
                     float: s.float.map(PointPayload::from),
                     collapsed: s.collapsed.clone(),
+                    mode: None,
                 }
             }
             PanelKind::Help => {
@@ -3708,6 +3711,7 @@ impl WallApi for WallCore {
                     side: s.side.as_str().to_owned(),
                     float: s.float.map(PointPayload::from),
                     collapsed: Vec::new(),
+                    mode: None,
                 }
             }
         }
@@ -3721,6 +3725,7 @@ impl WallApi for WallCore {
                 side,
                 float: patch.float,
                 collapsed: patch.collapsed,
+                mode: patch.mode.as_deref().and_then(SidebarMode::parse),
             }),
             PanelKind::Status => self.model.set_status_window(StatusWindowPatch {
                 open: patch.open,

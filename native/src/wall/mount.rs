@@ -26,7 +26,7 @@ use wall_core::menu::{
 use wall_core::model::WallSnapshot;
 use wall_core::palette::{PaletteGroup, PaletteSnapshot, PaletteTerminal};
 use wall_core::sidebar::{
-    SidebarGroup, SidebarInput as CoreSidebarInput, SidebarTerminal, build_sidebar,
+    SidebarGroup, SidebarInput as CoreSidebarInput, SidebarMode, SidebarTerminal, build_sidebar,
 };
 use wall_core::status::{TermdStatus, chip_look};
 use wall_core::wall::{Wall, WallFrame, help_sections};
@@ -419,7 +419,7 @@ impl Panels {
                 self.last_sidebar_float = Some(sb.float);
             }
             if let Some(snap) = &snapshot {
-                let core_input = build_core_sidebar_input(wall, snap, &sb.collapsed);
+                let core_input = build_core_sidebar_input(wall, snap, &sb.collapsed, sb.mode);
                 let input = panels::sidebar::SidebarInput {
                     model: build_sidebar(&core_input),
                     dock_rect: panels::sidebar::sidebar_dock_rect(
@@ -800,10 +800,21 @@ impl Panels {
             .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
             .collect();
         sb_terms.sort();
+        let mut sb_agents: Vec<String> = self
+            .sidebar
+            .agent_row_rects
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
+        sb_agents.sort();
+        // `terms` are the terminals' rows and `agents` the rows of agents
+        // with no terminal on the wall; `rows` is the whole list as drawn,
+        // top to bottom (`panels::sidebar::SidebarState::rows_drawn`).
         lines.push(format!(
-            "panel sidebar open={} side={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} folds={} terms={}",
+            "panel sidebar open={} side={} mode={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} mode_group={} mode_host={} folds={} terms={} agents={} rows={}",
             sb.open,
             dock_side_name(sb.side),
+            sb.mode.as_str(),
             sb_collapsed,
             fmt_opt_rect(self.sidebar.last_rect),
             fmt_opt_rect(self.sidebar.header_drag_rect),
@@ -811,8 +822,16 @@ impl Panels {
             fmt_opt_rect(self.sidebar.dock_btn_rects[1]),
             fmt_opt_rect(self.sidebar.dock_btn_rects[2]),
             fmt_opt_rect(self.sidebar.dock_btn_rects[3]),
+            fmt_opt_rect(self.sidebar.mode_btn_rects[0]),
+            fmt_opt_rect(self.sidebar.mode_btn_rects[1]),
             if sb_folds.is_empty() { "none".to_string() } else { sb_folds.join(";") },
             if sb_terms.is_empty() { "none".to_string() } else { sb_terms.join(";") },
+            if sb_agents.is_empty() { "none".to_string() } else { sb_agents.join(";") },
+            if self.sidebar.rows_drawn.is_empty() {
+                "none".to_string()
+            } else {
+                self.sidebar.rows_drawn.join(";")
+            },
         ));
 
         let st = &described.panels.status_window;
@@ -1067,6 +1086,7 @@ fn build_core_sidebar_input(
     wall: &Wall,
     snap: &WallSnapshot,
     collapsed: &[String],
+    mode: SidebarMode,
 ) -> CoreSidebarInput {
     let store = wall.store();
     CoreSidebarInput {
@@ -1096,6 +1116,7 @@ fn build_core_sidebar_input(
         focused_id: snap.focused_id.clone(),
         collapsed_groups: collapsed.iter().cloned().collect(),
         bus: wall.sidebar_bus_snapshot(),
+        mode,
     }
 }
 
@@ -1414,11 +1435,141 @@ mod tests {
         let pal_snap = build_palette_snapshot(&wall, &snap, &described, wall.platform());
         assert_eq!(pal_snap.bus.agents.len(), 1);
         assert_eq!(pal_snap.bus.agents[0].name, "coder");
-        let sb_in = build_core_sidebar_input(&wall, &snap, &[]);
+        let sb_in = build_core_sidebar_input(&wall, &snap, &[], SidebarMode::Host);
+        assert_eq!(sb_in.mode, SidebarMode::Host);
         assert_eq!(sb_in.bus.agents.len(), 1);
         assert_eq!(sb_in.bus.agents[0].name, "coder");
         assert!(wall.run("wall.palette close").text.starts_with("OK"));
         assert!(!wall.palette_open());
+    }
+
+    #[test]
+    fn sidebar_is_one_list_and_its_mode_switch_runs_the_verb_through_the_mount() {
+        use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        wall.terminal_appeared(TerminalAppeared::new("t2", 100, 30).with_title("zsh"));
+        wall.terminal_appeared(TerminalAppeared::new("gx-coder", 100, 30).with_title("coder"));
+        let mut panels = Panels::new();
+        let live = |name: &str, host: &str, status: &str| GomuxAgent {
+            name: name.to_owned(),
+            host: Some(host.to_owned()),
+            live: true,
+            status: Some(status.to_owned()),
+            ..Default::default()
+        };
+        wall.set_bus_snapshot(
+            Some(GomuxSnapshot {
+                gen: 1,
+                host: Some("workstation".to_owned()),
+                agents: vec![
+                    live("coder", "workstation", "processing"),
+                    live("gate", "workstation", "idle"),
+                    live("probe", "workstation", "waiting"),
+                ],
+                ..Default::default()
+            }),
+            "",
+        );
+        // `gate` is attached from another host: the wall asks for a terminal
+        // (no process runs here), and the one that appears is its attach terminal.
+        assert!(wall.run("wall.attach gate@workstation").text.starts_with("OK"));
+        wall.terminal_appeared(TerminalAppeared::new("t9", 100, 30));
+        let _ = wall.drain_effects();
+        assert_eq!(wall.store().attached("t9"), Some("gate@workstation"));
+        assert!(wall.run("wall.group t9 t1 gx-coder").text.starts_with("OK"));
+        assert!(wall.run("wall.sidebar left").text.starts_with("OK"));
+        assert_eq!(wall.store().sidebar().mode, SidebarMode::Group);
+        let _ = run_pass_at(&ctx, 1.0, Vec::new(), &mut panels, &mut wall);
+        let _ = run_pass_at(&ctx, 1.1, Vec::new(), &mut panels, &mut wall);
+
+        // By group: `coder` and `gate` are in their terminals' rows, this
+        // machine's members before workstation's though `t9` was grouped first;
+        // `probe` has no terminal.
+        assert_eq!(
+            panels.sidebar.rows_drawn,
+            vec![
+                "g:g-1[workstation=2,workstation=1]",
+                "t:t1",
+                "t:gx-coder+coder@workstation=processing",
+                "t:t9+gate@workstation=idle",
+                "s:none[workstation=1,workstation=1]",
+                "t:t2",
+                "a:probe@workstation=waiting",
+            ]
+        );
+
+        // The header's `host` half runs the verb, and the store keeps it.
+        let host_btn = panels.sidebar.mode_btn_rects[1]
+            .expect("the header draws the mode switch")
+            .center();
+        let _ = run_pass_at(
+            &ctx,
+            1.2,
+            vec![
+                egui::Event::PointerMoved(host_btn),
+                egui::Event::PointerButton {
+                    pos: host_btn,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut panels,
+            &mut wall,
+        );
+        let (verbs, _) = run_pass_at(
+            &ctx,
+            1.25,
+            vec![egui::Event::PointerButton {
+                pos: host_btn,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut panels,
+            &mut wall,
+        );
+        assert_eq!(verbs, vec!["wall.sidebar mode host".to_string()]);
+        assert_eq!(wall.store().sidebar().mode, SidebarMode::Host);
+        assert!(wall.store().sidebar().open);
+
+        let _ = run_pass_at(&ctx, 1.3, Vec::new(), &mut panels, &mut wall);
+        assert_eq!(
+            panels.sidebar.rows_drawn,
+            vec![
+                "h:workstation[3]",
+                "t:t1",
+                "t:gx-coder+coder@workstation=processing",
+                "t:t2",
+                "h:workstation[2]",
+                "t:t9+gate@workstation=idle",
+                "a:probe@workstation=waiting",
+            ]
+        );
+
+        // `app.where` prints the mode, the switch and the list as drawn.
+        let described = wall.frame();
+        let report = panels.format_where(&wall, &described);
+        let line = report
+            .lines()
+            .find(|l| l.starts_with("panel sidebar "))
+            .expect("app.where has a sidebar line");
+        assert!(line.contains(" mode=host "), "{line}");
+        assert!(!line.contains("mode_host=none"), "{line}");
+        assert!(line.contains(" agents=probe@workstation:"), "{line}");
+        assert!(
+            line.ends_with(
+                " rows=h:workstation[3];t:t1;t:gx-coder+coder@workstation=processing;t:t2;h:workstation[2];t:t9+gate@workstation=idle;a:probe@workstation=waiting"
+            ),
+            "{line}"
+        );
+
+        assert!(wall.run("wall.sidebar mode group").text.starts_with("OK"));
+        let _ = run_pass_at(&ctx, 1.4, Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.sidebar.rows_drawn[0], "g:g-1[workstation=2,workstation=1]");
     }
 
     #[test]

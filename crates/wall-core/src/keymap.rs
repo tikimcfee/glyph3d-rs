@@ -446,7 +446,7 @@ pub const KEYMAP: &[WallChord] = &[
         shift: None,
         mode: None,
         key: "B",
-        does: "the sidebar: every terminal and group",
+        does: "the sidebar: every terminal, group and agent",
         action: Some(ChordAction::ToggleSidebar),
     },
     WallChord {

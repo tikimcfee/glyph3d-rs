@@ -518,7 +518,7 @@ mod tests {
     use wall_core::router::CommandRouter;
     use wall_core::sidebar::{
         build_sidebar, BusAgentInput, BusSnapshot, SidebarGroup, SidebarInput as CoreSidebarInput,
-        SidebarTerminal,
+        SidebarMode, SidebarTerminal,
     };
 
     #[test]
@@ -573,55 +573,78 @@ mod tests {
                     detail: "ready".to_string(),
                     ..BusAgentInput::default()
                 },
+                BusAgentInput {
+                    name: "linux-gate".to_string(),
+                    host: "workstation".to_string(),
+                    live: true,
+                    status: "error".to_string(),
+                    attached: None,
+                    ..BusAgentInput::default()
+                },
             ],
         };
 
+        // The sidebar's one list: a group over two hosts (a local agent in
+        // its `gx-` terminal, a hidden shell, another host's agent in an
+        // attach terminal), a folded group, and agents with no terminal.
+        let sb_terminal = |id: &str, name: &str, group: Option<&str>, attached: Option<&str>| {
+            SidebarTerminal {
+                id: id.to_string(),
+                name: name.to_string(),
+                group: group.map(str::to_string),
+                hidden: false,
+                attached: attached.map(str::to_string),
+                agent_view_open: false,
+            }
+        };
         let raw_sb = CoreSidebarInput {
             terminals: vec![
                 SidebarTerminal {
-                    id: "gx-wall-lead".to_string(),
-                    name: "wall-lead".to_string(),
-                    group: Some("g1".to_string()),
-                    hidden: false,
-                    attached: Some("wall-lead@laptop-2".to_string()),
                     agent_view_open: true,
+                    ..sb_terminal(
+                        "gx-wall-lead",
+                        "wall-lead",
+                        Some("g-1"),
+                        Some("wall-lead@laptop-2"),
+                    )
                 },
                 SidebarTerminal {
-                    id: "term-2".to_string(),
-                    name: "termd logs".to_string(),
-                    group: Some("g1".to_string()),
                     hidden: true,
-                    attached: None,
-                    agent_view_open: false,
+                    ..sb_terminal("term-2", "termd logs", Some("g-1"), None)
                 },
-                SidebarTerminal {
-                    id: "term-3".to_string(),
-                    name: "zsh — glyph3d-rs".to_string(),
-                    group: None,
-                    hidden: false,
-                    attached: None,
-                    agent_view_open: false,
-                },
+                sb_terminal(
+                    "term-4",
+                    "bench",
+                    Some("g-1"),
+                    Some("bench-runner@workstation"),
+                ),
+                sb_terminal("term-5", "notes", Some("g-2"), None),
+                sb_terminal("term-3", "zsh — glyph3d-rs", None, None),
             ],
             groups: vec![
                 SidebarGroup {
-                    id: "g1".to_string(),
-                    name: "Core Fleet".to_string(),
+                    id: "g-1".to_string(),
+                    name: "fleet".to_string(),
                     layout: GroupLayout::Tile,
                     columns: 2,
-                    members: vec!["gx-wall-lead".to_string(), "term-2".to_string()],
+                    members: vec![
+                        "gx-wall-lead".to_string(),
+                        "term-2".to_string(),
+                        "term-4".to_string(),
+                    ],
                 },
                 SidebarGroup {
-                    id: "g2".to_string(),
-                    name: "Folded Docs".to_string(),
+                    id: "g-2".to_string(),
+                    name: "folded docs".to_string(),
                     layout: GroupLayout::Freeform,
                     columns: 1,
-                    members: Vec::new(),
+                    members: vec!["term-5".to_string()],
                 },
             ],
             focused_id: Some("gx-wall-lead".to_string()),
-            collapsed_groups: BTreeSet::from(["g2".to_string()]),
+            collapsed_groups: BTreeSet::from(["g-2".to_string()]),
             bus: bus.clone(),
+            mode: SidebarMode::Group,
         };
         let dock = dock_layout(&DockState {
             sidebar: DockPanel::new(true, DockSide::Left),
@@ -717,5 +740,85 @@ mod tests {
         let pal_px = *img.get_pixel(640, 200);
         assert_ne!(sb_px, clear_px, "sidebar region should be drawn");
         assert_ne!(pal_px, clear_px, "palette region should be drawn");
+
+        // A member's row carries its group's chip, and each group's is its
+        // own colour: g-1 the palette's blue, g-2 its orange. A row in no
+        // group has none. (This helper's target darkens what egui draws, so
+        // the pixels are judged by hue, not held to the hex.)
+        let px = |img: &image::RgbaImage, x: f32, y: f32| *img.get_pixel(x as u32, y as u32);
+        let member = sb_state.term_row_rects["term-4"];
+        let chip_px = px(&img, member.left() + 11.0, member.center().y);
+        let beside_px = px(&img, member.left() + 16.0, member.center().y);
+        assert_ne!(chip_px, beside_px, "a member row draws its chip");
+        assert!(
+            chip_px[2] > chip_px[0].saturating_add(60),
+            "g-1's chip is blue: {chip_px:?}"
+        );
+        let folded = sb_state.group_fold_rects["g-2"];
+        let head_px = px(&img, folded.right() + 5.0, folded.center().y);
+        assert!(
+            head_px[0] > head_px[2].saturating_add(60),
+            "g-2's chip is orange: {head_px:?}"
+        );
+        // (The target dithers: the panel's fill varies by a level.)
+        let loose = sb_state.term_row_rects["term-3"];
+        let (bare_px, bare_beside) = (
+            px(&img, loose.left() + 11.0, loose.center().y),
+            px(&img, loose.left() + 16.0, loose.center().y),
+        );
+        assert!(
+            (0..3).all(|c| bare_px[c].abs_diff(bare_beside[c]) <= 3),
+            "a row in no group has no chip: {bare_px:?} beside {bare_beside:?}"
+        );
+
+        // The same wall listed by host, on a PNG beside the first.
+        let by_host_path = out_path.with_file_name(format!(
+            "{}-by-host.png",
+            out_path.file_stem().unwrap().to_string_lossy()
+        ));
+        let sb_by_host = sidebar::SidebarInput {
+            model: build_sidebar(&CoreSidebarInput {
+                mode: SidebarMode::Host,
+                ..raw_sb
+            }),
+            ..sb_input
+        };
+        let mut sb_state = sidebar::SidebarState::new(true, DockSide::Left);
+        render_egui_offscreen_to_png(
+            &gpu,
+            1280,
+            800,
+            1.0,
+            wgpu::Color {
+                r: 0.012,
+                g: 0.014,
+                b: 0.022,
+                a: 1.0,
+            },
+            |ctx| sidebar::show(ctx, &mut sb_state, &sb_by_host, &mut out_verbs),
+            &by_host_path,
+        );
+        let by_host = image::open(&by_host_path).unwrap().to_rgba8();
+        assert_eq!(
+            sb_state.rows_drawn,
+            vec![
+                "h:laptop-2[5]",
+                "t:gx-wall-lead+wall-lead@laptop-2=processing",
+                "t:term-2",
+                "t:term-5",
+                "t:term-3",
+                "a:wall-layout@laptop-2=waiting",
+                "h:workstation[2]",
+                "t:term-4+bench-runner@workstation=idle",
+                "a:linux-gate@workstation=error",
+            ]
+        );
+        // Each grouped row keeps its chip under its host.
+        let member = sb_state.term_row_rects["term-4"];
+        let chip_px = px(&by_host, member.left() + 11.0, member.center().y);
+        assert!(
+            chip_px[2] > chip_px[0].saturating_add(60),
+            "g-1's chip is blue by host too: {chip_px:?}"
+        );
     }
 }

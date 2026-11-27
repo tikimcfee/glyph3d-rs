@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentSide, GroupLayout};
 use crate::geom::Point;
+use crate::sidebar::SidebarMode;
 use crate::split::{self, SplitNode};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -256,6 +257,10 @@ pub struct SidebarState {
     #[serde(with = "serde_point")]
     pub float: Point,
     pub collapsed: Vec<String>,
+    /// How the list is sectioned (`wall.sidebar mode group|host`, 2026-11-27).
+    /// A store written before it reads as `group`.
+    #[serde(default)]
+    pub mode: SidebarMode,
 }
 
 impl Default for SidebarState {
@@ -265,6 +270,7 @@ impl Default for SidebarState {
             side: PanelSide::Right,
             float: Point::new(80.0, 80.0),
             collapsed: Vec::new(),
+            mode: SidebarMode::default(),
         }
     }
 }
@@ -276,6 +282,7 @@ pub struct SidebarPatch {
     pub side: Option<PanelSide>,
     pub float: Option<Point>,
     pub collapsed: Option<Vec<String>>,
+    pub mode: Option<SidebarMode>,
 }
 
 impl From<SidebarState> for SidebarPatch {
@@ -285,6 +292,7 @@ impl From<SidebarState> for SidebarPatch {
             side: Some(s.side),
             float: Some(s.float),
             collapsed: Some(s.collapsed),
+            mode: Some(s.mode),
         }
     }
 }
@@ -974,6 +982,9 @@ impl WallStore {
         if let Some(collapsed) = p.collapsed {
             self.sidebar.collapsed = collapsed;
         }
+        if let Some(mode) = p.mode {
+            self.sidebar.mode = mode;
+        }
         self.persist();
     }
 
@@ -1143,6 +1154,13 @@ fn parse_sidebar(raw: Option<&serde_json::Value>) -> SidebarState {
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
     {
         out.collapsed = collapsed;
+    }
+    if let Some(mode) = obj
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .and_then(SidebarMode::parse)
+    {
+        out.mode = mode;
     }
     out
 }
@@ -1345,6 +1363,7 @@ mod tests {
             open: Some(true),
             side: Some(PanelSide::Left),
             collapsed: Some(vec!["g-1".to_string()]),
+            mode: Some(SidebarMode::Host),
             ..Default::default()
         });
 
@@ -1376,10 +1395,32 @@ mod tests {
                 side: PanelSide::Left,
                 float: Point::new(80.0, 80.0),
                 collapsed: vec!["g-1".to_string()],
+                mode: SidebarMode::Host,
             }
         );
         assert!(WallStore::open(&dir.0, "8093").groups().is_empty());
         assert!(!WallStore::open(&dir.0, "8093").sidebar().open);
+        assert_eq!(
+            WallStore::open(&dir.0, "8093").sidebar().mode,
+            SidebarMode::Group
+        );
+
+        // A store written before the sidebar had a mode lists by group, and
+        // a mode it does not know is ignored, not a reason to drop the rest.
+        let path = back.path().expect("a disk-backed store has a path").to_owned();
+        let mut root: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["sidebar"]["mode"], "host");
+        root["sidebar"].as_object_mut().unwrap().remove("mode");
+        fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        let old = WallStore::open(&dir.0, "8099");
+        assert_eq!(old.sidebar().mode, SidebarMode::Group);
+        assert!(old.sidebar().open);
+        root["sidebar"]["mode"] = serde_json::json!("sideways");
+        fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        let odd = WallStore::open(&dir.0, "8099");
+        assert_eq!(odd.sidebar().mode, SidebarMode::Group);
+        assert_eq!(odd.sidebar().collapsed, vec!["g-1".to_string()]);
         assert_eq!(back.new_group_id(), "g-3");
     }
 
@@ -1426,6 +1467,7 @@ mod tests {
                 side: PanelSide::Right,
                 float: Point::new(80.0, 80.0),
                 collapsed: Vec::new(),
+                mode: SidebarMode::Group,
             }
         );
         assert_ne!(back.keys().status, back.keys().sidebar);

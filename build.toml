@@ -101,7 +101,9 @@
 # including its doctest), wall-core (257), agent-feed (16), wall-control (7),
 # and native/src/wall (72 unit and offscreen GPU tests).
 # 1154 -> 1174 (2026-11-26): wall-root parity, perf, and idle/status-wake tests (+20).
-test_floor = 1174
+# 1174 -> 1184 (2026-11-27): the sidebar's one list (+10): wall-core's model
+# (7) and `wall.sidebar mode` (1), the panel's switch (1), the mount (1).
+test_floor = 1184
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target `test --relax` runs, each golden render, each kind = "cmd"
