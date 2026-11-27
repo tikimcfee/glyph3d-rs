@@ -2085,6 +2085,17 @@ impl WallPointer {
         {
             return;
         }
+        self.cancel_active_drag(host);
+    }
+
+    /// Cancel any active pointer gesture (regardless of `pointer_id`) and clear
+    /// buffered wheel-scroll momentum — used when the window loses focus (`blur`).
+    pub fn cancel_active(&mut self, host: &mut impl PointerHost) {
+        self.scroller.reset();
+        self.cancel_active_drag(host);
+    }
+
+    fn cancel_active_drag(&mut self, host: &mut impl PointerHost) {
         let Some(drag) = self.end_drag(host) else {
             return;
         };

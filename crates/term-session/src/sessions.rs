@@ -158,6 +158,12 @@ impl Sessions {
         &self.hub
     }
 
+    /// Whether the passive reconnect watcher is active and the namespace socket is currently absent.
+    pub fn is_reconnect_socket_absent(&self) -> bool {
+        self.watching_reconnect.load(Ordering::Acquire)
+            && self.target.resolve_socket().is_ok_and(|p| !p.exists())
+    }
+
     /// Underlying [`TerminalSession`] for `id`, if currently adopted.
     pub fn session(&self, id: &str) -> Option<&TerminalSession> {
         self.live.get(id).map(|t| &t.session)
