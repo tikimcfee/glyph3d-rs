@@ -32,7 +32,7 @@ use wall_core::status::{TermdStatus, chip_look};
 use wall_core::wall::{Wall, WallFrame, help_sections};
 
 use super::panels::{
-    self, bar_buttons, context_menu, help, palette, settings, status, topbar,
+    self, bar_buttons, context_menu, help, palette, selection_bar, settings, status, topbar,
 };
 
 const PALETTE_INPUT_ID: &str = "wall_palette_query_input";
@@ -43,6 +43,7 @@ const SETTINGS_SEARCH_ID: &str = "wall_settings_search_input";
 pub struct Panels {
     pub topbar: topbar::TopbarState,
     pub bar_buttons: bar_buttons::BarButtonsState,
+    pub selection_bar: selection_bar::SelectionBarState,
     pub palette: palette::PaletteState,
     pub sidebar: panels::sidebar::SidebarState,
     pub settings: settings::SettingsState,
@@ -85,6 +86,7 @@ impl Panels {
         }
         self.bar_buttons.is_holding()
             || described.terminals.iter().any(|t| t.close_hold_progress.is_some())
+            || (!described.selection_outlines.is_empty() && described.lasso.is_none())
             || (!self.wall_dragging && described.title_bars.iter().any(|b| b.hovered))
             || described.palette_open
             || self.palette.open
@@ -327,6 +329,40 @@ impl Panels {
         if let Some(delay) = bar_out.repaint_after {
             ctx.request_repaint_after(delay);
         }
+
+        // 0a2. Floating selection action bar (`group (N)` + `×`, matching `SelectionOverlay.js`).
+        let selection_bounds = if described.selection_outlines.is_empty() || fullscreen {
+            None
+        } else {
+            let mut acc: Option<egui::Rect> = None;
+            for sel in &described.selection_outlines {
+                let sbox = described.camera.to_screen_box(
+                    sel.rect,
+                    described.viewport.w,
+                    described.viewport.h,
+                );
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(sbox.left as f32, sbox.top as f32),
+                    egui::pos2(sbox.right as f32, sbox.bottom as f32),
+                );
+                acc = Some(match acc {
+                    Some(prev) => prev.union(r),
+                    None => r,
+                });
+            }
+            acc
+        };
+        selection_bar::show(
+            ctx,
+            &mut self.selection_bar,
+            &selection_bar::SelectionBarInput {
+                count: described.selection_outlines.len(),
+                selection_bounds,
+                lassoing: described.lasso.is_some(),
+                platform,
+            },
+            &mut out,
+        );
 
         // 0b. Topbar strip (`panels::topbar`), reserving space on the right for `TermdChip`.
         let ns = wall.termd().namespace();
@@ -732,6 +768,16 @@ impl Panels {
             self.palette.item_count,
             fmt_opt_rect(self.palette.last_rect),
         ));
+
+        if self.selection_bar.count > 0 {
+            lines.push(format!(
+                "panel selection_bar count={} rect={} group={} clear={}",
+                self.selection_bar.count,
+                fmt_opt_rect(self.selection_bar.last_rect),
+                fmt_opt_rect(self.selection_bar.group_rect),
+                fmt_opt_rect(self.selection_bar.clear_rect),
+            ));
+        }
 
         let sb = &described.panels.sidebar;
         let sb_collapsed = if sb.collapsed.is_empty() {
