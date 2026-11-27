@@ -35,6 +35,7 @@ pub mod script;
 #[cfg(feature = "windowed")]
 pub mod session;
 pub mod shapes;
+pub mod startup;
 pub mod test_pattern;
 #[cfg(feature = "egui-ui")]
 pub mod ui;
