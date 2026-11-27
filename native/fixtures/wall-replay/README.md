@@ -38,7 +38,14 @@ cargo run --release -p termd-client --example termd_record -- \
   --out native/fixtures/wall-replay/vim-screen.vt --size 80x24 --settle-ms 600 \
   -- /usr/bin/vim --clean -c "syntax on" -c "set number ruler" native/src/wall/replay.rs
 
-# 5-9. Wall default-size (100x30) visual parity captures (`out/wall-port/cell-parity-2026-11-26.md`):
+# 5. Offline Claude Code Ink TUI (`claude --bare` in an isolated scratch HOME with
+#    `ANTHROPIC_BASE_URL=http://127.0.0.1:1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
+#    `DISABLE_TELEMETRY=1`, `DISABLE_AUTOUPDATER=1` — exercises CHA `CSI G`, 24-bit RGB
+#    inline diff preview, Kitty keyboard `CSI < u` / `CSI > 5 u`, APC graphics query,
+#    DECRQM, and box-drawing rules without touching any live backend):
+./tools/vt-diff.sh --record-claude-tui native/fixtures/wall-replay/claude-tui.vt
+
+# 6-10. Wall default-size (100x30) visual parity captures (`out/wall-port/cell-parity-2026-11-26.md`):
 # - `zsh-prompt.vt`: Oh My Zsh `agnoster` powerline prompt with git status segments + `ls --color`
 # - `vim-rust.vt`: Vim 9 (`habamax`, `termguicolors`, italic doc comments, bold keywords/types, cursorline, statusline) on `native/src/wall/cell.rs`
 # - `top-live.vt`: Interactive macOS `/usr/bin/top -s 1 -n 18 -o cpu`
