@@ -1715,8 +1715,10 @@ mod tests {
 
         let ev = client.events().recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(ev, Event::Lagged { handle: 7, dropped: 4096, seq: 8192 });
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        // `push_event` sends on `events_tx` and then invokes `wake` before sending `repaint`,
+        // so waiting for `repaint_rx` orders `wake()` strictly before reading `wakes`.
         repaint_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
         drop(client);
         server.join().unwrap();
     }

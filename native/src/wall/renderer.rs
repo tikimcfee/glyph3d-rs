@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytemuck::{Pod, Zeroable};
@@ -223,11 +224,25 @@ enum DrawRun {
 }
 
 /// Shared wgpu cell renderer for any number of live terminals.
+struct ShapePipelines {
+    opaque: wgpu::RenderPipeline,
+    blend: wgpu::RenderPipeline,
+}
+
+struct CellPipelines {
+    panel: wgpu::RenderPipeline,
+    fill: wgpu::RenderPipeline,
+    ink: wgpu::RenderPipeline,
+    cursor: wgpu::RenderPipeline,
+    label: wgpu::RenderPipeline,
+}
+
 pub struct WallRenderer {
     glyphs: GlyphSource,
     metrics: CellMetrics,
     style: WallStyle,
     color_format: wgpu::TextureFormat,
+    pipeline_cache: Option<(Arc<wgpu::PipelineCache>, PathBuf)>,
     paper_buf: wgpu::Buffer,
     paper_bg: wgpu::BindGroup,
     paper_pl: wgpu::PipelineLayout,
@@ -239,8 +254,8 @@ pub struct WallRenderer {
     shapes_cap: usize,
     shapes_bg: wgpu::BindGroup,
     shape_pl: wgpu::PipelineLayout,
-    shape_opaque_pipeline: wgpu::RenderPipeline,
-    shape_blend_pipeline: wgpu::RenderPipeline,
+    shape_pipelines: Option<ShapePipelines>,
+    pending_shapes: Option<mpsc::Receiver<ShapePipelines>>,
     frame_buf: wgpu::Buffer,
     quad_index_buf: wgpu::Buffer,
     shared_bgl: wgpu::BindGroupLayout,
@@ -253,11 +268,8 @@ pub struct WallRenderer {
     labels_bg: wgpu::BindGroup,
     cell_pl: wgpu::PipelineLayout,
     label_pl: wgpu::PipelineLayout,
-    panel_pipeline: wgpu::RenderPipeline,
-    fill_pipeline: wgpu::RenderPipeline,
-    ink_pipeline: wgpu::RenderPipeline,
-    cursor_pipeline: wgpu::RenderPipeline,
-    label_pipeline: wgpu::RenderPipeline,
+    cell_pipelines: Option<CellPipelines>,
+    pending_cells: Option<mpsc::Receiver<CellPipelines>>,
     shader_watcher: Option<ShaderWatcher>,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
@@ -413,6 +425,7 @@ fn build_paper_pipeline(
     paper_pl: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("wall paper pipeline"),
@@ -447,7 +460,7 @@ fn build_paper_pipeline(
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
-        cache: None,
+        cache,
     })
 }
 
@@ -456,7 +469,8 @@ fn build_shape_pipelines(
     shape_pl: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    cache: Option<&wgpu::PipelineCache>,
+) -> ShapePipelines {
     let make = |label: &str, depth_write: bool| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
@@ -491,13 +505,13 @@ fn build_shape_pipelines(
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         })
     };
-    (
-        make("wall shape opaque pipeline", true),
-        make("wall shape blend pipeline", false),
-    )
+    ShapePipelines {
+        opaque: make("wall shape opaque pipeline", true),
+        blend: make("wall shape blend pipeline", false),
+    }
 }
 
 fn build_cell_pipelines(
@@ -506,13 +520,8 @@ fn build_cell_pipelines(
     label_pl: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-) {
+    cache: Option<&wgpu::PipelineCache>,
+) -> CellPipelines {
     let make = |label: &str, vs: &str, fs: &str, depth_write: bool| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
@@ -547,7 +556,7 @@ fn build_cell_pipelines(
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         })
     };
     let panel = make("wall panel pipeline", "vs_panel", "fs_panel", true);
@@ -587,9 +596,15 @@ fn build_cell_pipelines(
         }),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
-        cache: None,
+        cache,
     });
-    (panel, fill, ink, cursor, label)
+    CellPipelines {
+        panel,
+        fill,
+        ink,
+        cursor,
+        label,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,18 +868,56 @@ fn make_shared_bg(
 }
 
 impl WallRenderer {
-    /// Build a `WallRenderer` on `device`/`queue` targeting `color_format` + [`WALL_DEPTH_FORMAT`],
-    /// loading runtime fonts from `assets/fonts/` and lazy colour emoji from `emoji_sheet`.
+    /// Build a `WallRenderer` synchronously (all three shader pipeline groups compiled up front).
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         emoji_sheet: &Path,
         color_format: wgpu::TextureFormat,
+        style: WallStyle,
+    ) -> Self {
+        Self::new_internal(device, queue, None, emoji_sheet, color_format, style, None)
+    }
+
+    /// Build a `WallRenderer` optimized for fast time-to-first-frame: compiles only the paper
+    /// pipeline synchronously so Frame 1 paints immediately, while compiling `wall_shapes.wgsl`
+    /// and `wall_cells.wgsl` in parallel on background threads (using a persisted
+    /// `wgpu::PipelineCache` on Vulkan when supported) and invoking `wake` as each lands.
+    pub fn new_fast(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        adapter: &wgpu::Adapter,
+        emoji_sheet: &Path,
+        color_format: wgpu::TextureFormat,
+        style: WallStyle,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Self::new_internal(
+            device,
+            queue,
+            Some(adapter),
+            emoji_sheet,
+            color_format,
+            style,
+            Some(wake),
+        )
+    }
+
+    fn new_internal(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        adapter: Option<&wgpu::Adapter>,
+        emoji_sheet: &Path,
+        color_format: wgpu::TextureFormat,
         mut style: WallStyle,
+        deferred_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         let glyphs = GlyphSource::new(device, queue, emoji_sheet);
         let metrics = glyphs.cell_metrics();
         glyphs.apply_line_metrics(&mut style);
+
+        let pipeline_cache = adapter.and_then(|a| super::startup::open_pipeline_cache(device, a));
+        let cache_ref = pipeline_cache.as_ref().map(|(c, _)| c.as_ref());
 
         let paper_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall paper uniform"),
@@ -893,19 +946,24 @@ impl WallRenderer {
                 resource: paper_buf.as_entire_binding(),
             }],
         });
-        let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_paper.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_paper.wgsl",
-                include_str!("../shaders/wall_paper.wgsl"),
-            )),
-        });
-        let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wall paper pl"),
-            bind_group_layouts: &[Some(&paper_bgl)],
-            immediate_size: 0,
-        });
-        let paper_pipeline = build_paper_pipeline(device, &paper_pl, &paper_shader, color_format);
+        let (paper_pl, paper_pipeline) = {
+            let _s = super::startup::span("pipeline_paper");
+            let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wall_paper.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                    "wall_paper.wgsl",
+                    include_str!("../shaders/wall_paper.wgsl"),
+                )),
+            });
+            let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wall paper pl"),
+                bind_group_layouts: &[Some(&paper_bgl)],
+                immediate_size: 0,
+            });
+            let paper_pipeline =
+                build_paper_pipeline(device, &paper_pl, &paper_shader, color_format, cache_ref);
+            (paper_pl, paper_pipeline)
+        };
 
         let shape_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall shape frame uniform"),
@@ -959,20 +1017,11 @@ impl WallRenderer {
                 },
             ],
         });
-        let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_shapes.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_shapes.wgsl",
-                include_str!("../shaders/wall_shapes.wgsl"),
-            )),
-        });
         let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall shapes pl"),
             bind_group_layouts: &[Some(&shapes_bgl)],
             immediate_size: 0,
         });
-        let (shape_opaque_pipeline, shape_blend_pipeline) =
-            build_shape_pipelines(device, &shape_pl, &shape_shader, color_format);
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -1082,14 +1131,6 @@ impl WallRenderer {
             ],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wall_cells.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
-                "wall_cells.wgsl",
-                include_str!("../shaders/wall_cells.wgsl"),
-            )),
-        });
-
         let cell_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall cells pl"),
             bind_group_layouts: &[Some(&shared_bgl), Some(&term_bgl)],
@@ -1129,8 +1170,106 @@ impl WallRenderer {
             bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
             immediate_size: 0,
         });
-        let (panel_pipeline, fill_pipeline, ink_pipeline, cursor_pipeline, label_pipeline) =
-            build_cell_pipelines(device, &cell_pl, &label_pl, &shader, color_format);
+
+        let (shape_pipelines, pending_shapes, cell_pipelines, pending_cells) =
+            if let Some(wake) = deferred_wake {
+                let (stx, srx) = mpsc::channel();
+                {
+                    let dev = device.clone();
+                    let pl = shape_pl.clone();
+                    let cache = pipeline_cache.as_ref().map(|(c, _)| Arc::clone(c));
+                    let wake_s = Arc::clone(&wake);
+                    let _ = std::thread::Builder::new()
+                        .name("wall-pipe-shapes".to_string())
+                        .spawn(move || {
+                            let _s = super::startup::span("pipeline_shapes");
+                            let shader = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some("wall_shapes.wgsl"),
+                                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                                    "wall_shapes.wgsl",
+                                    include_str!("../shaders/wall_shapes.wgsl"),
+                                )),
+                            });
+                            let pipes = build_shape_pipelines(
+                                &dev,
+                                &pl,
+                                &shader,
+                                color_format,
+                                cache.as_deref(),
+                            );
+                            let _ = stx.send(pipes);
+                            wake_s();
+                        });
+                }
+                let (ctx, crx) = mpsc::channel();
+                {
+                    let dev = device.clone();
+                    let cpl = cell_pl.clone();
+                    let lpl = label_pl.clone();
+                    let cache = pipeline_cache.clone();
+                    let wake_c = wake;
+                    let _ = std::thread::Builder::new()
+                        .name("wall-pipe-cells".to_string())
+                        .spawn(move || {
+                            let _s = super::startup::span("pipeline_cells");
+                            let shader = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some("wall_cells.wgsl"),
+                                source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                                    "wall_cells.wgsl",
+                                    include_str!("../shaders/wall_cells.wgsl"),
+                                )),
+                            });
+                            let pipes = build_cell_pipelines(
+                                &dev,
+                                &cpl,
+                                &lpl,
+                                &shader,
+                                color_format,
+                                cache.as_ref().map(|(c, _)| c.as_ref()),
+                            );
+                            if let Some((c, path)) = &cache {
+                                super::startup::save_pipeline_cache(c, path);
+                            }
+                            let _ = ctx.send(pipes);
+                            wake_c();
+                        });
+                }
+                (None, Some(srx), None, Some(crx))
+            } else {
+                let shape_pipes = {
+                    let _s = super::startup::span("pipeline_shapes");
+                    let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("wall_shapes.wgsl"),
+                        source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                            "wall_shapes.wgsl",
+                            include_str!("../shaders/wall_shapes.wgsl"),
+                        )),
+                    });
+                    build_shape_pipelines(device, &shape_pl, &shape_shader, color_format, cache_ref)
+                };
+                let cell_pipes = {
+                    let _s = super::startup::span("pipeline_cells");
+                    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("wall_cells.wgsl"),
+                        source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                            "wall_cells.wgsl",
+                            include_str!("../shaders/wall_cells.wgsl"),
+                        )),
+                    });
+                    build_cell_pipelines(
+                        device,
+                        &cell_pl,
+                        &label_pl,
+                        &shader,
+                        color_format,
+                        cache_ref,
+                    )
+                };
+                if let Some((c, path)) = &pipeline_cache {
+                    super::startup::save_pipeline_cache(c, path);
+                }
+                (Some(shape_pipes), None, Some(cell_pipes), None)
+            };
 
         let shader_watcher = ShaderWatcher::from_env(Instant::now());
 
@@ -1139,6 +1278,7 @@ impl WallRenderer {
             metrics,
             style,
             color_format,
+            pipeline_cache,
             paper_buf,
             paper_bg,
             paper_pl,
@@ -1150,8 +1290,8 @@ impl WallRenderer {
             shapes_cap,
             shapes_bg,
             shape_pl,
-            shape_opaque_pipeline,
-            shape_blend_pipeline,
+            shape_pipelines,
+            pending_shapes,
             frame_buf,
             quad_index_buf,
             shared_bgl,
@@ -1164,11 +1304,8 @@ impl WallRenderer {
             labels_bg,
             cell_pl,
             label_pl,
-            panel_pipeline,
-            fill_pipeline,
-            ink_pipeline,
-            cursor_pipeline,
-            label_pipeline,
+            cell_pipelines,
+            pending_cells,
             shader_watcher,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
@@ -1177,6 +1314,47 @@ impl WallRenderer {
             draw_runs: Vec::new(),
             cursor_blink: CursorBlinkState::default(),
         }
+    }
+
+    /// Install any background-compiled shape/cell pipelines that have finished (non-blocking).
+    /// Returns `true` if at least one pipeline group became ready this call.
+    pub fn poll_ready_pipelines(&mut self) -> bool {
+        let mut arrived = false;
+        if let Some(rx) = &self.pending_shapes {
+            if let Ok(pipes) = rx.try_recv() {
+                self.shape_pipelines = Some(pipes);
+                self.pending_shapes = None;
+                arrived = true;
+            }
+        }
+        if let Some(rx) = &self.pending_cells {
+            if let Ok(pipes) = rx.try_recv() {
+                self.cell_pipelines = Some(pipes);
+                self.pending_cells = None;
+                arrived = true;
+            }
+        }
+        arrived
+    }
+
+    /// Block until any background-compiled shape/cell pipelines are installed (used before
+    /// offscreen screenshots so captures never omit terminals or chrome).
+    pub fn wait_for_pipelines(&mut self) {
+        if let Some(rx) = self.pending_shapes.take() {
+            if let Ok(pipes) = rx.recv() {
+                self.shape_pipelines = Some(pipes);
+            }
+        }
+        if let Some(rx) = self.pending_cells.take() {
+            if let Ok(pipes) = rx.recv() {
+                self.cell_pipelines = Some(pipes);
+            }
+        }
+    }
+
+    /// True once both shape and cell pipelines are compiled and ready to draw.
+    pub fn pipelines_ready(&self) -> bool {
+        self.shape_pipelines.is_some() && self.cell_pipelines.is_some()
     }
 
     pub fn metrics(&self) -> CellMetrics {
@@ -1381,39 +1559,49 @@ impl WallRenderer {
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
         });
 
+        let cache_ref = self.pipeline_cache.as_ref().map(|(c, _)| c.as_ref());
         match kind {
             WatchedShaderKind::Paper => {
-                let paper = build_paper_pipeline(device, &self.paper_pl, &module, self.color_format);
+                let paper = build_paper_pipeline(
+                    device,
+                    &self.paper_pl,
+                    &module,
+                    self.color_format,
+                    cache_ref,
+                );
                 if let Some(err) = pollster::block_on(scope.pop()) {
                     return Err(format!("{name}: wgpu validation error: {err}"));
                 }
                 self.paper_pipeline = paper;
             }
             WatchedShaderKind::Shapes => {
-                let (opaque, blend) =
-                    build_shape_pipelines(device, &self.shape_pl, &module, self.color_format);
+                let pipes = build_shape_pipelines(
+                    device,
+                    &self.shape_pl,
+                    &module,
+                    self.color_format,
+                    cache_ref,
+                );
                 if let Some(err) = pollster::block_on(scope.pop()) {
                     return Err(format!("{name}: wgpu validation error: {err}"));
                 }
-                self.shape_opaque_pipeline = opaque;
-                self.shape_blend_pipeline = blend;
+                self.pending_shapes = None;
+                self.shape_pipelines = Some(pipes);
             }
             WatchedShaderKind::Cells => {
-                let (panel, fill, ink, cursor, label) = build_cell_pipelines(
+                let pipes = build_cell_pipelines(
                     device,
                     &self.cell_pl,
                     &self.label_pl,
                     &module,
                     self.color_format,
+                    cache_ref,
                 );
                 if let Some(err) = pollster::block_on(scope.pop()) {
                     return Err(format!("{name}: wgpu validation error: {err}"));
                 }
-                self.panel_pipeline = panel;
-                self.fill_pipeline = fill;
-                self.ink_pipeline = ink;
-                self.cursor_pipeline = cursor;
-                self.label_pipeline = label;
+                self.pending_cells = None;
+                self.cell_pipelines = Some(pipes);
             }
         }
         Ok(())
@@ -1691,6 +1879,7 @@ impl WallRenderer {
         camera: &WallCamera,
         frame: &WallFrame<'_>,
     ) -> UploadStats {
+        let _ = self.poll_ready_pipelines();
         let target_is_srgb = self.color_format.is_srgb();
         if let Some(paper_uniform) = frame
             .paper
@@ -1926,16 +2115,25 @@ impl WallRenderer {
         for run in &self.draw_runs {
             match run {
                 DrawRun::ShapesOpaque(range) => {
-                    pass.set_pipeline(&self.shape_opaque_pipeline);
+                    let Some(sp) = &self.shape_pipelines else {
+                        continue;
+                    };
+                    pass.set_pipeline(&sp.opaque);
                     pass.set_bind_group(0, &self.shapes_bg, &[]);
                     pass.draw_indexed(0..6, 0, range.clone());
                 }
                 DrawRun::ShapesBlend(range) => {
-                    pass.set_pipeline(&self.shape_blend_pipeline);
+                    let Some(sp) = &self.shape_pipelines else {
+                        continue;
+                    };
+                    pass.set_pipeline(&sp.blend);
                     pass.set_bind_group(0, &self.shapes_bg, &[]);
                     pass.draw_indexed(0..6, 0, range.clone());
                 }
                 DrawRun::Terminal(idx) => {
+                    let Some(cp) = &self.cell_pipelines else {
+                        continue;
+                    };
                     let draw = &terminals[*idx];
                     let Some(gpu) = self.terminals.get(&draw.id) else {
                         continue;
@@ -1947,35 +2145,38 @@ impl WallRenderer {
                     let cursor_drawn = cursor_drawn_now(draw, self.cursor_blink.visible);
                     let cursor_solid = cursor_is_solid_block(draw, self.cursor_blink.visible);
 
-                    pass.set_pipeline(&self.panel_pipeline);
+                    pass.set_pipeline(&cp.panel);
                     pass.draw_indexed(0..6, 0, 0..1);
 
                     if cell_count > 0 && gpu.has_any_bg {
-                        pass.set_pipeline(&self.fill_pipeline);
+                        pass.set_pipeline(&cp.fill);
                         pass.draw_indexed(0..6, 0, 0..cell_count);
                     }
 
                     // Focused block cursor draws solid behind ink so the glyph renders
                     // over it in the cell's background colour without washout.
                     if cursor_solid {
-                        pass.set_pipeline(&self.cursor_pipeline);
+                        pass.set_pipeline(&cp.cursor);
                         pass.draw_indexed(0..6, 0, 0..1);
                     }
 
                     if cell_count > 0 {
-                        pass.set_pipeline(&self.ink_pipeline);
+                        pass.set_pipeline(&cp.ink);
                         pass.draw_indexed(0..6, 0, 0..cell_count);
                     }
 
                     // Hollow unfocused, bar, and underline cursors draw above ink
                     // without modifying the glyph underneath.
                     if cursor_drawn && !cursor_solid {
-                        pass.set_pipeline(&self.cursor_pipeline);
+                        pass.set_pipeline(&cp.cursor);
                         pass.draw_indexed(0..6, 0, 0..1);
                     }
                 }
                 DrawRun::Labels(range) => {
-                    pass.set_pipeline(&self.label_pipeline);
+                    let Some(cp) = &self.cell_pipelines else {
+                        continue;
+                    };
+                    pass.set_pipeline(&cp.label);
                     pass.set_bind_group(0, &self.shared_bg, &[]);
                     pass.set_bind_group(1, &self.labels_bg, &[]);
                     pass.draw_indexed(0..6, 0, range.clone());
@@ -4578,5 +4779,82 @@ mod tests {
             }
         }
         assert!(rocket_ink > 150, "rocket emoji must draw inside centred box (got {rocket_ink} px)");
+    }
+
+    #[test]
+    fn gpu_new_fast_renders_paper_immediately_and_fills_terminals_when_pipelines_land() {
+        let ctx = crate::gpu::test_device::context();
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakes_c = Arc::clone(&wakes);
+        let mut renderer = WallRenderer::new_fast(
+            &ctx.device,
+            &ctx.queue,
+            &ctx.adapter,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+            Arc::new(move || {
+                wakes_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+
+        let paper = PaperStyle {
+            show: true,
+            background: [0.05, 0.06, 0.09, 1.0],
+            minor_color: [0.25, 0.30, 0.40, 1.0],
+            major_color: [0.45, 0.55, 0.70, 1.0],
+            minor_spacing: 4.0,
+            major_every: 4,
+            line_px: 2.0,
+            min_px: 4.0,
+        };
+        let cam = WallCamera::new(Vec2::ZERO, 16.0);
+        // Frame 1: paper renders cleanly even before shapes/cells finish compiling.
+        let px_paper = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { paper: Some(&paper), ..Default::default() },
+            128,
+            128,
+        );
+        assert!(
+            px_paper.chunks_exact(4).any(|p| p[2] > 60),
+            "paper grid lines must render immediately on frame 1"
+        );
+
+        // Wait for background shapes + cells pipelines, then verify terminals draw normally.
+        renderer.wait_for_pipelines();
+        assert!(renderer.pipelines_ready());
+        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+
+        let mut screen = Screen::new(4, 2);
+        screen.default_bg = rgb(0x10, 0x80, 0x20);
+        let draws = [TerminalDraw {
+            id: 1,
+            screen: &screen,
+            position: Vec2::new(-2.0, 2.0),
+            z: 1.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        }];
+        let px_term = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { paper: Some(&paper), terminals: &draws, ..Default::default() },
+            128,
+            128,
+        );
+        let center = ((64 * 128) + 64) * 4;
+        assert!(
+            px_term[center + 1] > 100,
+            "terminal panel must render once background pipelines land (got {:?})",
+            &px_term[center..center + 3]
+        );
     }
 }

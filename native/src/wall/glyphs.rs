@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glyph_font::EmojiSource;
 #[cfg(feature = "wgpu")]
 use glyph_font::{
-    default_font_chain, normalize_family_key, resolve_family_chain, FamilyId, FontAtlas, FontError,
-    LineMetrics, ResolvedCell, TextureBacking, TextureDirty, CURVE_INITIAL_ROWS, MAP_INITIAL_ROWS,
-    MONASPACE_NEON_FAMILY, TEXTURE_WIDTH, U32S_PER_TEXEL,
+    default_font_chain_lazy, normalize_family_key, resolve_family_chain, FamilyId, FontAtlas,
+    FontError, LineMetrics, ResolvedCell, TextureBacking, TextureDirty, CURVE_INITIAL_ROWS,
+    MAP_INITIAL_ROWS, MONASPACE_NEON_FAMILY, TEXTURE_WIDTH, U32S_PER_TEXEL,
 };
 #[cfg(feature = "wgpu")]
 use term_cells::{Cell, Screen};
@@ -438,26 +438,69 @@ struct SparseEmojiState {
     pending: Vec<u32>,
 }
 
+enum ArchiveBacking {
+    Loaded(Arc<EmojiSheetArchive>),
+    Lazy {
+        path: PathBuf,
+        loaded: OnceLock<Arc<EmojiSheetArchive>>,
+    },
+}
+
 /// On-demand [`glyph_font::EmojiSource`] backed by [`EmojiSheetArchive`].
 ///
 /// Assigns dense sparse cell indices (`0, 1, 2, ...`) only to emoji cells actually queried,
 /// queuing newly allocated cells for [`GlyphSource::sync`] to decode and upload into the
-/// wall's sparse GPU emoji texture.
+/// wall's sparse GPU emoji texture. When constructed with [`Self::from_path`], the 10 MiB
+/// `emoji-sheet.bin` archive is not even read or parsed until the first emoji lookup.
 pub struct SparseEmojiSource {
-    archive: Arc<EmojiSheetArchive>,
+    archive: ArchiveBacking,
     state: Mutex<SparseEmojiState>,
 }
 
 impl SparseEmojiSource {
     pub fn new(archive: Arc<EmojiSheetArchive>) -> Self {
         Self {
-            archive,
+            archive: ArchiveBacking::Loaded(archive),
             state: Mutex::new(SparseEmojiState::default()),
         }
     }
 
+    /// Defer reading and parsing `emoji-sheet.bin` at `path` until the first emoji lookup.
+    pub fn from_path(path: PathBuf) -> Self {
+        Self {
+            archive: ArchiveBacking::Lazy {
+                path,
+                loaded: OnceLock::new(),
+            },
+            state: Mutex::new(SparseEmojiState::default()),
+        }
+    }
+
+    /// Whether the backing [`EmojiSheetArchive`] has been read and parsed from disk.
+    pub fn is_archive_loaded(&self) -> bool {
+        match &self.archive {
+            ArchiveBacking::Loaded(_) => true,
+            ArchiveBacking::Lazy { loaded, .. } => loaded.get().is_some(),
+        }
+    }
+
+    fn archive_if_loaded(&self) -> Option<&EmojiSheetArchive> {
+        match &self.archive {
+            ArchiveBacking::Loaded(a) => Some(a.as_ref()),
+            ArchiveBacking::Lazy { loaded, .. } => loaded.get().map(Arc::as_ref),
+        }
+    }
+
     pub fn archive(&self) -> &EmojiSheetArchive {
-        &self.archive
+        match &self.archive {
+            ArchiveBacking::Loaded(a) => a.as_ref(),
+            ArchiveBacking::Lazy { path, loaded } => loaded
+                .get_or_init(|| {
+                    let _s = super::startup::span("emoji_archive_parse");
+                    Arc::new(EmojiSheetArchive::load(path))
+                })
+                .as_ref(),
+        }
     }
 
     /// Number of unique emoji cells allocated so far.
@@ -500,7 +543,10 @@ impl SparseEmojiSource {
 
 impl EmojiSource for SparseEmojiSource {
     fn cell_for(&self, text: &str) -> Option<u32> {
-        let sheet_cell = self.archive.sheet_cell_for_text(text)?;
+        if text.is_ascii() {
+            return None;
+        }
+        let sheet_cell = self.archive().sheet_cell_for_text(text)?;
         let mut st = self.state.lock().expect("sparse emoji state lock");
         if let Some(&sparse_idx) = st.sheet_to_sparse.get(&sheet_cell) {
             return Some(sparse_idx);
@@ -577,8 +623,13 @@ impl SparseEmojiGpu {
         max_rows_cfg: u32,
     ) -> Self {
         assert!(cols_cfg > 0 && init_rows_cfg > 0 && max_rows_cfg >= init_rows_cfg);
-        let (cell_w, cell_h) = source.archive().cell_size();
-        let mip_levels = source.archive().mip_levels();
+        let (cell_w, cell_h, mip_levels) = match source.archive_if_loaded() {
+            Some(a) => {
+                let (w, h) = a.cell_size();
+                (w, h, a.mip_levels())
+            }
+            None => (0, 0, 1),
+        };
         // Start with a 1x1x1 (4-byte) placeholder until an emoji is actually used.
         let (texture, view) = create_emoji_texture(device, "wall sparse emoji (empty)", 1, 1, 1, 1);
         Self {
@@ -641,6 +692,13 @@ impl SparseEmojiGpu {
         let (pending, total) = self.source.take_pending();
         if pending.is_empty() {
             return;
+        }
+        if self.cell_w == 0 || self.cell_h == 0 {
+            let archive = self.source.archive();
+            let (w, h) = archive.cell_size();
+            self.cell_w = w;
+            self.cell_h = h;
+            self.mip_levels = archive.mip_levels();
         }
         self.allocated_cells = total;
 
@@ -826,19 +884,20 @@ impl GlyphSource {
         })
     }
 
-    /// Load the default font chain from `fonts_dir` and the sparse emoji archive from `emoji_sheet`.
+    /// Load the default font chain from `fonts_dir` (active family eager; fallbacks and sibling
+    /// families lazy) and attach `emoji_sheet` lazily (read on first emoji lookup).
     pub fn load(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         fonts_dir: &Path,
         emoji_sheet: &Path,
     ) -> Result<Self, FontError> {
-        let archive = Arc::new(EmojiSheetArchive::load(emoji_sheet));
-        Self::load_with_capacities(
+        let sparse_source = Arc::new(SparseEmojiSource::from_path(emoji_sheet.to_path_buf()));
+        Self::load_with_source(
             device,
             queue,
             fonts_dir,
-            archive,
+            sparse_source,
             CURVE_INITIAL_ROWS,
             MAP_INITIAL_ROWS,
             SPARSE_EMOJI_COLS,
@@ -863,9 +922,38 @@ impl GlyphSource {
         emoji_init_rows: u32,
         emoji_max_rows: u32,
     ) -> Result<Self, FontError> {
-        let specs = default_font_chain(fonts_dir);
-        let mut atlas = FontAtlas::load_with_initial_rows(&specs, curve_rows, map_rows)?;
         let sparse_source = Arc::new(SparseEmojiSource::new(archive));
+        Self::load_with_source(
+            device,
+            queue,
+            fonts_dir,
+            sparse_source,
+            curve_rows,
+            map_rows,
+            emoji_cols,
+            emoji_init_rows,
+            emoji_max_rows,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal constructor shared by lazy load() and preloaded test capacities"
+    )]
+    fn load_with_source(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        fonts_dir: &Path,
+        sparse_source: Arc<SparseEmojiSource>,
+        curve_rows: u32,
+        map_rows: u32,
+        emoji_cols: u32,
+        emoji_init_rows: u32,
+        emoji_max_rows: u32,
+    ) -> Result<Self, FontError> {
+        let _s_fonts = super::startup::span("font_parse_atlas");
+        let specs = default_font_chain_lazy(fonts_dir, MONASPACE_NEON_FAMILY);
+        let mut atlas = FontAtlas::load_with_initial_rows(&specs, curve_rows, map_rows)?;
         let emoji_dyn: Arc<dyn EmojiSource> = sparse_source.clone();
         atlas.set_emoji_source(Some(emoji_dyn));
 
@@ -874,16 +962,22 @@ impl GlyphSource {
             .family_id(MONASPACE_NEON_FAMILY)
             .unwrap_or_else(|| atlas.default_family());
 
-        // Drain any initial clean state and upload the zero-initialised initial textures so
-        // every texel on the device starts defined (slot 0 = [0, 0, 0, 0]).
+        // Drain any initial clean state; newly created wgpu textures are spec-guaranteed
+        // zero-initialized (slot 0 = [0, 0, 0, 0]), avoiding a redundant 1 MiB zero upload.
         let _ = atlas.take_dirty();
-        let (curves_tex, curves_view) =
-            create_and_upload_full(device, queue, "wall slug curves", atlas.curve_texture());
-        let (glyphmap_tex, glyphmap_view) = create_and_upload_full(
+        let curves_backing = atlas.curve_texture();
+        let (curves_tex, curves_view) = create_uint_texture(
             device,
-            queue,
+            "wall slug curves",
+            curves_backing.width,
+            curves_backing.height,
+        );
+        let map_backing = atlas.glyphmap_texture();
+        let (glyphmap_tex, glyphmap_view) = create_uint_texture(
+            device,
             "wall slug glyphmap",
-            atlas.glyphmap_texture(),
+            map_backing.width,
+            map_backing.height,
         );
         let emoji = SparseEmojiGpu::new(
             device,
@@ -1953,5 +2047,59 @@ mod tests {
             before_metrics.cell_height
         );
         assert_eq!(glyphs.atlas().slot_count(), before_slots);
+    }
+
+    #[test]
+    fn gpu_lazy_startup_skips_fallbacks_and_emoji_until_first_use() {
+        let ctx = crate::gpu::test_device::context();
+        let mut glyphs = GlyphSource::new(&ctx.device, &ctx.queue, &crate::default_emoji_sheet());
+
+        // Startup loads only Monaspace Neon (4 faces) and does NOT read emoji-sheet.bin.
+        assert_eq!(glyphs.atlas().loaded_font_count(), 4);
+        assert!(!glyphs.emoji_source().is_archive_loaded());
+
+        // Encoding ASCII + bold/italic + box sprites keeps fallbacks and emoji archive unloaded.
+        let screen = Screen::new(4, 1);
+        for (ch, a) in [('A', 0), ('B', attrs::BOLD), ('i', attrs::ITALIC), ('╭', 0)] {
+            let r = glyphs.resolve_cell(
+                &screen,
+                &Cell {
+                    content: ch as u32,
+                    fg: rgb(0xff, 0xff, 0xff),
+                    bg: 0,
+                    ul: 0,
+                    attrs: a,
+                    width: 1,
+                    _pad: 0,
+                },
+            );
+            assert!(r.slot > 0);
+        }
+        let _ = glyphs.sync(&ctx.device, &ctx.queue);
+        assert_eq!(glyphs.atlas().loaded_font_count(), 4);
+        assert!(!glyphs.emoji_source().is_archive_loaded());
+        assert_eq!(glyphs.emoji_layout().allocated_cells, 0);
+
+        // First emoji lazily loads emoji-sheet.bin, allocates cell 0, and uploads the sparse texture.
+        let r_emoji = glyphs.resolve_cell(
+            &screen,
+            &Cell {
+                content: '🚀' as u32,
+                fg: rgb(0xff, 0xff, 0xff),
+                bg: 0,
+                ul: 0,
+                attrs: 0,
+                width: 2,
+                _pad: 0,
+            },
+        );
+        assert!(r_emoji.slot > 0);
+        assert!(glyphs.emoji_source().is_archive_loaded());
+        let stats = glyphs.sync(&ctx.device, &ctx.queue);
+        assert!(stats.rebound);
+        assert_eq!(stats.emoji_cells_uploaded, 1);
+        let layout = glyphs.emoji_layout();
+        assert!(layout.cell_w > 0 && layout.cell_h > 0 && layout.allocated_cells == 1);
+        assert_emoji_cell_matches_archive(&ctx.device, &ctx.queue, &glyphs, 0);
     }
 }
