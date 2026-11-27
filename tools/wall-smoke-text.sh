@@ -33,9 +33,36 @@ if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
 fi
 
 D="/tmp/g3d-root-$$"
-mkdir -m 700 "$D"
+mkdir -m 700 -p "$D/bin"
 export G3D_TERMD_DIR="$D"
 export GLYPH_WALL_CLIPBOARD="memory"
+
+# Isolate the smoke window from the host's live gomuxai fleet.
+cat >"$D/bin/agent" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --backend-config) shift; shift ;;
+        -q|--quiet) shift ;;
+        --*) shift ;;
+        *) break ;;
+    esac
+done
+case "${1:-}" in
+    export)
+        printf '{"type":"snapshot","host":"smoke","stores":[],"agents":[]}\n'
+        exec tail -f /dev/null
+        ;;
+    sessions)
+        printf '[]\n'
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+chmod +x "$D/bin/agent"
+export PATH="$D/bin:${HOME}/.local/bin:${PATH}"
 
 SHOT_DIR="$REPO_ROOT/target/glyph-scratch/wall-smoke-text"
 mkdir -p "$SHOT_DIR"
@@ -173,8 +200,9 @@ wait_for_sel() {
     return 1
 }
 
-# Start scratch wall window in namespace `probe`.
-"$BIN" --wall --wall-ns "$NS" >"$SHOT_DIR/wall.log" 2>&1 &
+# Start scratch wall window in namespace `probe` from `$D` so no repo-local launch_config
+# overrides PATH discovery of the stub `agent`.
+(cd "$D" && "$BIN" --wall --wall-ns "$NS") >"$SHOT_DIR/wall.log" 2>&1 &
 WALL_PID=$!
 
 # Wait for control socket + initial terminal `t1`.

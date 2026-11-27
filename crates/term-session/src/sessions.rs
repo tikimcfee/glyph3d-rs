@@ -272,6 +272,12 @@ impl Sessions {
         &self.hub
     }
 
+    /// Controls whether every pushed primary `status_follow` tick wakes the window (e.g. while the
+    /// Status panel is open showing live `out_bps` / RSS) or only structural status changes.
+    pub fn set_live_status_updates(&self, live: bool) {
+        self.hub.set_status_wake_all(live);
+    }
+
     /// Whether the passive reconnect watcher is active and the namespace socket is absent
     /// or refusing connections (`ENOENT` / `ECONNREFUSED`).
     pub fn is_reconnect_socket_absent(&self) -> bool {

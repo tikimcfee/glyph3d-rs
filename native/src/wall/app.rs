@@ -756,6 +756,7 @@ impl App {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &self.terms) else {
             return;
         };
+        sessions.set_live_status_updates(wall.store().status_window().open);
         if !wall.model().connected() {
             return;
         }
@@ -1656,11 +1657,14 @@ impl App {
         let mut heard = false;
         let mut ended_any = false;
         if let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) {
+            sessions.set_live_status_updates(wall.store().status_window().open);
             let (sess_changed, news) = sessions.pump();
             changed = sess_changed;
             wall.set_agents_extra_connected(sessions.is_extra_connected("agents"));
             // Catch metadata-only scrollback updates (`ViewReply` offset/max or
             // `status_follow` scrollback_rows arriving after `Event::Repaint`).
+            // Only request a redraw when a visible scrollback indicator (`viewing || offset > 0`)
+            // changes; quiet live-bottom `max` updates must not wake/redraw an idle canvas.
             let mut live_count = 0usize;
             for id in sessions.ids() {
                 live_count += 1;
@@ -1670,15 +1674,29 @@ impl App {
                         max: sb.max,
                         viewing: sb.viewing,
                     };
-                    if self.scrollback_snapshot.get(id).copied() != Some(next) {
+                    let prev = self.scrollback_snapshot.get(id).copied();
+                    if prev != Some(next) {
                         self.scrollback_snapshot.insert(id.to_owned(), next);
-                        changed = true;
+                        let was_visible = prev.is_some_and(|p| p.viewing || p.offset > 0);
+                        let now_visible = next.viewing || next.offset > 0;
+                        if was_visible || now_visible {
+                            changed = true;
+                        }
                     }
                 }
             }
             if self.scrollback_snapshot.len() != live_count {
-                self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
-                changed = true;
+                let mut removed_visible = false;
+                self.scrollback_snapshot.retain(|id, prev| {
+                    let keep = sessions.screen(id).is_some();
+                    if !keep && (prev.viewing || prev.offset > 0) {
+                        removed_visible = true;
+                    }
+                    keep
+                });
+                if removed_visible {
+                    changed = true;
+                }
             }
             for n in news {
                 match n {

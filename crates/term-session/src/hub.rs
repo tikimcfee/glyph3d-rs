@@ -146,9 +146,102 @@ impl Drop for PendingSubscribeGuard<'_> {
     }
 }
 
+/// Structural fields of `g3d-termd`'s pushed `Event::Status` document whose change should wake
+/// the window even while the Status panel is closed. Volatile telemetry (`at`, `out_bps`,
+/// `daemon.brain.rss`, `daemon.snapshots`, `saved_seq`) is excluded so an idle wall is not woken
+/// once per second while `out_bps` decays or RSS fluctuates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusWakeSig {
+    daemon_exiting: bool,
+    daemon_version: Option<String>,
+    daemon_instance: Option<String>,
+    errors: Vec<String>,
+    terminals: Vec<TerminalStatusSig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalStatusSig {
+    id: String,
+    exited: bool,
+    scrollback_rows: u64,
+    title: String,
+    pwd: String,
+    cwd: String,
+    alt: bool,
+}
+
+fn status_wake_sig(doc: &serde_json::Value) -> StatusWakeSig {
+    let daemon = doc.get("daemon");
+    let daemon_exiting = daemon
+        .and_then(|d| d.get("exiting"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let daemon_version = daemon
+        .and_then(|d| d.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let daemon_instance = daemon
+        .and_then(|d| d.get("instance"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let errors = doc
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().map(serde_json::Value::to_string).collect())
+        .unwrap_or_default();
+    let mut terminals: Vec<TerminalStatusSig> = doc
+        .get("terminals")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|t| TerminalStatusSig {
+                    id: t
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    exited: t.get("exit").is_some_and(|e| !e.is_null()),
+                    scrollback_rows: t
+                        .get("scrollback_rows")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    title: t
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    pwd: t
+                        .get("pwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    cwd: t
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    alt: t
+                        .get("alt")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    terminals.sort();
+    StatusWakeSig {
+        daemon_exiting,
+        daemon_version,
+        daemon_instance,
+        errors,
+        terminals,
+    }
+}
+
 struct DaemonTracking {
     state: DaemonState,
     events: VecDeque<DaemonEvent>,
+    last_status_sig: Option<StatusWakeSig>,
 }
 
 pub(crate) struct HubInner {
@@ -160,6 +253,7 @@ pub(crate) struct HubInner {
     async_worker: Mutex<Option<JoinHandle<()>>>,
     router_thread: Mutex<Option<JoinHandle<()>>>,
     closing: AtomicBool,
+    status_wake_all: AtomicBool,
     theme: Mutex<Theme>,
     options: HubOptions,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -320,11 +414,13 @@ impl SessionHub {
                     restarted: false,
                 },
                 events: VecDeque::new(),
+                last_status_sig: None,
             }),
             async_queue,
             async_worker: Mutex::new(Some(async_worker)),
             router_thread: Mutex::new(None),
             closing: AtomicBool::new(false),
+            status_wake_all: AtomicBool::new(false),
             theme: Mutex::new(options.theme.clone()),
             options,
             wake,
@@ -514,6 +610,13 @@ impl SessionHub {
         self.inner.termd_handle().status()
     }
 
+    /// Controls whether every pushed `Event::Status` wakes the host (e.g. while a live Status
+    /// panel is open showing `out_bps` and RSS), or only structural status changes (terminal
+    /// list, exit, scrollback, title/pwd/cwd, errors, exiting).
+    pub fn set_status_wake_all(&self, wake_all: bool) {
+        self.inner.status_wake_all.store(wake_all, Ordering::Release);
+    }
+
     /// Enables pushed [`DaemonEvent::Status`] updates at `interval_ms`.
     pub fn status_follow(&self, interval_ms: Option<u64>) -> Result<u64, Error> {
         self.inner.termd_handle().status_follow(interval_ms)
@@ -646,11 +749,27 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
             return;
         }
         Event::Status(doc) => {
-            {
+            let sig = status_wake_sig(doc);
+            let should_wake = {
                 let mut guard = inner.daemon.lock().expect("daemon mutex poisoned");
-                guard.events.push_back(DaemonEvent::Status(doc.clone()));
+                // Coalesce queued status snapshots so a sleeping host never accumulates stale docs.
+                if let Some(existing) = guard
+                    .events
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, DaemonEvent::Status(_)))
+                {
+                    *existing = DaemonEvent::Status(doc.clone());
+                } else {
+                    guard.events.push_back(DaemonEvent::Status(doc.clone()));
+                }
+                let changed = guard.last_status_sig.as_ref() != Some(&sig);
+                guard.last_status_sig = Some(sig);
+                changed || inner.status_wake_all.load(Ordering::Acquire)
+            };
+            if should_wake {
+                (inner.wake)();
             }
-            (inner.wake)();
             return;
         }
         Event::UpgradeFailed { message } => {
@@ -681,5 +800,62 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
 
     if let Some(inbox) = inbox {
         let _ = inbox.push(ev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_wake_sig_ignores_volatile_telemetry_and_detects_structural_changes() {
+        let base = serde_json::json!({
+            "at": 1000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false, "brain": { "rss": 6_000_000 }, "snapshots": { "bytes": 0 } },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false, "out_bps": 444, "saved_seq": 100 }
+            ]
+        });
+        let volatile_only = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false, "brain": { "rss": 6_400_000 }, "snapshots": { "bytes": 16384 } },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false, "out_bps": 0, "saved_seq": 425 }
+            ]
+        });
+        assert_eq!(status_wake_sig(&base), status_wake_sig(&volatile_only));
+
+        let with_new_term = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false },
+                { "id": "ext2", "scrollback_rows": 0, "title": "", "pwd": "", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_new_term));
+
+        let with_scrollback = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 11, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_scrollback));
+
+        let with_error = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": ["holder error"],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_error));
     }
 }
