@@ -65,10 +65,16 @@ pub struct WallStyle {
     pub underline_raise: f32,
     pub curly_amplitude: f32,
     pub dim_alpha: f32,
+    /// Physical pixels per cell row below which terminals skip cell fill/ink/cursor
+    /// passes and draw their mean-ink-tinted panel only (`0.0` = always draw cells).
+    pub show_glyphs_px: f32,
+    /// Multiplier on mean ink coverage for far-zoom panel tint (`[lod] backdrop_gain`).
+    pub far_backdrop_gain: f32,
 }
 
 impl From<&WallSettings> for WallStyle {
     fn from(s: &WallSettings) -> Self {
+        let lod = &crate::config::settings().lod;
         Self {
             clear_color: s.clear_color,
             panel_opacity: s.panel_opacity,
@@ -89,6 +95,8 @@ impl From<&WallSettings> for WallStyle {
             underline_raise: s.underline_raise,
             curly_amplitude: s.curly_amplitude,
             dim_alpha: s.dim_alpha,
+            show_glyphs_px: lod.show_glyphs_px,
+            far_backdrop_gain: lod.backdrop_gain,
         }
     }
 }
@@ -185,7 +193,7 @@ struct TerminalUniform {
     border_override: u32,
     scale: f32,
     cursor_color: u32,
-    _pad1: u32,
+    far_tint: u32,
     _pad2: u32,
 }
 
@@ -196,6 +204,8 @@ struct TerminalGpu {
     uploaded_selection: Option<CellSelection>,
     uploaded_hover_link: Option<CellLinkHover>,
     force_repack: bool,
+    far_tint: u32,
+    far_tint_gen: Option<u64>,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
     uniform_buf: wgpu::Buffer,
@@ -206,7 +216,7 @@ struct TerminalGpu {
 /// Per-frame GPU upload counters returned by [`WallRenderer::prepare`] / [`WallRenderer::render`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UploadStats {
-    /// Terminals included in the draw list.
+    /// Visible terminals included in the draw list (off-screen culled terminals excluded).
     pub terminals_drawn: usize,
     /// Terminals whose cell buffer received at least one row upload this frame.
     pub terminals_uploaded: usize,
@@ -219,7 +229,7 @@ pub struct UploadStats {
 enum DrawRun {
     ShapesOpaque(Range<u32>),
     ShapesBlend(Range<u32>),
-    Terminal(usize),
+    Terminal { idx: usize, far_lod: bool },
     Labels(Range<u32>),
 }
 
@@ -276,6 +286,8 @@ pub struct WallRenderer {
     shape_scratch: Vec<ShapeGpu>,
     label_scratch: Vec<LabelGlyphGpu>,
     draw_runs: Vec<DrawRun>,
+    last_culled_terminals: usize,
+    last_far_lod_terminals: usize,
     cursor_blink: CursorBlinkState,
 }
 
@@ -1312,6 +1324,8 @@ impl WallRenderer {
             shape_scratch: Vec::new(),
             label_scratch: Vec::new(),
             draw_runs: Vec::new(),
+            last_culled_terminals: 0,
+            last_far_lod_terminals: 0,
             cursor_blink: CursorBlinkState::default(),
         }
     }
@@ -1644,11 +1658,22 @@ impl WallRenderer {
         self.terminals.len()
     }
 
+    /// Number of terminals culled as off-screen on the most recent [`Self::prepare`].
+    pub fn last_culled_terminals(&self) -> usize {
+        self.last_culled_terminals
+    }
+
+    /// Number of visible terminals drawn as panel-only far-LOD on the most recent [`Self::prepare`].
+    pub fn last_far_lod_terminals(&self) -> usize {
+        self.last_far_lod_terminals
+    }
+
     fn sync_terminal(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         draw: &TerminalDraw<'_>,
+        far_lod: bool,
         stats: &mut UploadStats,
     ) {
         let screen = draw.screen;
@@ -1711,7 +1736,9 @@ impl WallRenderer {
                     uploaded_gen: 0,
                     uploaded_selection: None,
                     uploaded_hover_link: None,
-                    force_repack: false,
+                    force_repack: true,
+                    far_tint: 0,
+                    far_tint_gen: None,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
                     uniform_buf,
@@ -1725,6 +1752,16 @@ impl WallRenderer {
             .terminals
             .get_mut(&draw.id)
             .expect("terminal GPU state just inserted");
+
+        let far_tint = if far_lod {
+            if gpu.far_tint_gen != Some(screen.generation) {
+                gpu.far_tint = compute_far_tint(screen, self.style.far_backdrop_gain);
+                gpu.far_tint_gen = Some(screen.generation);
+            }
+            gpu.far_tint
+        } else {
+            0
+        };
 
         let (cursor_col, cursor_span) = resolved_cursor_cell(screen);
         let term_uniform = TerminalUniform {
@@ -1741,10 +1778,14 @@ impl WallRenderer {
             border_override: draw.border_color.unwrap_or(0),
             scale: sanitize_scale(draw.scale),
             cursor_color: screen.cursor_color,
-            _pad1: 0,
+            far_tint,
             _pad2: 0,
         };
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
+
+        if far_lod {
+            return;
+        }
 
         let active_selection = draw.selection.filter(|s| !s.is_empty());
         let active_hover_link = draw.hover_link.filter(|l| !l.is_empty());
@@ -1753,6 +1794,7 @@ impl WallRenderer {
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
             gpu.uploaded_hover_link = active_hover_link;
+            gpu.force_repack = false;
             return;
         }
 
@@ -1895,12 +1937,34 @@ impl WallRenderer {
         let viewport_f = [viewport.0.max(1) as f32, viewport.1.max(1) as f32];
 
         let terminals = frame.terminals;
-        let mut stats = UploadStats {
-            terminals_drawn: terminals.len(),
-            ..Default::default()
-        };
-        for draw in terminals {
-            self.sync_terminal(device, queue, draw, &mut stats);
+        let visible_world = camera
+            .visible_world_rect(viewport)
+            .expand(4.0 / camera.zoom.max(1e-3));
+        let mut stats = UploadStats::default();
+        self.last_culled_terminals = 0;
+        self.last_far_lod_terminals = 0;
+        let mut visible_terminals: Vec<(usize, bool)> = Vec::with_capacity(terminals.len());
+        for (i, draw) in terminals.iter().enumerate() {
+            let panel_rect = self.metrics.terminal_panel_rect(
+                draw.position,
+                draw.screen.cols,
+                draw.screen.rows,
+                self.style.panel_padding,
+                draw.scale,
+            );
+            if !panel_rect.intersects(visible_world) {
+                self.last_culled_terminals += 1;
+                continue;
+            }
+            let row_px =
+                camera.cell_height_px(self.metrics.cell_height * sanitize_scale(draw.scale));
+            let far_lod = self.style.show_glyphs_px > 0.0 && row_px < self.style.show_glyphs_px;
+            if far_lod {
+                self.last_far_lod_terminals += 1;
+            }
+            stats.terminals_drawn += 1;
+            self.sync_terminal(device, queue, draw, far_lod, &mut stats);
+            visible_terminals.push((i, far_lod));
         }
 
         // Expand shapes and labels and interleave with terminals back-to-front by world z.
@@ -1908,13 +1972,13 @@ impl WallRenderer {
         #[derive(Clone, Copy)]
         enum Pending {
             Shape { opaque: bool, raw_idx: usize },
-            Terminal(usize),
+            Terminal { idx: usize, far_lod: bool },
             Label(usize),
         }
         let mut raw_shapes: Vec<ShapeGpu> = Vec::new();
         let mut raw_labels: Vec<LabelGlyphGpu> = Vec::new();
         let mut pending: Vec<(f32, u8, Pending)> =
-            Vec::with_capacity(terminals.len() + frame.shapes.len() + frame.labels.len());
+            Vec::with_capacity(visible_terminals.len() + frame.shapes.len() + frame.labels.len());
         for shape in frame.shapes {
             expand_shape(shape, camera.zoom, |opaque, gpu| {
                 let raw_idx = raw_shapes.len();
@@ -1923,8 +1987,8 @@ impl WallRenderer {
                 pending.push((z, if opaque { 0 } else { 2 }, Pending::Shape { opaque, raw_idx }));
             });
         }
-        for (i, draw) in terminals.iter().enumerate() {
-            pending.push((draw.z, 1, Pending::Terminal(i)));
+        for (i, far_lod) in visible_terminals {
+            pending.push((terminals[i].z, 1, Pending::Terminal { idx: i, far_lod }));
         }
         let label_family = self.glyphs.family();
         for label in frame.labels {
@@ -2007,8 +2071,8 @@ impl WallRenderer {
                         self.draw_runs.push(DrawRun::ShapesBlend(gpu_idx..gpu_idx + 1));
                     }
                 }
-                Pending::Terminal(idx) => {
-                    self.draw_runs.push(DrawRun::Terminal(idx));
+                Pending::Terminal { idx, far_lod } => {
+                    self.draw_runs.push(DrawRun::Terminal { idx, far_lod });
                 }
                 Pending::Label(raw_idx) => {
                     let gpu_idx = self.label_scratch.len() as u32;
@@ -2130,7 +2194,7 @@ impl WallRenderer {
                     pass.set_bind_group(0, &self.shapes_bg, &[]);
                     pass.draw_indexed(0..6, 0, range.clone());
                 }
-                DrawRun::Terminal(idx) => {
+                DrawRun::Terminal { idx, far_lod } => {
                     let Some(cp) = &self.cell_pipelines else {
                         continue;
                     };
@@ -2142,11 +2206,15 @@ impl WallRenderer {
                     pass.set_bind_group(0, &self.shared_bg, &[]);
                     pass.set_bind_group(1, &gpu.bind_group, &[]);
 
-                    let cursor_drawn = cursor_drawn_now(draw, self.cursor_blink.visible);
-                    let cursor_solid = cursor_is_solid_block(draw, self.cursor_blink.visible);
-
                     pass.set_pipeline(&cp.panel);
                     pass.draw_indexed(0..6, 0, 0..1);
+
+                    if *far_lod {
+                        continue;
+                    }
+
+                    let cursor_drawn = cursor_drawn_now(draw, self.cursor_blink.visible);
+                    let cursor_solid = cursor_is_solid_block(draw, self.cursor_blink.visible);
 
                     if cell_count > 0 && gpu.has_any_bg {
                         pass.set_pipeline(&cp.fill);
@@ -2259,6 +2327,57 @@ impl WallRenderer {
         self.record_into_pass(&mut pass, frame);
         stats
     }
+}
+
+/// Compute packed sRGB RGBA8 mean-ink wash over a terminal's panel for far-zoom LOD
+/// (`row_px < show_glyphs_px`), matching `GlyphFarLod` (`[lod] backdrop_gain = 0.7`).
+/// Returns `0` when the terminal has no non-blank cells (panel draws pure `default_bg`).
+fn compute_far_tint(screen: &Screen, gain: f32) -> u32 {
+    let total = usize::from(screen.cols) * usize::from(screen.rows);
+    if total == 0 || !gain.is_finite() || gain <= 0.0 {
+        return 0;
+    }
+    const GLYPH_FILL: f32 = 0.30;
+    let mut r_sum = 0.0f32;
+    let mut g_sum = 0.0f32;
+    let mut b_sum = 0.0f32;
+    let mut weight_sum = 0.0f32;
+    for cell in &screen.cells {
+        if cell.width == 0 {
+            continue;
+        }
+        let span = f32::from(cell.width);
+        let bg_a = (cell.bg >> 24) & 0xFF;
+        if bg_a != 0 {
+            let w = span * (bg_a as f32 / 255.0);
+            r_sum += (cell.bg & 0xFF) as f32 * w;
+            g_sum += ((cell.bg >> 8) & 0xFF) as f32 * w;
+            b_sum += ((cell.bg >> 16) & 0xFF) as f32 * w;
+            weight_sum += w;
+        }
+        if cell.content != 0 && cell.content != u32::from(b' ') {
+            let fg_a = (cell.fg >> 24) & 0xFF;
+            if fg_a != 0 {
+                let w = span * GLYPH_FILL * (fg_a as f32 / 255.0);
+                r_sum += (cell.fg & 0xFF) as f32 * w;
+                g_sum += ((cell.fg >> 8) & 0xFF) as f32 * w;
+                b_sum += ((cell.fg >> 16) & 0xFF) as f32 * w;
+                weight_sum += w;
+            }
+        }
+    }
+    if weight_sum <= 0.0 {
+        return 0;
+    }
+    let r = (r_sum / weight_sum).clamp(0.0, 255.0).round() as u32;
+    let g = (g_sum / weight_sum).clamp(0.0, 255.0).round() as u32;
+    let b = (b_sum / weight_sum).clamp(0.0, 255.0).round() as u32;
+    let cover = (weight_sum / total as f32).min(1.0);
+    let a = ((cover * gain).clamp(0.0, 1.0) * 255.0).round() as u32;
+    if a == 0 {
+        return 0;
+    }
+    r | (g << 8) | (b << 16) | (a << 24)
 }
 
 /// Render a wall frame offscreen into a PNG at `path` (reused by `--wall-test-pattern`).
@@ -4866,5 +4985,163 @@ mod tests {
             "terminal panel must render once background pipelines land (got {:?})",
             &px_term[center..center + 3]
         );
+    }
+
+    #[test]
+    fn gpu_culls_offscreen_terminals_while_keeping_gpu_buffers_cached() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+        let mut s1 = Screen::new(8, 4);
+        s1.default_bg = rgb(0x10, 0x20, 0x30);
+        s1.generation = 1;
+        let mut s2 = Screen::new(8, 4);
+        s2.default_bg = rgb(0x30, 0x10, 0x20);
+        s2.generation = 1;
+        let draws = [
+            TerminalDraw {
+                id: 1,
+                screen: &s1,
+                position: Vec2::new(-2.0, 2.0),
+                z: 1.0,
+                scale: 1.0,
+                focused: true,
+                panel_opacity: Some(1.0),
+                border_color: None,
+                selection: None,
+                hover_link: None,
+            },
+            TerminalDraw {
+                id: 2,
+                screen: &s2,
+                position: Vec2::new(500.0, 2.0),
+                z: 1.0,
+                scale: 1.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+                selection: None,
+                hover_link: None,
+            },
+        ];
+        let frame = WallFrame { terminals: &draws, ..Default::default() };
+
+        // Camera centered on terminal 1: terminal 2 at x=500 is off-screen and culled.
+        let cam1 = WallCamera::new(Vec2::ZERO, 16.0);
+        let st1 = renderer.prepare(&ctx.device, &ctx.queue, (256, 256), &cam1, &frame);
+        assert_eq!(st1.terminals_drawn, 1);
+        assert_eq!(renderer.last_culled_terminals(), 1);
+        assert_eq!(st1.terminals_uploaded, 1);
+        assert_eq!(renderer.cached_terminal_count(), 1);
+
+        // Pan to terminal 2: terminal 1 is culled (but stays cached on GPU!), terminal 2 uploads.
+        let cam2 = WallCamera::new(Vec2::new(502.0, 0.0), 16.0);
+        let st2 = renderer.prepare(&ctx.device, &ctx.queue, (256, 256), &cam2, &frame);
+        assert_eq!(st2.terminals_drawn, 1);
+        assert_eq!(renderer.last_culled_terminals(), 1);
+        assert_eq!(st2.terminals_uploaded, 1);
+        assert_eq!(renderer.cached_terminal_count(), 2, "culled terminal 1 GPU buffer must remain cached");
+
+        // Pan back to terminal 1: already cached, so zero cell rows re-upload!
+        let st3 = renderer.prepare(&ctx.device, &ctx.queue, (256, 256), &cam1, &frame);
+        assert_eq!(st3.terminals_drawn, 1);
+        assert_eq!(renderer.last_culled_terminals(), 1);
+        assert_eq!(st3.terminals_uploaded, 0);
+        assert_eq!(st3.rows_uploaded, 0);
+        assert_eq!(renderer.cached_terminal_count(), 2);
+    }
+
+    #[test]
+    fn gpu_far_lod_skips_cell_passes_and_tints_panel_below_show_glyphs_px() {
+        let ctx = crate::gpu::test_device::context();
+        let mut style = WallStyle::default();
+        style.show_glyphs_px = 1.0;
+        style.far_backdrop_gain = 0.7;
+        style.border_width_px = 0.0;
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            style,
+        );
+        let mut empty = Screen::new(40, 24);
+        empty.default_bg = rgb(0x10, 0x10, 0x18);
+        empty.generation = 1;
+
+        let mut red_text = Screen::new(40, 24);
+        red_text.default_bg = rgb(0x10, 0x10, 0x18);
+        for cell in &mut red_text.cells {
+            cell.content = u32::from(b'M');
+            cell.fg = rgb(0xff, 0x20, 0x20);
+        }
+        red_text.generation = 1;
+
+        // Place both terminals visible at zoom=0.5 (cell_height_px = 0.5 < 1.0 => far-LOD).
+        let draws = [
+            TerminalDraw {
+                id: 1,
+                screen: &empty,
+                position: Vec2::new(-30.0, 12.0),
+                z: 1.0,
+                scale: 1.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+                selection: None,
+                hover_link: None,
+            },
+            TerminalDraw {
+                id: 2,
+                screen: &red_text,
+                position: Vec2::new(5.0, 12.0),
+                z: 1.0,
+                scale: 1.0,
+                focused: false,
+                panel_opacity: Some(1.0),
+                border_color: None,
+                selection: None,
+                hover_link: None,
+            },
+        ];
+        let frame = WallFrame { terminals: &draws, ..Default::default() };
+        let far_cam = WallCamera::new(Vec2::ZERO, 0.5);
+        let st_far = renderer.prepare(&ctx.device, &ctx.queue, (256, 256), &far_cam, &frame);
+        assert_eq!(st_far.terminals_drawn, 2);
+        assert_eq!(renderer.last_far_lod_terminals(), 2);
+        assert_eq!(st_far.terminals_uploaded, 0, "far-LOD must not pack/upload cell rows");
+        assert_eq!(st_far.rows_uploaded, 0);
+
+        let px = render_rgba_bytes(&ctx, &mut renderer, &far_cam, &frame, 256, 256);
+        let m = renderer.metrics();
+        let p_empty = far_cam.world_to_screen(
+            m.grid_rect(Vec2::new(-30.0, 12.0), 40, 24).center(),
+            (256, 256),
+        );
+        let p_red = far_cam.world_to_screen(
+            m.grid_rect(Vec2::new(5.0, 12.0), 40, 24).center(),
+            (256, 256),
+        );
+        let i_empty = ((p_empty.y as u32 * 256 + p_empty.x as u32) * 4) as usize;
+        let i_red = ((p_red.y as u32 * 256 + p_red.x as u32) * 4) as usize;
+        assert!(
+            px[i_red] > px[i_empty] + 30,
+            "far-LOD red-ink terminal panel ({:?}) must show reddish wash over empty panel ({:?})",
+            &px[i_red..i_red + 3],
+            &px[i_empty..i_empty + 3]
+        );
+
+        // Zoom in above show_glyphs_px: switches back to near-LOD and uploads cells cleanly!
+        let near_cam = WallCamera::new(Vec2::new(15.0, 0.0), 16.0);
+        let st_near = renderer.prepare(&ctx.device, &ctx.queue, (256, 256), &near_cam, &frame);
+        assert_eq!(st_near.terminals_drawn, 1);
+        assert_eq!(renderer.last_far_lod_terminals(), 0);
+        assert_eq!(st_near.terminals_uploaded, 1);
+        assert_eq!(st_near.rows_uploaded, 24);
     }
 }

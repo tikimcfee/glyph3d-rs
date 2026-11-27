@@ -243,14 +243,16 @@ pub fn sanitize_scale_factor(scale_factor: f64) -> f64 {
 }
 
 /// Scale every physical-pixel field in [`WallStyle`] from logical-px `base`
-/// values by `scale_factor` (`border_width_px`, `cursor_border_px`, `greek_px`),
-/// leaving live-tuned world-space fields (`panel_padding`, `line_thickness_scale`,
-/// `underline_raise`, `curly_amplitude`, `dim_alpha`) untouched.
+/// values by `scale_factor` (`border_width_px`, `cursor_border_px`, `greek_px`,
+/// `show_glyphs_px`), leaving live-tuned world-space fields (`panel_padding`,
+/// `line_thickness_scale`, `underline_raise`, `curly_amplitude`, `dim_alpha`)
+/// untouched.
 pub fn apply_scale_to_wall_style(style: &mut WallStyle, base: &WallStyle, scale_factor: f32) {
     let sf = sanitize_scale_factor(f64::from(scale_factor)) as f32;
     style.border_width_px = base.border_width_px * sf;
     style.cursor_border_px = base.cursor_border_px * sf;
     style.greek_px = base.greek_px * sf;
+    style.show_glyphs_px = base.show_glyphs_px * sf;
 }
 
 /// Shared scale-factor + viewport update path called on window open, resize,

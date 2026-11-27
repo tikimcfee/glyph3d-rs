@@ -41,6 +41,13 @@ impl WorldRect {
             && point.y <= self.max.y
     }
 
+    pub fn intersects(&self, other: Self) -> bool {
+        self.min.x <= other.max.x
+            && self.max.x >= other.min.x
+            && self.min.y <= other.max.y
+            && self.max.y >= other.min.y
+    }
+
     pub fn union(&self, other: Self) -> Self {
         Self {
             min: self.min.min(other.min),

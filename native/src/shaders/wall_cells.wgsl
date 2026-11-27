@@ -88,7 +88,7 @@ struct TerminalUniform {
     border_override: u32,
     scale: f32,
     cursor_color: u32,
-    _pad1: u32,
+    far_tint: u32,
     _pad2: u32,
 };
 
@@ -283,6 +283,7 @@ struct PanelVsOut {
     @location(4) @interpolate(flat) foot_p0: vec3<f32>,
     @location(5) @interpolate(flat) foot_pu: vec3<f32>,
     @location(6) @interpolate(flat) foot_pv: vec3<f32>,
+    @location(7) @interpolate(flat) far_tint: vec4<f32>,
 };
 
 @vertex
@@ -323,6 +324,7 @@ fn vs_panel(@builtin(vertex_index) vi: u32) -> PanelVsOut {
     out.foot_p0 = foot_c0.xyw * foot_scale;
     out.foot_pu = foot_cu.xyw * foot_scale;
     out.foot_pv = foot_cv.xyw * foot_scale;
+    out.far_tint = unpack_rgba8(term.far_tint);
     return out;
 }
 
@@ -338,8 +340,13 @@ fn fs_panel(in: PanelVsOut) -> @location(0) vec4<f32> {
     let rim = band * in.border_color.a;
 
     let fill_rgb = srgb_to_output(in.fill_color.rgb);
+    let tinted_rgb = select(
+        fill_rgb,
+        mix(fill_rgb, srgb_to_output(in.far_tint.rgb), in.far_tint.a),
+        in.far_tint.a > 0.0,
+    );
     let border_rgb = srgb_to_output(in.border_color.rgb);
-    let final_rgb = mix(fill_rgb, border_rgb, rim);
+    let final_rgb = mix(tinted_rgb, border_rgb, rim);
     let final_alpha = max(in.fill_color.a, rim);
     return vec4<f32>(final_rgb * final_alpha, final_alpha);
 }
