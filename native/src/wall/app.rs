@@ -135,6 +135,7 @@ struct App {
     gfx: Option<Gfx>,
     ctx: GpuContext,
     opts: Option<WallOptions>,
+    persistent_ns: Option<String>,
     proxy: EventLoopProxy<Wake>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
@@ -346,19 +347,9 @@ fn screen_text(s: &Screen) -> String {
     out
 }
 
-/// Where the wall keeps its state between runs. A scratch daemon directory
-/// (`G3D_TERMD_DIR`, as tests and probes set) keeps a scratch store beside
-/// it, so a probe never touches a person's saved wall.
+/// Where the wall keeps its state between runs (`wall_core::store::default_store_dir`).
 fn store_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("G3D_TERMD_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/glyph3d/wall")
-    } else {
-        std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".local/state")).join("glyph3d/wall")
-    }
+    wall_core::store::default_store_dir()
 }
 
 impl App {
@@ -451,6 +442,7 @@ impl App {
     fn open(&mut self, event_loop: &ActiveEventLoop) {
         let opts = self.opts.take().expect("the window opens once");
         self.exit_after = opts.exit_after;
+        self.persistent_ns.clone_from(&opts.namespace);
 
         let proxy_ctl = self.proxy.clone();
         let gate_ctl = self.wakes.clone();
@@ -1002,6 +994,12 @@ impl App {
                     ran = true;
                     continue;
                 }
+                Some("wall.import") => {
+                    let reply = self.handle_wall_import(&argv);
+                    responder.send(reply);
+                    ran = true;
+                    continue;
+                }
                 _ => {}
             }
             if let Some(parsed) = super::script::parse_script_line(&line) {
@@ -1024,6 +1022,91 @@ impl App {
             self.apply_effects();
             self.redraw();
         }
+    }
+
+    /// Import a browser-wall JSON export into this namespace's native [`WallStore`]
+    /// and re-adopt live terminals against the imported layout, groups, splits, names,
+    /// panels, and config knobs.
+    fn handle_wall_import(&mut self, argv: &[String]) -> String {
+        if !(2..=3).contains(&argv.len()) {
+            return "ERR: usage: wall.import <browser-export.json> [browser-scope]".to_string();
+        }
+        let Some(ns) = self.persistent_ns.clone() else {
+            return "ERR: wall.import requires a namespace-backed wall (not --wall-test-pattern)"
+                .to_string();
+        };
+        let dir = store_dir();
+        let export_path = std::path::Path::new(&argv[1]);
+        let source_scope = argv.get(2).map(String::as_str);
+        let report = match wall_core::import::import_browser_file(export_path, source_scope, &dir, &ns) {
+            Ok(r) => r,
+            Err(msg) => return format!("ERR: {msg}"),
+        };
+        if let Some(g) = &self.gfx {
+            let was_connected = self
+                .wall
+                .as_ref()
+                .is_none_or(|w| w.model().snapshot().connected);
+            let metrics = g.renderer.metrics();
+            let sf = g.window.scale_factor();
+            let rules = RulesOptions {
+                geometry: CellGeometry::with_padding(
+                    f64::from(metrics.cell_width * g.cell_scale),
+                    f64::from(metrics.cell_height * g.cell_scale),
+                    f64::from(PANEL_PAD),
+                    f64::from(PANEL_PAD),
+                ),
+                platform: Platform::host(),
+                viewport: Size::new(
+                    f64::from(g.config.width) / sf,
+                    f64::from(g.config.height) / sf,
+                ),
+                scale_factor: sf,
+                namespace: ns.clone(),
+                ..RulesOptions::default()
+            };
+            let mut wall = Wall::open(dir, ns, rules);
+            if let Some(Terminals::Live(sessions)) = &self.terms {
+                let welcome = sessions.hub().welcome();
+                wall.on_termd_welcome(
+                    welcome.instance.as_deref().unwrap_or(""),
+                    &welcome.features,
+                    epoch_now_ms(),
+                );
+                let live_ids: Vec<String> = sessions.ids().map(str::to_string).collect();
+                if !live_ids.is_empty() {
+                    wall.set_live_terminals(&live_ids);
+                }
+                for id in &live_ids {
+                    let (cols, rows, title, modes) = sessions.screen(id).map_or(
+                        (
+                            wall_core::wall::DEFAULT_SPAWN_COLS,
+                            wall_core::wall::DEFAULT_SPAWN_ROWS,
+                            String::new(),
+                            term_cells::Modes::default(),
+                        ),
+                        |s| (u32::from(s.cols), u32::from(s.rows), s.title.clone(), s.modes),
+                    );
+                    wall.terminal_appeared(
+                        TerminalAppeared::adopted(id.clone(), cols, rows)
+                            .with_title(title)
+                            .with_modes(modes),
+                    );
+                }
+                wall.set_connected(was_connected);
+            }
+            self.wall = Some(wall);
+            self.sync_font_and_text_knobs(None);
+            self.sync_macos_option_as_alt();
+            self.apply_effects();
+            self.refresh_termd_status();
+            if let Some(wall) = &mut self.wall {
+                if wall.frame().fullscreen_backdrop.is_none() {
+                    wall.run("wall.fit");
+                }
+            }
+        }
+        report.summary_text()
     }
 
     /// Take in what the terminals' reader thread queued.
@@ -2248,6 +2331,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         gfx: None,
         ctx,
         opts: Some(opts),
+        persistent_ns: None,
         proxy: event_loop.create_proxy(),
         wall: None,
         terms: None,
