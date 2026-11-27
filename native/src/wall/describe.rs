@@ -14,10 +14,19 @@ use wall_core::wall::{TerminalFrame, WallFrame as DescribedFrame};
 use super::camera::WallCamera;
 use super::chrome::{
     ChromeFonts, ChromeStyle, ChromeView, DropPreviewDesc, FullscreenVeilDesc, GroupFrameDesc,
-    LassoDesc, MapLabelDesc, MapLabelGeometry, NoticeDesc, NoticeKind, SelectionOutlineDesc,
-    TitleBarDesc, push_drop_preview, push_fullscreen_veil, push_group_frame, push_lasso,
-    push_map_label, push_notice, push_selection_outline, push_title_bar,
+    LassoDesc, MapLabelDesc, MapLabelGeometry, NoticeDesc, NoticeKind, ScrollbackIndicatorDesc,
+    SelectionOutlineDesc, TitleBarDesc, push_drop_preview, push_fullscreen_veil, push_group_frame,
+    push_lasso, push_map_label, push_notice, push_scrollback_indicator, push_selection_outline,
+    push_title_bar,
 };
+
+/// Plain-data scrollback view position supplied per terminal by the host session layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalScrollback {
+    pub offset: u64,
+    pub max: u64,
+    pub viewing: bool,
+}
 use super::labels::Label;
 use super::metrics::WorldRect;
 use super::paper::PaperStyle;
@@ -129,6 +138,34 @@ pub fn describe_frame_chrome(
     shapes: &mut Vec<Shape>,
     labels: &mut Vec<Label<'static>>,
 ) -> PaperStyle {
+    describe_frame_chrome_with_scrollback(
+        described,
+        camera,
+        viewport,
+        scale_factor,
+        fonts,
+        shapes,
+        labels,
+        |_| None,
+    )
+}
+
+/// Same as [`describe_frame_chrome`], plus per-terminal scrollback indicators
+/// whenever `scrollback(id)` reports a scrolled-back terminal (`viewing || offset > 0`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors describe_frame_chrome with one callback for session scrollback state"
+)]
+pub fn describe_frame_chrome_with_scrollback(
+    described: &DescribedFrame,
+    camera: &WallCamera,
+    viewport: (u32, u32),
+    scale_factor: f32,
+    fonts: &mut ChromeFonts<'_>,
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    scrollback: impl Fn(&str) -> Option<TerminalScrollback>,
+) -> PaperStyle {
     let view = ChromeView::new(camera.zoom, scale_factor);
     let mut style = ChromeStyle {
         bar_max_world: BAR_ROOM as f32,
@@ -189,6 +226,29 @@ pub fn describe_frame_chrome(
         desc.max_world_height = Some(bar.rect.height() as f32);
         desc.reserve_button_room = true;
         push_title_bar(shapes, labels, fonts, &style, view, &desc);
+    }
+
+    // 2b. Per-terminal scrolled-back indicators (silent on live terminals).
+    for term in &described.terminals {
+        if let Some(sb) = scrollback(&term.id) {
+            if sb.viewing || sb.offset > 0 {
+                push_scrollback_indicator(
+                    shapes,
+                    labels,
+                    fonts,
+                    view,
+                    &ScrollbackIndicatorDesc {
+                        body_rect: to_world_rect(term.body_rect),
+                        z: term.z as f32,
+                        offset: sb.offset,
+                        max: sb.max,
+                        visible_rows: term.rows.min(u32::from(u16::MAX)) as u16,
+                        viewing: sb.viewing,
+                        focused: term.focused,
+                    },
+                );
+            }
+        }
     }
 
     // 3. Multi-terminal selection outlines (`3px` outside each selected window).
