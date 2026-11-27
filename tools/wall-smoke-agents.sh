@@ -50,6 +50,9 @@ SHOT_DIR="$REPO_ROOT/target/glyph-scratch/wall-smoke-agents"
 mkdir -p "$SHOT_DIR"
 rm -f "$SHOT_DIR"/fail-*.png "$SHOT_DIR"/wall.log
 WALL_SMOKE_SHOTS="${WALL_SMOKE_SHOTS:-0}"
+if [[ "${1:-}" == "--shots" ]]; then
+    WALL_SMOKE_SHOTS=1
+fi
 if [[ "$WALL_SMOKE_SHOTS" == "1" ]]; then
     rm -f "$SHOT_DIR"/*.png
 fi

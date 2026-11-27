@@ -779,7 +779,7 @@ fn run_fleet_loop(
             .stderr(Stdio::piped());
 
         let mut saw_snapshot = false;
-        let run_err: Option<String> = match cmd.spawn() {
+        let run_err: Option<String> = match crate::cli::spawn_command(&mut cmd) {
             Err(e) => Some(format!(
                 "could not spawn `{}`: {e}",
                 cli.describe(&arg_refs)

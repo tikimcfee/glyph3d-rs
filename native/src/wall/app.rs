@@ -83,6 +83,8 @@ pub struct WallOptions {
 
 /// Where the wall's terminals come from.
 enum Terminals {
+    /// Connecting/spawning `g3d-termd` off the window thread.
+    Connecting,
     Live(Box<Sessions>),
     /// Screens that never change (the test pattern), by id.
     Fixed(BTreeMap<String, Screen>),
@@ -91,6 +93,7 @@ enum Terminals {
 impl Terminals {
     fn screen(&self, id: &str) -> Option<&Screen> {
         match self {
+            Terminals::Connecting => None,
             Terminals::Live(s) => s.screen(id),
             Terminals::Fixed(m) => m.get(id),
         }
@@ -98,12 +101,12 @@ impl Terminals {
 
     fn scrollback(&self, id: &str) -> Option<super::describe::TerminalScrollback> {
         match self {
+            Terminals::Connecting | Terminals::Fixed(_) => None,
             Terminals::Live(s) => s.scrollback(id).map(|sb| super::describe::TerminalScrollback {
                 offset: sb.offset,
                 max: sb.max,
                 viewing: sb.viewing,
             }),
-            Terminals::Fixed(_) => None,
         }
     }
 }
@@ -116,7 +119,7 @@ impl Terminals {
 /// `wl_proxy_destroy` at every exit).
 struct Gfx {
     #[cfg(feature = "egui-ui")]
-    ui: WallUi,
+    ui: Option<WallUi>,
     renderer: WallRenderer,
     depth: wgpu::TextureView,
     surface: wgpu::Surface<'static>,
@@ -167,6 +170,10 @@ struct App {
     /// Next wake deadline while `termd` is in a restarting/unreachable trouble state
     /// so the rules' notice grace timers advance even while the window is idle.
     termd_tick_at: Option<Instant>,
+    /// Background `g3d-termd` connect/spawn/list/adopt in flight at startup.
+    pending_termd: Option<super::startup::PendingTermd>,
+    /// True while waiting for initial `g3d-termd` startup (shows `"starting termd..."` notice).
+    starting_termd: bool,
     occluded: bool,
     wakes: Arc<WakeGate>,
     perf: super::perf::WallPerf,
@@ -385,8 +392,8 @@ impl App {
         if ui_outcome.consumed {
             return true;
         }
-        self.gfx.as_ref().is_some_and(|g| {
-            pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+        self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| {
+            pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
                 == PointerTarget::Ui
         })
     }
@@ -448,7 +455,8 @@ impl App {
         // window, opening a second `WallStore` writer, or stealing `Role::Own`
         // size ownership from the running wall window.
         if let Some(ns) = &opts.namespace {
-            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake) {
+            let _s = super::startup::span("control_socket_bind");
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake.clone()) {
                 Ok(server) => self.control = Some(server),
                 Err(wall_control::Error::AlreadyRunning { path, .. }) => {
                     eprintln!(
@@ -461,36 +469,72 @@ impl App {
             }
         }
 
-        let window = Arc::new(
-            event_loop
-                .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
-                .expect("window creation failed"),
-        );
-        window.set_ime_allowed(true);
-        let surface = self.ctx.instance.create_surface(window.clone()).expect("surface creation failed");
-        let caps = surface.get_capabilities(&self.ctx.adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-        };
-        surface.configure(&self.ctx.device, &config);
-        let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
+        // The terminals: coalesce duplicate queued `Wake`s and suppress wakes
+        // while a surface redraw is already armed (`draw` pumps before building).
+        let proxy_sess = self.proxy.clone();
+        let gate_sess = self.wakes.clone();
+        let session_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_sess.redraw_armed.load(std::sync::atomic::Ordering::SeqCst)
+                && !gate_sess.pending.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = proxy_sess.send_event(Wake);
+            }
+        });
+        // Start `g3d-termd` connect/spawn/list/adopt off the window thread right away so it
+        // overlaps macOS AppKit window creation and never blocks Frame 1.
+        let pending_termd = opts
+            .namespace
+            .as_ref()
+            .map(|ns| super::startup::PendingTermd::spawn(ns.clone(), session_wake.clone()));
 
-        let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
+        let window = {
+            let _s = super::startup::span("window_create");
+            let w = Arc::new(
+                event_loop
+                    .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
+                    .expect("window creation failed"),
+            );
+            w.set_ime_allowed(true);
+            w
+        };
+        let (surface, format, config, depth) = {
+            let _s = super::startup::span("surface_configure");
+            let surface = self.ctx.instance.create_surface(window.clone()).expect("surface creation failed");
+            let caps = surface.get_capabilities(&self.ctx.adapter);
+            let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+            let size = window.inner_size();
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
+                width: size.width.max(1),
+                height: size.height.max(1),
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes[0],
+                view_formats: vec![],
+            };
+            surface.configure(&self.ctx.device, &config);
+            let depth = crate::scene::create_depth(&self.ctx.device, WALL_DEPTH_FORMAT, config.width, config.height);
+            (surface, format, config, depth)
+        };
+
+        let mut renderer = if self.exit_after.is_some() {
+            WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default())
+        } else {
+            WallRenderer::new_fast(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &self.ctx.adapter,
+                &opts.emoji_sheet,
+                format,
+                WallStyle::default(),
+                control_wake,
+            )
+        };
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
         renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
-        #[cfg(feature = "egui-ui")]
-        let ui = WallUi::new(&self.ctx.device, &window, format);
         let sf = window.scale_factor();
 
         // The rules, at the renderer's cell size and the window's viewport.
@@ -504,63 +548,23 @@ impl App {
             namespace: namespace.clone(),
             ..RulesOptions::default()
         };
-        let mut wall = if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) };
+        let mut wall = {
+            let _s = super::startup::span("wall_store_load");
+            if opts.namespace.is_some() { Wall::open(store_dir(), namespace.clone(), rules) } else { Wall::in_memory(rules) }
+        };
 
-        // The terminals: coalesce duplicate queued `Wake`s and suppress wakes
-        // while a surface redraw is already armed (`draw` pumps before building).
-        let proxy_sess = self.proxy.clone();
-        let gate_sess = self.wakes.clone();
-        let session_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            if !gate_sess.redraw_armed.load(std::sync::atomic::Ordering::SeqCst)
-                && !gate_sess.pending.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                let _ = proxy_sess.send_event(Wake);
-            }
-        });
-        let terms = match &opts.namespace {
-            Some(ns) => {
-                let mut sessions = match Sessions::open(ns, session_wake.clone()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("error: the wall could not reach its terminals: {e}");
-                        std::process::exit(1);
-                    }
-                };
-                let welcome = sessions.hub().welcome();
-                wall.on_termd_welcome(
-                    welcome.instance.as_deref().unwrap_or(""),
-                    &welcome.features,
-                    epoch_now_ms(),
-                );
-                let ids = sessions.list().unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                });
-                wall.set_live_terminals(&ids);
-                for id in &ids {
-                    match sessions.adopt(id) {
-                        Ok((cols, rows)) => {
-                            wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
-                        }
-                        Err(e) => log::error!("{e}"),
-                    }
-                }
-                wall.set_connected(true);
-                if ids.is_empty() {
-                    wall.run("wall.spawn");
-                }
-                Terminals::Live(Box::new(sessions))
-            }
-            None => {
-                let screen = super::test_pattern::build_primary_screen();
-                wall.terminal_appeared(TerminalAppeared::new("pattern", u32::from(screen.cols), u32::from(screen.rows)).with_title(screen.title.clone()));
-                Terminals::Fixed(BTreeMap::from([("pattern".to_string(), screen)]))
-            }
+        let terms = if opts.namespace.is_some() {
+            Terminals::Connecting
+        } else {
+            let screen = super::test_pattern::build_primary_screen();
+            wall.terminal_appeared(TerminalAppeared::new("pattern", u32::from(screen.cols), u32::from(screen.rows)).with_title(screen.title.clone()));
+            wall.run("wall.fit");
+            Terminals::Fixed(BTreeMap::from([("pattern".to_string(), screen)]))
         };
 
         self.gfx = Some(Gfx {
             #[cfg(feature = "egui-ui")]
-            ui,
+            ui: None,
             renderer,
             depth,
             surface,
@@ -568,45 +572,93 @@ impl App {
             window,
             cell_scale,
         });
+        self.wall = Some(wall);
+        self.terms = Some(terms);
+        self.starting_termd = pending_termd.is_some();
+        self.pending_termd = pending_termd;
+        self.sync_font_and_text_knobs(None);
+        self.apply_effects();
+        self.serve_control();
+        // Paint and present Frame 1 (drafting paper) immediately — before waiting on any
+        // `termd` spawn/adopt/status RPC, egui init, or background shapes/cells pipelines.
+        if self.exit_after.is_none() {
+            self.draw(true);
+        }
         let launch_cfg = crate::launch_config::LaunchConfig::load_or_default();
-        let agents = match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
+        self.agents = Some(match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
             Ok(agent_opts) => super::agents::WallAgents::with_options(agent_opts, session_wake),
             Err(e) => {
                 log::warn!("{e}");
                 super::agents::WallAgents::new(session_wake)
             }
-        };
-        self.wall = Some(wall);
-        self.terms = Some(terms);
-        self.agents = Some(agents);
-        self.sync_font_and_text_knobs(None);
-        self.apply_effects();
-        self.refresh_termd_status();
-        if let Some(wall) = &mut self.wall {
-            wall.run("wall.fit");
-        }
-        self.apply_effects();
-        self.serve_control();
-        self.pump(false);
-        if let Ok(hover_id) = std::env::var("GLYPH_WALL_HOVER") {
-            let hover_pt = self.wall.as_mut().and_then(|wall| {
-                let f = wall.frame();
-                let bar = f.title_bars.iter().find(|b| b.terminal_id == hover_id)?;
-                let sb = f.camera.to_screen_box(bar.rect, f.viewport.w, f.viewport.h);
-                Some(Point::new(0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom)))
-            });
-            if let Some(pt) = hover_pt {
-                self.cursor = pt;
-                let ev = self.pointer(None);
-                if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
-                    wall.pointer_move(&ev, &screen_lookup(|id| terms.screen(id)));
-                }
-                self.apply_effects();
-            }
-        }
+        });
+        self.poll_pending_termd();
         self.sync_macos_option_as_alt();
         self.perf.mark_opened(&self.proxy);
         self.redraw();
+    }
+
+    /// Attach `g3d-termd` sessions once the background connect/spawn/list/adopt thread completes.
+    fn poll_pending_termd(&mut self) -> bool {
+        let Some(res) = self.pending_termd.as_ref().and_then(|p| p.try_take()) else {
+            return false;
+        };
+        self.pending_termd = None;
+        self.starting_termd = false;
+        match res {
+            Ok(ready) => {
+                let welcome = ready.sessions.hub().welcome().clone();
+                self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
+                if let Some(wall) = &mut self.wall {
+                    wall.on_termd_welcome(
+                        welcome.instance.as_deref().unwrap_or(""),
+                        &welcome.features,
+                        epoch_now_ms(),
+                    );
+                    wall.set_live_terminals(&ready.live_ids);
+                    for (id, cols, rows) in ready.adopted {
+                        wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    }
+                    wall.set_connected(true);
+                    if ready.live_ids.is_empty() {
+                        wall.run("wall.spawn");
+                    }
+                }
+                self.apply_effects();
+                if let Some(wall) = &mut self.wall {
+                    wall.run("wall.fit");
+                }
+                self.apply_effects();
+                self.refresh_termd_status();
+                self.pump(false);
+                if let Ok(hover_id) = std::env::var("GLYPH_WALL_HOVER") {
+                    let hover_pt = self.wall.as_mut().and_then(|wall| {
+                        let f = wall.frame();
+                        let bar = f.title_bars.iter().find(|b| b.terminal_id == hover_id)?;
+                        let sb = f.camera.to_screen_box(bar.rect, f.viewport.w, f.viewport.h);
+                        Some(Point::new(0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom)))
+                    });
+                    if let Some(pt) = hover_pt {
+                        self.cursor = pt;
+                        let ev = self.pointer(None);
+                        if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                            wall.pointer_move(&ev, &screen_lookup(|id| terms.screen(id)));
+                        }
+                        self.apply_effects();
+                    }
+                }
+                self.redraw();
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                if let Some(wall) = &mut self.wall {
+                    wall.notify(&msg);
+                }
+                self.quit = true;
+            }
+        }
+        self.sync_macos_option_as_alt();
+        true
     }
 
     fn sync_macos_option_as_alt(&mut self) {
@@ -619,7 +671,7 @@ impl App {
                 {
                     self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
                         || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard)
-                        || g.ui.context().egui_wants_keyboard_input()
+                        || g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input())
                 }
                 #[cfg(not(feature = "egui-ui"))]
                 {
@@ -640,7 +692,7 @@ impl App {
     fn sync_ime_cursor_area(&mut self, described: &Described) {
         let (Some(g), Some(terms)) = (&self.gfx, &self.terms) else { return };
         #[cfg(feature = "egui-ui")]
-        if g.ui.context().egui_wants_keyboard_input() {
+        if g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input()) {
             return;
         }
         let Some(focused) = described.terminals.iter().find(|t| t.focused) else { return };
@@ -742,8 +794,8 @@ impl App {
             return self.memory_clipboard.clone();
         }
         #[cfg(all(target_os = "linux", feature = "egui-ui"))]
-        if let Some(g) = &mut self.gfx {
-            return g.ui.clipboard_text();
+        if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+            return ui.clipboard_text();
         }
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(text) => Some(text),
@@ -761,8 +813,8 @@ impl App {
             return;
         }
         #[cfg(all(target_os = "linux", feature = "egui-ui"))]
-        if let Some(g) = &mut self.gfx {
-            g.ui.set_clipboard_text(text);
+        if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+            ui.set_clipboard_text(text);
             return;
         }
         if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
@@ -990,80 +1042,84 @@ impl App {
     /// Take in what the terminals' reader thread queued.
     fn pump(&mut self, request_redraw: bool) {
         let _perf = self.perf.pump_scope();
-        let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let (changed, news) = sessions.pump();
+        let mut changed = false;
         let mut heard = false;
         let mut ended_any = false;
-        for n in news {
-            match n {
-                News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
-                    if let Some(screen) = sessions.screen(&id) {
-                        if let Some(agents) = &mut self.agents {
-                            agents.note_terminal_scrolled(&id, scrolled_top, resized, within_margins, screen.modes.alt_screen);
+        if let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) {
+            let (sess_changed, news) = sessions.pump();
+            changed = sess_changed;
+            for n in news {
+                match n {
+                    News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                        super::startup::mark_once("first_repaint_applied");
+                        if let Some(screen) = sessions.screen(&id) {
+                            if let Some(agents) = &mut self.agents {
+                                agents.note_terminal_scrolled(&id, scrolled_top, resized, within_margins, screen.modes.alt_screen);
+                            }
+                            heard |= wall.terminal_screen_filled(
+                                &id,
+                                screen,
+                                ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
+                            );
                         }
-                        heard |= wall.terminal_screen_filled(
-                            &id,
-                            screen,
-                            ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
-                        );
+                    }
+                    News::Resized { id, cols, rows } => {
+                        wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
+                        heard = true;
+                    }
+                    News::Title { id, title } => {
+                        wall.terminal_title(&id, title);
+                        heard = true;
+                    }
+                    News::Modes { id, modes } => {
+                        wall.terminal_modes(&id, modes);
+                        heard = true;
+                    }
+                    News::Ended { id } => {
+                        wall.terminal_ended(&id);
+                        heard = true;
+                        ended_any = true;
+                    }
+                    News::Disconnected { message } => {
+                        log::error!("termd is gone: {message}");
+                        wall.set_connected(false);
+                        wall.on_termd_disconnected(false, epoch_now_ms());
+                        heard = true;
                     }
                 }
-                News::Resized { id, cols, rows } => {
-                    wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
-                    heard = true;
-                }
-                News::Title { id, title } => {
-                    wall.terminal_title(&id, title);
-                    heard = true;
-                }
-                News::Modes { id, modes } => {
-                    wall.terminal_modes(&id, modes);
-                    heard = true;
-                }
-                News::Ended { id } => {
-                    wall.terminal_ended(&id);
-                    heard = true;
-                    ended_any = true;
-                }
-                News::Disconnected { message } => {
-                    log::error!("termd is gone: {message}");
-                    wall.set_connected(false);
-                    wall.on_termd_disconnected(false, epoch_now_ms());
-                    heard = true;
-                }
             }
-        }
-        if let Some(live_ids) = sessions.take_reconnected() {
-            log::info!("termd came back ({} terminal(s))", live_ids.len());
-            let welcome = sessions.hub().welcome();
-            wall.on_termd_welcome(
-                welcome.instance.as_deref().unwrap_or(""),
-                &welcome.features,
-                epoch_now_ms(),
-            );
-            wall.dismiss_termd_lost();
-            if !live_ids.is_empty() {
-                wall.set_live_terminals(&live_ids);
+            if let Some(live_ids) = sessions.take_reconnected() {
+                log::info!("termd came back ({} terminal(s))", live_ids.len());
+                let welcome = sessions.hub().welcome();
+                wall.on_termd_welcome(
+                    welcome.instance.as_deref().unwrap_or(""),
+                    &welcome.features,
+                    epoch_now_ms(),
+                );
+                wall.dismiss_termd_lost();
+                if !live_ids.is_empty() {
+                    wall.set_live_terminals(&live_ids);
+                }
+                for id in &live_ids {
+                    match sessions.adopt(id) {
+                        Ok((cols, rows)) => {
+                            wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                        }
+                        Err(e) => log::error!("{e}"),
+                    }
+                }
+                wall.set_connected(true);
+                heard = true;
+                ended_any = true;
             }
-            for id in &live_ids {
-                match sessions.adopt(id) {
+            for id in sessions.take_external_appeared() {
+                match sessions.adopt(&id) {
                     Ok((cols, rows)) => {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                        wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                        heard = true;
                     }
                     Err(e) => log::error!("{e}"),
                 }
-            }
-            wall.set_connected(true);
-            heard = true;
-            ended_any = true;
-        }
-        for id in sessions.take_external_appeared() {
-            match sessions.adopt(&id) {
-                Ok((cols, rows)) => {
-                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
-                    heard = true;
-                }
-                Err(e) => log::error!("{e}"),
             }
         }
         if ended_any {
@@ -1139,6 +1195,7 @@ impl App {
         use wgpu::CurrentSurfaceTexture as Cst;
         let t_acq = Instant::now();
         let frame = if to_surface {
+            let _s = (self.frames == 0).then(|| super::startup::span("first_surface_acquire"));
             match g.surface.get_current_texture() {
                 Cst::Success(f) | Cst::Suboptimal(f) => {
                     self.occluded = false;
@@ -1211,7 +1268,10 @@ impl App {
         let mut shapes: Vec<Shape> = Vec::new();
         let mut labels: Vec<Label<'static>> = Vec::new();
         if described.notice.is_none() {
-            described.notice = g.renderer.shader_error_notice().map(str::to_owned);
+            described.notice = self
+                .starting_termd
+                .then(|| "starting termd...".to_string())
+                .or_else(|| g.renderer.shader_error_notice().map(str::to_owned));
         }
         let paper = {
             let metrics = g.renderer.metrics();
@@ -1254,53 +1314,73 @@ impl App {
         #[cfg(feature = "egui-ui")]
         let agents_open = self.wall.as_ref().zip(self.agents.as_ref()).is_some_and(|(w, a)| a.has_open_views(w));
         #[cfg(feature = "egui-ui")]
-        let mut ui_painted = if self.hud_open || agents_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
-            let hud_terms: Vec<HudTerminalInfo<'_>> = described
-                .terminals
-                .iter()
-                .zip(&ids)
-                .filter_map(|(t, (_, render_id))| {
-                    let s = terms.screen(&t.id)?;
-                    Some(HudTerminalInfo { id: *render_id, title: &t.id, cols: s.cols, rows: s.rows, scale: t.scale as f32, focused: t.focused })
-                })
-                .collect();
-            let hud_input = DebugHudInput { camera_zoom: camera.zoom, camera_center: camera.center, viewport, stats, terminals: &hud_terms };
-            let hud_open = &mut self.hud_open;
-            let panels = &mut self.panels;
-            let wall_ref = self.wall.as_ref();
-            let mut agents_ref = self.agents.as_mut();
-            let window_sf = g.window.scale_factor();
-            let mut ui_frame = g.ui.run(&g.window, viewport, |ctx| {
-                agent_verbs.clear();
-                if let (Some(w), Some(ag)) = (wall_ref, agents_ref.as_deref_mut()) {
-                    ag.show_panel(ctx, w, viewport, window_sf, &mut agent_verbs);
+        let mut ui_painted = {
+            let skip_bootstrap_ui =
+                self.frames == 0 && self.exit_after.is_none() && self.pending_shot.is_none();
+            let ui_needed = !skip_bootstrap_ui
+                && (self.hud_open
+                    || agents_open
+                    || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described))
+                    || g.ui.as_ref().is_some_and(WallUi::is_active));
+            if ui_needed {
+                let ui = g.ui.get_or_insert_with(|| {
+                    let _s = super::startup::span("egui_init");
+                    WallUi::new(&self.ctx.device, &g.window, g.config.format)
+                });
+                let hud_terms: Vec<HudTerminalInfo<'_>> = described
+                    .terminals
+                    .iter()
+                    .zip(&ids)
+                    .filter_map(|(t, (_, render_id))| {
+                        let s = terms.screen(&t.id)?;
+                        Some(HudTerminalInfo { id: *render_id, title: &t.id, cols: s.cols, rows: s.rows, scale: t.scale as f32, focused: t.focused })
+                    })
+                    .collect();
+                let hud_input = DebugHudInput { camera_zoom: camera.zoom, camera_center: camera.center, viewport, stats, terminals: &hud_terms };
+                let hud_open = &mut self.hud_open;
+                let panels = &mut self.panels;
+                let wall_ref = self.wall.as_ref();
+                let mut agents_ref = self.agents.as_mut();
+                let window_sf = g.window.scale_factor();
+                let mut ui_frame = ui.run(&g.window, viewport, |ctx| {
+                    agent_verbs.clear();
+                    if let (Some(w), Some(ag)) = (wall_ref, agents_ref.as_deref_mut()) {
+                        ag.show_panel(ctx, w, viewport, window_sf, &mut agent_verbs);
+                    }
+                    if let Some(w) = wall_ref {
+                        panel_verbs = panels.show(ctx, w, &described);
+                    }
+                    if *hud_open {
+                        show_debug_hud(ctx, hud_open, &hud_input);
+                    }
+                });
+                panel_egui_keys = ui_frame.wants_keyboard;
+                if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
+                    ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
                 }
-                if let Some(w) = wall_ref {
-                    panel_verbs = panels.show(ctx, w, &described);
+                match ui_frame.repaint_after {
+                    Some(delay) if delay.is_zero() => {
+                        self.ui_repaint_at = None;
+                        g.window.request_redraw();
+                    }
+                    Some(delay) => self.ui_repaint_at = Some(Instant::now() + delay),
+                    None => self.ui_repaint_at = None,
                 }
-                if *hud_open {
-                    show_debug_hud(ctx, hud_open, &hud_input);
-                }
-            });
-            panel_egui_keys = ui_frame.wants_keyboard;
-            if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
-                g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
+                ui_frame.painted
+            } else {
+                self.ui_repaint_at = None;
+                None
             }
-            match ui_frame.repaint_after {
-                Some(delay) if delay.is_zero() => {
-                    self.ui_repaint_at = None;
-                    g.window.request_redraw();
-                }
-                Some(delay) => self.ui_repaint_at = Some(Instant::now() + delay),
-                None => self.ui_repaint_at = None,
-            }
-            ui_frame.painted
-        } else {
-            self.ui_repaint_at = None;
-            None
         };
         if let Some(enc) = encoder {
+            let presented = frame.is_some();
             self.perf.submit_and_record(&self.ctx, enc, frame, (now, t_acq, t_post_acq), stats);
+            if presented {
+                super::startup::mark_once("first_frame_presented");
+                if !draws.is_empty() && g.renderer.pipelines_ready() {
+                    super::startup::mark_once("first_terminal_frame_presented");
+                }
+            }
         }
 
         // A counted run can keep its last frame: GLYPH_WALL_SHOT=path.png
@@ -1308,11 +1388,12 @@ impl App {
         let asked = self.pending_shot.take();
         let counted = (self.exit_after == Some(self.frames + 1)).then(|| std::env::var("GLYPH_WALL_SHOT").ok().map(PathBuf::from)).flatten();
         if asked.is_some() || counted.is_some() {
+            g.renderer.wait_for_pipelines();
             for path in asked.iter().map(|(p, _)| p.clone()).chain(counted) {
                 super::renderer::render_wall_to_png_with_overlay(&self.ctx, &mut g.renderer, &camera, &wall_frame, viewport, 1, &path, |enc, color_view| {
                     #[cfg(feature = "egui-ui")]
-                    if let Some(painted) = ui_painted.as_mut() {
-                        g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, color_view, painted);
+                    if let (Some(ui), Some(painted)) = (g.ui.as_mut(), ui_painted.as_mut()) {
+                        ui.paint(&self.ctx.device, &self.ctx.queue, enc, color_view, painted);
                     }
                     #[cfg(not(feature = "egui-ui"))]
                     let _ = (enc, color_view);
@@ -1511,8 +1592,8 @@ impl App {
         #[cfg(feature = "egui-ui")]
         if matches!(decision, KeyDecision::Chord { blur_field: true, .. }) {
             self.panels.blur_docked_inputs();
-            if let Some(g) = &self.gfx {
-                g.ui.surrender_focus();
+            if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
+                ui.surrender_focus();
             }
         }
         #[cfg(not(feature = "egui-ui"))]
@@ -1837,9 +1918,9 @@ impl App {
     fn script_move(&mut self, x: f64, y: f64) {
         self.cursor = Point::new(x, y);
         #[cfg(feature = "egui-ui")]
-        if let Some(g) = &mut self.gfx {
-            g.ui.push_egui_event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
-            if pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+        if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+            ui.push_egui_event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+            if pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
                 == PointerTarget::Ui
             {
                 return;
@@ -1870,13 +1951,19 @@ impl App {
             let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
             if state == ElementState::Pressed {
                 let to_ui = self.buttons == 0
-                    && self.gfx.as_ref().is_some_and(|g| {
-                        pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
-                            == PointerTarget::Ui
-                    });
+                    && self
+                        .gfx
+                        .as_ref()
+                        .and_then(|g| g.ui.as_ref())
+                        .is_some_and(|ui| {
+                            pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
+                                == PointerTarget::Ui
+                        });
                 if to_ui {
-                    if let (Some(g), Some(btn)) = (&mut self.gfx, egui_btn) {
-                        g.ui.push_egui_event(egui::Event::PointerButton {
+                    if let (Some(ui), Some(btn)) =
+                        (self.gfx.as_mut().and_then(|g| g.ui.as_mut()), egui_btn)
+                    {
+                        ui.push_egui_event(egui::Event::PointerButton {
                             pos,
                             button: btn,
                             pressed: true,
@@ -1889,8 +1976,10 @@ impl App {
                 let wall_held = button_of(button)
                     .is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0);
                 if !wall_held {
-                    if let (Some(g), Some(btn)) = (&mut self.gfx, egui_btn) {
-                        g.ui.push_egui_event(egui::Event::PointerButton {
+                    if let (Some(ui), Some(btn)) =
+                        (self.gfx.as_mut().and_then(|g| g.ui.as_mut()), egui_btn)
+                    {
+                        ui.push_egui_event(egui::Event::PointerButton {
                             pos,
                             button: btn,
                             pressed: false,
@@ -1921,8 +2010,8 @@ impl App {
             #[cfg(feature = "egui-ui")]
             {
                 self.panels.blur_docked_inputs();
-                if let Some(g) = &self.gfx {
-                    g.ui.surrender_focus();
+                if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
+                    ui.surrender_focus();
                 }
             }
             // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
@@ -1970,6 +2059,10 @@ impl ApplicationHandler<Wake> for App {
             event_loop.exit();
             return;
         }
+        self.poll_pending_termd();
+        if self.gfx.as_mut().is_some_and(|g| g.renderer.poll_ready_pipelines()) {
+            self.redraw();
+        }
         self.serve_control();
         self.pump(true);
     }
@@ -1999,10 +2092,10 @@ impl ApplicationHandler<Wake> for App {
         let feed_ui = !wall_chord_bypass
             && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
                 || panels_want_keys
-                || self.gfx.as_ref().is_some_and(|g| g.ui.context().egui_wants_keyboard_input()));
+                || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| ui.context().egui_wants_keyboard_input()));
         #[cfg(feature = "egui-ui")]
         let ui_outcome = match (&mut self.gfx, feed_ui) {
-            (Some(g), true) => g.ui.on_window_event(&g.window, &event),
+            (Some(g), true) => g.ui.as_mut().map_or_else(UiEventOutcome::default, |ui| ui.on_window_event(&g.window, &event)),
             _ => UiEventOutcome::default(),
         };
         #[cfg(feature = "egui-ui")]
@@ -2079,6 +2172,10 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         const COVERED_TICK: std::time::Duration = std::time::Duration::from_millis(32);
+        self.poll_pending_termd();
+        if self.gfx.as_mut().is_some_and(|g| g.renderer.poll_ready_pipelines()) {
+            self.redraw();
+        }
         self.serve_control();
         if self.quit || self.perf.should_exit_on_wake(false) {
             event_loop.exit();
@@ -2222,6 +2319,8 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         ui_repaint_at: None,
         blink_repaint_at: None,
         termd_tick_at: None,
+        pending_termd: None,
+        starting_termd: false,
         occluded: false,
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
