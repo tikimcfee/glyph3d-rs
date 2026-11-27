@@ -60,9 +60,13 @@ pub const SPARSE_EMOJI_INIT_ROWS: u32 = 2;
 #[cfg(feature = "wgpu")]
 pub const SPARSE_EMOJI_MAX_ROWS: u32 = 32;
 
-/// Default directory holding the wall's runtime font files (`<repo>/assets/fonts`).
+/// Default directory holding the wall's runtime font files: bundle `Contents/Resources/fonts`
+/// (or `<prefix>/share/glyph3d-wall/fonts`) when installed, else `<repo>/assets/fonts`.
 pub fn default_fonts_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/fonts")
+    crate::resolve_runtime_asset(None, "fonts/Cousine-Regular.ttf")
+        .parent()
+        .expect("fonts/Cousine-Regular.ttf has a parent directory")
+        .to_path_buf()
 }
 
 /// One cell record in [`EmojiSheetArchive`] (`[glyph_id, png_offset, png_len]`).
@@ -99,7 +103,8 @@ impl EmojiSheetArchive {
         let archive = Self::from_bytes(&bytes, &path.display().to_string());
         let seq_count = archive.sequences.len() / (2 + archive.seq_max as usize);
         log::info!(
-            "wall sparse emoji archive: {} cells ({}x{}, {} mips), {} codepoints, {} sequences; parse {:.1} ms (0 decoded)",
+            "wall sparse emoji archive ({}): {} cells ({}x{}, {} mips), {} codepoints, {} sequences; parse {:.1} ms (0 decoded)",
+            path.display(),
             archive.cells.len(),
             archive.cell_w,
             archive.cell_h,
@@ -812,8 +817,13 @@ impl GlyphSource {
     /// index tables of `emoji_sheet` (zero PNG decoding at startup), and allocate the
     /// initial GPU textures.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, emoji_sheet: &Path) -> Self {
-        Self::load(device, queue, &default_fonts_dir(), emoji_sheet)
-            .expect("failed to load default wall font chain from assets/fonts")
+        let fonts_dir = default_fonts_dir();
+        Self::load(device, queue, &fonts_dir, emoji_sheet).unwrap_or_else(|e| {
+            panic!(
+                "failed to load default wall font chain from {}: {e}",
+                fonts_dir.display()
+            )
+        })
     }
 
     /// Load the default font chain from `fonts_dir` and the sparse emoji archive from `emoji_sheet`.

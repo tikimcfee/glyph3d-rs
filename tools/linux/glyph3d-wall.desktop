@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Glyph3D Wall
+GenericName=Terminal Canvas
+Comment=Infinite GPU canvas of live terminals backed by g3d-termd
+Exec=glyph3d-native
+TryExec=glyph3d-native
+Icon=glyph3d-wall
+Terminal=false
+Categories=Development;System;TerminalEmulator;
+Keywords=terminal;console;shell;multiplexer;termd;wall;gpu;
+StartupNotify=true
+StartupWMClass=glyph3d-native
