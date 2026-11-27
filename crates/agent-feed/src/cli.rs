@@ -139,7 +139,8 @@ impl AgentCli {
     /// Run `agent <args>` to completion, returning stdout or a descriptive error naming stderr.
     pub fn run(&self, args: &[&str]) -> Result<Vec<u8>, String> {
         let line = self.describe(args);
-        let out = self.command(args).output().map_err(|e| {
+        let mut cmd = self.command(args);
+        let out = output_command(&mut cmd).map_err(|e| {
             format!(
                 "could not run `{line}`: {e} (gomuxai's `agent` must be on PATH or at ~/.local/bin/agent, or set agent_binary)"
             )
@@ -162,6 +163,34 @@ impl AgentCli {
             )
         })
     }
+}
+
+/// Spawn `cmd`, retrying briefly on `ETXTBSY` (`ExecutableFileBusy`): when one
+/// thread finishes writing an executable stub while another forks a child
+/// process, the forked child briefly holds the inherited write descriptor until
+/// its `execve`.
+pub(crate) fn spawn_command(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    for _ in 0..10 {
+        match cmd.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            res => return res,
+        }
+    }
+    cmd.spawn()
+}
+
+fn output_command(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    for _ in 0..10 {
+        match cmd.output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            res => return res,
+        }
+    }
+    cmd.output()
 }
 
 /// One directory gomuxai scans for one harness's sessions (`agent sessions --dirs --json`).

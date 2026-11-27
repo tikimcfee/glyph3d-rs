@@ -32,6 +32,7 @@ use glyph3d_native::*;
 /// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
 /// a repo scan, or one of the exit-driver instruments (fixture, GPU info).
 fn main() {
+    wall::startup::init_process_start();
     // Unified logging & tracing substrate.
     // tracing-log automatically captures all log::* records and routes them into tracing.
     // Filtering precedence:
@@ -123,7 +124,10 @@ fn main() {
         CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
             #[cfg(target_os = "macos")]
             set_macos_process_name(WALL_MACOS_APP_NAME);
-            let ctx = pollster::block_on(gpu::init(None));
+            let ctx = {
+                let _s = wall::startup::span("gpu_adapter_device");
+                pollster::block_on(gpu::init(None))
+            };
             // The test pattern needs no daemon: one fixed screen.
             let namespace = (!pattern).then_some(namespace);
             wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, namespace, exit_after: frames.map(u64::from) });

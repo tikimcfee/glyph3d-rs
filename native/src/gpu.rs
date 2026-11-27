@@ -570,6 +570,13 @@ pub async fn init(compatible_surface: Option<&wgpu::Surface<'_>>) -> GpuContext 
     if adapter_features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) {
         required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
+    // Persistent GPU pipeline cache (Vulkan `VkPipelineCache`; wgpu 30's Metal
+    // backend stubs `create_pipeline_cache` and does not advertise this feature).
+    let has_pipeline_cache = adapter_features.contains(wgpu::Features::PIPELINE_CACHE);
+    if has_pipeline_cache {
+        required_features |= wgpu::Features::PIPELINE_CACHE;
+    }
+    log::info!("adapter features: PIPELINE_CACHE={has_pipeline_cache}");
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
