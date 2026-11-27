@@ -1185,7 +1185,7 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
                 && lines.first().map(String::as_str) == Some("1")
                 && lines.get(29).map(String::as_str) == Some("30")
         }),
-        "grow1 at 132x40 did not pull scrollback history lines 1..=7 via coalesced repaint: rows={:?} stats={:?}",
+        "grow1 at 132x40 does not show scrollback history lines 1..=7 pulled back onto the screen: rows={:?} stats={:?}",
         screen_lines(&session),
         session.stats()
     );
@@ -1210,16 +1210,41 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         );
     }
 
+    // The rows above are back on the screen, and that is the claim. Who brought them is the
+    // daemon's business: since the T2 fix (PROTOCOL.md `resize`: a primary-screen resize that
+    // grows while the terminal holds scrollback sends each raw subscriber a live `REPAINT`
+    // right after `size`), g3d-termd pulls them itself, and the session's own debounced
+    // request is no longer what does it. Until 2026-11-27 this asserted `repaints_sent == 1`
+    // here, true of a daemon that sent `size` alone; against one that repaints, the screen is
+    // right before the session's settle timer has run, and the count read 0 or 1 by timing.
+    //
+    // What stays the session's to hold: at most ONE request for the whole 14-step drag, never
+    // one per step. (Against this daemon it still sends that one: the drag's last steps have no
+    // scrollback left to pull, so their `size` comes with no `REPAINT` to cancel the timer.)
+    // Let the timer run out, then count, and see the screen is still right.
+    std::thread::sleep(term_session::DEFAULT_GROW_REPAINT_SETTLE * 4);
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            session.pump();
+            let lines = screen_lines(&session);
+            (session.screen().cols, session.screen().rows) == (132, 40)
+                && lines.first().map(String::as_str) == Some("1")
+                && lines.get(29).map(String::as_str) == Some("30")
+        }),
+        "grow1 lost its pulled-back rows once the drag settled: rows={:?}",
+        screen_lines(&session)
+    );
     let grow_stats = session.stats();
     println!(
-        "[bench T2 14-step primary grow 80x24->132x40] resizes_sent={} (of 14) · repaints_sent={} (expected 1)",
+        "[bench T2 14-step primary grow 80x24->132x40] resizes_sent={} (of 14) · repaints_sent={} (at most 1 for the drag)",
         grow_stats.resizes_sent, grow_stats.repaints_sent
     );
-    assert_eq!(
-        grow_stats.repaints_sent, 1,
-        "14-step primary grow should coalesce to a single repaint after settling, got {}",
+    assert!(
+        grow_stats.repaints_sent <= 1,
+        "a 14-step primary grow asks termd for a repaint at most once, after it settles, got {}",
         grow_stats.repaints_sent
     );
+    let asked_for_the_grow = grow_stats.repaints_sent;
 
     // 2. Shrinking on primary screen (132x40 -> 60x20) must NOT ask for a repaint and must still match capture.
     session.send_resize(60, 20);
@@ -1235,8 +1260,8 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
     session.pump();
     assert_eq!(
         session.stats().repaints_sent,
-        1,
-        "primary-screen shrink must not request an extra repaint"
+        asked_for_the_grow,
+        "primary-screen shrink must not request a repaint"
     );
     let cap_shrunk = hub
         .client()

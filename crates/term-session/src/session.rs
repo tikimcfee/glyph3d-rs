@@ -931,11 +931,17 @@ fn session_worker_loop(
                         view_offset_zeroed = true;
                         meta_dirty = true;
                         coalescer.mark_dirty();
-                        // `g3d-termd` sends raw subscribers `EVENT size` without `REPAINT`, so
-                        // when a primary-screen terminal grows `cols` or `rows` (pulling history
-                        // rows out of daemon scrollback), debounce and ask once after the drag
-                        // settles (`grow_repaint_settle`) rather than on every intermediate step,
-                        // and never on the alternate screen where the program redraws itself.
+                        // A primary-screen terminal that grows `cols` or `rows` pulls history
+                        // rows out of the daemon's scrollback, and a raw subscriber needs a
+                        // `REPAINT` to see them. A `g3d-termd` with the T2 fix (PROTOCOL.md
+                        // `resize`; the protocol 1.6 daemon has it) sends one itself right after
+                        // `size` whenever there is scrollback to pull, which cancels this request
+                        // (the `Repaint` arm above). One from before it sent `size` alone, so:
+                        // debounce and ask once after the drag settles (`grow_repaint_settle`)
+                        // rather than on every intermediate step, and never on the alternate
+                        // screen where the program redraws itself. Against a daemon that
+                        // repaints, the request still goes out once after a grow whose last
+                        // step had nothing left to pull (its `size` came with no `REPAINT`).
                         if on_alt {
                             grow_repaint_due = None;
                         } else if grew_primary || grow_repaint_due.is_some() {
