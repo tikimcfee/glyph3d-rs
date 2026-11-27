@@ -23,6 +23,7 @@ pub mod config;
 pub mod dock;
 pub mod fullscreen;
 pub mod groups;
+pub mod import;
 pub mod keymap;
 pub mod labels;
 pub mod layout;
