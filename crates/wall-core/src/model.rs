@@ -273,6 +273,15 @@ pub enum WallEffect {
         cols: u32,
         rows: u32,
     },
+    /// Ask the host to subscribe directly to extra-namespace terminal `id` (e.g. `gx-<name>` via
+    /// `Sessions::reattach`), falling back to spawning `fallback_argv` in the primary namespace
+    /// when `id` is not hosted in the extra namespace.
+    ReattachTerminal {
+        id: String,
+        fallback_argv: Vec<String>,
+        cols: u32,
+        rows: u32,
+    },
     /// Ask `termd` to kill terminal `id` (its store state has already been forgotten).
     KillTerminal { id: String },
     /// Ask `termd` to resize terminal `id` to `cols × rows` cells.

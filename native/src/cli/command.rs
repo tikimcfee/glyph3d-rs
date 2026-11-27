@@ -33,6 +33,8 @@ pub enum CliCommand {
         pattern: bool,
         /// The termd namespace its terminals live in.
         namespace: String,
+        /// Extra termd namespaces to attach alongside `namespace` (off by default).
+        extra_namespaces: Vec<String>,
         /// Exit after this many frames (`--frames`).
         frames: Option<u32>,
     },
@@ -177,6 +179,7 @@ impl Cli {
                 emoji_sheet,
                 pattern: self.wall_test_pattern,
                 namespace: self.wall_ns.clone(),
+                extra_namespaces: self.wall_extra_ns.clone(),
                 frames: self.frames,
             };
         }
@@ -222,6 +225,7 @@ impl Cli {
                 emoji_sheet,
                 pattern: false,
                 namespace: self.wall_ns.clone(),
+                extra_namespaces: self.wall_extra_ns.clone(),
                 frames: self.frames,
             };
         }

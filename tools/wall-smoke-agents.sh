@@ -32,7 +32,9 @@ cd "$REPO_ROOT"
 BIN="$REPO_ROOT/target/release/glyph3d-native"
 WALLCTL="$REPO_ROOT/target/release/wallctl"
 G3D="${HOME}/.local/bin/g3d"
+G3D_TERMD="${HOME}/.local/bin/g3d-termd"
 NS="probe"
+EXTRA_NS="probe2"
 
 if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
     echo "ERR: missing $BIN or $WALLCTL (build --release -p glyph3d-native -p wall-control first)" >&2
@@ -75,6 +77,7 @@ cleanup() {
     fi
     if [[ -x "$G3D" ]]; then
         "$G3D" --ns "$NS" stop >/dev/null 2>&1 || true
+        "$G3D" --ns "$EXTRA_NS" stop >/dev/null 2>&1 || true
     fi
     rm -rf "$D"
 }
@@ -480,7 +483,8 @@ print(m.group(1) if m else "-1")
 }
 
 # Start scratch wall window from `$D` so no repo-local launch_config overrides `PATH` discovery.
-(cd "$D" && "$BIN" --wall --wall-ns "$NS") >"$SHOT_DIR/wall.log" 2>&1 &
+# `--wall-extra-ns agents=probe2` exercises passive extra-namespace watching (`probe2` starts later in #12).
+(cd "$D" && "$BIN" --wall --wall-ns "$NS" --wall-extra-ns "agents=$EXTRA_NS") >"$SHOT_DIR/wall.log" 2>&1 &
 WALL_PID=$!
 
 READY=0
@@ -791,12 +795,145 @@ if [[ "$WALL_SMOKE_SHOTS" == "1" ]]; then
     ctl wall.fit >/dev/null
     wait_settled >/dev/null
     maybe_shot "$SHOT_DIR/12-neighbour-overlap.png"
+    ctl wall.close t2 >/dev/null 2>&1 || true
 fi
 
 if [[ "$BUS_OUT" == *"laptop-2"* && "$BUS_OUT" == *"coder"* && "$BUS_OUT" == *"reviewer"* && "$BUS_OUT" == *"workstation"* && "$BUS_OUT" == *"linux-gate"* ]]; then
     record_pass "bus snapshot in sidebar & palette" "hosts laptop-2 + workstation (4 live agents) populated"
 else
     record_fail "bus snapshot in sidebar & palette" "wall.bus output: $(tr '\n' ' ' <<<"$BUS_OUT")"
+fi
+
+# ── 12. Extra namespace (`probe2` playing `agents`): `gx-coder` pair, detach & reattach ─
+# Close `t1`'s Agent View first so `gx-coder` pairs cleanly on its own.
+ctl wall.agent t1 close >/dev/null 2>&1 || true
+
+# Start scratch `probe2` daemon in `$D` (`G3D_TERMD_DIR="$D"`) and create `agent-coder`
+# via `g3d-termd` wire protocol 1.5 with NO OSC title and NO OSC 7 pwd.
+"$G3D_TERMD" --ns "$EXTRA_NS" --daemon >/dev/null 2>&1
+for _ in $(seq 1 60); do
+    [[ -S "$D/termd-${EXTRA_NS}.sock" ]] && break
+    sleep 0.05
+done
+
+python3 - "$D/termd-${EXTRA_NS}.sock" "create" <<'PY'
+import json, socket, struct, sys
+
+sock_path, action = sys.argv[1], sys.argv[2]
+
+def send_frame(s, ty, payload_obj):
+    raw = json.dumps(payload_obj).encode("utf-8")
+    hdr = struct.pack("<IBBH I", 8 + len(raw), ty, 0, 0, 0)
+    s.sendall(hdr + raw)
+
+def recv_frame(s):
+    buf = b""
+    while len(buf) < 12:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise RuntimeError("eof")
+        buf += chunk
+    length, ty, flags, _, stream = struct.unpack("<IBBHI", buf[:12])
+    need = length - 8
+    payload = buf[12:]
+    while len(payload) < need:
+        chunk = s.recv(4096)
+        if not chunk:
+            raise RuntimeError("eof")
+        payload += chunk
+    return ty, json.loads(payload[:need].decode("utf-8"))
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.connect(sock_path)
+    send_frame(s, 0x01, {"proto": [1, 5], "client": "wall-smoke-agents"})
+    recv_frame(s)  # WELCOME
+    send_frame(s, 0x02, {
+        "req": 1,
+        "op": "create",
+        "id": "agent-coder",
+        "cols": 80,
+        "rows": 24,
+        "argv": ["/bin/sh", "-c", "printf 'EXTRA_AGENT_LIVE_42\\r\\n'; exec sleep 60"],
+    })
+    while True:
+        ty, msg = recv_frame(s)
+        if ty == 0x82 and msg.get("req") == 1:
+            assert msg.get("ok"), f"create failed: {msg}"
+            break
+PY
+
+# Wait for passive extra-namespace watcher on `Sessions` to connect and mount `gx-coder`.
+GX_MOUNTED=0
+if wait_for_text "gx-coder" "EXTRA_AGENT_LIVE_42" 60; then
+    GX_MOUNTED=1
+fi
+
+# Pair `gx-coder` with `sess-coder-1` purely via its `gx-<name>` canvas id.
+ctl wall.agent gx-coder open >/dev/null 2>&1 || true
+GX_PAIRED_EXP=0
+for _ in $(seq 1 40); do
+    GX_PAIRED_EXP="$(ctl wall.agent.expand gx-coder 2>/dev/null | expanded_count_of)"
+    if [[ "$GX_PAIRED_EXP" -ge 5 ]]; then
+        break
+    fi
+    sleep 0.05
+done
+ctl wall.agent.collapse gx-coder >/dev/null 2>&1 || true
+
+# Close `gx-coder` on the wall: must detach locally without killing `agent-coder` in `probe2`,
+# and must stay suppressed across `status_follow` (>650 ms).
+ctl wall.close gx-coder >/dev/null
+sleep 0.70
+W_AFTER_CLOSE="$(ctl app.where)"
+STILL_IN_PROBE2="$(python3 - "$D/termd-${EXTRA_NS}.sock" <<'PY'
+import json, socket, struct, sys
+
+def send_frame(s, ty, payload_obj):
+    raw = json.dumps(payload_obj).encode("utf-8")
+    hdr = struct.pack("<IBBHI", 8 + len(raw), ty, 0, 0, 0)
+    s.sendall(hdr + raw)
+
+def recv_frame(s):
+    buf = b""
+    while len(buf) < 12:
+        buf += s.recv(4096)
+    length, ty, _, _, _ = struct.unpack("<IBBHI", buf[:12])
+    need = length - 8
+    payload = buf[12:]
+    while len(payload) < need:
+        payload += s.recv(4096)
+    return ty, json.loads(payload[:need].decode("utf-8"))
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.connect(sys.argv[1])
+    send_frame(s, 0x01, {"proto": [1, 5], "client": "wall-smoke-check"})
+    recv_frame(s)
+    send_frame(s, 0x02, {"req": 2, "op": "list"})
+    while True:
+        ty, msg = recv_frame(s)
+        if ty == 0x82 and msg.get("req") == 2:
+            ids = [t["id"] for t in msg.get("terminals", [])]
+            print("1" if "agent-coder" in ids else "0")
+            break
+PY
+)"
+
+# Now re-pick the closed local agent (`wall.attach coder@laptop-2`, as Sidebar & Palette emit):
+# must reattach `gx-coder` directly via `Sessions::reattach` (no `t2` shell wrapper spawned!).
+R_REATTACH="$(ctl wall.attach coder@laptop-2)"
+GX_REATTACHED=0
+if wait_for_text "gx-coder" "EXTRA_AGENT_LIVE_42" 40; then
+    GX_REATTACHED=1
+fi
+W_AFTER_REATTACH="$(ctl app.where)"
+
+if [[ "$GX_MOUNTED" -eq 1 && "$GX_PAIRED_EXP" -ge 5 ]] \
+    && ! grep -q "^terminal gx-coder " <<<"$W_AFTER_CLOSE" \
+    && [[ "$STILL_IN_PROBE2" == "1" && "$GX_REATTACHED" -eq 1 ]] \
+    && ! grep -q "^terminal t2 " <<<"$W_AFTER_REATTACH"; then
+    record_pass "extra-ns gx-coder detach & reattach" "mounted gx-coder, paired ($GX_PAIRED_EXP rows), detached cleanly, reattached via wall.attach without wrapper"
+else
+    record_fail "extra-ns gx-coder detach & reattach" "mounted=$GX_MOUNTED exp=$GX_PAIRED_EXP alive=$STILL_IN_PROBE2 reattached=$GX_REATTACHED attach_reply='$R_REATTACH'"
 fi
 
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"
