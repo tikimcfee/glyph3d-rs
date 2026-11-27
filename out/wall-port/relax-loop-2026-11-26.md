@@ -95,6 +95,15 @@ Under `PresentMode::Fifo`, an occasional JIT/GC frame crossing 16.7 ms quantizes
 
 ## Caveats & Relax Findings
 
+> **Corrected 2026-11-27** (`out/wall-port/relax-patches/README.md`): finding 1's
+> crash is real, but background type-checking is not its trigger and
+> `RELAX_BG_TYPECK=0` does not prevent it (3 of 11 crashes on upstream `work`
+> 63f80c998 had it at 0). It happens when the proc-macro world is built after
+> `main` has started: relax's sources newer than its binary, or a cache a
+> crashed boot left unsettled. The fix is a patch to relax's `const_drain`
+> (0 crashes in 85 boots). The boot times below are also stale: a settled warm
+> boot reaches the control socket in about 1.1 s, a cold start in about 36 s.
+
 1. **Warm-boot host SIGSEGV without `RELAX_BG_TYPECK=0` (reported to avoid surprises):**
    With background type-checking left on, warm boots reproducibly crashed in host code (`signal 11`) at `relax_compiler::jit::Unit::vtable+0x80` or `Unit::const_addr+0x114`, called from `jit::const_drain` → `owner::serve` → `owner::pump_wait_at` → `QueryLatch::wait`, while the proc-macro host (`pmhost.rs`, `proc_macro::__relax::bridge`, `syn::parse`) was active on the owner thread. `const_drain` reads the process-global `CONSTS_WANTED` queue against `cur_unit()` and only guards by `collect_epoch`, which is `0` in both the program unit and the proc-macro world's auxiliary unit — so a `Wanted` item from a background worker of the program unit gets resolved against the proc-macro world's `Unit`. Even when it did not crash, `typeck_bg` + `pmhost` stalled the owner thread for ~42 s (`typeck_bg.rs:399` 26 s + `pmhost.rs:1031` 16 s). Exporting `RELAX_BG_TYPECK=0` (now the default in `tools/wall-relax.sh`) eliminated both the SIGSEGV and the stall across 10+ consecutive runs and live patches.
 2. **Non-fatal third-party Relax compile notices:** When background typeck is enabled, `bevy_transform 0.20.0-rc.2` (`E0477`), `lock_api 0.4.14`, `typewit 1.15.2`, and `serde 1.0.229` emit background gap notices; none affect wall execution.

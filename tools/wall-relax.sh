@@ -15,8 +15,10 @@
 #   GLYPH_RELAX           Path to relax binary (default: /Users/lugo/localdev/makepad/target/release/relax, else `relax`)
 #   GLYPH_WALL_SHADER_DIR Directory for disk-loaded WGSL shaders (default: <repo>/native/src/shaders)
 #   G3D_BIN               Path to g3d CLI for scratch daemon teardown (default: ~/.local/bin/g3d, else `g3d`)
-#   RELAX_BG_TYPECK       Background typecheck toggle (default: 0; avoids a host SIGSEGV in relax's
-#                         const_drain/pmhost interaction on warm boots; set to 1 to re-enable)
+#   RELAX_BG_TYPECK       Background typecheck toggle (default: 0; set to 1 to re-enable). It was
+#                         set to 0 as the workaround for a host SIGSEGV in relax's const_drain; it
+#                         is not one (2026-11-27: 3 of 11 crashes had it at 0). The fix is a patch
+#                         to relax: out/wall-port/relax-patches/README.md
 
 set -euo pipefail
 
