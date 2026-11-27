@@ -3736,5 +3736,64 @@ fn context_menu_hits_map_labels_and_fullscreen_padding_and_pinch_respects_fullsc
     ));
 }
 
+#[test]
+fn pointer_leave_clears_hover_and_link_without_canceling_active_drag() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    h.set_screen_lines(&t1, &["open https://example.com/docs now"]);
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // Hover over the URL with Cmd held: sets hovered terminal, hovered link, and Pointer cursor.
+    let url_pt = h.cell_world(&t1, 10, 0);
+    let url_screen = h.wall.camera().to_screen(url_pt);
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: url_screen.x,
+            y: url_screen.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    h.pump();
+    let f_hovered = h.frame();
+    assert!(f_hovered.terminals.iter().any(|t| t.id == t1 && t.hovered));
+    assert!(f_hovered.terminals.iter().any(|t| t.id == t1 && t.hovered_link.is_some()));
+
+    // Leaving the window clears hover, link underline, and restores Default cursor.
+    assert!(h.wall.pointer_leave());
+    h.pump();
+    let f_left = h.frame();
+    assert!(f_left.terminals.iter().all(|t| !t.hovered && t.hovered_link.is_none()));
+    assert_eq!(h.cursors.last().copied(), Some(CursorIcon::Default));
+    // Repeated leave while already idle is a no-op (avoids spurious redraws).
+    assert!(!h.wall.pointer_leave());
+
+    // Starting a title-bar drag and crossing the window edge must NOT cancel the drag.
+    let bar = h.frame().title_bars[0].rect;
+    let bar_center = h.wall.camera().to_screen(Point::new(
+        0.5 * (bar.min_x + bar.max_x),
+        0.5 * (bar.min_y + bar.max_y),
+    ));
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: bar_center.x,
+            y: bar_center.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_NONE,
+            time_ms: h.now_ms + 10.0,
+        },
+        &h.screens,
+    );
+    assert!(!h.wall.pointer_leave(), "pointer_leave must not interfere with an active drag");
+    assert!(h.wall.pointer().busy());
+}
+
 
 

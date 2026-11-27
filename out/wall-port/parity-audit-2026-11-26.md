@@ -38,9 +38,9 @@
 9. ~~**Other dead or split-source settings (`renderLoop`, `traceInput`, `menuHint`, `clickRepeatMs`, static `[wall]` knobs)**~~ — **Closed**: `panelOpacity`, `greekPx`, and `cursorBlinkMs` are now live `WallConfig`/`KNOBS` settings synced into `WallRenderer::style_mut()` (with `greekPx` surviving resize/DPI changes via `WindowLifecycle::set_base_greek_px`); `app.rs` reads `wall.config().click_repeat_ms` for title-bar/canvas double-click instead of hardcoded `DOUBLE_CLICK_MS`; `renderLoop`, `traceInput`, and `menuHint` are hidden from the native Settings panel while remaining in `WallConfig`/`WallStore` so browser imports round-trip cleanly.
 
 10. **Minor polish & unhandled window/session hooks**
-    - `WindowEvent::CursorLeft` is unhandled (moving pointer outside the window leaves the last `hovered_id` highlighted).
-    - `sessions.take_bell()` (no bell flash/sound) and `sessions.pwd()` (OSC 7) are unused by `app.rs`.
-    - `VtEvent::ClipboardWrite` (OSC 52 from programs) is parsed by `glyph-vt` (`crates/glyph-vt/src/lib.rs:43`) but not forwarded through `term-session` to `app.rs` (note: JS `TerminalEmulator.js` also does not forward OSC 52).
+    - ~~`WindowEvent::CursorLeft` is unhandled~~ — **Closed**: `Wall::pointer_leave()` clears passive terminal, group-header, map-label, and hyperlink hover highlights (and restores `CursorIcon::Default` without interrupting an active drag), wired from `WindowEvent::CursorLeft` in `app.rs` (`wall_scenarios::pointer_leave_clears_hover_and_link_without_canceling_active_drag`).
+    - `sessions.take_bell()` (no bell flash/sound) and `sessions.pwd()` (OSC 7) are unused by `app.rs` (matches JS for bell; `pwd` is owned by the Agent View integration).
+    - `VtEvent::ClipboardWrite` (OSC 52 from programs) is parsed by `glyph-vt` (`crates/glyph-vt/src/lib.rs:43`) but not forwarded through `term-session` to `app.rs` — confirmed JS `TerminalEmulator.js` and `TerminalWall.js` also do not handle or forward OSC 52.
     - ~~`OSC 8` hyperlink spans~~ — **Closed**: `term-session::sync_screen_into` copies `Screen::hyperlinks`, `Screen::link_spans`, and `cursor_color` (bumping `generation`), and `wall-core`'s `impl ScreenView for Screen` forwards `hyperlink_at` / `hyperlink_span_at` to `Screen::hyperlink_at` / `hyperlink_range_at`; verified live with `printf` OSC 8 + `⌘`-hover screenshot underline.
     - ~~No live smoke script exercises egui panels~~ — **Closed** (landed on `wall` as `tools/wall-smoke-panels.sh`, 12 checks).
 

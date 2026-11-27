@@ -2126,6 +2126,19 @@ impl App {
         }
     }
 
+    fn cursor_left(&mut self) {
+        let mut changed = self.hovered_scrollback_pill.take().is_some();
+        if let Some(wall) = &mut self.wall {
+            if wall.pointer_leave() {
+                changed = true;
+            }
+        }
+        self.apply_effects();
+        if changed {
+            self.redraw();
+        }
+    }
+
     fn pinch(&mut self, delta: f64, phase: TouchPhase) {
         let factor = pinch_zoom_factor(delta, phase);
         if let Some(wall) = &mut self.wall {
@@ -3120,6 +3133,7 @@ impl ApplicationHandler<Wake> for App {
                 }
                 self.move_cursor(x, y);
             }
+            WindowEvent::CursorLeft { .. } => self.cursor_left(),
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
                     if ui_pointer {

@@ -4826,6 +4826,32 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
+    /// Handle pointer leaving the window (`WindowEvent::CursorLeft`): clears passive
+    /// terminal, group-header, map-label, and hyperlink hover highlights and restores
+    /// `CursorIcon::Default` when no pointer drag is in flight. Returns `true` if any
+    /// hover state changed.
+    pub fn pointer_leave(&mut self) -> bool {
+        if self.pointer.busy() {
+            return false;
+        }
+        let had_hover = self.router.context.model.hovered_id().is_some()
+            || self.router.context.hovered_group_id.is_some()
+            || self.router.context.hovered_label_id.is_some()
+            || self.router.context.hovered_link.is_some()
+            || self.router.context.cursor != CursorIcon::Default;
+        if !had_hover {
+            return false;
+        }
+        self.router.context.model.set_hovered(None);
+        self.router.context.set_hovered_group(None);
+        self.router.context.set_hovered_label(None);
+        self.router.context.set_hovered_link(None);
+        self.router.context.set_cursor(CursorIcon::Default);
+        self.sync_pointer_flags();
+        self.router.context.model.notify_changed();
+        true
+    }
+
     /// Handle pointer cancellation (window blur, capture lost).
     pub fn pointer_cancel(&mut self, event: &PointerEvent) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
