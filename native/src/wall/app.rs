@@ -152,8 +152,8 @@ struct App {
     buttons: u8,
     /// The last left release: when and where (for double clicks).
     last_release: Option<(f64, Point)>,
-    /// The renderer keys a terminal's GPU buffers by a number.
-    render_ids: HashMap<String, u64>,
+    /// The renderer keys a terminal's GPU buffers by a monotonic number.
+    render_ids: RenderIds,
     start: Instant,
     last_tick: Instant,
     /// The wall said something is still moving: draw again without waiting.
@@ -195,6 +195,41 @@ struct App {
 struct WakeGate {
     pending: std::sync::atomic::AtomicBool,
     redraw_armed: std::sync::atomic::AtomicBool,
+}
+
+/// Maps terminal string ids to monotonic `u64` renderer keys so closed terminals can be
+/// freed from [`WallRenderer`] without ever colliding ids across spawn/close cycles.
+#[derive(Default)]
+struct RenderIds {
+    next: u64,
+    ids: HashMap<String, u64>,
+}
+
+impl RenderIds {
+    fn id_for(&mut self, id: &str) -> u64 {
+        if let Some(&existing) = self.ids.get(id) {
+            return existing;
+        }
+        self.next = self.next.saturating_add(1);
+        self.ids.insert(id.to_string(), self.next);
+        self.next
+    }
+
+    /// Forget `id` and free its cached GPU buffers in `renderer`, if present.
+    fn remove_from(&mut self, id: &str, renderer: Option<&mut WallRenderer>) -> bool {
+        let Some(rid) = self.ids.remove(id) else {
+            return false;
+        };
+        renderer.is_some_and(|r| r.remove_terminal(rid))
+    }
+
+    /// Keep only `live_ids`, freeing cached GPU buffers for terminals absent after reconnect.
+    fn retain_live(&mut self, live_ids: &[String], renderer: Option<&mut WallRenderer>) {
+        self.ids.retain(|id, _| live_ids.iter().any(|live| live == id));
+        if let Some(r) = renderer {
+            r.retain_terminals(|rid| self.ids.values().any(|&live_rid| live_rid == rid));
+        }
+    }
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -391,8 +426,7 @@ impl App {
     }
 
     fn render_id(&mut self, id: &str) -> u64 {
-        let next = self.render_ids.len() as u64 + 1;
-        *self.render_ids.entry(id.to_string()).or_insert(next)
+        self.render_ids.id_for(id)
     }
 
     #[cfg(feature = "egui-ui")]
@@ -1166,6 +1200,7 @@ impl App {
                 }
                 News::Ended { id } => {
                     wall.terminal_ended(&id);
+                    self.render_ids.remove_from(&id, self.gfx.as_mut().map(|g| &mut g.renderer));
                     heard = true;
                     ended_any = true;
                 }
@@ -1189,6 +1224,7 @@ impl App {
             if !live_ids.is_empty() {
                 wall.set_live_terminals(&live_ids);
             }
+            self.render_ids.retain_live(&live_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
             for id in &live_ids {
                 match sessions.adopt(id) {
                     Ok((cols, rows)) => {
@@ -1745,7 +1781,16 @@ impl App {
         use super::script::{button_label, keys_for_typed_text, ScriptCommand};
         match cmd {
             ScriptCommand::Where => match &mut self.wall {
-                Some(wall) => super::script::format_where(&wall.frame(), self.cursor),
+                Some(wall) => {
+                    let mut out = super::script::format_where(&wall.frame(), self.cursor);
+                    if let Some(g) = &self.gfx {
+                        out.push_str(&format!(
+                            "\nrenderer cached_terminals={}",
+                            g.renderer.cached_terminal_count()
+                        ));
+                    }
+                    out
+                }
                 None => "ERR: the wall is not open yet".to_string(),
             },
             ScriptCommand::Move { x, y } => {
@@ -2246,7 +2291,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         cursor: Point::new(0.0, 0.0),
         buttons: 0,
         last_release: None,
-        render_ids: HashMap::new(),
+        render_ids: RenderIds::default(),
         start: now,
         last_tick: now,
         animating: false,
@@ -2288,6 +2333,83 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
                 print!("{}", screen_text(s));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod render_id_tests {
+    use super::*;
+    use crate::wall::renderer::{WallFrame, WallStyle};
+
+    #[test]
+    fn render_ids_free_closed_and_reconnected_terminals_in_renderer() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+        let mut ids = RenderIds::default();
+        let cam = WallCamera::new(Vec2::ZERO, 20.0);
+        let vp = (320, 200);
+        let screen = Screen::new(40, 12);
+
+        let draw = |rid: u64, x: f32| TerminalDraw {
+            id: rid,
+            screen: &screen,
+            position: Vec2::new(x, 0.0),
+            z: 1.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+
+        assert_eq!(renderer.cached_terminal_count(), 0);
+
+        // Two live terminals populate the GPU cache.
+        let r1 = ids.id_for("t1");
+        let r2 = ids.id_for("t2");
+        assert_ne!(r1, r2);
+        let _ = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { terminals: &[draw(r1, 0.0), draw(r2, 50.0)], ..Default::default() },
+        );
+        assert_eq!(renderer.cached_terminal_count(), 2);
+
+        // Closing t1 (News::Ended) frees its GPU buffer and returns count to 1.
+        assert!(ids.remove_from("t1", Some(&mut renderer)));
+        assert_eq!(renderer.cached_terminal_count(), 1);
+        assert!(!ids.remove_from("t1", Some(&mut renderer)));
+
+        // Spawning t3 after t1 closed gets a fresh monotonic id (never collides with t2).
+        let r3 = ids.id_for("t3");
+        assert_ne!(r3, r2);
+        assert_ne!(r3, r1);
+        let _ = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { terminals: &[draw(r2, 0.0), draw(r3, 50.0)], ..Default::default() },
+        );
+        assert_eq!(renderer.cached_terminal_count(), 2);
+
+        // Reconnect pruning retains only terminals still alive in termd.
+        ids.retain_live(&["t3".to_string()], Some(&mut renderer));
+        assert_eq!(renderer.cached_terminal_count(), 1);
+        assert_eq!(ids.id_for("t3"), r3);
+
+        // Reconnect with zero live terminals returns cached count all the way to baseline 0.
+        ids.retain_live(&[], Some(&mut renderer));
+        assert_eq!(renderer.cached_terminal_count(), 0);
     }
 }
 
