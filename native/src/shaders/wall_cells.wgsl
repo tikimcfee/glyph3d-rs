@@ -524,6 +524,15 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
             cell_style = cell_style & (~STYLE_DIM);
         }
     }
+    var sprite_arg = glyph_arg;
+    if mode == 3u && sprite_arg < 255u && frame.target_is_srgb != 0u {
+        // Same sRGB-vs-linear blending rule for shade sprites (░ 25%, ▒ 50%, ▓ 75%,
+        // legacy half-shades): blending 25% coverage linearly on an *_Srgb target
+        // inflates ░ from ~58 to 109 and compresses the ░▒▓█ ramp into light grey.
+        let shade_bg = select(cell_bg, resolved_cursor_color().rgb, under_cursor);
+        fg_rgb = mix(shade_bg, fg_rgb, f32(sprite_arg) / 255.0);
+        sprite_arg = 255u;
+    }
     let fg_srgb = vec4<f32>(fg_rgb, fg_alpha);
 
     let visible_span_cols = min(span_cols, term.cols - col);
@@ -535,7 +544,7 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     out.curve_start = curve_start;
     out.curve_count = curve_count;
     out.mode = mode;
-    out.glyph_arg = glyph_arg;
+    out.glyph_arg = sprite_arg;
     out.style = cell_style;
     out.cell_info = vec4<f32>(
         quad_w / max(cell_size.x, 1e-6),
@@ -648,22 +657,31 @@ fn fs_ink(in: InkVsOut) -> @location(0) vec4<f32> {
     let greek = frame.greek_px > 0.0 && (1.0 / fw.y) < frame.greek_px;
 
     if in.mode == 1u {
-        // Bitmap colour emoji, centred as a square inside the cell quad so 2-cell
-        // emoji stay aspect-true while lines still span both columns.
-        let aspect_x = in.cell_info.w;
-        let local_x = in.glyph_uv.x * aspect_x - 0.5 * (aspect_x - 1.0);
-        if local_x >= 0.0 && local_x <= 1.0 && frame.emoji_cols > 0u && frame.emoji_rows > 0u {
-            let cell_f = vec2<f32>(frame.emoji_cell);
-            let dx_tex = j[0] * cell_f * vec2<f32>(aspect_x, -1.0);
-            let dy_tex = j[1] * cell_f * vec2<f32>(aspect_x, -1.0);
+        // Bitmap colour emoji, centred vertically and horizontally at its native
+        // bitmap aspect ratio (136x128 = 1.0625) with ~8% top/bottom breathing room
+        // (matching `EmojiRasterWorker.js`'s 0.82*cellPx centred rasterization so
+        // emoji stay aspect-true and never crash into adjacent rows or cell fills).
+        let cell_f = vec2<f32>(frame.emoji_cell);
+        let tex_aspect = cell_f.x / max(cell_f.y, 1.0);
+        let emoji_h = 0.84;
+        let emoji_w = emoji_h * tex_aspect;
+        let quad_aspect = in.cell_info.w;
+        let local_x = (in.glyph_uv.x * quad_aspect - 0.5 * (quad_aspect - emoji_w)) / emoji_w;
+        let local_y = (in.glyph_uv.y - 0.5 * (1.0 - emoji_h)) / emoji_h;
+        if local_x >= 0.0 && local_x <= 1.0 && local_y >= 0.0 && local_y <= 1.0
+            && frame.emoji_cols > 0u && frame.emoji_rows > 0u
+        {
+            let uv_scale = vec2<f32>(quad_aspect / emoji_w, -1.0 / emoji_h);
+            let dx_tex = j[0] * cell_f * uv_scale;
+            let dy_tex = j[1] * cell_f * uv_scale;
             // Half-texel inset scaled to the sampled mip level (capped at mip 3 = 8x)
             // prevents bilinear/trilinear neighbor-cell bleed in the sparse emoji grid.
             let mip_scale = clamp(max(length(dx_tex), length(dy_tex)), 1.0, 8.0);
             let inset = vec2<f32>(0.5 * mip_scale);
             let span = max(cell_f - 2.0 * inset, vec2<f32>(1.0));
-            let emoji_uv = (in.emoji_cell_xy + inset + vec2<f32>(local_x, 1.0 - in.glyph_uv.y) * span)
+            let emoji_uv = (in.emoji_cell_xy + inset + vec2<f32>(local_x, 1.0 - local_y) * span)
                 / frame.emoji_layer;
-            let grad_scale = (span / frame.emoji_layer) * vec2<f32>(aspect_x, -1.0);
+            let grad_scale = (span / frame.emoji_layer) * uv_scale;
             let texel = textureSampleGrad(
                 emoji_tex,
                 emoji_samp,

@@ -189,6 +189,30 @@ pub struct Modes {
     pub synchronized_output: bool,
 }
 
+/// One contiguous run of columns on a single row carrying an `OSC 8` hyperlink.
+///
+/// `start_col..end_col` is half-open in cell columns (`0..=cols`, `start_col < end_col`),
+/// including any trailing wide-character half belonging to a linked cell.
+/// `link_id` is a 0-based index into [`Screen::hyperlinks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub link_id: u32,
+}
+
+/// Resolved `OSC 8` hyperlink under a cell, joined across soft-wrapped rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenLink<'a> {
+    pub uri: &'a str,
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    /// End-exclusive column on `end_row` (`1..=cols`).
+    pub end_col: u16,
+}
+
 /// A terminal's visible screen.
 ///
 /// Rows are top to bottom, cells left to right, `cols * rows` of them.
@@ -213,6 +237,10 @@ pub struct Screen {
     pub title: String,
     /// The texts `Cell::content` refers to at `CLUSTER_BASE + index`.
     pub clusters: Vec<String>,
+    /// Deduplicated `OSC 8` hyperlink URIs referenced by [`Screen::link_spans`].
+    pub hyperlinks: Vec<String>,
+    /// Sorted by `(row, start_col)`, non-overlapping runs of cells carrying an `OSC 8` hyperlink.
+    pub link_spans: Vec<LinkSpan>,
     /// The terminal's own colours: what an unstyled cell draws in, and the
     /// panel behind every cell with no fill.
     pub default_fg: u32,
@@ -242,6 +270,8 @@ impl Screen {
         self.row_gen.resize(rows as usize, self.generation);
         self.wrapped.clear();
         self.wrapped.resize(rows as usize, false);
+        self.hyperlinks.clear();
+        self.link_spans.clear();
     }
 
     /// Row `r`'s cells.
@@ -280,11 +310,144 @@ impl Screen {
             }
         }
     }
+
+    /// Return the single-row [`LinkSpan`] covering `(col, row)`, if any.
+    pub fn hyperlink_span_at(&self, col: u16, row: u16) -> Option<LinkSpan> {
+        if col >= self.cols || row >= self.rows || self.link_spans.is_empty() {
+            return None;
+        }
+        let idx = self.link_spans.partition_point(|s| (s.row, s.start_col) <= (row, col));
+        if idx == 0 {
+            return None;
+        }
+        let cand = self.link_spans[idx - 1];
+        (cand.row == row && col >= cand.start_col && col < cand.end_col).then_some(cand)
+    }
+
+    /// Return the `OSC 8` hyperlink URI at `(col, row)`, if any.
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<&str> {
+        let span = self.hyperlink_span_at(col, row)?;
+        self.hyperlinks.get(span.link_id as usize).map(String::as_str)
+    }
+
+    /// Return the `OSC 8` hyperlink at `(col, row)` together with its full
+    /// contiguous span joined across soft-wrapped rows (`Screen::wrapped`).
+    pub fn hyperlink_range_at(&self, col: u16, row: u16) -> Option<ScreenLink<'_>> {
+        if col >= self.cols || row >= self.rows || self.link_spans.is_empty() {
+            return None;
+        }
+        let pos = self.link_spans.partition_point(|s| (s.row, s.start_col) <= (row, col));
+        if pos == 0 {
+            return None;
+        }
+        let hit_idx = pos - 1;
+        let hit = self.link_spans[hit_idx];
+        if hit.row != row || col < hit.start_col || col >= hit.end_col {
+            return None;
+        }
+        let uri = self.hyperlinks.get(hit.link_id as usize)?.as_str();
+        let target_id = hit.link_id;
+
+        let mut lo_idx = hit_idx;
+        while lo_idx > 0 && self.link_spans[lo_idx].start_col == 0 && self.link_spans[lo_idx].row > 0 {
+            let prev_row = self.link_spans[lo_idx].row - 1;
+            let prev = self.link_spans[lo_idx - 1];
+            if self.wrapped.get(usize::from(prev_row)).copied().unwrap_or(false)
+                && prev.row == prev_row
+                && prev.end_col == self.cols
+                && prev.link_id == target_id
+            {
+                lo_idx -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut hi_idx = hit_idx;
+        while hi_idx + 1 < self.link_spans.len()
+            && self.link_spans[hi_idx].end_col == self.cols
+            && usize::from(self.link_spans[hi_idx].row) + 1 < usize::from(self.rows)
+        {
+            let cur_row = self.link_spans[hi_idx].row;
+            let next = self.link_spans[hi_idx + 1];
+            if self.wrapped.get(usize::from(cur_row)).copied().unwrap_or(false)
+                && next.row == cur_row + 1
+                && next.start_col == 0
+                && next.link_id == target_id
+            {
+                hi_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        let first = self.link_spans[lo_idx];
+        let last = self.link_spans[hi_idx];
+        Some(ScreenLink {
+            uri,
+            start_row: first.row,
+            start_col: first.start_col,
+            end_row: last.row,
+            end_col: last.end_col,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_stays_20_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 20);
+    }
+
+    #[test]
+    fn hyperlink_lookup_single_and_soft_wrapped_spans() {
+        let mut s = Screen::new(10, 4);
+        s.hyperlinks.push("https://example.org/wrapped".into());
+        s.hyperlinks.push("https://example.org/second".into());
+        // Row 0 wraps onto row 1; row 1 does NOT wrap onto row 2.
+        s.wrapped[0] = true;
+        s.link_spans = vec![
+            LinkSpan { row: 0, start_col: 4, end_col: 10, link_id: 0 },
+            LinkSpan { row: 1, start_col: 0, end_col: 6, link_id: 0 },
+            LinkSpan { row: 2, start_col: 0, end_col: 5, link_id: 0 },
+            LinkSpan { row: 2, start_col: 6, end_col: 10, link_id: 1 },
+        ];
+
+        assert_eq!(s.hyperlink_at(3, 0), None);
+        assert_eq!(s.hyperlink_at(4, 0), Some("https://example.org/wrapped"));
+        assert_eq!(s.hyperlink_at(2, 1), Some("https://example.org/wrapped"));
+        assert_eq!(s.hyperlink_at(6, 1), None);
+        assert_eq!(s.hyperlink_at(7, 2), Some("https://example.org/second"));
+
+        let expected_wrapped = Some(ScreenLink {
+            uri: "https://example.org/wrapped",
+            start_row: 0,
+            start_col: 4,
+            end_row: 1,
+            end_col: 6,
+        });
+        assert_eq!(s.hyperlink_range_at(5, 0), expected_wrapped);
+        assert_eq!(s.hyperlink_range_at(2, 1), expected_wrapped);
+
+        // Hard break between row 1 and row 2 must NOT merge even for the same link_id.
+        assert_eq!(
+            s.hyperlink_range_at(1, 2),
+            Some(ScreenLink {
+                uri: "https://example.org/wrapped",
+                start_row: 2,
+                start_col: 0,
+                end_row: 2,
+                end_col: 5,
+            })
+        );
+
+        s.resize(10, 4);
+        assert!(s.hyperlinks.is_empty());
+        assert!(s.link_spans.is_empty());
+    }
 
     #[test]
     fn a_screen_indexes_its_rows_and_stamps_what_changed() {
