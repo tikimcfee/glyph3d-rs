@@ -368,6 +368,13 @@ impl Panels {
             self.last_sidebar_float = None;
         }
 
+        // Spread simultaneous unplaced (`float: None`) right-anchored floating panels
+        // (`status`, `settings`, `help`) side-by-side (or cascaded on narrow viewports)
+        // so opening two at once never stacks one panel directly under another, while
+        // keeping the exact JS `{ right: 12, top: 46 }` spot when opened alone.
+        let (default_status_float, default_settings_float, default_help_float) =
+            compute_default_float_spots(viewport, described, &self.status);
+
         // 2. `termd` status chip, window & trouble notice (`wall.status`).
         if chip_pos.is_some() || status_window_or_notice || self.status_was_active {
             let wall_names: BTreeMap<String, String> = snapshot
@@ -379,7 +386,10 @@ impl Panels {
                         .collect()
                 })
                 .unwrap_or_default();
-            let st = &described.panels.status_window;
+            let mut st = described.panels.status_window.clone();
+            if st.float.is_none() {
+                st.float = default_status_float;
+            }
             let input = status::StatusInput {
                 placement: st.clone(),
                 status: wall.termd().clone(),
@@ -408,7 +418,10 @@ impl Panels {
         // 3. Settings panel (`wall.settings`).
         let settings_open = described.panels.settings_panel.open;
         if settings_open || self.settings_was_open {
-            let sp = &described.panels.settings_panel;
+            let mut sp = described.panels.settings_panel.clone();
+            if sp.float.is_none() {
+                sp.float = default_settings_float;
+            }
             let input = settings::SettingsInput {
                 placement: sp.clone(),
                 config: wall.config().clone(),
@@ -438,7 +451,7 @@ impl Panels {
             let input = help::HelpPanelInput {
                 open: help_open,
                 side: hp.side,
-                float_pos: hp.float,
+                float_pos: hp.float.or(default_help_float),
                 dock_rect: help::HelpPanelInput::dock_rect_for(
                     hp.side,
                     &described.panels.dock,
@@ -635,6 +648,168 @@ impl Panels {
         false
     }
 
+    /// Format screen-space panel & chrome geometry lines appended to `app.where`.
+    pub fn format_where(&self, wall: &Wall, described: &WallFrame) -> String {
+        let mut lines = Vec::new();
+        if let Some(bar_rect) = self.topbar.last_bar_rect {
+            let btn = |k: &str| fmt_opt_rect(self.topbar.button_rects.get(k).copied());
+            lines.push(format!(
+                "topbar rect={} spawn={} fit={} find={} sidebar={} status={} settings={} help={} chip={}",
+                fmt_rect(bar_rect),
+                btn("spawn"),
+                btn("fit"),
+                btn("find"),
+                btn("sidebar"),
+                btn("status"),
+                btn("settings"),
+                btn("help"),
+                fmt_opt_rect(self.topbar.last_chip_rect),
+            ));
+        }
+
+        let bar_target_id: Option<&str> = self.bar_buttons.hold_target().or_else(|| {
+            (!self.wall_dragging)
+                .then(|| {
+                    described
+                        .title_bars
+                        .iter()
+                        .find(|b| b.hovered)
+                        .map(|b| b.terminal_id.as_str())
+                })
+                .flatten()
+        });
+        if let Some(tid) = bar_target_id {
+            if let Some(bar) = described.title_bars.iter().find(|b| b.terminal_id == tid) {
+                let sbox =
+                    described
+                        .camera
+                        .to_screen_box(bar.rect, described.viewport.w, described.viewport.h);
+                let bar_egui = egui::Rect::from_min_max(
+                    egui::pos2(sbox.left as f32, sbox.top as f32),
+                    egui::pos2(sbox.right as f32, sbox.bottom as f32),
+                );
+                if let Some((cluster, [agent, hide, close], _)) =
+                    bar_buttons::button_cluster_rects(bar_egui, wall.config().bar_buttons_min_px as f32)
+                {
+                    lines.push(format!(
+                        "bar_buttons terminal={tid} rect={} agent={} hide={} close={} holding={}",
+                        fmt_rect(cluster),
+                        fmt_rect(agent),
+                        fmt_rect(hide),
+                        fmt_rect(close),
+                        self.bar_buttons.is_holding(),
+                    ));
+                }
+            }
+        }
+
+        let pal_open = described.palette_open || self.palette.open;
+        lines.push(format!(
+            "palette open={} query={:?} active={} items={} rect={}",
+            pal_open,
+            self.palette.palette.query,
+            self.palette.palette.selected,
+            self.palette.item_count,
+            fmt_opt_rect(self.palette.last_rect),
+        ));
+
+        let sb = &described.panels.sidebar;
+        let sb_collapsed = if sb.collapsed.is_empty() {
+            "none".to_string()
+        } else {
+            sb.collapsed.join(",")
+        };
+        let mut sb_folds: Vec<String> = self
+            .sidebar
+            .group_fold_rects
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
+        sb_folds.sort();
+        let mut sb_terms: Vec<String> = self
+            .sidebar
+            .term_row_rects
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
+        sb_terms.sort();
+        lines.push(format!(
+            "panel sidebar open={} side={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} folds={} terms={}",
+            sb.open,
+            dock_side_name(sb.side),
+            sb_collapsed,
+            fmt_opt_rect(self.sidebar.last_rect),
+            fmt_opt_rect(self.sidebar.header_drag_rect),
+            fmt_opt_rect(self.sidebar.dock_btn_rects[0]),
+            fmt_opt_rect(self.sidebar.dock_btn_rects[1]),
+            fmt_opt_rect(self.sidebar.dock_btn_rects[2]),
+            fmt_opt_rect(self.sidebar.dock_btn_rects[3]),
+            if sb_folds.is_empty() { "none".to_string() } else { sb_folds.join(";") },
+            if sb_terms.is_empty() { "none".to_string() } else { sb_terms.join(";") },
+        ));
+
+        let st = &described.panels.status_window;
+        let st_rows = if self.status.shown_row_ids.is_empty() {
+            "none".to_string()
+        } else {
+            self.status.shown_row_ids.join(",")
+        };
+        lines.push(format!(
+            "panel status open={} side={} rows={} rect={} header={}",
+            st.open,
+            dock_side_name(st.side),
+            st_rows,
+            fmt_opt_rect(self.status.last_rect),
+            fmt_opt_rect(self.status.header_drag_rect),
+        ));
+
+        let sp = &described.panels.settings_panel;
+        let mut sp_ctrls: Vec<String> = self
+            .settings
+            .control_rects
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
+        sp_ctrls.sort();
+        lines.push(format!(
+            "panel settings open={} side={} query={:?} items={} rect={} header={} controls={}",
+            sp.open,
+            dock_side_name(sp.side),
+            self.settings.query,
+            self.settings.visible_count,
+            fmt_opt_rect(self.settings.last_rect),
+            fmt_opt_rect(self.settings.header_drag_rect),
+            if sp_ctrls.is_empty() { "none".to_string() } else { sp_ctrls.join(";") },
+        ));
+
+        let hp = &described.panels.help_panel;
+        lines.push(format!(
+            "panel help open={} side={} query={:?} rows={} rect={} header={}",
+            hp.open,
+            dock_side_name(hp.side),
+            self.help.query,
+            self.help.shown_row_count,
+            fmt_opt_rect(self.help.last_rect()),
+            fmt_opt_rect(self.help.header_drag_rect),
+        ));
+
+        let mut menu_items: Vec<String> = self
+            .context_menu
+            .item_rects
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
+        menu_items.sort();
+        lines.push(format!(
+            "context_menu open={} rect={} items={}",
+            described.menu.is_some(),
+            fmt_opt_rect(self.context_menu.last_rect()),
+            if menu_items.is_empty() { "none".to_string() } else { menu_items.join(";") },
+        ));
+
+        lines.join("\n")
+    }
+
     fn help_sections_for(&mut self, platform: Platform, wall: &Wall) -> Vec<HelpGroup> {
         let zoom_keys = wall.config().zoom_keys.clone();
         if let Some((cached_plat, cached_zoom, sections)) = &self.cached_help {
@@ -655,6 +830,77 @@ fn epoch_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn dock_side_name(side: DockSide) -> &'static str {
+    match side {
+        DockSide::Left => "left",
+        DockSide::Right => "right",
+        DockSide::Float => "float",
+    }
+}
+
+fn fmt_rect(r: egui::Rect) -> String {
+    format!("{:.2},{:.2},{:.2},{:.2}", r.min.x, r.min.y, r.max.x, r.max.y)
+}
+
+fn fmt_opt_rect(r: Option<egui::Rect>) -> String {
+    r.map_or_else(|| "none".to_string(), fmt_rect)
+}
+
+/// Default floating origins for simultaneously open unplaced (`float: None`) right-anchored
+/// panels (`status`, `settings`, `help`). When only one is open and no panel is docked on the
+/// right edge, returns `None` so it uses its exact JS `{ right: 12, top: 46 }` spot; when two
+/// or more are open together (or a right dock insets the edge), places them side-by-side from
+/// `viewport.right() - inset.right` (cascading diagonally only on narrow viewports).
+fn compute_default_float_spots(
+    viewport: egui::Rect,
+    described: &WallFrame,
+    status_state: &status::StatusState,
+) -> (Option<Point>, Option<Point>, Option<Point>) {
+    let st_unplaced = described.panels.status_window.open
+        && described.panels.status_window.side == DockSide::Float
+        && described.panels.status_window.float.is_none();
+    let sp_unplaced = described.panels.settings_panel.open
+        && described.panels.settings_panel.side == DockSide::Float
+        && described.panels.settings_panel.float.is_none();
+    let hp_unplaced = described.panels.help_panel.open
+        && described.panels.help_panel.side == DockSide::Float
+        && described.panels.help_panel.float.is_none();
+
+    let count = usize::from(st_unplaced) + usize::from(sp_unplaced) + usize::from(hp_unplaced);
+    let inset_right = (described.panels.dock.inset.right as f32).max(12.0);
+    if count == 0 || (count == 1 && inset_right <= 12.5) {
+        return (None, None, None);
+    }
+
+    let max_w = (viewport.width() - 32.0).max(140.0);
+    let st_w = status_state.effective_float_width((viewport.width() - 32.0).max(160.0));
+    let sp_w = (DOCK_WIDTHS.settings as f32).min(max_w);
+    let hp_w = (DOCK_WIDTHS.help as f32).min(max_w);
+
+    let mut cursor_right = viewport.right() - inset_right;
+    let base_y = viewport.top() + 46.0;
+    let mut slot = 0usize;
+    let mut next_spot = |w: f32| -> Point {
+        let candidate_x = cursor_right - w;
+        let (x, y) = if slot == 0 || candidate_x >= viewport.left() + 12.0 {
+            let x = candidate_x.max(viewport.left() + 8.0);
+            cursor_right = x - 12.0;
+            (x, base_y)
+        } else {
+            let stagger = slot as f32 * 36.0;
+            let x = (viewport.right() - inset_right - w - stagger).max(viewport.left() + 8.0);
+            (x, base_y + stagger)
+        };
+        slot += 1;
+        Point::new(f64::from(x), f64::from(y))
+    };
+
+    let st_spot = st_unplaced.then(|| next_spot(st_w));
+    let sp_spot = sp_unplaced.then(|| next_spot(sp_w));
+    let hp_spot = hp_unplaced.then(|| next_spot(hp_w));
+    (st_spot, sp_spot, hp_spot)
 }
 
 fn measure_termd_chip_width(ctx: &egui::Context, status: &TermdStatus) -> f32 {

@@ -79,6 +79,7 @@ pub struct WallOptions {
 }
 
 /// Where the wall's terminals come from.
+#[expect(clippy::large_enum_variant, reason = "one Terminals instance lives on App for the lifetime of the window")]
 enum Terminals {
     Live(Sessions),
     /// Screens that never change (the test pattern), by id.
@@ -780,6 +781,7 @@ impl App {
         }
         if ran {
             self.apply_effects();
+            self.draw(false);
             self.redraw();
         }
     }
@@ -927,7 +929,13 @@ impl App {
         };
         let need_offscreen = self.pending_shot.is_some()
             || (self.exit_after == Some(self.frames + 1) && std::env::var_os("GLYPH_WALL_SHOT").is_some());
-        if frame.is_none() && !need_offscreen {
+        #[cfg(feature = "egui-ui")]
+        let need_ui = !to_surface
+            || g.ui.has_pending_input()
+            || self.ui_repaint_at.is_some_and(|d| now >= d);
+        #[cfg(not(feature = "egui-ui"))]
+        let need_ui = false;
+        if frame.is_none() && !need_offscreen && !need_ui {
             return;
         }
         let sf = g.window.scale_factor() as f32;
@@ -936,44 +944,50 @@ impl App {
         let camera = WallCamera::new(Vec2::new(described.camera.x as f32, described.camera.y as f32), described.camera.zoom as f32 * sf);
         let viewport = (g.config.width, g.config.height);
 
-        let mut draws: Vec<TerminalDraw<'_>> = Vec::with_capacity(described.terminals.len());
-        for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
-            let Some(screen) = terms.screen(&t.id) else { continue };
-            draws.push(TerminalDraw {
-                id: *render_id,
-                screen,
-                position: v2(t.cell_origin),
-                z: t.z as f32,
-                scale: g.cell_scale * t.scale as f32,
-                focused: t.focused,
-                panel_opacity: None,
-                border_color: t.hovered.then_some(term_cells::rgb(0x5a, 0x6b, 0x86)).filter(|_| !t.focused),
-                selection: t.text_selection.as_ref().map(|sel| {
-                    let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
-                        .then(|| css_rgb_u32(&sel.foreground));
-                    CellSelection {
-                        start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
-                        start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
-                        end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
-                        end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
-                        block: sel.block,
-                        background: css_rgb_u32(&sel.background),
-                        foreground: fg,
-                    }
-                }),
-            });
+        let build_scene = frame.is_some() || need_offscreen;
+        let mut draws: Vec<TerminalDraw<'_>> = Vec::new();
+        if build_scene {
+            draws.reserve(described.terminals.len());
+            for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
+                let Some(screen) = terms.screen(&t.id) else { continue };
+                draws.push(TerminalDraw {
+                    id: *render_id,
+                    screen,
+                    position: v2(t.cell_origin),
+                    z: t.z as f32,
+                    scale: g.cell_scale * t.scale as f32,
+                    focused: t.focused,
+                    panel_opacity: None,
+                    border_color: t.hovered.then_some(term_cells::rgb(0x5a, 0x6b, 0x86)).filter(|_| !t.focused),
+                    selection: t.text_selection.as_ref().map(|sel| {
+                        let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
+                            .then(|| css_rgb_u32(&sel.foreground));
+                        CellSelection {
+                            start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
+                            start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
+                            end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
+                            end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
+                            block: sel.block,
+                            background: css_rgb_u32(&sel.background),
+                            foreground: fg,
+                        }
+                    }),
+                });
+            }
         }
 
         let mut shapes: Vec<Shape> = Vec::new();
         let mut labels: Vec<Label<'static>> = Vec::new();
-        let paper = {
+        let paper = build_scene.then(|| {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
             super::describe::describe_frame_chrome(&described, &camera, viewport, sf, &mut fonts, &mut shapes, &mut labels)
-        };
-        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
-        self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
+        });
+        let wall_frame = WallFrame { paper: paper.as_ref(), terminals: &draws, shapes: &shapes, labels: &labels };
+        if build_scene {
+            self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
+        }
         let view = frame.as_ref().map(|f| f.texture.create_view(&Default::default()));
         let mut encoder = view.as_ref().map(|_| self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") }));
         let stats = match (&view, &mut encoder) {
@@ -991,6 +1005,8 @@ impl App {
         let mut panel_verbs: Vec<String> = Vec::new();
         #[cfg(feature = "egui-ui")]
         let mut panel_egui_keys = false;
+        #[cfg(feature = "egui-ui")]
+        let mut ui_painted_on_gpu = false;
         #[cfg(feature = "egui-ui")]
         let mut ui_painted = if self.hud_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
             let hud_terms: Vec<HudTerminalInfo<'_>> = described
@@ -1017,10 +1033,11 @@ impl App {
             panel_egui_keys = ui_frame.wants_keyboard;
             if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
                 g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
+                ui_painted_on_gpu = true;
             }
             match ui_frame.repaint_after {
                 Some(delay) if delay.is_zero() => {
-                    self.ui_repaint_at = None;
+                    self.ui_repaint_at = Some(Instant::now() + std::time::Duration::from_millis(16));
                     g.window.request_redraw();
                 }
                 Some(delay) => self.ui_repaint_at = Some(Instant::now() + delay),
@@ -1054,6 +1071,7 @@ impl App {
                     #[cfg(feature = "egui-ui")]
                     if let Some(painted) = ui_painted.as_mut() {
                         g.ui.paint(&self.ctx.device, &self.ctx.queue, enc, color_view, painted);
+                        ui_painted_on_gpu = true;
                     }
                     #[cfg(not(feature = "egui-ui"))]
                     let _ = (enc, color_view);
@@ -1076,6 +1094,12 @@ impl App {
             }
         }
         #[cfg(feature = "egui-ui")]
+        if !ui_painted_on_gpu {
+            if let Some(painted) = ui_painted.as_mut() {
+                g.ui.sync_textures_only(&self.ctx.device, &self.ctx.queue, painted);
+            }
+        }
+        #[cfg(feature = "egui-ui")]
         {
             let mut changed = false;
             let mut status_opened = false;
@@ -1095,9 +1119,11 @@ impl App {
             }
             if status_opened {
                 self.refresh_termd_status();
+                changed = true;
             }
             if changed {
                 self.apply_effects();
+                self.redraw();
             }
         }
         self.frames += 1;
@@ -1211,108 +1237,281 @@ impl App {
         }
     }
 
+    #[cfg(feature = "egui-ui")]
+    fn script_pointer_goes_to_ui(&self) -> bool {
+        if self.buttons != 0 {
+            return false;
+        }
+        self.gfx.as_ref().is_some_and(|g| {
+            pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+                == PointerTarget::Ui
+        })
+    }
+
+    fn script_move(&mut self, x: f64, y: f64, run_ui_pass: bool) {
+        self.cursor = Point::new(x, y);
+        #[cfg(feature = "egui-ui")]
+        let ui_pointer = self.script_pointer_goes_to_ui();
+        #[cfg(not(feature = "egui-ui"))]
+        let ui_pointer = false;
+        #[cfg(feature = "egui-ui")]
+        if let Some(g) = &mut self.gfx {
+            g.ui.push_script_pointer_moved(egui::pos2(x as f32, y as f32));
+        }
+        if !ui_pointer {
+            self.move_cursor(x, y);
+        }
+        if run_ui_pass {
+            self.draw(false);
+        }
+    }
+
+    fn script_down(&mut self, button: MouseButton, mods: Option<ModifiersState>) {
+        let prev = self.modifiers;
+        if let Some(m) = mods {
+            self.modifiers = m;
+        }
+        #[cfg(feature = "egui-ui")]
+        let ui_pointer = self.script_pointer_goes_to_ui();
+        #[cfg(not(feature = "egui-ui"))]
+        let ui_pointer = false;
+        #[cfg(feature = "egui-ui")]
+        if let (Some(g), Some(eb)) = (&mut self.gfx, super::ui::winit_button_to_egui(button)) {
+            let emods = super::ui::winit_mods_to_egui(self.modifiers);
+            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
+            g.ui.push_script_pointer_moved(pos);
+            g.ui.push_script_pointer_button(pos, eb, true, emods);
+        }
+        if !ui_pointer {
+            self.mouse(ElementState::Pressed, button);
+        }
+        self.draw(false);
+        if mods.is_some() {
+            self.modifiers = prev;
+            #[cfg(feature = "egui-ui")]
+            if let Some(g) = &mut self.gfx {
+                g.ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+            }
+        }
+    }
+
+    fn script_up(&mut self, button: MouseButton, mods: Option<ModifiersState>) {
+        let prev = self.modifiers;
+        if let Some(m) = mods {
+            self.modifiers = m;
+        }
+        #[cfg(feature = "egui-ui")]
+        if let (Some(g), Some(eb)) = (&mut self.gfx, super::ui::winit_button_to_egui(button)) {
+            let emods = super::ui::winit_mods_to_egui(self.modifiers);
+            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
+            g.ui.push_script_pointer_button(pos, eb, false, emods);
+        }
+        if button_of(button).is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0) {
+            self.mouse(ElementState::Released, button);
+        }
+        self.draw(false);
+        if mods.is_some() {
+            self.modifiers = prev;
+            #[cfg(feature = "egui-ui")]
+            if let Some(g) = &mut self.gfx {
+                g.ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+            }
+        }
+    }
+
+    fn script_key(&mut self, k: &super::script::ScriptKey) {
+        let prev = self.modifiers;
+        self.modifiers = k.mods;
+        #[cfg(feature = "egui-ui")]
+        if self.modifiers.super_key()
+            && !self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && k.physical == PhysicalKey::Code(KeyCode::KeyQ)
+        {
+            self.quit = true;
+            self.modifiers = prev;
+            return;
+        }
+        #[cfg(feature = "egui-ui")]
+        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+            || self
+                .gfx
+                .as_ref()
+                .is_some_and(|g| g.ui.is_active() && g.ui.context().egui_wants_keyboard_input());
+        #[cfg(not(feature = "egui-ui"))]
+        let panels_want_keys = false;
+
+        #[cfg(feature = "egui-ui")]
+        if !panels_want_keys && k.physical == PhysicalKey::Code(KeyCode::F1) {
+            self.hud_open = !self.hud_open;
+            self.draw(false);
+            self.modifiers = prev;
+            return;
+        }
+
+        if panels_want_keys {
+            #[cfg(feature = "egui-ui")]
+            if let Some(g) = &mut self.gfx {
+                let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                g.ui.push_script_key(ekey, true, emods, k.text.as_deref());
+            }
+            self.draw(false);
+            #[cfg(feature = "egui-ui")]
+            if let Some(g) = &mut self.gfx {
+                let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                g.ui.push_script_key(ekey, false, emods, None);
+            }
+            self.draw(false);
+        } else {
+            let down = super::keys::key_from_parts(
+                k.physical,
+                &k.logical,
+                k.text.as_deref(),
+                ElementState::Pressed,
+                false,
+                self.modifiers,
+            );
+            let up = super::keys::key_from_parts(
+                k.physical,
+                &k.logical,
+                None,
+                ElementState::Released,
+                false,
+                self.modifiers,
+            );
+            self.key_input(down);
+            self.key_input(up);
+            self.draw(false);
+        }
+        self.modifiers = prev;
+        #[cfg(feature = "egui-ui")]
+        if let Some(g) = &mut self.gfx {
+            g.ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+        }
+    }
+
     fn run_script(&mut self, cmd: super::script::ScriptCommand) -> String {
         use super::script::{button_label, keys_for_typed_text, ScriptCommand};
         match cmd {
-            ScriptCommand::Where => match &mut self.wall {
-                Some(wall) => super::script::format_where(&wall.frame(), self.cursor),
-                None => "ERR: the wall is not open yet".to_string(),
-            },
+            ScriptCommand::Where => {
+                self.draw(false);
+                match &mut self.wall {
+                    Some(wall) => {
+                        let described = wall.frame();
+                        let mut out = super::script::format_where(&described, self.cursor);
+                        out.push_str(&format!(
+                            "\npaper grid_show={} grid_minor={}",
+                            described.paper.grid_show, described.paper.grid.grid_minor
+                        ));
+                        #[cfg(feature = "egui-ui")]
+                        {
+                            let panel_lines = self.panels.format_where(wall, &described);
+                            if !panel_lines.is_empty() {
+                                out.push('\n');
+                                out.push_str(&panel_lines);
+                            }
+                        }
+                        out
+                    }
+                    None => "ERR: the wall is not open yet".to_string(),
+                }
+            }
             ScriptCommand::Move { x, y } => {
-                self.move_cursor(x, y);
+                self.script_move(x, y, true);
                 format!("OK: moved to ({x:.2}, {y:.2})")
             }
             ScriptCommand::Down { button, mods } => {
-                let prev = self.modifiers;
-                if let Some(m) = mods {
-                    self.modifiers = m;
-                }
-                self.mouse(ElementState::Pressed, button);
-                if mods.is_some() {
-                    self.modifiers = prev;
-                }
+                self.script_down(button, mods);
                 format!("OK: down {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
             }
             ScriptCommand::Up { button, mods } => {
-                let prev = self.modifiers;
-                if let Some(m) = mods {
-                    self.modifiers = m;
-                }
-                self.mouse(ElementState::Released, button);
-                if mods.is_some() {
-                    self.modifiers = prev;
-                }
+                self.script_up(button, mods);
                 format!("OK: up {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
             }
             ScriptCommand::Click { x, y, button, mods } => {
-                let prev = self.modifiers;
-                self.modifiers = mods;
                 self.last_release = None;
-                self.move_cursor(x, y);
-                self.mouse(ElementState::Pressed, button);
-                self.mouse(ElementState::Released, button);
-                self.modifiers = prev;
+                self.script_move(x, y, true);
+                self.script_down(button, Some(mods));
+                self.script_up(button, Some(mods));
                 format!("OK: clicked {} at ({x:.2}, {y:.2})", button_label(button))
             }
             ScriptCommand::DblClick { x, y } => {
                 self.last_release = None;
-                self.move_cursor(x, y);
-                self.mouse(ElementState::Pressed, MouseButton::Left);
-                self.mouse(ElementState::Released, MouseButton::Left);
-                self.mouse(ElementState::Pressed, MouseButton::Left);
-                self.mouse(ElementState::Released, MouseButton::Left);
+                self.script_move(x, y, true);
+                self.script_down(MouseButton::Left, None);
+                self.script_up(MouseButton::Left, None);
+                self.script_down(MouseButton::Left, None);
+                self.script_up(MouseButton::Left, None);
                 format!("OK: dblclick at ({x:.2}, {y:.2})")
             }
             ScriptCommand::Drag { x0, y0, x1, y1, steps, button, mods } => {
                 let prev = self.modifiers;
                 self.modifiers = mods;
                 self.last_release = None;
-                self.move_cursor(x0, y0);
-                self.mouse(ElementState::Pressed, button);
+                self.script_move(x0, y0, true);
+                self.script_down(button, Some(mods));
+                self.modifiers = mods;
+                let wall_gesture = self.buttons != 0;
                 for i in 1..=steps {
                     let t = i as f64 / steps as f64;
-                    self.move_cursor(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+                    self.script_move(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, !wall_gesture);
                 }
-                self.mouse(ElementState::Released, button);
+                self.script_up(button, Some(mods));
                 self.modifiers = prev;
                 format!("OK: dragged {} ({x0:.2}, {y0:.2}) -> ({x1:.2}, {y1:.2}) in {steps} steps", button_label(button))
             }
             ScriptCommand::Wheel { x, y, dx, dy, mods } => {
                 let prev = self.modifiers;
                 self.modifiers = mods;
-                self.move_cursor(x, y);
-                let sf = self.scale_factor();
-                self.wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf)));
+                self.script_move(x, y, true);
+                #[cfg(feature = "egui-ui")]
+                let ui_pointer = self.script_pointer_goes_to_ui();
+                #[cfg(not(feature = "egui-ui"))]
+                let ui_pointer = false;
+                #[cfg(feature = "egui-ui")]
+                if let Some(g) = &mut self.gfx {
+                    let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                    g.ui.push_script_wheel(
+                        egui::pos2(x as f32, y as f32),
+                        egui::vec2(dx as f32, dy as f32),
+                        emods,
+                    );
+                }
+                if !ui_pointer {
+                    let sf = self.scale_factor();
+                    self.wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf)));
+                }
+                self.draw(false);
                 self.modifiers = prev;
+                #[cfg(feature = "egui-ui")]
+                if let Some(g) = &mut self.gfx {
+                    g.ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+                }
                 format!("OK: wheel ({dx:.2}, {dy:.2}) at ({x:.2}, {y:.2})")
             }
             ScriptCommand::Pinch { x, y, factor } => {
-                self.move_cursor(x, y);
-                self.pinch(factor - 1.0);
+                self.script_move(x, y, true);
+                #[cfg(feature = "egui-ui")]
+                let ui_pointer = self.script_pointer_goes_to_ui();
+                #[cfg(not(feature = "egui-ui"))]
+                let ui_pointer = false;
+                if !ui_pointer {
+                    self.pinch(factor - 1.0);
+                }
                 format!("OK: pinch {factor:.4} at ({x:.2}, {y:.2})")
             }
             ScriptCommand::Key(k) => {
-                let prev = self.modifiers;
-                self.modifiers = k.mods;
-                let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                self.key_input(down);
-                self.key_input(up);
-                self.modifiers = prev;
+                self.script_key(&k);
                 "OK: key".to_string()
             }
             ScriptCommand::Type(text) => {
                 let seq = keys_for_typed_text(&text);
                 let count = seq.len();
-                let prev = self.modifiers;
-                for k in seq {
-                    self.modifiers = k.mods;
-                    let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                    let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                    self.key_input(down);
-                    self.key_input(up);
+                for k in &seq {
+                    self.script_key(k);
                 }
-                self.modifiers = prev;
                 format!("OK: typed {count} key(s)")
             }
         }
@@ -1500,6 +1699,10 @@ impl ApplicationHandler<Wake> for App {
             if now >= deadline {
                 self.ui_repaint_at = None;
                 self.redraw();
+                self.draw(false);
+                if let Some(next_ui) = self.ui_repaint_at {
+                    next_repaint = Some(next_ui);
+                }
             } else {
                 next_repaint = Some(deadline);
             }
