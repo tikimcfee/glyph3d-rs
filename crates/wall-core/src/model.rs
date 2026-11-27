@@ -457,6 +457,7 @@ pub struct WallModel {
     notice_expires_at_ms: Option<f64>,
     split_landing: Option<PendingSplit>,
     flow: Option<FlowAnchor>,
+    pub(crate) agent_views: crate::agent_views::AgentViews,
     generation: u64,
     dirty: bool,
     effects: Vec<WallEffect>,
@@ -479,6 +480,8 @@ impl WallModel {
         for (bad_key, _) in &rejected {
             store.clear_config(bad_key);
         }
+        let agent_views =
+            crate::agent_views::AgentViews::from_store(&store, config.agent_view_side);
 
         WallModel {
             store,
@@ -506,6 +509,7 @@ impl WallModel {
             notice_expires_at_ms: None,
             split_landing: None,
             flow: None,
+            agent_views,
             generation: 1,
             dirty: false,
             effects: Vec::new(),
@@ -1105,19 +1109,27 @@ impl WallModel {
         self.flow = None;
     }
 
+    /// Anchor terminal id of the active spawn flow, if any.
+    pub(crate) fn flow_anchor_id(&self) -> Option<&str> {
+        self.flow.as_ref().and_then(|f| f.anchor_id.as_deref())
+    }
+
     /// Focus navigation history (oldest to newest).
     pub fn focus_history(&self) -> &[String] {
         &self.focus_history
     }
 
     /// Mount terminal `spec` into `terminals`, `order`, and `z_order` using either a saved
-    /// store spot or the next free flow slot, without running inline split/group relayout.
-    pub(crate) fn mount_terminal_raw(
+    /// store spot or the next free flow slot, with optional pre-computed canvas footprint
+    /// rectangles (`body_rect` unioned with any open Agent View) and anchor frame target.
+    pub(crate) fn mount_terminal_with_taken(
         &mut self,
         spec: TerminalSpec,
         modes: term_cells::Modes,
         canvas_camera_override: Option<CameraPose>,
         track_flow: bool,
+        taken_override: Option<&[Rect]>,
+        anchor_frame_target: Option<CameraPose>,
     ) -> Point {
         let id = spec.id;
         let saved_cam = self.pre_fullscreen_camera;
@@ -1131,7 +1143,13 @@ impl WallModel {
                 axis: SplitAxis::Right,
             });
         }
-        let position = self.compute_initial_position(&id, spec.cols, spec.rows);
+        let position = self.compute_initial_position_with(
+            &id,
+            spec.cols,
+            spec.rows,
+            taken_override,
+            anchor_frame_target,
+        );
         self.split_landing = saved_split;
         self.pre_fullscreen_camera = saved_cam;
 
@@ -1163,6 +1181,9 @@ impl WallModel {
     /// group relayout or focus restoration. Returns `(existed, was_focused)`.
     pub(crate) fn unmount_terminal_raw(&mut self, id: &str) -> (bool, bool) {
         let existed = self.terminals.remove(id).is_some();
+        if self.store.agent_view(id).is_none() {
+            self.agent_views.forget_terminal(id);
+        }
         let was_focused = self.focused_id.as_deref() == Some(id);
         if was_focused {
             self.focused_id = None;
@@ -1327,7 +1348,12 @@ impl WallModel {
         self.camera.pose()
     }
 
-    fn keep_flow(&self, pose: CameraPose, zoom: f64) -> bool {
+    fn keep_flow(
+        &self,
+        pose: CameraPose,
+        zoom: f64,
+        anchor_frame_target: Option<CameraPose>,
+    ) -> bool {
         let Some(flow) = &self.flow else {
             return false;
         };
@@ -1341,7 +1367,7 @@ impl WallModel {
                 }
             }
             if !self.fullscreen_active() {
-                if let Some(ft) = self.frame_target(anchor_id) {
+                if let Some(ft) = anchor_frame_target.or_else(|| self.frame_target(anchor_id)) {
                     if (pose.x - ft.x).hypot(pose.y - ft.y) * zoom < 4.0 {
                         return true;
                     }
@@ -1351,27 +1377,62 @@ impl WallModel {
         (pose.x - flow.camera.x).hypot(pose.y - flow.camera.y) * zoom < 4.0
     }
 
+    fn terminal_taken_rect(&self, id: &str, entry: &TerminalEntry, zoom: f64) -> Rect {
+        let tr = entry.body_rect(self.geometry);
+        if let Some(av) = self.store.agent_view(id).filter(|a| a.open) {
+            let dims = crate::agent_view::AgentViewDims::new(
+                self.config.agent_view_width,
+                self.config.agent_view_height,
+                self.config.agent_view_gap,
+            );
+            let ar = crate::agent_view::agent_view_rect(tr, self.bar_height(id, zoom), av.side, dims);
+            union_rect(&[tr, ar]).unwrap_or(tr)
+        } else {
+            tr
+        }
+    }
+
     fn compute_initial_position(&mut self, id: &str, cols: u32, rows: u32) -> Point {
+        self.compute_initial_position_with(id, cols, rows, None, None)
+    }
+
+    fn compute_initial_position_with(
+        &mut self,
+        id: &str,
+        cols: u32,
+        rows: u32,
+        taken_override: Option<&[Rect]>,
+        anchor_frame_target: Option<CameraPose>,
+    ) -> Point {
         if let Some(saved) = self.store.position(id) {
             return saved;
         }
         let body_w = f64::from(cols) * self.geometry.stride.x + 2.0 * self.geometry.padding.x;
         let body_h = f64::from(rows) * self.geometry.stride.y + 2.0 * self.geometry.padding.y;
-        let taken: Vec<Rect> = self
-            .terminals
-            .iter()
-            .filter(|(tid, _)| tid.as_str() != id)
-            .map(|(_, entry)| entry.body_rect(self.geometry))
-            .collect();
+        let cur_zoom = self.camera.zoom().max(1e-9);
+        let computed_taken: Vec<Rect>;
+        let taken: &[Rect] = match taken_override {
+            Some(slice) => slice,
+            None => {
+                computed_taken = self
+                    .terminals
+                    .iter()
+                    .filter(|(tid, _)| tid.as_str() != id)
+                    .map(|(tid, entry)| self.terminal_taken_rect(tid, entry, cur_zoom))
+                    .collect();
+                &computed_taken
+            }
+        };
 
         let pose = self.canvas_camera_pose();
         let zoom = if pose.zoom > 0.0 { pose.zoom } else { 1.0 };
-        let origin = if self.split_landing.is_none() && self.keep_flow(pose, zoom) {
-            self.flow
-                .as_ref()
-                .expect("keep_flow checked flow is Some")
-                .origin
-        } else {
+        let origin =
+            if self.split_landing.is_none() && self.keep_flow(pose, zoom, anchor_frame_target) {
+                self.flow
+                    .as_ref()
+                    .expect("keep_flow checked flow is Some")
+                    .origin
+            } else {
             let docked = dock_layout(&crate::fullscreen::dock_state_from_store(&self.store));
             let (view_w, _) = self.camera.view();
             let dx_px = if view_w > docked.edges.left + docked.edges.right {
@@ -1395,7 +1456,7 @@ impl WallModel {
             }
         };
 
-        let slot = free_flow_slot(body_w, body_h, &taken, Some(origin))
+        let slot = free_flow_slot(body_w, body_h, taken, Some(origin))
             .unwrap_or(origin);
         self.store.set_position(id, slot);
         if self.split_landing.is_none() {
@@ -1520,6 +1581,9 @@ impl WallModel {
         keep.extend(self.terminals.keys().cloned());
         let gone = self.store.prune(keep);
         if !gone.is_empty() {
+            for gid in &gone {
+                self.agent_views.forget_terminal(gid);
+            }
             self.relayout_all_groups();
             self.sync_bar_rooms();
             self.apply_z_order();
@@ -1640,6 +1704,9 @@ impl WallModel {
 
     fn detach_in_memory(&mut self, id: &str, was_focused: bool, preferred_group: Option<&str>) {
         self.terminals.remove(id);
+        if self.store.agent_view(id).is_none() {
+            self.agent_views.forget_terminal(id);
+        }
         self.order.retain(|x| x != id);
         self.z_order.retain(|x| x != id);
         self.selection.retain(|x| x != id);
@@ -2000,14 +2067,35 @@ impl WallModel {
 
     // ── framing ─────────────────────────────────────────────────────────────
 
-    /// Compute the [`CameraPose`] that frames terminal `id` and its screen-sized
-    /// title bar, capped at [`FRAME_MAX_LINE_PX`] pixels per row.
+    /// Compute the [`CameraPose`] that frames terminal `id`, its screen-sized
+    /// title bar, and any open Agent View, capped at [`FRAME_MAX_LINE_PX`] pixels per row.
     pub fn frame_target(&self, id: &str) -> Option<CameraPose> {
         let body = self.terminal_rect(id)?;
         let cap = FRAME_MAX_LINE_PX / self.geometry.stride.y.max(1e-9);
-        let first = self.camera.fit_target(body, DEFAULT_FIT_MARGIN, cap);
+        let cur_zoom = self.camera.zoom().max(1e-9);
+        let dims = crate::agent_view::AgentViewDims::new(
+            self.config.agent_view_width,
+            self.config.agent_view_height,
+            self.config.agent_view_gap,
+        );
+        let open_side = self.store.agent_view(id).filter(|av| av.open).map(|av| av.side);
+        let initial = match open_side {
+            Some(side) => {
+                let ag = crate::agent_view::agent_view_rect(body, self.bar_height(id, cur_zoom), side, dims);
+                union_rect(&[body, ag]).unwrap_or(body)
+            }
+            None => body,
+        };
+        let first = self.camera.fit_target(initial, DEFAULT_FIT_MARGIN, cap);
         let win = self.window_rect_at_zoom(id, first.zoom)?;
-        Some(self.camera.fit_target(win, DEFAULT_FIT_MARGIN, cap))
+        let second = match open_side {
+            Some(side) => {
+                let ag = crate::agent_view::agent_view_rect(body, self.bar_height(id, first.zoom), side, dims);
+                union_rect(&[win, ag]).unwrap_or(win)
+            }
+            None => win,
+        };
+        Some(self.camera.fit_target(second, DEFAULT_FIT_MARGIN, cap))
     }
 
     /// Ease the camera to frame terminal `id`.

@@ -1118,6 +1118,25 @@ impl AgentViews {
         }
     }
 
+    /// Synchronize open/side/session/filter state from `store`, marking any existing
+    /// entry absent from `store` closed while preserving in-memory shove records so
+    /// [`Self::footprint_changed`] can still give room back when a view closes.
+    pub fn sync_open_from_store(&mut self, store: &WallStore, default_side: AgentSide) {
+        for (id, entry) in &mut self.views {
+            if !store.agent_views().contains_key(id) {
+                entry.open = false;
+            }
+        }
+        self.hydrate_from_store(store, default_side);
+    }
+
+    /// Forget all view, sync, and shove state for a killed or pruned terminal `id`.
+    pub fn forget_terminal(&mut self, id: &str) {
+        self.views.remove(id);
+        self.term_sync.remove(id);
+        self.shoves.remove(id);
+    }
+
     // ── Queries & geometry ───────────────────────────────────────────────────
 
     /// Whether an Agent View is open on mounted terminal `id` (`WallAgentViews.isOpen`).

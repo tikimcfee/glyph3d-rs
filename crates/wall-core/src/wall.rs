@@ -1248,6 +1248,147 @@ impl WallHost for ReadGroupsView<'_> {
     }
 }
 
+/// Split-borrow adapter wiring [`crate::agent_views::AgentViews::footprint_changed`]
+/// against `WallCore` (`TerminalWall.footprintChanged` / `_giveRoomBack`).
+struct AgentFootprintBridge<'a> {
+    model: &'a mut WallModel,
+    groups: &'a mut Groups,
+    fullscreen: &'a WallFullscreen,
+    names: &'a mut WallNames,
+    needs_fullscreen_refit: bool,
+}
+
+impl crate::agent_views::AgentViewsHost for AgentFootprintBridge<'_> {
+    fn agent_views_config(&self) -> crate::agent_views::AgentViewsConfig {
+        let cfg = self.model.config();
+        crate::agent_views::AgentViewsConfig {
+            default_side: cfg.agent_view_side,
+            dims: AgentViewDims::new(
+                cfg.agent_view_width,
+                cfg.agent_view_height,
+                cfg.agent_view_gap,
+            ),
+            group_gap: cfg.group_gap,
+            snap: cfg.snap,
+            grid: GridSpec::new(
+                cfg.grid_minor,
+                cfg.grid_major_every.max(1.0) as u32,
+                cfg.grid_min_px,
+            ),
+        }
+    }
+
+    fn terminal(&self, id: &str) -> Option<crate::agent_views::AgentTerminalSnapshot> {
+        let entry = self.model.terminal(id)?;
+        let rgv = ReadGroupsView {
+            model: self.model,
+            fullscreen: self.fullscreen,
+            names: self.names,
+        };
+        let body_rect = rgv.canvas_body_rect_of(id)?;
+        Some(crate::agent_views::AgentTerminalSnapshot {
+            body_rect,
+            position: entry.position,
+            scrolled_rows: 0,
+            cursor_row: 0,
+            alt_screen: entry.modes.alt_screen,
+            window_title: entry.shell_title.clone(),
+            on_canvas: self.model.is_shown(id) && !self.fullscreen.active(),
+        })
+    }
+
+    fn bar_height(&self, id: &str, zoom: f64) -> f64 {
+        self.names.bar_height(id, zoom)
+    }
+
+    fn terminal_name(&self, id: &str) -> String {
+        self.model.name_of(id)
+    }
+
+    fn store_name(&self, id: &str) -> Option<String> {
+        self.model.store().name(id).map(str::to_owned)
+    }
+
+    fn focused_id(&self) -> Option<&str> {
+        self.model.focused_id()
+    }
+
+    fn fullscreen_active(&self) -> bool {
+        self.fullscreen.active()
+    }
+
+    fn zoom(&self) -> f64 {
+        self.model.camera().zoom()
+    }
+}
+
+impl crate::agent_views::FootprintCanvas for AgentFootprintBridge<'_> {
+    fn terminal_order(&self) -> Vec<String> {
+        self.model.order().to_vec()
+    }
+
+    fn group_of(&self, id: &str) -> Option<String> {
+        self.groups.group_of(id)
+    }
+
+    fn group_stand(&self, gid: &str) -> Option<crate::agent_views::GroupStand> {
+        let g = self.groups.group(gid)?;
+        Some(crate::agent_views::GroupStand {
+            layout: g.layout,
+            origin: g.origin,
+            members: g.members.clone(),
+        })
+    }
+
+    fn relayout_group(&mut self, _views: &crate::agent_views::AgentViews, gid: &str) {
+        let mut gb = GroupsBridge {
+            model: self.model,
+            fullscreen: self.fullscreen,
+            names: self.names,
+            needs_fullscreen_refit: false,
+        };
+        let _ = self.groups.relayout(&mut gb, gid);
+        self.needs_fullscreen_refit |= gb.needs_fullscreen_refit;
+    }
+
+    fn group_box_rect(
+        &self,
+        _views: &crate::agent_views::AgentViews,
+        gid: &str,
+        zoom: f64,
+        bare: Option<&str>,
+    ) -> Option<Rect> {
+        let rgv = ReadGroupsView {
+            model: self.model,
+            fullscreen: self.fullscreen,
+            names: self.names,
+        };
+        self.groups.box_rect(&rgv, gid, zoom, bare).ok().flatten()
+    }
+
+    fn move_group(&mut self, gid: &str, dx: f64, dy: f64) {
+        let mut gb = GroupsBridge {
+            model: self.model,
+            fullscreen: self.fullscreen,
+            names: self.names,
+            needs_fullscreen_refit: false,
+        };
+        let _ = self.groups.move_group(&mut gb, gid, dx, dy);
+        self.needs_fullscreen_refit |= gb.needs_fullscreen_refit;
+    }
+
+    fn move_terminal(&mut self, id: &str, dx: f64, dy: f64) {
+        if let Some(pos) = self
+            .model
+            .terminal(id)
+            .map(|t| Point::new(t.position.x + dx, t.position.y + dy))
+        {
+            self.model.set_terminal_position(id, pos);
+            self.model.remember_position(id);
+        }
+    }
+}
+
 // ── WallCore orchestration helpers ───────────────────────────────────────────
 
 impl WallCore {
@@ -2023,14 +2164,48 @@ impl WallCore {
             .is_none_or(|p| p.split.is_none() && p.window_top_left.is_none())
             && !info.adopted;
         let canvas_cam = self.fullscreen.state().map(|s| s.camera);
+        let cur_zoom = self.model.camera().zoom().max(1e-9);
+        let taken_rects: Vec<Rect> = {
+            let rgv = self.read_groups_view();
+            let dims = rgv.agent_dims();
+            self.model
+                .order()
+                .iter()
+                .filter(|tid| tid.as_str() != id.as_str())
+                .filter_map(|tid| {
+                    let tr = rgv.canvas_body_rect_of(tid)?;
+                    if let Some(side) = rgv.open_agent_side(tid) {
+                        let ar = agent_view::agent_view_rect(
+                            tr,
+                            self.names.bar_height(tid, cur_zoom),
+                            side,
+                            dims,
+                        );
+                        union_rect(&[tr, ar])
+                    } else {
+                        Some(tr)
+                    }
+                })
+                .collect()
+        };
+        let anchor_ft = self
+            .model
+            .flow_anchor_id()
+            .and_then(|aid| self.frame_target(aid));
         let spec = TerminalSpec {
             id: id.clone(),
             cols: info.cols,
             rows: info.rows,
             shell_title: info.title,
         };
-        self.model
-            .mount_terminal_raw(spec, info.modes, canvas_cam, track_flow);
+        self.model.mount_terminal_with_taken(
+            spec,
+            info.modes,
+            canvas_cam,
+            track_flow,
+            Some(&taken_rects),
+            anchor_ft,
+        );
         self.names.attach(&id);
         let word_chars = self.model.config().selection_word_chars.clone();
         self.selections
@@ -2576,16 +2751,18 @@ impl WallCore {
                 sel.set_word_chars(&word_chars);
             }
         }
-        if matches!(
-            key,
-            "agentViewWidth"
-                | "agentViewHeight"
-                | "agentViewGap"
-                | "splitGap"
-                | "tileGap"
-                | "groupPad"
-                | "groupColumns"
-        ) {
+        if matches!(key, "agentViewWidth" | "agentViewHeight" | "agentViewGap") {
+            let open_ids: Vec<String> = self
+                .model
+                .order()
+                .iter()
+                .filter(|id| self.model.store().agent_view(id).is_some_and(|av| av.open))
+                .cloned()
+                .collect();
+            for id in open_ids {
+                self.agent_footprint_changed(&id);
+            }
+        } else if matches!(key, "splitGap" | "tileGap" | "groupPad" | "groupColumns") {
             let _ = self.with_groups(|g, host| g.relayout_all(host));
         }
         if self.fullscreen.active()
@@ -3009,6 +3186,31 @@ impl WallCore {
             menu: self.model.menu().cloned(),
             palette_open: self.palette_open,
             panels,
+        }
+    }
+
+    fn agent_footprint_changed(&mut self, id: &str) {
+        let mut av = std::mem::take(&mut self.model.agent_views);
+        let default_side = self.model.config().agent_view_side;
+        av.sync_open_from_store(self.model.store(), default_side);
+        let mut bridge = AgentFootprintBridge {
+            model: &mut self.model,
+            groups: &mut self.groups,
+            fullscreen: &self.fullscreen,
+            names: &mut self.names,
+            needs_fullscreen_refit: false,
+        };
+        av.prune(&bridge, |tid| {
+            bridge.model.terminal(tid).is_some() || bridge.model.store().agent_view(tid).is_some()
+        });
+        av.footprint_changed(&mut bridge, id);
+        let refit = bridge.needs_fullscreen_refit;
+        let _ = av.drain_effects();
+        self.model.agent_views = av;
+        self.sync_groups_to_store();
+        self.apply_z_order();
+        if refit {
+            self.flush_cross_effects(true, Vec::new());
         }
     }
 }
@@ -3810,7 +4012,7 @@ impl WallApi for WallCore {
         let session = (next.session != "auto").then(|| next.session.clone());
         self.model.store_mut().set_agent_view(id, Some(next));
         let owned = id.to_owned();
-        let _ = self.with_groups(|g, host| g.relayout_of(host, &owned));
+        self.agent_footprint_changed(&owned);
         self.model.notify_changed();
         Ok(AgentOpenResult {
             open,
