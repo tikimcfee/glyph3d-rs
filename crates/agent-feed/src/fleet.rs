@@ -1113,9 +1113,9 @@ mod tests {
         // remote namespace stays None when omitted, and local_agent("lead") ignores remote "lead".
         assert!(apply(
             &mut st,
-            r#"{"type":"host","host":{"host":"m2"},"agents":[
-                {"name":"lead","host":"m2","backend":"claude","session":"lead","created_at":"2026-10-12T11:00:00Z","live":true,"status":"idle"},
-                {"name":"dead","host":"m2","backend":"claude","session":"dead","created_at":"2026-10-12T11:01:00Z","live":true,"attached":false,"status":"error"}
+            r#"{"type":"host","host":{"host":"far-host"},"agents":[
+                {"name":"lead","host":"far-host","backend":"claude","session":"lead","created_at":"2026-10-12T11:00:00Z","live":true,"status":"idle"},
+                {"name":"dead","host":"far-host","backend":"claude","session":"dead","created_at":"2026-10-12T11:01:00Z","live":true,"attached":false,"status":"error"}
             ]}"#,
         ));
         let snap = st.snapshot();
@@ -1127,7 +1127,7 @@ mod tests {
         let remote_lead = snap
             .agents
             .iter()
-            .find(|a| a.name == "lead" && a.host.as_deref() == Some("m2"))
+            .find(|a| a.name == "lead" && a.host.as_deref() == Some("far-host"))
             .unwrap();
         assert_eq!(remote_lead.attached, None);
         assert!(remote_lead.attachable());
@@ -1137,7 +1137,7 @@ mod tests {
         let remote_dead = snap
             .agents
             .iter()
-            .find(|a| a.name == "dead" && a.host.as_deref() == Some("m2"))
+            .find(|a| a.name == "dead" && a.host.as_deref() == Some("far-host"))
             .unwrap();
         assert_eq!(remote_dead.attached, Some(false));
         assert!(!remote_dead.attachable());
@@ -1148,14 +1148,14 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].host, "workstation");
         assert_eq!(groups[0].agents.len(), 1, "departed worker excluded from by_host");
-        assert_eq!(groups[1].host, "m2");
+        assert_eq!(groups[1].host, "far-host");
         assert_eq!(
             groups[1]
                 .agents
                 .iter()
                 .map(|a| a.target.as_str())
                 .collect::<Vec<_>>(),
-            vec!["dead@m2", "lead@m2"]
+            vec!["dead@far-host", "lead@far-host"]
         );
 
         // Unknown line type errors cleanly without corrupting snapshot.

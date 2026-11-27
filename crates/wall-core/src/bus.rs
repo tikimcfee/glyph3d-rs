@@ -487,7 +487,7 @@ mod tests {
         };
         assert_eq!(bus_target(&remote), "helper@workstation");
 
-        for ok in ["helper", "helper-m2", "a_b@workstation", "X@laptop-2"] {
+        for ok in ["helper", "helper-2", "a_b@workstation", "X@laptop-2"] {
             assert!(is_bus_target(ok), "expected valid target: {ok}");
         }
         for bad in ["", "-x", "a b", "a@", "@h", "a@b@c", "a;rm", "a.b", "$(x)"] {
