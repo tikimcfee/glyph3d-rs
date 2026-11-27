@@ -28,7 +28,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use glam::Vec2;
-use winit::event::WindowEvent;
+use winit::event::{MouseButton, WindowEvent};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::Window;
 
 use crate::config::WallSettings;
@@ -163,6 +164,101 @@ impl WallUi {
         }
     }
 
+    /// True if scripted or window events are queued in `RawInput` awaiting [`Self::run`].
+    pub fn has_pending_input(&self) -> bool {
+        !self.state.egui_input().events.is_empty()
+    }
+
+    /// Synchronize modifier state for scripted input (`egui` 0.34 carries `modifiers` per event).
+    pub fn set_script_modifiers(&mut self, _modifiers: egui::Modifiers) {}
+
+    /// Queue a scripted pointer move in logical window points.
+    pub fn push_script_pointer_moved(&mut self, pos: egui::Pos2) {
+        self.state
+            .egui_input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+    }
+
+    /// Queue a scripted pointer button press or release in logical window points.
+    pub fn push_script_pointer_button(
+        &mut self,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+    ) {
+        self.state
+            .egui_input_mut()
+            .events
+            .push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            });
+    }
+
+    /// Queue a scripted wheel scroll in logical point deltas (`+y` = scroll up).
+    pub fn push_script_wheel(
+        &mut self,
+        pos: egui::Pos2,
+        delta: egui::Vec2,
+        modifiers: egui::Modifiers,
+    ) {
+        let raw = self.state.egui_input_mut();
+        raw.events.push(egui::Event::PointerMoved(pos));
+        raw.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            modifiers,
+            phase: egui::TouchPhase::Move,
+        });
+    }
+
+    /// Queue a scripted key press or release (and `Event::Text` on non-chord presses).
+    pub fn push_script_key(
+        &mut self,
+        key: Option<egui::Key>,
+        pressed: bool,
+        modifiers: egui::Modifiers,
+        text: Option<&str>,
+    ) {
+        let raw = self.state.egui_input_mut();
+        if let Some(k) = key {
+            raw.events.push(egui::Event::Key {
+                key: k,
+                physical_key: Some(k),
+                pressed,
+                repeat: false,
+                modifiers,
+            });
+        }
+        if pressed && !modifiers.command && !modifiers.mac_cmd && !modifiers.ctrl {
+            if let Some(t) = text.filter(|s| !s.is_empty()) {
+                raw.events.push(egui::Event::Text(t.to_owned()));
+            }
+        }
+    }
+
+    /// Apply pending font/image texture uploads and frees when a surface-free UI pass
+    /// runs without calling [`Self::paint`].
+    pub fn sync_textures_only(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        painted: &mut PaintedUi,
+    ) {
+        for id in self.pending_free.drain(..) {
+            self.renderer.free_texture(&id);
+        }
+        for (id, image_deltas) in painted.textures_delta.set.drain() {
+            for image_delta in image_deltas {
+                self.renderer.update_texture(device, queue, id, &image_delta);
+            }
+        }
+        self.pending_free.extend(painted.textures_delta.free.drain());
+    }
     /// The system clipboard's text, through the window's own clipboard
     /// (`smithay-clipboard` on Wayland, where a fresh `arboard` speaks only
     /// X11 and fails; `arboard` elsewhere).
@@ -339,6 +435,132 @@ impl WallUi {
 pub fn color32_from_srgb(rgba: [f32; 4]) -> egui::Color32 {
     let ch = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     egui::Color32::from_rgba_unmultiplied(ch(rgba[0]), ch(rgba[1]), ch(rgba[2]), ch(rgba[3]))
+}
+
+/// Convert a winit [`MouseButton`] into [`egui::PointerButton`].
+pub fn winit_button_to_egui(button: MouseButton) -> Option<egui::PointerButton> {
+    match button {
+        MouseButton::Left => Some(egui::PointerButton::Primary),
+        MouseButton::Right => Some(egui::PointerButton::Secondary),
+        MouseButton::Middle => Some(egui::PointerButton::Middle),
+        MouseButton::Back => Some(egui::PointerButton::Extra1),
+        MouseButton::Forward => Some(egui::PointerButton::Extra2),
+        MouseButton::Other(_) => None,
+    }
+}
+
+/// Convert winit [`ModifiersState`] into [`egui::Modifiers`].
+pub fn winit_mods_to_egui(mods: ModifiersState) -> egui::Modifiers {
+    let mac = cfg!(target_os = "macos");
+    egui::Modifiers {
+        alt: mods.alt_key(),
+        ctrl: mods.control_key(),
+        shift: mods.shift_key(),
+        mac_cmd: mac && mods.super_key(),
+        command: if mac {
+            mods.super_key()
+        } else {
+            mods.control_key()
+        },
+    }
+}
+
+/// Convert winit [`PhysicalKey`] / [`Key`] into [`egui::Key`] for scripted input.
+pub fn winit_key_to_egui(physical: PhysicalKey, logical: &Key) -> Option<egui::Key> {
+    if let Key::Named(named) = logical {
+        let mapped = match named {
+            NamedKey::Enter => Some(egui::Key::Enter),
+            NamedKey::Tab => Some(egui::Key::Tab),
+            NamedKey::Escape => Some(egui::Key::Escape),
+            NamedKey::Space => Some(egui::Key::Space),
+            NamedKey::Backspace => Some(egui::Key::Backspace),
+            NamedKey::Delete => Some(egui::Key::Delete),
+            NamedKey::Insert => Some(egui::Key::Insert),
+            NamedKey::Home => Some(egui::Key::Home),
+            NamedKey::End => Some(egui::Key::End),
+            NamedKey::PageUp => Some(egui::Key::PageUp),
+            NamedKey::PageDown => Some(egui::Key::PageDown),
+            NamedKey::ArrowUp => Some(egui::Key::ArrowUp),
+            NamedKey::ArrowDown => Some(egui::Key::ArrowDown),
+            NamedKey::ArrowLeft => Some(egui::Key::ArrowLeft),
+            NamedKey::ArrowRight => Some(egui::Key::ArrowRight),
+            NamedKey::F1 => Some(egui::Key::F1),
+            NamedKey::F2 => Some(egui::Key::F2),
+            NamedKey::F3 => Some(egui::Key::F3),
+            NamedKey::F4 => Some(egui::Key::F4),
+            NamedKey::F5 => Some(egui::Key::F5),
+            NamedKey::F6 => Some(egui::Key::F6),
+            NamedKey::F7 => Some(egui::Key::F7),
+            NamedKey::F8 => Some(egui::Key::F8),
+            NamedKey::F9 => Some(egui::Key::F9),
+            NamedKey::F10 => Some(egui::Key::F10),
+            NamedKey::F11 => Some(egui::Key::F11),
+            NamedKey::F12 => Some(egui::Key::F12),
+            _ => None,
+        };
+        if mapped.is_some() {
+            return mapped;
+        }
+    }
+    if let PhysicalKey::Code(code) = physical {
+        let mapped = match code {
+            KeyCode::KeyA => Some(egui::Key::A),
+            KeyCode::KeyB => Some(egui::Key::B),
+            KeyCode::KeyC => Some(egui::Key::C),
+            KeyCode::KeyD => Some(egui::Key::D),
+            KeyCode::KeyE => Some(egui::Key::E),
+            KeyCode::KeyF => Some(egui::Key::F),
+            KeyCode::KeyG => Some(egui::Key::G),
+            KeyCode::KeyH => Some(egui::Key::H),
+            KeyCode::KeyI => Some(egui::Key::I),
+            KeyCode::KeyJ => Some(egui::Key::J),
+            KeyCode::KeyK => Some(egui::Key::K),
+            KeyCode::KeyL => Some(egui::Key::L),
+            KeyCode::KeyM => Some(egui::Key::M),
+            KeyCode::KeyN => Some(egui::Key::N),
+            KeyCode::KeyO => Some(egui::Key::O),
+            KeyCode::KeyP => Some(egui::Key::P),
+            KeyCode::KeyQ => Some(egui::Key::Q),
+            KeyCode::KeyR => Some(egui::Key::R),
+            KeyCode::KeyS => Some(egui::Key::S),
+            KeyCode::KeyT => Some(egui::Key::T),
+            KeyCode::KeyU => Some(egui::Key::U),
+            KeyCode::KeyV => Some(egui::Key::V),
+            KeyCode::KeyW => Some(egui::Key::W),
+            KeyCode::KeyX => Some(egui::Key::X),
+            KeyCode::KeyY => Some(egui::Key::Y),
+            KeyCode::KeyZ => Some(egui::Key::Z),
+            KeyCode::Digit0 => Some(egui::Key::Num0),
+            KeyCode::Digit1 => Some(egui::Key::Num1),
+            KeyCode::Digit2 => Some(egui::Key::Num2),
+            KeyCode::Digit3 => Some(egui::Key::Num3),
+            KeyCode::Digit4 => Some(egui::Key::Num4),
+            KeyCode::Digit5 => Some(egui::Key::Num5),
+            KeyCode::Digit6 => Some(egui::Key::Num6),
+            KeyCode::Digit7 => Some(egui::Key::Num7),
+            KeyCode::Digit8 => Some(egui::Key::Num8),
+            KeyCode::Digit9 => Some(egui::Key::Num9),
+            KeyCode::Slash => Some(egui::Key::Slash),
+            KeyCode::Backslash => Some(egui::Key::Backslash),
+            KeyCode::Comma => Some(egui::Key::Comma),
+            KeyCode::Period => Some(egui::Key::Period),
+            KeyCode::Semicolon => Some(egui::Key::Semicolon),
+            KeyCode::Quote => Some(egui::Key::Quote),
+            KeyCode::BracketLeft => Some(egui::Key::OpenBracket),
+            KeyCode::BracketRight => Some(egui::Key::CloseBracket),
+            KeyCode::Minus => Some(egui::Key::Minus),
+            KeyCode::Equal => Some(egui::Key::Equals),
+            KeyCode::Backquote => Some(egui::Key::Backtick),
+            _ => None,
+        };
+        if mapped.is_some() {
+            return mapped;
+        }
+    }
+    if let Key::Character(s) = logical {
+        return egui::Key::from_name(s.as_str());
+    }
+    None
 }
 
 /// Directory holding the bundled UI and fallback fonts (`Contents/Resources/fonts`

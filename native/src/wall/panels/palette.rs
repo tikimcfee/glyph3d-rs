@@ -49,6 +49,10 @@ pub struct PaletteState {
     /// Last pointer position observed inside the list, so keyboard `↑`/`↓`
     /// navigation is not overridden by a stationary cursor hovering a row.
     last_pointer_pos: Option<egui::Pos2>,
+    /// Last rendered modal bounding box when open.
+    pub last_rect: Option<egui::Rect>,
+    /// Number of filtered items shown in `Find` mode on the last open pass.
+    pub item_count: usize,
 }
 
 impl PaletteState {
@@ -80,6 +84,8 @@ impl PaletteState {
         self.wants_keyboard = false;
         self.palette = Palette::new(PaletteMode::Find);
         self.last_pointer_pos = None;
+        self.last_rect = None;
+        self.item_count = 0;
     }
 
     /// Whether the palette wants keyboard events routed to `egui` rather than
@@ -154,6 +160,8 @@ pub fn show(
 ) {
     if !state.open {
         state.wants_keyboard = false;
+        state.last_rect = None;
+        state.item_count = 0;
         return;
     }
     state.wants_keyboard = true;
@@ -217,6 +225,9 @@ pub fn show(
         .fixed_pos(egui::pos2(box_left, box_top))
         .fade_in(false)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("wall_palette initial sizing");
+            }
             let frame = egui::Frame::NONE
                 .fill(egui::Color32::from_rgb(0x0e, 0x11, 0x18))
                 .stroke(egui::Stroke::new(
@@ -309,6 +320,7 @@ pub fn show(
 
                 if state.palette.mode == PaletteMode::Find {
                     let items = state.palette.items(&input.snapshot);
+                    state.item_count = items.len();
                     state.palette.selected = state
                         .palette
                         .selected
@@ -426,6 +438,7 @@ pub fn show(
             });
         });
     modal_rect = modal_rect.union(area_resp.response.rect);
+    state.last_rect = Some(modal_rect);
 
     // Handle Escape (`P-panels.md`: Escape clears the search then closes).
     if esc_pressed {

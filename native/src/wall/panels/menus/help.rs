@@ -116,6 +116,10 @@ pub struct HelpPanelState {
     pub query: String,
     drag: Option<HeadDrag>,
     last_rect: Option<egui::Rect>,
+    /// Floating header drag rectangle when open.
+    pub header_drag_rect: Option<egui::Rect>,
+    /// Total filtered rows displayed on the last open pass.
+    pub shown_row_count: usize,
 }
 
 impl HelpPanelState {
@@ -161,6 +165,8 @@ pub fn show(
         state.last_search_rect = None;
         state.drag = None;
         state.last_rect = None;
+        state.header_drag_rect = None;
+        state.shown_row_count = 0;
         return false;
     }
 
@@ -281,6 +287,7 @@ pub fn show(
 
     let live_pos = state.drag.map_or(panel_pos, |d| d.current_pos);
     let shown = search_help(&input.sections, &state.query);
+    state.shown_row_count = shown.iter().map(|s| s.rows.len()).sum();
     let is_floating = input.side == DockSide::Float;
 
     let frame = if is_floating {
@@ -304,6 +311,9 @@ pub fn show(
         .constrain(false)
         .interactable(true)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("wall_help initial sizing");
+            }
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             let inner = frame.show(ui, |ui| {
                 ui.set_min_width(panel_width);
@@ -465,6 +475,7 @@ fn draw_header(
             head_rect.min,
             egui::pos2(drag_right, head_rect.max.y),
         );
+        state.header_drag_rect = Some(drag_rect);
         let head_resp = ui.interact(
             drag_rect,
             egui::Id::new("wall_help_head_drag"),
