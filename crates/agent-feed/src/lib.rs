@@ -44,7 +44,7 @@ pub use sessions::{
     list_sessions, nest_subagents, ResolveError, SessionListSnapshot, SessionPoller, SessionStore,
 };
 pub use transcript::{
-    read_transcript_window, tail_from, FoldOutcome, FoldedEntry, LiveAddNotice,
-    TranscriptFollower, TranscriptOptions, TranscriptSnapshot, TranscriptState, TranscriptWindow,
-    WindowParams, MAX_READ_BYTES, STREAM_WINDOW_BYTES,
+    read_transcript_window, tail_from, FoldOutcome, FoldedEntry, LineBatch, LineFollower,
+    LiveAddNotice, TranscriptFollower, TranscriptOptions, TranscriptSnapshot, TranscriptState,
+    TranscriptWindow, WindowParams, MAX_READ_BYTES, STREAM_WINDOW_BYTES,
 };
