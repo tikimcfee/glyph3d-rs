@@ -956,6 +956,247 @@ fn run_transcript_follow(
     }
 }
 
+/// Drained raw JSONL lines and terminal state from a [`LineFollower`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineBatch {
+    /// Complete non-empty JSONL lines emitted since the previous [`LineFollower::take_batch`].
+    pub lines: Vec<String>,
+    /// `true` once the `agent transcript --follow` child has exited (reported once).
+    pub ended: bool,
+    /// Non-zero exit or spawn/read error when `ended` is `true`.
+    pub error: Option<String>,
+}
+
+struct LineFollowerInner {
+    lines: Vec<String>,
+    following: bool,
+    stopped: bool,
+    ended_pending: bool,
+    ended_error: Option<String>,
+}
+
+/// Raw JSONL line follower for `agent transcript <path> --follow [--from <byte>] -q`
+/// (`agentEvents/follow` in `cli/agentevents.go`).
+///
+/// Unlike [`TranscriptFollower`] (which owns its own [`TranscriptState`]), [`LineFollower`]
+/// hands raw `EVENTS.md` lines to callers whose model (such as `wall_core::agent_views::AgentViews`)
+/// folds streams and stamps terminal scrollback anchors itself.
+pub struct LineFollower {
+    inner: Arc<Mutex<LineFollowerInner>>,
+    child: Arc<Mutex<Option<Child>>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LineFollower {
+    /// Spawn `agent transcript <path> --follow [--from <from_byte>] -q` on a background reader
+    /// thread, invoking `wake` whenever new lines or process termination arrive.
+    pub fn start<F>(cli: AgentCli, path: impl Into<String>, from_byte: Option<u64>, wake: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let path = path.into();
+        let inner = Arc::new(Mutex::new(LineFollowerInner {
+            lines: Vec::new(),
+            following: true,
+            stopped: false,
+            ended_pending: false,
+            ended_error: None,
+        }));
+        let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
+
+        let inner_bg = Arc::clone(&inner);
+        let child_bg = Arc::clone(&child_slot);
+        let handle = thread::Builder::new()
+            .name("agent-feed-lines".to_string())
+            .spawn(move || run_line_follow(cli, path, from_byte, inner_bg, child_bg, wake))
+            .expect("spawning agent-feed-lines thread must succeed");
+
+        Self {
+            inner,
+            child: child_slot,
+            thread: Mutex::new(Some(handle)),
+        }
+    }
+
+    /// Whether the underlying `agent transcript --follow` process is still running.
+    pub fn is_following(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("line follower mutex poisoned")
+            .following
+    }
+
+    /// Drain all queued lines and any newly latched exit/error transition in FIFO order.
+    pub fn take_batch(&self) -> LineBatch {
+        let mut guard = self.inner.lock().expect("line follower mutex poisoned");
+        let lines = std::mem::take(&mut guard.lines);
+        let ended = std::mem::replace(&mut guard.ended_pending, false);
+        let error = if ended {
+            guard.ended_error.clone()
+        } else {
+            None
+        };
+        LineBatch {
+            lines,
+            ended,
+            error,
+        }
+    }
+
+    /// Stop the `agent transcript --follow` child process and join its reader thread.
+    pub fn stop(&self) {
+        {
+            let mut guard = self.inner.lock().expect("line follower mutex poisoned");
+            guard.stopped = true;
+            guard.following = false;
+        }
+        if let Some(child) = self
+            .child
+            .lock()
+            .expect("line follower child mutex poisoned")
+            .as_mut()
+        {
+            let _ = child.kill();
+        }
+        if let Some(handle) = self
+            .thread
+            .lock()
+            .expect("line follower join mutex poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for LineFollower {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_line_follow(
+    cli: AgentCli,
+    path: String,
+    from: Option<u64>,
+    inner: Arc<Mutex<LineFollowerInner>>,
+    child_slot: Arc<Mutex<Option<Child>>>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) {
+    let mut owned_args = vec![
+        "transcript".to_string(),
+        path,
+        "--follow".to_string(),
+        "-q".to_string(),
+    ];
+    if let Some(off) = from {
+        owned_args.push("--from".to_string());
+        owned_args.push(off.to_string());
+    }
+    let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+
+    let mut cmd = cli.command(&arg_refs);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let mut guard = inner.lock().expect("line follower mutex poisoned");
+            guard.following = false;
+            if !guard.stopped {
+                guard.ended_pending = true;
+                guard.ended_error = Some(format!(
+                    "could not spawn `{}`: {e}",
+                    cli.describe(&arg_refs)
+                ));
+                drop(guard);
+                wake();
+            }
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.take(4096).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).trim().to_string()
+    });
+
+    {
+        let stopped = inner.lock().expect("line follower mutex poisoned").stopped;
+        let mut slot = child_slot.lock().expect("line follower child mutex poisoned");
+        if stopped {
+            let _ = child.kill();
+        }
+        *slot = Some(child);
+    }
+
+    let mut stream_err: Option<String> = None;
+    for raw in BufReader::new(stdout).lines() {
+        match raw {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let should_wake = {
+                    let mut guard = inner.lock().expect("line follower mutex poisoned");
+                    if guard.stopped {
+                        break;
+                    }
+                    let was_empty = guard.lines.is_empty();
+                    guard.lines.push(trimmed.to_string());
+                    was_empty
+                };
+                if should_wake {
+                    wake();
+                }
+            }
+            Err(e) => {
+                stream_err = Some(format!("transcript follow read error: {e}"));
+                break;
+            }
+        }
+    }
+
+    let status = child_slot
+        .lock()
+        .expect("line follower child mutex poisoned")
+        .take()
+        .and_then(|mut c| c.wait().ok());
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    let notify_end = {
+        let mut guard = inner.lock().expect("line follower mutex poisoned");
+        guard.following = false;
+        if guard.stopped {
+            false
+        } else {
+            guard.ended_pending = true;
+            if let Some(err) = stream_err {
+                guard.ended_error = Some(err);
+            } else if let Some(st) = status {
+                if !st.success() {
+                    guard.ended_error = Some(if stderr_text.is_empty() {
+                        format!("`{}` exited with {st}", cli.describe(&arg_refs))
+                    } else {
+                        stderr_text
+                    });
+                }
+            }
+            true
+        }
+    };
+    if notify_end {
+        wake();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -1423,5 +1664,39 @@ mod tests {
                 .contains("corrupt transcript tail")
         );
         assert!(wakes.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn line_follower_streams_raw_lines_and_reports_clean_or_error_exit() {
+        let scratch = Scratch::new("line-follow");
+        let stub = scratch.0.join("agent");
+        write_stub(
+            &stub,
+            "#!/bin/sh\n\
+             printf '{\"type\":\"session\",\"session_id\":\"s-ln\",\"harness\":\"claude\",\"status\":\"processing\"}\\n'\n\
+             printf '{\"type\":\"event\",\"op\":\"add\",\"id\":\"e1\",\"at\":10,\"kind\":\"prompt\",\"prompt\":{\"text\":\"hi\"}}\\n'\n",
+        );
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_cb = Arc::clone(&wakes);
+        let follower = LineFollower::start(
+            AgentCli::new(&stub),
+            "/tmp/fake.jsonl",
+            Some(4),
+            move || {
+                wakes_cb.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        wait_until("line follower finishes", || !follower.is_following());
+        let batch = follower.take_batch();
+        assert_eq!(batch.lines.len(), 2);
+        assert!(batch.ended);
+        assert!(batch.error.is_none());
+        assert!(wakes.load(Ordering::SeqCst) >= 1);
+
+        // Subsequent drain returns empty batch with ended == false.
+        let empty = follower.take_batch();
+        assert!(empty.lines.is_empty() && !empty.ended);
     }
 }
