@@ -352,6 +352,17 @@ else
     record_fail "SIGTERM shows the outage" "holder='${HOLDER_PID:-none found}' notice='${TERM_NOTICE}' want='$(lost_notice sigterm)'"
 fi
 
+# ── The wall can only run the stub `agent` ──────────────────────────────────
+# Its fleet feed runs the `agent` it found first on PATH (the stub above), and since
+# 2026-11-27 it hands that same binary to every attach terminal, whose own PATH (termd gives
+# a terminal /usr/bin:/bin) would otherwise lead through the login shell to the real CLI.
+AGENT_CLI="$(ctl app.where 2>/dev/null | sed -n 's/^agent_cli //p')"
+if [[ "$AGENT_CLI" == "$D/bin/agent" ]]; then
+    record_pass "only the stub agent CLI" "the wall's feed and its attach terminals run $AGENT_CLI"
+else
+    record_fail "only the stub agent CLI" "the wall would run '${AGENT_CLI:-nothing reported}', not the stub $D/bin/agent"
+fi
+
 echo ""
 echo "=== TERMD SMOKE SUMMARY: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
 [[ "$FAIL_COUNT" -eq 0 ]]

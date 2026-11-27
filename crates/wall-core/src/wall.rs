@@ -636,6 +636,9 @@ struct WallCore {
     /// True when the local `agents` extra `termd` namespace is connected (`--wall-extra-ns agents`),
     /// so `wall.attach` prefers direct local subscription (`gx-<name>`) over spawning a shell wrapper.
     agents_extra_connected: bool,
+    /// The `agent` binary the host's fleet feed runs, when it resolved one to a path: what a
+    /// `wall.attach` terminal runs ([`attach_argv`]).
+    agent_program: Option<String>,
     platform: Platform,
     char_widths: CharWidths,
     default_cols: u32,
@@ -1419,6 +1422,7 @@ impl WallCore {
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
             agents_extra_connected: false,
+            agent_program: None,
             platform: opts.platform,
             char_widths: opts.char_widths.sanitized(),
             default_cols: opts.default_cols,
@@ -3951,7 +3955,7 @@ impl WallApi for WallCore {
                 "{target} is not an agent any more: it {how} and was cleaned up"
             ));
         }
-        let argv = attach_argv(target)?;
+        let argv = attach_argv(target, self.agent_program.as_deref())?;
         let zoom = self.model.camera().zoom();
         let canonical_target = found
             .map(|a| a.target)
@@ -5661,6 +5665,19 @@ impl Wall {
     /// Whether the local `agents` extra `termd` namespace is marked connected.
     pub fn agents_extra_connected(&self) -> bool {
         self.router.context.agents_extra_connected
+    }
+
+    /// Name the `agent` binary a `wall.attach` terminal runs: the one the host's own fleet
+    /// feed runs, so the agents the wall lists and the ones it attaches come from one CLI.
+    /// `None` (or a bare name the host could not resolve) leaves the terminal to look
+    /// `agent` up on its own PATH, then its login shell's.
+    pub fn set_agent_program(&mut self, program: Option<String>) {
+        self.router.context.agent_program = program.filter(|p| !p.is_empty());
+    }
+
+    /// The binary [`Self::set_agent_program`] named, if any.
+    pub fn agent_program(&self) -> Option<&str> {
+        self.router.context.agent_program.as_deref()
     }
 
     // ── Verbs ────────────────────────────────────────────────────────────────

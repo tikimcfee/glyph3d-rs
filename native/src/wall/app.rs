@@ -983,13 +983,19 @@ impl App {
             self.draw(true);
         }
         let launch_cfg = crate::launch_config::LaunchConfig::load_or_default();
-        self.agents = Some(match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
-            Ok(agent_opts) => super::agents::WallAgents::with_options(agent_opts, session_wake),
-            Err(e) => {
-                log::warn!("{e}");
-                super::agents::WallAgents::new(session_wake)
-            }
+        let agent_opts = super::agents::WallAgentsOptions::from_launch_config(&launch_cfg).unwrap_or_else(|e| {
+            log::warn!("{e}");
+            super::agents::WallAgentsOptions::default()
         });
+        // An attach terminal runs the `agent` this wall's own feed runs, when that is a
+        // binary the wall found: one CLI and one store for what is listed and what is
+        // attached (a configured `agent_binary` included), and a test's stub CLI the only
+        // one its terminals can reach. A bare name (nothing found) is left to the terminal.
+        if let Some(wall) = &mut self.wall {
+            let program = &agent_opts.cli.program;
+            wall.set_agent_program(program.is_absolute().then(|| program.to_string_lossy().into_owned()));
+        }
+        self.agents = Some(super::agents::WallAgents::with_options(agent_opts, session_wake));
         self.poll_pending_termd();
         self.sync_macos_option_as_alt();
         self.perf.mark_opened(&self.proxy);
@@ -2848,6 +2854,9 @@ impl App {
                         // The daemon as the Status window has it: its state, which way a
                         // namespace that left on purpose went, and the window's own words
                         // (to the end of the line).
+                        // The `agent` binary an attach terminal runs (the wall's own feed's),
+                        // or `unresolved` when the terminal is left to look one up.
+                        out.push_str(&format!("\nagent_cli {}", wall.agent_program().unwrap_or("unresolved")));
                         out.push_str(&format!(
                             "\ntermd state={} left={} says={}",
                             wall.termd().state().as_str(),

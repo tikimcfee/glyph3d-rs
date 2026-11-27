@@ -163,6 +163,8 @@ export_snap = {
             "transcript": transcript_file,
             "dialect": "claude",
         },
+        # A record whose terminal session is gone (`attached: false`): export still prints
+        # its last report, `idle`, and the wall reads it as `agent status` does, ended (gone).
         {
             "name": "reviewer",
             "host": "laptop-2",
@@ -187,7 +189,7 @@ export_snap = {
             "cwd": d_dir,
             "created_at": "2026-11-26T18:10:00Z",
             "live": True,
-            "attached": False,
+            "attached": True,
             "status": "waiting",
             "tool": "Bash",
             "detail": "tools/wall-perf.sh",
@@ -410,6 +412,29 @@ case "\$sub" in
         ;;
     sessions)
         cat "$SESSIONS_JSON"
+        ;;
+    attach)
+        case "\${1:-}" in
+            ghost*)
+                # An agent that was cleaned up, as the real CLI says it.
+                printf 'Error: agent "%s" not found on host workstation (2 agents there: agent list --host workstation)\n' "\${1%%@*}" >&2
+                exit 1
+                ;;
+            *)
+                # A session that stays up until its terminal is closed.
+                printf 'STUB_ATTACHED %s\n' "\${1:-}"
+                exec sleep 600
+                ;;
+        esac
+        ;;
+    status)
+        case "\${1:-}" in
+            ghost*)
+                printf 'Error: agent "%s" not found on host workstation (2 agents there: agent list --host workstation)\n' "\${1%%@*}" >&2
+                exit 1
+                ;;
+            *) printf '%s: idle\n' "\${1:-}" ;;
+        esac
         ;;
     transcript)
         mode="window"
@@ -1108,11 +1133,10 @@ term_ids() {
     ctl app.where 2>/dev/null | awk '/^terminal / {print $2}' | sort | tr '\n' ' '
 }
 
-# Only `coder` is ever attached here. It lives in the extra namespace, so the wall
-# reattaches its termd session directly (#13). Any other agent's attach runs the
-# `agent attach` wrapper INSIDE a terminal, and termd gives its children a bare PATH
-# (`/usr/bin:/bin`): the wrapper then takes the login shell's PATH and finds the REAL
-# `agent`, not the stub above. So this never clicks `bench` or `linux-gate`.
+# `coder` lives in the extra namespace, so the wall reattaches its termd session directly
+# (#13). Any other agent's attach runs the `agent attach` program INSIDE a terminal, which
+# the checks after this one do, now that the terminal is handed the wall's own `agent`
+# (the stub above) instead of looking one up on the login shell's PATH.
 ctl wall.rename t1 shell >/dev/null
 ctl wall.close gx-coder >/dev/null
 ctl wall.sidebar left >/dev/null
@@ -1201,9 +1225,10 @@ away = ["a:bench@workstation=processing", "a:linux-gate@workstation=idle"]
 
 # `coder` closed: an agent row of its own, between the others by urgency.
 want_open = ["s:none[laptop-2=4,workstation=2]", "t:t1", "a:perf-probe@laptop-2=waiting",
-             "a:coder@laptop-2=processing", "a:reviewer@laptop-2=idle", *away]
+             "a:coder@laptop-2=processing", "a:reviewer@laptop-2=ended", *away]
 # Clicked: one row, the terminal, with the status of the agent it shows.
-loose = ["a:perf-probe@laptop-2=waiting", "a:reviewer@laptop-2=idle"]
+# The session of `reviewer` is gone: it reads ended, whatever it last reported.
+loose = ["a:perf-probe@laptop-2=waiting", "a:reviewer@laptop-2=ended"]
 want_attached = ["s:none[laptop-2=4,workstation=2]", "t:t1", coder, *loose, *away]
 
 members = {g_build: ["t:t1", coder], g_ops: [f"t:{sh1}", f"t:{sh2}"]}
@@ -1243,6 +1268,153 @@ if [[ "${OL_CHECK%% *}" == "1" ]]; then
     record_pass "sidebar one list (group & host)" "${OL_CHECK#* }"
 else
     record_fail "sidebar one list (group & host)" "${OL_CHECK#* }"
+fi
+
+# ── 15. An attach terminal runs the wall's own `agent`: the stub ─────────────
+# `bench` is on another host, so its attach is the `agent attach` program in a terminal.
+# Until 2026-11-27 that program looked `agent` up through the login shell's PATH and ran
+# the real CLI here; the stub's log never saw the attach.
+new_term_id() { # $1 = ids before: the first terminal id that is new now
+    python3 -c '
+import sys
+before = set(sys.argv[1].split())
+print(next((i for i in sys.argv[2].split() if i not in before), ""))
+' "$1" "$(term_ids)"
+}
+IDS_15="$(term_ids)"
+R_ATT="$(ctl wall.attach bench@workstation 2>&1)"
+ATT_ID=""
+for _ in $(seq 1 100); do
+    ATT_ID="$(new_term_id "$IDS_15")"
+    [[ -n "$ATT_ID" ]] && break
+    sleep 0.05
+done
+ATT_SEEN=0
+[[ -n "$ATT_ID" ]] && wait_for_text "$ATT_ID" "STUB_ATTACHED bench@workstation" 120 && ATT_SEEN=1
+ATT_RAN="$(grep -c '^attach bench@workstation$' "$INVOCATIONS_LOG")"
+if [[ "$ATT_SEEN" -eq 1 && "$ATT_RAN" -eq 1 ]]; then
+    record_pass "attach terminal runs the stub" "wall.attach bench@workstation opened $ATT_ID, whose program was the stub (its banner on screen, 1 attach in its log)"
+else
+    record_fail "attach terminal runs the stub" "reply='${R_ATT}' id='${ATT_ID}' banner=$ATT_SEEN stub attach calls=$ATT_RAN text='$(ctl app.text "${ATT_ID:-none}" 2>/dev/null | tr '\n' ' ' | cut -c1-200)'"
+fi
+[[ -n "$ATT_ID" ]] && ctl wall.close "$ATT_ID" >/dev/null
+
+# ── 16. An agent that was cleaned up: said once, never retried ──────────────
+# The fleet does not know `ghost`, so the wall tries it, and the CLI answers as the real
+# one does for a cleaned-up agent. The terminal says so, offers no retry, and Enter closes.
+IDS_16="$(term_ids)"
+ctl wall.attach ghost@workstation >/dev/null 2>&1
+GHOST_ID=""
+for _ in $(seq 1 100); do
+    GHOST_ID="$(new_term_id "$IDS_16")"
+    [[ -n "$GHOST_ID" ]] && break
+    sleep 0.05
+done
+GONE_NOTE="[ghost@workstation is not an agent any more (it was cleaned up), so there is nothing to attach to. Enter closes.]"
+# The note is longer than the terminal is wide, so it wraps: compare with all whitespace out.
+GHOST_SAID=0
+GHOST_TEXT=""
+for _ in $(seq 1 120); do
+    GHOST_TEXT="$(ctl app.text "${GHOST_ID:-none}" 2>/dev/null || true)"
+    if [[ "$(tr -d '[:space:]' <<<"$GHOST_TEXT")" == *"$(tr -d '[:space:]' <<<"$GONE_NOTE")"* ]]; then
+        GHOST_SAID=1
+        break
+    fi
+    sleep 0.05
+done
+GHOST_RETRY=0
+[[ "$(tr -d '[:space:]' <<<"$GHOST_TEXT")" == *"Enterattachesagain"* ]] && GHOST_RETRY=1
+GHOST_CLOSED=0
+if [[ -n "$GHOST_ID" ]]; then
+    ctl terminal.focus "$GHOST_ID" >/dev/null
+    ctl app.key enter >/dev/null
+    for _ in $(seq 1 100); do
+        if ! grep -qw "$GHOST_ID" <<<"$(term_ids)"; then
+            GHOST_CLOSED=1
+            break
+        fi
+        sleep 0.05
+    done
+fi
+GHOST_ATTACHES="$(grep -c '^attach ghost@workstation$' "$INVOCATIONS_LOG")"
+GHOST_ASKED="$(grep -c '^status ghost@workstation$' "$INVOCATIONS_LOG")"
+if [[ "$GHOST_SAID" -eq 1 && "$GHOST_RETRY" -eq 0 && "$GHOST_CLOSED" -eq 1 \
+    && "$GHOST_ATTACHES" -eq 1 && "$GHOST_ASKED" -eq 1 ]]; then
+    record_pass "a cleaned-up agent is not retried" "$GHOST_ID said it once, offered no retry, and closed on Enter (1 attach, 1 status in the stub's log)"
+else
+    record_fail "a cleaned-up agent is not retried" "id='${GHOST_ID}' said=$GHOST_SAID retry_offered=$GHOST_RETRY closed=$GHOST_CLOSED attaches=$GHOST_ATTACHES status=$GHOST_ASKED text='$(tr '\n' ' ' <<<"$GHOST_TEXT" | cut -c1-240)'"
+fi
+
+# ── 17. A cleaned-up agent leaves the list ──────────────────────────────────
+# The follow stream's event lines as the CLI prints them: beside the agent, an `id`, the
+# store's directory as a STRING, `at`, and for `changed` a `reason`. Until 2026-11-27 the
+# wall could not read a line shaped so, and a helper stayed "processing" in the sidebar an
+# hour after it was cleaned up.
+ctl wall.sidebar left >/dev/null
+ctl wall.sidebar mode group >/dev/null
+W_17_BEFORE="$(wait_sidebar_rows "a:perf-probe@laptop-2=waiting")"
+python3 - "$D" "$EXPORT_STREAM" changed <<'PY'
+import json, sys
+d_dir, stream, kind = sys.argv[1:4]
+agent = {
+    "name": "perf-probe", "host": "laptop-2", "kind": "termd", "run": 7, "backend": "claude",
+    "session": "perf-probe", "namespace": "agents", "store": d_dir + "/store", "cwd": d_dir,
+    "created_at": "2026-11-26T18:10:00Z", "live": True, "attached": True, "resumable": False,
+    "status": "processing", "event": "PostToolUse", "detail": "Bash: tools/wall-perf.sh",
+    "tool": "Bash", "status_at": "2026-11-26T18:31:00Z", "dialect": "claude",
+}
+line = {"type": "changed", "id": 101, "store": d_dir + "/store", "at": "2026-11-26T18:31:00Z",
+        "reason": "status", "agent": agent}
+with open(stream, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(line) + "\n")
+PY
+W_17_CHANGED="$(wait_sidebar_rows "a:perf-probe@laptop-2=processing")"
+ROWS_17_CHANGED="$(sb_tok "$W_17_CHANGED" rows)"
+python3 - "$D" "$EXPORT_STREAM" <<'PY'
+import json, sys
+d_dir, stream = sys.argv[1:3]
+agent = {
+    "name": "perf-probe", "host": "laptop-2", "kind": "termd", "run": 7, "backend": "claude",
+    "session": "perf-probe", "namespace": "agents", "store": d_dir + "/store", "cwd": d_dir,
+    "created_at": "2026-11-26T18:10:00Z", "ended_at": "2026-11-26T18:32:00Z", "live": False,
+    "attached": False, "resumable": False, "status": "ended", "end_reason": "quit",
+    "dialect": "claude",
+}
+line = {"type": "removed", "id": 102, "store": d_dir + "/store", "at": "2026-11-26T18:32:00Z",
+        "agent": agent}
+with open(stream, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(line) + "\n")
+PY
+ROWS_17_REMOVED=""
+LEFT_17=0
+for _ in $(seq 1 120); do
+    ROWS_17_REMOVED="$(sb_tok "$(ctl app.where 2>/dev/null)" rows)"
+    if [[ -n "$ROWS_17_REMOVED" && "$ROWS_17_REMOVED" != *"perf-probe"* ]]; then
+        LEFT_17=1
+        break
+    fi
+    sleep 0.05
+done
+# Clicking where it was does nothing now, and `wall.attach` says why.
+R_17_ATTACH="$(ctl wall.attach perf-probe@laptop-2 2>&1)"
+ctl wall.sidebar close >/dev/null
+if [[ "$(sb_tok "$W_17_BEFORE" rows)" == *"a:perf-probe@laptop-2=waiting"* \
+    && "$ROWS_17_CHANGED" == *"a:perf-probe@laptop-2=processing"* && "$LEFT_17" -eq 1 \
+    && "$R_17_ATTACH" == *"perf-probe@laptop-2 is not an agent any more: it ended (quit) and was cleaned up"* ]]; then
+    record_pass "a cleaned-up agent leaves the list" "perf-probe went waiting -> processing on a changed line, then off the list on its removed line; wall.attach: '${R_17_ATTACH}'"
+else
+    record_fail "a cleaned-up agent leaves the list" "before='$(sb_tok "$W_17_BEFORE" rows)' changed='${ROWS_17_CHANGED}' removed='${ROWS_17_REMOVED}' attach='${R_17_ATTACH}'"
+fi
+
+# ── The wall can only run the stub `agent` ──────────────────────────────────
+# Its fleet feed runs the `agent` it found first on PATH (the stub above), and since
+# 2026-11-27 it hands that same binary to every attach terminal, whose own PATH (termd gives
+# a terminal /usr/bin:/bin) would otherwise lead through the login shell to the real CLI.
+AGENT_CLI="$(ctl app.where 2>/dev/null | sed -n 's/^agent_cli //p')"
+if [[ "$AGENT_CLI" == "$D/bin/agent" ]]; then
+    record_pass "only the stub agent CLI" "the wall's feed and its attach terminals run $AGENT_CLI"
+else
+    record_fail "only the stub agent CLI" "the wall would run '${AGENT_CLI:-nothing reported}', not the stub $D/bin/agent"
 fi
 
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"
