@@ -595,6 +595,11 @@ pub struct EntryRow {
     /// `["wall.reveal", id]` for a terminal, `["wall.attach", target]` for an
     /// agent with none.
     pub click_cmd: Vec<String>,
+    /// What a right-click on the row runs, the panel adding where the
+    /// pointer is: `["wall.menu", "row", id]` for a terminal (its own menu,
+    /// as on the canvas), `["wall.menu", "agent", target]` for an agent with
+    /// none. Empty for an agent whose menu would have nothing in it.
+    pub menu_cmd: Vec<String>,
 }
 
 impl EntryRow {
@@ -602,6 +607,27 @@ impl EntryRow {
     pub fn is_agent_only(&self) -> bool {
         self.terminal.is_none()
     }
+}
+
+/// What the right-click menu reads about each agent the list shows
+/// ([`crate::menu::MenuState::agents`]): the list's own answer to whether
+/// an agent can be attached and which terminal shows it, so the menu of an
+/// agent's row and the row agree.
+pub fn menu_agents(model: &SidebarModel) -> Vec<crate::menu::MenuAgent> {
+    model
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            SidebarRow::Entry(e) => e.agent.as_ref(),
+            _ => None,
+        })
+        .map(|a| crate::menu::MenuAgent {
+            target: a.target.clone(),
+            name: a.name.clone(),
+            attachable: a.attachable,
+            on_wall: a.on_wall.clone(),
+        })
+        .collect()
 }
 
 /// One row of the sidebar's list, in drawing order.
@@ -939,6 +965,7 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
                 interactive: true,
                 tooltip,
                 click_cmd: vec!["wall.reveal".to_string(), t.id.clone()],
+                menu_cmd: vec!["wall.menu".to_string(), "row".to_string(), t.id.clone()],
             },
             group: group.unwrap_or(NO_GROUP),
             member,
@@ -965,6 +992,15 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
                 interactive: attachable || on_wall.is_some(),
                 tooltip: build_agent_tooltip(a, attachable, on_wall.as_deref(), false),
                 click_cmd: vec!["wall.attach".to_string(), a.target.clone()],
+                menu_cmd: if attachable || on_wall.is_some() {
+                    vec![
+                        "wall.menu".to_string(),
+                        "agent".to_string(),
+                        a.target.clone(),
+                    ]
+                } else {
+                    Vec::new()
+                },
             },
             group: NO_GROUP,
             member: usize::MAX,
@@ -1394,11 +1430,28 @@ mod tests {
         assert!(probe.agent.as_ref().unwrap().on_wall.is_none());
         assert!(probe.tooltip.ends_with("click to attach"));
 
-        // No session to attach to: listed, dimmed.
+        // A right-click: a terminal's row opens the terminal's own menu, an
+        // agent's row the agent's.
+        assert_eq!(lead.menu_cmd, vec!["wall.menu", "row", "gx-lead"]);
+        assert_eq!(worker.menu_cmd, vec!["wall.menu", "row", "t7"]);
+        assert_eq!(probe.menu_cmd, vec!["wall.menu", "agent", "probe@laptop-2"]);
+
+        // No session to attach to: listed, dimmed, and with no menu (it
+        // would have nothing in it).
         let reviewer = entry(&model, "a:reviewer@laptop-2");
+        assert!(reviewer.menu_cmd.is_empty());
         assert!(!reviewer.interactive);
         assert!(!reviewer.agent.as_ref().unwrap().attachable);
         assert!(reviewer.tooltip.ends_with("no live session to attach to"));
+
+        // What the menu reads about the agents is the list's own answer.
+        let agents = menu_agents(&model);
+        let of = |target: &str| agents.iter().find(|a| a.target == target).unwrap();
+        assert_eq!(of("lead@laptop-2").on_wall.as_deref(), Some("gx-lead"));
+        assert_eq!(of("worker@workstation").on_wall.as_deref(), Some("t7"));
+        assert!(of("probe@laptop-2").attachable && of("probe@laptop-2").on_wall.is_none());
+        assert!(!of("reviewer@laptop-2").attachable);
+        assert_eq!(of("probe@laptop-2").name, "probe");
 
         // The same agents, merged the same way, whichever mode lists them.
         let by_host = build_sidebar(&fleet(SidebarMode::Host));

@@ -22,6 +22,11 @@
 //! - Is as wide as its edge was dragged ([`super::resize`]): `wall.sidebar
 //!   width` docked, `wall.sidebar size` floating; a name is cut only when the
 //!   panel is too narrow for it.
+//! - A right-click on a row opens its menu (2026-11-27): a terminal's is the
+//!   terminal's own, as a right-click on it gives on the canvas (and what
+//!   still applies, for a hidden one); an agent's with no terminal offers to
+//!   attach it. The row sends `wall.menu row <id> <x> <y>` or `wall.menu
+//!   agent <name> <x> <y>`; the menu is the wall's ([`super::context_menu`]).
 //! - Never steals keyboard focus from the focused terminal (`wants_keyboard` is
 //!   always `false`).
 
@@ -1002,7 +1007,22 @@ fn draw_entry_row(
     } else {
         row_hit.on_hover_text(sanitize_egui_text(&e.tooltip))
     };
-    if row_hit.clicked() && !tool_interacted {
+    // A right-click anywhere on the row (its tools too) opens its menu
+    // where the pointer is: a terminal's own menu, as on the canvas, or an
+    // agent's. On a Mac a Ctrl+click is a right-click here as it is there.
+    let ctrl_click = platform == Platform::Mac
+        && row_hit.clicked()
+        && ui.input(|i| i.modifiers.ctrl);
+    let right_click = ui.rect_contains_pointer(row_rect)
+        && ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary));
+    if (ctrl_click || right_click) && !e.menu_cmd.is_empty() {
+        if let Some(at) = ui.input(|i| i.pointer.interact_pos()) {
+            let mut cmd = e.menu_cmd.clone();
+            cmd.push((at.x.round() as i64).to_string());
+            cmd.push((at.y.round() as i64).to_string());
+            push_cmd(out, &cmd);
+        }
+    } else if row_hit.clicked() && !tool_interacted {
         push_cmd(out, &e.click_cmd);
     }
 }
@@ -1601,6 +1621,124 @@ mod tests {
                 |ui| show(ui.ctx(), state, input, out),
             );
         }
+    }
+
+    /// A press and release of `button` at `pos` in a 1280 x 800 window, as
+    /// two passes; what was sent.
+    fn press_at(
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        button: egui::PointerButton,
+        modifiers: egui::Modifiers,
+        time: f64,
+        state: &mut SidebarState,
+        input: &SidebarInput,
+    ) -> Vec<String> {
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut out = Vec::new();
+        for (k, pressed) in [true, false].into_iter().enumerate() {
+            // (The modifiers held arrive as an event of their own.)
+            let mut events = vec![egui::Event::ModifiersChanged(modifiers)];
+            if pressed {
+                events.push(egui::Event::PointerMoved(pos));
+            }
+            events.push(egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            });
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(vp),
+                    time: Some(time + k as f64 * 0.016),
+                    events,
+                    ..egui::RawInput::default()
+                },
+                |ui| show(ui.ctx(), state, input, &mut out),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_asks_for_its_menu_where_the_pointer_is() {
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut state = SidebarState::new(true, DockSide::Left);
+        let input = sample_sidebar_input(vp, SidebarMode::Group);
+        let mut out = Vec::new();
+        settle(&ctx, vp, 1.0, &mut state, &input, &mut out);
+        assert!(out.is_empty());
+        let right = egui::PointerButton::Secondary;
+        let plain = egui::Modifiers::NONE;
+
+        // A terminal's row: its own menu, by its id, at the pointer.
+        let t1 = state.term_row_rects["t1"].center();
+        assert_eq!(
+            press_at(&ctx, t1, right, plain, 2.0, &mut state, &input),
+            vec![format!("wall.menu row t1 {} {}", t1.x.round(), t1.y.round())]
+        );
+        // A hidden terminal's row has one too: it is the only place it has.
+        let t2 = state.term_row_rects["t2"].center();
+        assert_eq!(
+            press_at(&ctx, t2, right, plain, 3.0, &mut state, &input),
+            vec![format!("wall.menu row t2 {} {}", t2.x.round(), t2.y.round())]
+        );
+        // Anywhere on the row counts, its tools at the right end too.
+        let over_tools = egui::pos2(240.0, t1.y);
+        assert!(!state.term_row_rects["t1"].contains(over_tools));
+        assert_eq!(
+            press_at(&ctx, over_tools, right, plain, 4.0, &mut state, &input),
+            vec![format!("wall.menu row t1 240 {}", t1.y.round())]
+        );
+
+        // An agent with no terminal on the wall: the agent's menu, by its name.
+        let (target, rect) = state
+            .agent_row_rects
+            .iter()
+            .find(|(k, _)| k.starts_with("lead"))
+            .map(|(k, r)| (k.clone(), *r))
+            .expect("lead has a row of its own");
+        let at = rect.center();
+        assert_eq!(
+            press_at(&ctx, at, right, plain, 5.0, &mut state, &input),
+            vec![format!("wall.menu agent {target} {} {}", at.x.round(), at.y.round())]
+        );
+
+        // A plain click is still the row's own: reveal, or attach.
+        let left = egui::PointerButton::Primary;
+        assert_eq!(
+            press_at(&ctx, t1, left, plain, 6.0, &mut state, &input),
+            vec!["wall.reveal t1"]
+        );
+        assert_eq!(
+            press_at(&ctx, at, left, plain, 7.0, &mut state, &input),
+            vec![format!("wall.attach {target}")]
+        );
+        // On a Mac, Ctrl+click is the right-click it is on the canvas.
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(
+            press_at(&ctx, t1, left, ctrl, 8.0, &mut state, &input),
+            vec![format!("wall.menu row t1 {} {}", t1.x.round(), t1.y.round())]
+        );
+        let other = SidebarInput {
+            platform: Platform::Other,
+            ..input.clone()
+        };
+        assert_eq!(
+            press_at(&ctx, t1, left, ctrl, 9.0, &mut state, &other),
+            vec!["wall.reveal t1"]
+        );
+
+        // A right-click on a header, or beside the panel, asks for nothing.
+        let header = state.group_fold_rects["g1"].center() + egui::vec2(60.0, 0.0);
+        assert!(press_at(&ctx, header, right, plain, 10.0, &mut state, &input).is_empty());
+        let outside = egui::pos2(600.0, t1.y);
+        assert!(press_at(&ctx, outside, right, plain, 11.0, &mut state, &input).is_empty());
     }
 
     #[test]

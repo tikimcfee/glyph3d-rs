@@ -562,9 +562,13 @@ pub use crate::camera::ScreenBox;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MenuTarget {
+    /// `part` is `"body"`, `"title"`, `"edge"`, or `"row"`: its row in the
+    /// sidebar, the one part a hidden terminal has.
     Terminal { id: String, part: String },
     Group { id: String },
     Canvas,
+    /// An agent's row in the sidebar, by `name` or `name@host`.
+    Agent { target: String },
 }
 
 /// Matched knob entry returned in [`ConfigSearchGroup`] (`wall.config.find`).
@@ -799,6 +803,18 @@ pub trait WallApi {
     fn bus_view(&self) -> BusView;
     fn terminals_attached_to(&self, target: &str) -> Vec<String>;
     fn attach_agent(&mut self, target: &str) -> Result<AttachOutcome, String>;
+
+    /// [`Self::attach_agent`], and open the Agent View of the terminal it
+    /// reveals or opens (`wall.attach <target> view`). This default opens
+    /// the view of a terminal that is already there; a wall whose attach
+    /// asks for a terminal that arrives later opens it then.
+    fn attach_agent_with_view(&mut self, target: &str) -> Result<AttachOutcome, String> {
+        let outcome = self.attach_agent(target)?;
+        if outcome.existing {
+            self.agent_set_open(&outcome.id, "open")?;
+        }
+        Ok(outcome)
+    }
 
     fn agent_set_open(&mut self, id: &str, how: &str) -> Result<AgentOpenResult, String>;
     fn agent_set_side(&mut self, id: &str, side: &str) -> Result<AgentSideResult, String>;
@@ -1951,17 +1967,17 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.menu",
-        "terminal <id> [x y] | group <gid> [x y] | canvas [x y] | close",
-        "Open the right-click menu on a terminal, a group or the canvas (at canvas px), or close it",
+        "terminal <id> [x y] | group <gid> [x y] | canvas [x y] | row <id> [x y] | agent <name[@host]> [x y] | close",
+        "Open the right-click menu on a terminal, a group or the canvas (at canvas px), on a terminal's or an agent's row in the sidebar, or close it",
         |args, wall| {
             let kind = args.first().map_or("undefined", String::as_str);
             if kind == "close" {
                 wall.close_menu();
                 return Ok(CommandReply::ok("menu closed", None));
             }
-            if !matches!(kind, "terminal" | "group" | "canvas") {
+            if !matches!(kind, "terminal" | "group" | "canvas" | "row" | "agent") {
                 return Err(format!(
-                    "the menu opens on terminal|group|canvas (or close), not '{kind}'"
+                    "the menu opens on terminal|group|canvas|row|agent (or close), not '{kind}'"
                 ));
             }
             let (id_opt, rest): (Option<&str>, &[String]) = if kind == "canvas" {
@@ -1969,7 +1985,11 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
             } else {
                 let id = args.get(1).map_or("", String::as_str);
                 if id.is_empty() {
-                    return Err(format!("name a {kind}"));
+                    return Err(match kind {
+                        "row" => "name a terminal".to_string(),
+                        "agent" => "name an agent".to_string(),
+                        _ => format!("name a {kind}"),
+                    });
                 }
                 (Some(id), args.get(2..).unwrap_or(&[]))
             };
@@ -2002,6 +2022,13 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
                 "terminal" => MenuTarget::Terminal {
                     id: id_opt.expect("terminal id").to_string(),
                     part: "body".to_string(),
+                },
+                "row" => MenuTarget::Terminal {
+                    id: id_opt.expect("terminal id").to_string(),
+                    part: "row".to_string(),
+                },
+                "agent" => MenuTarget::Agent {
+                    target: id_opt.expect("agent name").to_string(),
                 },
                 "group" => MenuTarget::Group { id: id_opt.expect("group id").to_string() },
                 _ => MenuTarget::Canvas,
@@ -2316,25 +2343,38 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.attach",
-        "<name[@host]>",
-        "Attach to a gomuxai agent: reveal its terminal, else attach directly to its local termd session (or ssh on another host)",
+        "<name[@host]> [view]",
+        "Attach to a gomuxai agent: reveal its terminal, else attach directly to its local termd session (or ssh on another host); `view` opens its Agent View too",
         |args, wall| {
             let Some(target) = args.first().filter(|s| !s.is_empty()) else {
                 return Err(
                     "name an agent: name, or name@host for one on another host".into(),
                 );
             };
-            let outcome = match wall.attach_agent(target) {
+            let with_view = match args.get(1).map(String::as_str) {
+                None => false,
+                Some("view") => true,
+                Some(other) => {
+                    return Err(format!("attach takes an agent, then `view` or nothing, not '{other}'"));
+                }
+            };
+            let attached = if with_view {
+                wall.attach_agent_with_view(target)
+            } else {
+                wall.attach_agent(target)
+            };
+            let outcome = match attached {
                 Ok(o) => o,
                 Err(e) => {
                     wall.notify(&format!("attach: {e}"));
                     return Err(e);
                 }
             };
+            let view = if with_view { ", with its agent view" } else { "" };
             let msg = if outcome.existing {
-                format!("revealed {}, attached to {target}", outcome.id)
+                format!("revealed {}, attached to {target}{view}", outcome.id)
             } else {
-                format!("{} attaches to {target}", outcome.id)
+                format!("{} attaches to {target}{view}", outcome.id)
             };
             Ok(CommandReply::ok(
                 msg,
@@ -3966,6 +4006,65 @@ mod tests {
         r.execute(["wall.sidebar", "close"]);
         r.execute(["wall.sidebar", "open"]);
         assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn the_menu_opens_on_a_sidebar_row_and_attach_can_open_the_agent_view_too() {
+        let mut r = wall_router();
+        r.context.add_term("t1", false);
+        r.context.add_term("t2", true);
+
+        // A terminal's row, by its id, where the pointer is; the target
+        // says it is the row, which a hidden terminal has too.
+        let row = r.execute(["wall.menu", "row", "t2", "40", "300"]);
+        assert_eq!(row.text, "OK: menu on row t2 at (40, 300)");
+        let menu = r.context.menu.as_ref().unwrap();
+        assert_eq!(
+            menu.target,
+            MenuTarget::Terminal { id: "t2".into(), part: "row".into() }
+        );
+        assert_eq!(menu.at, Point::new(40.0, 300.0));
+
+        // An agent's row, by its name.
+        let agent = r.execute(["wall.menu", "agent", "probe@laptop-2", "50", "360"]);
+        assert_eq!(agent.text, "OK: menu on agent probe@laptop-2 at (50, 360)");
+        assert_eq!(
+            r.context.menu.as_ref().unwrap().target,
+            MenuTarget::Agent { target: "probe@laptop-2".into() }
+        );
+        // With no place given, the middle of the view.
+        r.execute(["wall.menu", "row", "t1"]);
+        assert_eq!(r.context.menu.as_ref().unwrap().at, Point::new(400.0, 300.0));
+
+        for (line, why) in [
+            ("wall.menu row", "name a terminal"),
+            ("wall.menu agent", "name an agent"),
+            (
+                "wall.menu sidebar",
+                "the menu opens on terminal|group|canvas|row|agent (or close), not 'sidebar'",
+            ),
+        ] {
+            let reply = r.execute(line);
+            assert!(reply.is_err() && reply.text.contains(why), "{line}: {}", reply.text);
+        }
+
+        // `view` after the agent opens the Agent View of the terminal the
+        // attach reveals or opens.
+        let first = r.execute(["wall.attach", "local-agy"]);
+        assert_eq!(first.text, "OK: gx-local-agy attaches to local-agy");
+        assert!(!r.context.agent_open.get("gx-local-agy").is_some_and(|v| v.0));
+        let again = r.execute(["wall.attach", "local-agy", "view"]);
+        assert_eq!(
+            again.text,
+            "OK: revealed gx-local-agy, attached to local-agy, with its agent view"
+        );
+        assert!(r.context.agent_open["gx-local-agy"].0);
+        let bad = r.execute(["wall.attach", "local-agy", "big"]);
+        assert!(
+            bad.text.contains("attach takes an agent, then `view` or nothing, not 'big'"),
+            "{}",
+            bad.text
+        );
     }
 
     #[test]

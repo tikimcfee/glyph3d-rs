@@ -58,6 +58,12 @@ pub fn caption_of(target: &MenuTarget, state: &MenuState) -> String {
             .find(|g| &g.id == id)
             .map_or_else(|| id.clone(), |g| g.name.clone()),
         MenuTarget::Canvas { .. } => "canvas".to_owned(),
+        // An agent's row in the sidebar: the agent's name, as its row has it.
+        MenuTarget::Agent { target } => state
+            .agents
+            .iter()
+            .find(|a| &a.target == target)
+            .map_or_else(|| target.clone(), |a| a.name.clone()),
     }
 }
 
@@ -1577,6 +1583,7 @@ mod tests {
                 bars: true,
                 members: vec!["t2".to_owned()],
             }],
+            agents: Vec::new(),
         }
     }
 

@@ -1422,9 +1422,16 @@ pub fn format_where(described: &WallFrame, cursor: Point, platform: Platform) ->
         None => "none".to_string(),
         Some(m) => {
             let target = match &m.target {
+                // A terminal's row in the sidebar, the one part a hidden
+                // terminal has, and an agent's row there.
+                MenuTarget::Terminal {
+                    id,
+                    part: wall_core::menu::TerminalPart::Row,
+                } => format!("row:{id}"),
                 MenuTarget::Terminal { id, .. } => format!("terminal:{id}"),
                 MenuTarget::Group { id } => format!("group:{id}"),
                 MenuTarget::Canvas { .. } => "canvas".to_string(),
+                MenuTarget::Agent { target } => format!("agent:{target}"),
             };
             format!("{target} at={:.2},{:.2}", m.at.x, m.at.y)
         }

@@ -97,6 +97,7 @@ mod tests {
                 bars: true,
                 members: vec![],
             }],
+            agents: Vec::new(),
         };
         let menu_input = ContextMenuInput {
             open: Some(OpenContextMenu::from_wall(

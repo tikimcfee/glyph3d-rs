@@ -908,6 +908,62 @@ else
     record_fail "panel edges (drag, reset)" "${RS_CHECK#* }"
 fi
 
+# ── 14. Sidebar rows: a right-click opens the terminal's own menu; a hidden one's has `show` ──
+# `menu` on app.where names what the open menu is on (`row:<id>` for a sidebar row);
+# `items=` on the `context_menu` line are the rows a click runs.
+ctl wall.sidebar right >/dev/null
+ctl app.where >/dev/null
+W_RM0="$(ctl app.where)"
+read -r RM_X RM_Y < <(map_entry_center "panel sidebar " "terms" "t1" "$W_RM0")
+ctl app.click "$RM_X" "$RM_Y" right >/dev/null
+ctl app.where >/dev/null
+W_RM1="$(ctl app.where)"
+read -r RM_HIDE_X RM_HIDE_Y < <(map_entry_center "context_menu " "items" "hide" "$W_RM1")
+ctl app.click "$RM_HIDE_X" "$RM_HIDE_Y" >/dev/null
+ctl app.where >/dev/null
+W_RM2="$(ctl app.where)"
+# Hidden: its row is still in the list, and is where it has a menu.
+read -r RM_X2 RM_Y2 < <(map_entry_center "panel sidebar " "terms" "t1" "$W_RM2")
+ctl app.click "$RM_X2" "$RM_Y2" right >/dev/null
+ctl app.where >/dev/null
+W_RM3="$(ctl app.where)"
+read -r RM_SHOW_X RM_SHOW_Y < <(map_entry_center "context_menu " "items" "show" "$W_RM3")
+ctl app.click "$RM_SHOW_X" "$RM_SHOW_Y" >/dev/null
+ctl app.where >/dev/null
+W_RM4="$(ctl app.where)"
+ctl wall.sidebar close >/dev/null
+
+RM_CHECK="$(python3 -c '
+import sys
+w1, w2, w3, w4 = sys.argv[1:5]
+def line(s, prefix):
+    for l in s.splitlines():
+        if l.startswith(prefix):
+            return l
+    return ""
+def items(s):
+    for t in line(s, "context_menu ").split():
+        if t.startswith("items="):
+            return [e.split(":")[0] for e in t[6:].split(";") if ":" in e]
+    return []
+shown = lambda s: any(l.startswith("terminal t1 ") for l in s.splitlines())
+i1, i3 = items(w1), items(w3)
+ok = (
+    line(w1, "menu ").startswith("menu row:t1 at=")
+    and all(k in i1 for k in ("frame", "paste", "split-right", "hide", "close"))
+    and line(w2, "menu ") == "menu none" and not shown(w2)          # `hide` ran, the menu closed
+    and line(w3, "menu ").startswith("menu row:t1 at=")
+    and "show" in i3 and "frame" not in i3 and "close" in i3
+    and line(w4, "menu ") == "menu none" and shown(w4)              # `show` ran
+)
+print(f"{int(ok)} shown_row={len(i1)} rows ({chr(44).join(i1[:4])}…) hidden_row={chr(44).join(i3)} hid={not shown(w2)} shown_again={shown(w4)}")
+' "$W_RM1" "$W_RM2" "$W_RM3" "$W_RM4")"
+if [[ "${RM_CHECK%% *}" == "1" ]]; then
+    record_pass "sidebar row menu (hide, show)" "${RM_CHECK#* }"
+else
+    record_fail "sidebar row menu (hide, show)" "${RM_CHECK#* }"
+fi
+
 echo ""
 echo "=== PANEL SMOKE SUMMARY: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
 [[ "$FAIL_COUNT" -eq 0 ]]

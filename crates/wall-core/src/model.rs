@@ -2948,6 +2948,15 @@ impl WallModel {
     /// Open the right-click context menu on `target` at viewport-local pixel coordinates `at` (`wall.menu`).
     pub fn open_menu(&mut self, target: MenuTarget, at: Point) -> Result<(), String> {
         match &target {
+            // A row in the sidebar is there for a hidden terminal too.
+            MenuTarget::Terminal {
+                id,
+                part: crate::menu::TerminalPart::Row,
+            } => {
+                if !self.terminals.contains_key(id) {
+                    return Err(format!("no terminal '{id}'"));
+                }
+            }
             MenuTarget::Terminal { id, .. } => {
                 if !self.is_shown(id) {
                     return Err(if self.terminals.contains_key(id) {
@@ -2962,7 +2971,7 @@ impl WallModel {
                     return Err(format!("no group '{id}'"));
                 }
             }
-            MenuTarget::Canvas { .. } => {}
+            MenuTarget::Canvas { .. } | MenuTarget::Agent { .. } => {}
         }
         let client = self.camera.bounds().to_client(at);
         let world = self.camera.to_world(client);
@@ -2984,9 +2993,15 @@ impl WallModel {
 
     fn prune_menu(&mut self) {
         let should_drop = match self.menu.as_ref().map(|m| &m.target) {
+            // A row's menu outlives its terminal being hidden (its rows
+            // change); a window's does not.
+            Some(MenuTarget::Terminal {
+                id,
+                part: crate::menu::TerminalPart::Row,
+            }) => !self.terminals.contains_key(id),
             Some(MenuTarget::Terminal { id, .. }) => !self.is_shown(id),
             Some(MenuTarget::Group { id }) => self.store.group(id).is_none(),
-            Some(MenuTarget::Canvas { .. }) | None => false,
+            Some(MenuTarget::Canvas { .. } | MenuTarget::Agent { .. }) | None => false,
         };
         if should_drop {
             self.menu = None;

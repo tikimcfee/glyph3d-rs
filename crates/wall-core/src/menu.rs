@@ -32,6 +32,9 @@ pub enum TerminalPart {
     Body,
     Title,
     Edge,
+    /// Not its window: its row in the sidebar's list (2026-11-27). The one
+    /// part a hidden terminal has.
+    Row,
 }
 
 /// What sits under the pointer as the menu reads it (`MenuTarget` in `wall/contextMenu.js`).
@@ -40,6 +43,9 @@ pub enum MenuTarget {
     Terminal { id: String, part: TerminalPart },
     Group { id: String },
     Canvas { world: Option<Point> },
+    /// An agent's row in the sidebar's list, by its `name` or `name@host`
+    /// (2026-11-27): an agent no terminal's row shows.
+    Agent { target: String },
 }
 
 /// Event facts inspected by [`context_policy`].
@@ -134,6 +140,7 @@ pub fn context_policy(event: &ContextEvent) -> ContextDecision {
         MenuTarget::Terminal { .. } => "over terminal",
         MenuTarget::Group { .. } => "over group",
         MenuTarget::Canvas { .. } => "over canvas",
+        MenuTarget::Agent { .. } => "over agent row",
     };
     ContextDecision {
         verdict: Verdict::Ours,
@@ -318,6 +325,19 @@ impl Default for MenuConfig {
     }
 }
 
+/// What the menu of an agent's row reads about the agent
+/// ([`crate::sidebar::menu_agents`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MenuAgent {
+    /// Its `name` or `name@host`: what `wall.attach` takes.
+    pub target: String,
+    pub name: String,
+    /// Whether it has a live session a terminal can attach to.
+    pub attachable: bool,
+    /// The terminal on the wall that shows it, if one does.
+    pub on_wall: Option<String>,
+}
+
 /// Wall snapshot state read by [`menu_items`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MenuState {
@@ -331,6 +351,8 @@ pub struct MenuState {
     pub config: MenuConfig,
     pub terminals: Vec<MenuTerminal>,
     pub groups: Vec<MenuGroup>,
+    /// The agents the sidebar lists, for the menu of an agent's row.
+    pub agents: Vec<MenuAgent>,
 }
 
 /// One option chip inside a [`MenuItem::Choice`] row.
@@ -432,9 +454,124 @@ pub fn menu_items(
     platform: Platform,
 ) -> Vec<MenuItem> {
     match target {
+        MenuTarget::Terminal {
+            id,
+            part: TerminalPart::Row,
+        } => row_items(id, state, config, platform),
         MenuTarget::Terminal { id, .. } => terminal_items(id, state, config, platform),
         MenuTarget::Group { id } => group_items(id, state, platform),
         MenuTarget::Canvas { world } => canvas_items(world.unwrap_or(Point::new(0.0, 0.0)), state),
+        MenuTarget::Agent { target } => agent_items(target, state),
+    }
+}
+
+/// The menu of a terminal's row in the sidebar. For a terminal on the
+/// canvas it IS the terminal's own menu ([`terminal_items`]: what a
+/// right-click on its body or title bar gives), which already frames it,
+/// takes it out of its group, hides and closes it. A hidden terminal has no
+/// window to right-click, so its row is the one place it has a menu: show
+/// it, rename it, take it out of its group, close it.
+fn row_items(
+    id: &str,
+    state: &MenuState,
+    config: &MenuConfig,
+    platform: Platform,
+) -> Vec<MenuItem> {
+    let Some(term) = state.terminals.iter().find(|t| t.id == id) else {
+        return Vec::new();
+    };
+    if !term.hidden {
+        return terminal_items(id, state, config, platform);
+    }
+    let mut items = vec![
+        action(
+            "show",
+            "show",
+            verb(["wall.show", id]),
+            Some("at its own spot".to_owned()),
+        ),
+        rename_item(term),
+    ];
+    if let Some(grp) = group_of(term, state) {
+        items.push(leave_item(id, grp));
+    }
+    items.push(sep("s3"));
+    items.push(close_item(id));
+    items
+}
+
+/// The menu of an agent's row: an agent no terminal's row shows. One a
+/// terminal can attach to offers that, alone or with its Agent View; one
+/// already shown by a terminal on the wall (hidden, say) offers that
+/// terminal and its Agent View. An agent that is neither has no menu.
+fn agent_items(target: &str, state: &MenuState) -> Vec<MenuItem> {
+    let Some(agent) = state.agents.iter().find(|a| a.target == target) else {
+        return Vec::new();
+    };
+    match &agent.on_wall {
+        Some(id) => vec![
+            action("frame", "frame its terminal", verb(["wall.reveal", id]), None),
+            action(
+                "agent-view",
+                "agent view",
+                verb(["wall.agent", id, "toggle"]),
+                None,
+            ),
+        ],
+        None if agent.attachable => vec![
+            action(
+                "attach",
+                "attach",
+                verb(["wall.attach", target]),
+                Some("opens its terminal".to_owned()),
+            ),
+            action(
+                "attach-view",
+                "attach with agent view",
+                verb(["wall.attach", target, "view"]),
+                None,
+            ),
+        ],
+        None => Vec::new(),
+    }
+}
+
+/// The group `term` is in, if it is in one the state knows.
+fn group_of<'a>(term: &MenuTerminal, state: &'a MenuState) -> Option<&'a MenuGroup> {
+    term.group
+        .as_deref()
+        .and_then(|gid| state.groups.iter().find(|g| g.id == gid))
+}
+
+fn rename_item(term: &MenuTerminal) -> MenuItem {
+    MenuItem::Rename {
+        id: "rename".to_owned(),
+        label: "rename…".to_owned(),
+        verb: verb(["wall.rename", &term.id]),
+        value: if term.named {
+            term.name.clone()
+        } else {
+            String::new()
+        },
+        placeholder: term.name.clone(),
+    }
+}
+
+fn leave_item(id: &str, group: &MenuGroup) -> MenuItem {
+    action(
+        "leave",
+        format!("take out of {}", curly_quote(&group.name)),
+        verb(["wall.group.remove", id]),
+        None,
+    )
+}
+
+fn close_item(id: &str) -> MenuItem {
+    MenuItem::Hold {
+        id: "close".to_owned(),
+        label: "close".to_owned(),
+        verb: verb(["wall.close", id]),
+        detail: Some("hold · kills the shell".to_owned()),
     }
 }
 
@@ -451,10 +588,7 @@ fn terminal_items(
         return Vec::new();
     }
 
-    let group = term
-        .group
-        .as_deref()
-        .and_then(|gid| state.groups.iter().find(|g| g.id == gid));
+    let group = group_of(term, state);
     let in_selection = state.selection.iter().any(|sel| sel == id);
     let others: Vec<&str> = state
         .selection
@@ -510,17 +644,7 @@ fn terminal_items(
         items.push(action("focus", "focus", verb(["terminal.focus", id]), None));
     }
 
-    items.push(MenuItem::Rename {
-        id: "rename".to_owned(),
-        label: "rename…".to_owned(),
-        verb: verb(["wall.rename", id]),
-        value: if term.named {
-            term.name.clone()
-        } else {
-            String::new()
-        },
-        placeholder: term.name.clone(),
-    });
+    items.push(rename_item(term));
 
     let mut agent_options = Vec::with_capacity(1 + AGENT_SIDES.len());
     agent_options.push(ChoiceOption {
@@ -561,12 +685,7 @@ fn terminal_items(
     ));
 
     if let Some(grp) = group {
-        items.push(action(
-            "leave",
-            format!("take out of {}", curly_quote(&grp.name)),
-            verb(["wall.group.remove", id]),
-            None,
-        ));
+        items.push(leave_item(id, grp));
     } else {
         if !others.is_empty() {
             let mut group_verb = vec!["wall.group".to_owned()];
@@ -708,12 +827,7 @@ fn append_tail(items: &mut Vec<MenuItem>, id: &str, config: &MenuConfig) {
         verb(["wall.hide", id]),
         Some("keeps running".to_owned()),
     ));
-    items.push(MenuItem::Hold {
-        id: "close".to_owned(),
-        label: "close".to_owned(),
-        verb: verb(["wall.close", id]),
-        detail: Some("hold · kills the shell".to_owned()),
-    });
+    items.push(close_item(id));
 }
 
 fn group_items(gid: &str, state: &MenuState, platform: Platform) -> Vec<MenuItem> {
@@ -1141,7 +1255,157 @@ mod tests {
                 bars: false,
                 members: vec!["t3".to_owned(), "t4".to_owned()],
             }],
+            agents: vec![
+                MenuAgent {
+                    target: "probe@laptop-2".to_owned(),
+                    name: "probe".to_owned(),
+                    attachable: true,
+                    on_wall: None,
+                },
+                MenuAgent {
+                    target: "lead@laptop-2".to_owned(),
+                    name: "lead".to_owned(),
+                    attachable: true,
+                    on_wall: Some("t4".to_owned()),
+                },
+                MenuAgent {
+                    target: "reviewer@laptop-2".to_owned(),
+                    name: "reviewer".to_owned(),
+                    attachable: false,
+                    on_wall: None,
+                },
+            ],
         }
+    }
+
+    fn verb_of<'a>(items: &'a [MenuItem], id: &str) -> &'a [String] {
+        match items.iter().find(|it| it.id() == id) {
+            Some(
+                MenuItem::Action { verb, .. }
+                | MenuItem::Hold { verb, .. }
+                | MenuItem::Rename { verb, .. },
+            ) => verb,
+            other => panic!("no verb row '{id}': {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sidebar_row_has_its_terminals_own_menu_and_a_hidden_terminal_what_still_applies() {
+        let state = snap_fixture();
+        let row = |id: &str| {
+            menu_items(
+                &MenuTarget::Terminal {
+                    id: id.to_owned(),
+                    part: TerminalPart::Row,
+                },
+                &state,
+                &state.config,
+                Platform::Mac,
+            )
+        };
+        let window = |id: &str, part| {
+            menu_items(
+                &MenuTarget::Terminal {
+                    id: id.to_owned(),
+                    part,
+                },
+                &state,
+                &state.config,
+                Platform::Mac,
+            )
+        };
+
+        // A terminal on the canvas: its row gives the very rows a
+        // right-click on its body or its title bar gives.
+        for id in ["t1", "t2", "t3"] {
+            let from_row = row(id);
+            assert!(!from_row.is_empty(), "{id}");
+            for part in [TerminalPart::Body, TerminalPart::Title, TerminalPart::Edge] {
+                assert_eq!(from_row, window(id, part), "{id} {part:?}");
+            }
+        }
+        // Those rows already do what the row's own tools do: frame it, take
+        // it out of its group, hide it, close it.
+        let t3 = row("t3");
+        assert_eq!(verb_of(&t3, "frame"), ["wall.reveal", "t3"]);
+        assert_eq!(verb_of(&t3, "leave"), ["wall.group.remove", "t3"]);
+        assert_eq!(verb_of(&t3, "hide"), ["wall.hide", "t3"]);
+        assert_eq!(verb_of(&t3, "close"), ["wall.close", "t3"]);
+
+        // A hidden terminal has no window to right-click: its row is where
+        // it has a menu, of what still applies to it.
+        assert!(window("t4", TerminalPart::Body).is_empty());
+        assert!(window("t4", TerminalPart::Title).is_empty());
+        let hidden = row("t4");
+        let ids: Vec<&str> = hidden.iter().map(MenuItem::id).collect();
+        assert_eq!(ids, ["show", "rename", "leave", "s3", "close"]);
+        assert_eq!(verb_of(&hidden, "show"), ["wall.show", "t4"]);
+        assert_eq!(verb_of(&hidden, "rename"), ["wall.rename", "t4"]);
+        assert_eq!(verb_of(&hidden, "leave"), ["wall.group.remove", "t4"]);
+        assert!(matches!(
+            hidden.iter().find(|it| it.id() == "leave"),
+            Some(MenuItem::Action { label, .. }) if label == "take out of “group 1”"
+        ));
+        assert!(matches!(
+            hidden.last(),
+            Some(MenuItem::Hold { verb, .. }) if verb == &["wall.close", "t4"]
+        ));
+        // In no group, it has nothing to leave.
+        let mut loose = snap_fixture();
+        loose.terminals[3].group = None;
+        let ids: Vec<String> = menu_items(
+            &MenuTarget::Terminal {
+                id: "t4".to_owned(),
+                part: TerminalPart::Row,
+            },
+            &loose,
+            &loose.config,
+            Platform::Mac,
+        )
+        .iter()
+        .map(|it| it.id().to_owned())
+        .collect();
+        assert_eq!(ids, ["show", "rename", "s3", "close"]);
+
+        // A terminal that is not there has no rows.
+        assert!(row("nope").is_empty());
+    }
+
+    #[test]
+    fn an_agents_row_offers_to_attach_it_or_the_terminal_that_shows_it() {
+        let state = snap_fixture();
+        let agent = |target: &str| {
+            menu_items(
+                &MenuTarget::Agent {
+                    target: target.to_owned(),
+                },
+                &state,
+                &state.config,
+                Platform::Mac,
+            )
+        };
+
+        // One a terminal can attach to: attach it, alone or with its Agent View.
+        let probe = agent("probe@laptop-2");
+        let ids: Vec<&str> = probe.iter().map(MenuItem::id).collect();
+        assert_eq!(ids, ["attach", "attach-view"]);
+        assert_eq!(verb_of(&probe, "attach"), ["wall.attach", "probe@laptop-2"]);
+        assert_eq!(
+            verb_of(&probe, "attach-view"),
+            ["wall.attach", "probe@laptop-2", "view"]
+        );
+
+        // One a terminal on the wall shows (a hidden one, here): that
+        // terminal, and its Agent View.
+        let lead = agent("lead@laptop-2");
+        let ids: Vec<&str> = lead.iter().map(MenuItem::id).collect();
+        assert_eq!(ids, ["frame", "agent-view"]);
+        assert_eq!(verb_of(&lead, "frame"), ["wall.reveal", "t4"]);
+        assert_eq!(verb_of(&lead, "agent-view"), ["wall.agent", "t4", "toggle"]);
+
+        // One with no session to attach to, and one that is not listed: no rows.
+        assert!(agent("reviewer@laptop-2").is_empty());
+        assert!(agent("nobody@nowhere").is_empty());
     }
 
     fn non_sep_ids(items: &[MenuItem]) -> Vec<&str> {

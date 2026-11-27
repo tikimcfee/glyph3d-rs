@@ -4251,3 +4251,89 @@ fn the_settings_section_shown_is_kept_through_a_restart() {
         "OK: settings shows groups"
     );
 }
+
+// ── The sidebar's right-click menus (`wall.menu row|agent`) ──────────────────
+
+#[test]
+fn a_rows_menu_opens_for_a_hidden_terminal_and_an_agents_attach_can_bring_its_view() {
+    use wall_core::menu::{MenuTarget, TerminalPart};
+
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok(&format!("wall.hide {t2}"));
+
+    // A hidden terminal has no window, so no menu on the canvas; its row
+    // in the sidebar has one.
+    assert!(h.wall.run(format!("wall.menu terminal {t2}")).is_err());
+    h.run_ok(&format!("wall.menu row {t2} 30 200"));
+    let menu = h.frame().menu.expect("the row's menu is open");
+    assert_eq!(
+        menu.target,
+        MenuTarget::Terminal {
+            id: t2.clone(),
+            part: TerminalPart::Row,
+        }
+    );
+    assert_eq!((menu.at.x, menu.at.y), (30.0, 200.0));
+    // It stays open as the terminal is shown and hidden under it (its rows
+    // change), and goes when the terminal does.
+    h.run_ok(&format!("wall.show {t2}"));
+    assert!(h.frame().menu.is_some());
+    h.run_ok(&format!("wall.hide {t2}"));
+    assert!(h.frame().menu.is_some());
+    h.run_ok(&format!("terminal.kill {t2}"));
+    assert!(h.frame().menu.is_none());
+    // A window's menu still closes when its terminal is hidden.
+    h.run_ok(&format!("wall.menu terminal {t1}"));
+    h.run_ok(&format!("wall.hide {t1}"));
+    assert!(h.frame().menu.is_none());
+    assert!(h.wall.run("wall.menu row nope").is_err());
+
+    // An agent's row: the agent must be one the wall knows of.
+    h.wall.set_bus_snapshot(
+        Some(GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![GomuxAgent {
+                name: "coder".into(),
+                host: Some("laptop-2".into()),
+                live: true,
+                attached: Some(true),
+                status: Some("idle".into()),
+                ..GomuxAgent::default()
+            }],
+        }),
+        "",
+    );
+    h.run_ok("wall.menu agent coder@laptop-2 12 340");
+    assert!(matches!(
+        h.frame().menu.map(|m| m.target),
+        Some(MenuTarget::Agent { target }) if target.starts_with("coder")
+    ));
+    let nobody = h.wall.run("wall.menu agent nobody@nowhere");
+    assert!(nobody.is_err() && nobody.text.contains("no agent 'nobody@nowhere'"), "{}", nobody.text);
+    h.run_ok("wall.menu close");
+
+    // `attach … view`: the terminal the attach asks for lands with its
+    // Agent View open; a plain attach of another leaves the view shut.
+    let before = h.wall.snapshot().terminals.len();
+    h.run_ok("wall.attach coder@laptop-2 view");
+    h.settle();
+    let snap = h.wall.snapshot();
+    assert_eq!(snap.terminals.len(), before + 1);
+    let landed = snap
+        .terminals
+        .iter()
+        .find(|t| t.attached.is_some())
+        .expect("a terminal attached to the agent");
+    assert!(
+        h.wall.store().agent_view(&landed.id).is_some_and(|v| v.open),
+        "the attached terminal's Agent View is open"
+    );
+    // Asked again, it reveals that terminal and leaves its view open.
+    let again = h.wall.run("wall.attach coder@laptop-2 view");
+    assert!(again.text.contains("revealed") && again.text.contains("with its agent view"), "{}", again.text);
+    assert_eq!(h.wall.snapshot().terminals.len(), before + 1);
+}

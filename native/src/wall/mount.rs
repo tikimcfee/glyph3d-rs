@@ -607,7 +607,19 @@ impl Panels {
 
         // 6. Right-click / menu-key context menu (`WallFrame::menu`, topmost).
         if let (Some(open_menu), Some(snap)) = (&described.menu, &snapshot) {
-            let menu_state = build_menu_state(wall, snap, described);
+            let mut menu_state = build_menu_state(wall, snap, described);
+            // The menu of an agent's row reads what the sidebar's list says
+            // of the agent, so the two agree on what can be attached.
+            if matches!(open_menu.target, wall_core::menu::MenuTarget::Agent { .. }) {
+                let sb = &described.panels.sidebar;
+                let listed = build_sidebar(&build_core_sidebar_input(
+                    wall,
+                    snap,
+                    &sb.collapsed,
+                    sb.mode,
+                ));
+                menu_state.agents = wall_core::sidebar::menu_agents(&listed);
+            }
             let mut open_ctx = context_menu::OpenContextMenu::from_wall(
                 open_menu.target.clone(),
                 open_menu.at,
@@ -1255,6 +1267,8 @@ fn build_menu_state(wall: &Wall, snap: &WallSnapshot, described: &WallFrame) -> 
                 members: g.members.clone(),
             })
             .collect(),
+        // Filled in when the menu is an agent's row's (`Panels::show`).
+        agents: Vec::new(),
     }
 }
 
@@ -1986,5 +2000,163 @@ mod tests {
         pass(Vec::new(), &mut panels, &mut wall);
         pass(Vec::new(), &mut panels, &mut wall);
         assert_eq!(panels.settings.shown_section.as_deref(), Some("selection"));
+    }
+
+    #[test]
+    fn a_right_click_on_a_sidebar_row_opens_the_terminals_own_menu_and_an_agents_its_own() {
+        use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+        use wall_core::menu::{MenuTarget, TerminalPart};
+
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        wall.terminal_appeared(TerminalAppeared::new("t2", 100, 30).with_title("logs"));
+        wall.set_bus_snapshot(
+            Some(GomuxSnapshot {
+                gen: 1,
+                host: Some("workstation".to_owned()),
+                dirs: Vec::new(),
+                agents: vec![GomuxAgent {
+                    name: "probe".to_owned(),
+                    host: Some("workstation".to_owned()),
+                    live: true,
+                    status: Some("idle".to_owned()),
+                    attached: Some(true),
+                    ..GomuxAgent::default()
+                }],
+            }),
+            "",
+        );
+        assert!(wall.run("wall.sidebar left").text.starts_with("OK"));
+        let _ = wall.tick(5.0, 6000.0);
+        let _ = wall.drain_effects();
+
+        let mut panels = Panels::new();
+        let mut now = 1.0;
+        let mut pass = |events: Vec<egui::Event>, panels: &mut Panels, wall: &mut Wall| {
+            now += 0.05;
+            run_pass_at(&ctx, now, events, panels, wall).0
+        };
+        let press = |pos: egui::Pos2, button: egui::PointerButton, pressed: bool| {
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+        let right = egui::PointerButton::Secondary;
+        let left = egui::PointerButton::Primary;
+        type Pass<'a> = &'a mut dyn FnMut(Vec<egui::Event>, &mut Panels, &mut Wall) -> Vec<String>;
+        let click = |pos: egui::Pos2,
+                     button: egui::PointerButton,
+                     panels: &mut Panels,
+                     wall: &mut Wall,
+                     pass: Pass<'_>| {
+            let mut sent = pass(vec![egui::Event::PointerMoved(pos)], panels, wall);
+            sent.extend(pass(vec![press(pos, button, true)], panels, wall));
+            sent.extend(pass(vec![press(pos, button, false)], panels, wall));
+            sent
+        };
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+
+        // A right-click on t2's row: the wall opens the menu on the row,
+        // and it is the terminal's own menu, as on the canvas.
+        let row = panels.sidebar.term_row_rects["t2"].center();
+        let sent = click(row, right, &mut panels, &mut wall, &mut pass);
+        assert_eq!(
+            sent,
+            vec![format!("wall.menu row t2 {} {}", row.x.round(), row.y.round())]
+        );
+        assert_eq!(
+            wall.menu().map(|m| m.target.clone()),
+            Some(MenuTarget::Terminal {
+                id: "t2".to_owned(),
+                part: TerminalPart::Row,
+            })
+        );
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        // (`item_rects` holds the rows a click runs: not the rename field
+        // or the rows of choices.)
+        for id in ["paste", "frame", "select", "split-right", "redraw", "hide", "close"] {
+            assert!(
+                panels.context_menu.item_rects.contains_key(id),
+                "no '{id}' in the row's menu: {:?}",
+                panels.context_menu.item_rects.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // `hide`, from the menu: the terminal is hidden and the menu closes.
+        let hide = panels.context_menu.item_rects["hide"].center();
+        let sent = click(hide, left, &mut panels, &mut wall, &mut pass);
+        assert_eq!(sent, vec!["wall.hide t2".to_string(), "wall.menu close".to_string()]);
+        assert!(wall.store().hidden("t2"));
+        assert!(wall.menu().is_none());
+        pass(Vec::new(), &mut panels, &mut wall);
+
+        // Hidden, it has no window to right-click; its row still has a
+        // menu, of what applies to it now.
+        let row = panels.sidebar.term_row_rects["t2"].center();
+        click(row, right, &mut panels, &mut wall, &mut pass);
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        let mut ids: Vec<&str> = panels
+            .context_menu
+            .item_rects
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["close", "show"]);
+        let show = panels.context_menu.item_rects["show"].center();
+        let sent = click(show, left, &mut panels, &mut wall, &mut pass);
+        assert_eq!(sent, vec!["wall.show t2".to_string(), "wall.menu close".to_string()]);
+        assert!(!wall.store().hidden("t2"));
+        pass(Vec::new(), &mut panels, &mut wall);
+
+        // An agent no terminal shows: its row's menu attaches it, alone or
+        // with its Agent View.
+        let (target, rect) = panels
+            .sidebar
+            .agent_row_rects
+            .iter()
+            .map(|(k, r)| (k.clone(), *r))
+            .next()
+            .expect("probe has a row of its own");
+        let sent = click(rect.center(), right, &mut panels, &mut wall, &mut pass);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with(&format!("wall.menu agent {target} ")), "{sent:?}");
+        assert!(matches!(
+            wall.menu().map(|m| &m.target),
+            Some(MenuTarget::Agent { .. })
+        ));
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        let mut ids: Vec<&str> = panels
+            .context_menu
+            .item_rects
+            .keys()
+            .map(String::as_str)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["attach", "attach-view"]);
+        // `app.where` names the menu's target as a row or an agent.
+        let described = wall.frame();
+        let report = crate::wall::script::format_where(
+            &described,
+            Point::new(0.0, 0.0),
+            wall.platform(),
+        );
+        assert!(report.contains(&format!("menu agent:{target} at=")), "{report}");
+
+        let attach = panels.context_menu.item_rects["attach-view"].center();
+        let sent = click(attach, left, &mut panels, &mut wall, &mut pass);
+        assert_eq!(
+            sent,
+            vec![format!("wall.attach {target} view"), "wall.menu close".to_string()]
+        );
+        assert!(wall.menu().is_none());
     }
 }

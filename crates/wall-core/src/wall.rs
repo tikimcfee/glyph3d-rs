@@ -597,6 +597,8 @@ struct PendingSpawn {
     zoom_when_asked: f64,
     split: Option<(String, SplitInsertDir)>,
     attach_target: Option<String>,
+    /// Open the terminal's Agent View when it arrives (`wall.attach <target> view`).
+    open_agent_view: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2217,6 +2219,10 @@ impl WallCore {
         if let Some(ref target) = pending.as_ref().and_then(|p| p.attach_target.clone()) {
             self.model.store_mut().set_attached(&id, Some(target));
         }
+        if pending.as_ref().is_some_and(|p| p.open_agent_view) {
+            // Asked for with the attach; the terminal is here now.
+            let _ = WallApi::agent_set_open(self, &id, "open");
+        }
 
         if let Some(gid) = self.groups.group_of(&id) {
             let _ = self.with_groups(|g, host| g.relayout(host, &gid));
@@ -3343,6 +3349,7 @@ impl WallApi for WallCore {
             zoom_when_asked: zoom,
             split: None,
             attach_target: None,
+            open_agent_view: false,
         });
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: at,
@@ -3645,6 +3652,7 @@ impl WallApi for WallCore {
             zoom_when_asked: zoom,
             split: Some((target, split_dir)),
             attach_target: None,
+            open_agent_view: false,
         });
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: None,
@@ -3803,6 +3811,24 @@ impl WallApi for WallCore {
     fn open_menu(&mut self, target: CmdMenuTarget, at: Point) -> Result<Value, String> {
         let world = self.model.camera().to_world(at);
         let menu_target = match &target {
+            // Its row in the sidebar: there for a hidden terminal too.
+            CmdMenuTarget::Terminal { id, part } if part == "row" => {
+                if self.model.terminal(id).is_none() {
+                    return Err(format!("no terminal '{id}'"));
+                }
+                MenuTarget::Terminal {
+                    id: id.clone(),
+                    part: TerminalPart::Row,
+                }
+            }
+            CmdMenuTarget::Agent { target } => {
+                let Some(found) = find_bus_agent(self.bus.as_ref(), target) else {
+                    return Err(format!("no agent '{target}'"));
+                };
+                MenuTarget::Agent {
+                    target: found.target,
+                }
+            }
             CmdMenuTarget::Terminal { id, part } => {
                 if !self.model.is_shown(id) {
                     return Err(if self.model.terminal(id).is_some() {
@@ -3966,6 +3992,7 @@ impl WallApi for WallCore {
             zoom_when_asked: zoom,
             split: None,
             attach_target: Some(canonical_target),
+            open_agent_view: false,
         });
         if self.agents_extra_connected {
             if let Some(ref ln) = local_name {
@@ -3999,6 +4026,20 @@ impl WallApi for WallCore {
                 .unwrap_or_else(|| "pending".to_owned()),
             existing: false,
         })
+    }
+
+    fn attach_agent_with_view(&mut self, target: &str) -> Result<AttachOutcome, String> {
+        let asked_before = self.pending_spawns.len();
+        let outcome = self.attach_agent(target)?;
+        if outcome.existing {
+            self.agent_set_open(&outcome.id, "open")?;
+        } else if self.pending_spawns.len() > asked_before {
+            // The terminal is on its way: its view opens when it lands.
+            if let Some(pending) = self.pending_spawns.back_mut() {
+                pending.open_agent_view = true;
+            }
+        }
+        Ok(outcome)
     }
 
     fn agent_set_open(&mut self, id: &str, how: &str) -> Result<AgentOpenResult, String> {
@@ -4326,6 +4367,7 @@ fn register_terminal_commands(router: &mut CommandRouter<WallCore>) {
                 zoom_when_asked: zoom,
                 split: None,
                 attach_target: None,
+                open_agent_view: false,
             });
             core.model.push_effect(WallEffect::SpawnTerminal {
                 window_top_left: None,
