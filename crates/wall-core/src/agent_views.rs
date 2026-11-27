@@ -785,6 +785,57 @@ pub struct AgentViewDescriptor {
     pub rows: Vec<AgentEventRow>,
 }
 
+/// What a drag on an Agent View's outer edge sets: one of the two knobs
+/// that size every Agent View, and the value the drag has reached.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeDial {
+    /// `"agentViewWidth"` for a view beside its terminal, `"agentViewHeight"`
+    /// for one above or below it.
+    pub knob: &'static str,
+    pub value: f64,
+}
+
+/// The knob an Agent View on `side` is sized by along the line away from
+/// its terminal.
+pub const fn edge_knob(side: AgentSide) -> &'static str {
+    match side {
+        AgentSide::Left | AgentSide::Right => "agentViewWidth",
+        AgentSide::Top | AgentSide::Bottom => "agentViewHeight",
+    }
+}
+
+/// Dial an Agent View's size by dragging its outer edge, the one away from
+/// its terminal (2026-11-27). `start` is the knob's value when the drag
+/// began, in world units; `drag_px` how far the pointer has moved since, in
+/// screen pixels (y down); `zoom` the screen pixels a world unit takes.
+///
+/// Dragging away from the terminal grows the view. The value is held to the
+/// knob's own limits (it is never refused: a drag stops at them) and lands
+/// on half world units, so a drag sends a new value only every so often.
+pub fn dial_from_edge_drag(side: AgentSide, start: f64, drag_px: (f64, f64), zoom: f64) -> EdgeDial {
+    let knob = edge_knob(side);
+    let outward_px = match side {
+        AgentSide::Right => drag_px.0,
+        AgentSide::Left => -drag_px.0,
+        AgentSide::Bottom => drag_px.1,
+        AgentSide::Top => -drag_px.1,
+    };
+    let (min, max) = match crate::settings::knob_def(knob).map(|def| def.kind) {
+        Some(crate::settings::KnobKind::Number { min, max, .. }) => (
+            min.unwrap_or(f64::MIN_POSITIVE),
+            max.unwrap_or(f64::MAX),
+        ),
+        _ => (f64::MIN_POSITIVE, f64::MAX),
+    };
+    let world = if zoom.is_finite() && zoom > 0.0 {
+        start + outward_px / zoom
+    } else {
+        start
+    };
+    let value = ((world * 2.0).round() / 2.0).clamp(min, max);
+    EdgeDial { knob, value }
+}
+
 /// Visible per-frame screen placement computed from [`WallCamera`] (`updateScreenTransforms`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisibleScreenPlacement {
@@ -4376,5 +4427,60 @@ mod tests {
         assert_eq!(views.describe(&canvas, "t1").unwrap().unread_count, 1);
         views.scroll_to_tail(&canvas, "t1").unwrap();
         assert_eq!(views.describe(&canvas, "t1").unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn an_outer_edge_drag_dials_the_knob_for_its_side_and_stops_at_its_limits() {
+        // Beside the terminal the width; above or below it the height.
+        for side in [AgentSide::Left, AgentSide::Right] {
+            assert_eq!(edge_knob(side), "agentViewWidth");
+        }
+        for side in [AgentSide::Top, AgentSide::Bottom] {
+            assert_eq!(edge_knob(side), "agentViewHeight");
+        }
+
+        // Dragging away from the terminal grows the view: 40 px at 8 px a
+        // world unit is 5 units.
+        let zoom = 8.0;
+        let grow = [
+            (AgentSide::Right, (40.0, 3.0)),
+            (AgentSide::Left, (-40.0, 3.0)),
+            (AgentSide::Bottom, (3.0, 40.0)),
+            (AgentSide::Top, (3.0, -40.0)),
+        ];
+        for (side, drag) in grow {
+            let start = 60.0;
+            let out = dial_from_edge_drag(side, start, drag, zoom);
+            assert_eq!(out.knob, edge_knob(side));
+            assert_eq!(out.value, 65.0, "{side:?} outward");
+            let back = dial_from_edge_drag(side, start, (-drag.0, -drag.1), zoom);
+            assert_eq!(back.value, 55.0, "{side:?} inward");
+        }
+        // It lands on half world units.
+        assert_eq!(
+            dial_from_edge_drag(AgentSide::Right, 76.0, (10.0, 0.0), zoom).value,
+            77.5
+        );
+        assert_eq!(
+            dial_from_edge_drag(AgentSide::Right, 76.0, (1.0, 0.0), zoom).value,
+            76.0
+        );
+        // A drag stops at the knob's own limits, and every value it gives is
+        // one the knob takes.
+        for (side, far, limit) in [
+            (AgentSide::Right, 1e6, 300.0),
+            (AgentSide::Right, -1e6, 24.0),
+            (AgentSide::Bottom, 1e6, 240.0),
+            (AgentSide::Bottom, -1e6, 16.0),
+        ] {
+            let out = dial_from_edge_drag(side, 60.0, (far, far), zoom);
+            assert_eq!(out.value, limit, "{side:?}");
+            assert!(crate::config::check_config(out.knob, out.value).is_ok());
+        }
+        // A zoom that is no zoom leaves the size where it was.
+        assert_eq!(
+            dial_from_edge_drag(AgentSide::Right, 60.0, (500.0, 0.0), 0.0).value,
+            60.0
+        );
     }
 }

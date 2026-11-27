@@ -29,8 +29,8 @@ use wall_core::agent_view::{
     GroupSelection, CATEGORY_GROUPS_TREE, CATEGORY_IDS,
 };
 use wall_core::agent_views::{
-    AgentEventRow, AgentViewDescriptor, AgentViews, AgentViewsHost, ScreenPlacement,
-    VisibleScreenPlacement,
+    dial_from_edge_drag, edge_knob, AgentEventRow, AgentViewDescriptor, AgentViews,
+    AgentViewsHost, ScreenPlacement, VisibleScreenPlacement,
 };
 use wall_core::camera::WallCamera as CoreWallCamera;
 use wall_core::config::AgentSide;
@@ -180,6 +180,8 @@ struct HeaderDragState {
 pub struct AgentViewPanelState {
     cards: BTreeMap<String, CardUiState>,
     drag: Option<HeaderDragState>,
+    /// A drag on a card's outer edge, in progress ([`card_edge_grip`]).
+    resize: Option<EdgeResize>,
     /// True when an open category menu drawer should capture keyboard input (`Escape` to close)
     /// rather than forwarding keys to the focused terminal.
     pub wants_keyboard: bool,
@@ -354,6 +356,8 @@ fn apply_scaled_card_style(ui: &mut egui::Ui, m: CardMetrics) {
     style.spacing.window_margin = egui::Margin::ZERO;
     style.spacing.scroll.bar_width = (5.0 * s).clamp(3.0, 8.0);
     style.spacing.scroll.floating = true;
+    // The card's outer edge is a resize grip: a scroll bar stays clear of it.
+    style.spacing.scroll.bar_outer_margin = EDGE_GRIP_PX;
     style.visuals.override_text_color = Some(rgb_hex(0xd4d9e4));
     style.visuals.widgets.noninteractive.bg_stroke =
         egui::Stroke::new(m.hairline, rgb_hex(0x263149));
@@ -546,6 +550,154 @@ fn draw_dashed_rect(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Str
     }
 }
 
+/// How far into a card its outer edge (the one away from its terminal)
+/// takes a resize drag.
+const EDGE_GRIP_PX: f32 = 4.0;
+
+/// A drag on a card's outer edge, in progress.
+#[derive(Clone, Debug)]
+struct EdgeResize {
+    /// The card's terminal.
+    id: String,
+    side: AgentSide,
+    /// The knob's value when the drag began, in world units.
+    start: f64,
+    /// Where the pointer went down.
+    from: egui::Pos2,
+    /// Screen points a world unit took when the drag began.
+    zoom: f64,
+    /// The value last sent, so each is sent once.
+    sent: f64,
+}
+
+/// The card's resize grip (2026-11-27): a strip along its outer edge, the
+/// one away from its terminal. A card is as wide (beside its terminal) or
+/// as tall (above or below it) as a knob says, the same for every card, so
+/// the drag dials that knob: `wall.config agentViewWidth|agentViewHeight
+/// <value>` each time the value moves, the wall laying the card out again
+/// under the pointer. A double click puts the knob's default back. What the
+/// value is for a drag is `wall_core::agent_views::dial_from_edge_drag`.
+fn card_edge_grip(
+    ui: &mut egui::Ui,
+    state: &mut AgentViewPanelState,
+    card: &AgentViewCardInput,
+    outer_rect: egui::Rect,
+    out: &mut Vec<String>,
+) {
+    let id = &card.view.id;
+    let side = card.view.side;
+    let world = card.placement.world_rect;
+    let (world_len, screen_len, strip) = match side {
+        AgentSide::Right => (
+            world.max_x - world.min_x,
+            outer_rect.width(),
+            egui::Rect::from_min_max(
+                egui::pos2(outer_rect.right() - EDGE_GRIP_PX, outer_rect.top()),
+                outer_rect.max,
+            ),
+        ),
+        AgentSide::Left => (
+            world.max_x - world.min_x,
+            outer_rect.width(),
+            egui::Rect::from_min_max(
+                outer_rect.min,
+                egui::pos2(outer_rect.left() + EDGE_GRIP_PX, outer_rect.bottom()),
+            ),
+        ),
+        AgentSide::Top => (
+            world.max_y - world.min_y,
+            outer_rect.height(),
+            egui::Rect::from_min_max(
+                outer_rect.min,
+                egui::pos2(outer_rect.right(), outer_rect.top() + EDGE_GRIP_PX),
+            ),
+        ),
+        AgentSide::Bottom => (
+            world.max_y - world.min_y,
+            outer_rect.height(),
+            egui::Rect::from_min_max(
+                egui::pos2(outer_rect.left(), outer_rect.bottom() - EDGE_GRIP_PX),
+                outer_rect.max,
+            ),
+        ),
+    };
+    if world_len <= 0.0 || screen_len <= 0.0 {
+        return;
+    }
+    state.hit_rects.insert(format!("{id}:resize"), strip);
+    let resp = ui.interact(
+        strip,
+        egui::Id::new(("wall_agent_view_resize", id)),
+        egui::Sense::click_and_drag(),
+    );
+
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        let from = ui
+            .input(|i| i.pointer.press_origin().or_else(|| i.pointer.interact_pos()))
+            .unwrap_or_else(|| strip.center());
+        state.resize = Some(EdgeResize {
+            id: id.clone(),
+            side,
+            start: world_len,
+            from,
+            zoom: f64::from(screen_len) / world_len,
+            sent: world_len,
+        });
+    }
+    let mine = state.resize.as_ref().is_some_and(|r| &r.id == id);
+    if mine && resp.dragged_by(egui::PointerButton::Primary) {
+        if let (Some(pointer), Some(drag)) =
+            (ui.input(|i| i.pointer.interact_pos()), state.resize.as_mut())
+        {
+            let moved = pointer - drag.from;
+            let dial = dial_from_edge_drag(
+                drag.side,
+                drag.start,
+                (f64::from(moved.x), f64::from(moved.y)),
+                drag.zoom,
+            );
+            if dial.value != drag.sent {
+                drag.sent = dial.value;
+                out.push(format!("wall.config {} {}", dial.knob, dial.value));
+            }
+        }
+    }
+    if mine && resp.drag_stopped() {
+        state.resize = None;
+    }
+    if resp.double_clicked() {
+        state.resize = None;
+        out.push(format!("wall.config {} default", edge_knob(side)));
+    }
+
+    if resp.hovered() || mine {
+        state.wants_pointer = true;
+        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(0x8a, 0xb4, 0xf8));
+        let painter = ui.painter();
+        match side {
+            AgentSide::Right => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                painter.vline(outer_rect.right() - 1.0, outer_rect.y_range(), stroke);
+            }
+            AgentSide::Left => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                painter.vline(outer_rect.left() + 1.0, outer_rect.y_range(), stroke);
+            }
+            AgentSide::Top => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                painter.hline(outer_rect.x_range(), outer_rect.top() + 1.0, stroke);
+            }
+            AgentSide::Bottom => {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                painter.hline(outer_rect.x_range(), outer_rect.bottom() - 1.0, stroke);
+            }
+        }
+    }
+    let _ = resp.on_hover_text(
+        "drag to resize every agent view on this side · double-click for the default size",
+    );
+}
+
 fn placement_in_points(
     p: &VisibleScreenPlacement,
     units: PlacementUnits,
@@ -586,6 +738,7 @@ pub fn show(
 
     if input.fullscreen || input.cards.is_empty() {
         state.drag = None;
+        state.resize = None;
         return false;
     }
 
@@ -683,6 +836,9 @@ pub fn show(
                         pointer_pressed_pos,
                         out,
                     );
+                    // Over the card's contents, so the edge takes the
+                    // pointer from whatever reaches it.
+                    card_edge_grip(ui, state, card, outer_rect, out);
                 }
             });
     }
@@ -3609,6 +3765,110 @@ mod tests {
                 reply.text
             );
         }
+    }
+
+    #[test]
+    fn dragging_a_cards_outer_edge_dials_the_knob_that_sizes_it() {
+        let ctx = egui::Context::default();
+        let vp = egui::vec2(1280.0, 900.0);
+        let press = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // A card 448 x 272 px over 56 x 34 world units: 8 px a unit.
+        let card_on = |side: AgentSide| {
+            let mut view = sample_descriptor("t1");
+            view.side = side;
+            AgentViewPanelInput {
+                cards: vec![AgentViewCardInput {
+                    view,
+                    placement: placement_at(400, 100, 448, 272, 1.0, true),
+                    terminal_screen_rect: None,
+                }],
+                fullscreen: false,
+                units: PlacementUnits::Points,
+            }
+        };
+
+        // Beside its terminal on the right: the right edge, the width knob.
+        let input = card_on(AgentSide::Right);
+        let mut state = AgentViewPanelState::new();
+        let _ = run_frame(&ctx, vp, Vec::new(), &mut state, &input);
+        let strip = state.hit_rect("t1", "resize").expect("the card has a grip");
+        assert_eq!((strip.right(), strip.width()), (848.0, EDGE_GRIP_PX));
+        assert_eq!((strip.top(), strip.bottom()), (100.0, 372.0));
+        let from = strip.center();
+        let mut sent = Vec::new();
+        sent.extend(run_frame(&ctx, vp, vec![egui::Event::PointerMoved(from)], &mut state, &input).0);
+        sent.extend(run_frame(&ctx, vp, vec![press(from, true)], &mut state, &input).0);
+        assert!(sent.is_empty(), "{sent:?}");
+        // 40 px outward is 5 world units on 56: each new value is sent
+        // once, as the pointer reaches it.
+        let step = |by: f32, state: &mut AgentViewPanelState| {
+            run_frame(
+                &ctx,
+                vp,
+                vec![egui::Event::PointerMoved(from + egui::vec2(by, 2.0))],
+                state,
+                &input,
+            )
+            .0
+        };
+        assert_eq!(step(20.0, &mut state), vec!["wall.config agentViewWidth 58.5"]);
+        assert_eq!(step(40.0, &mut state), vec!["wall.config agentViewWidth 61"]);
+        assert!(step(41.0, &mut state).is_empty());
+        assert!(state.wants_pointer);
+        let done = run_frame(&ctx, vp, vec![press(from + egui::vec2(41.0, 2.0), false)], &mut state, &input).0;
+        assert!(done.is_empty(), "{done:?}");
+        assert!(state.resize.is_none());
+
+        // A double click on the edge puts the default back.
+        let mut sent = Vec::new();
+        for pressed in [true, false, true, false] {
+            sent.extend(run_frame(&ctx, vp, vec![press(from, pressed)], &mut state, &input).0);
+        }
+        assert_eq!(sent, vec!["wall.config agentViewWidth default"]);
+
+        // On the left it is the left edge, and dragging left grows it.
+        let input = card_on(AgentSide::Left);
+        let mut state = AgentViewPanelState::new();
+        let _ = run_frame(&ctx, vp, Vec::new(), &mut state, &input);
+        let strip = state.hit_rect("t1", "resize").unwrap();
+        assert_eq!(strip.left(), 400.0);
+        let from = strip.center();
+        let _ = run_frame(&ctx, vp, vec![egui::Event::PointerMoved(from)], &mut state, &input);
+        let _ = run_frame(&ctx, vp, vec![press(from, true)], &mut state, &input);
+        let grew = run_frame(
+            &ctx,
+            vp,
+            vec![egui::Event::PointerMoved(from - egui::vec2(16.0, 0.0))],
+            &mut state,
+            &input,
+        )
+        .0;
+        assert_eq!(grew, vec!["wall.config agentViewWidth 58"]);
+        let _ = run_frame(&ctx, vp, vec![press(from - egui::vec2(16.0, 0.0), false)], &mut state, &input);
+
+        // Above its terminal: the top edge, the height knob, and up grows it.
+        let input = card_on(AgentSide::Top);
+        let mut state = AgentViewPanelState::new();
+        let _ = run_frame(&ctx, vp, Vec::new(), &mut state, &input);
+        let strip = state.hit_rect("t1", "resize").unwrap();
+        assert_eq!((strip.top(), strip.height(), strip.width()), (100.0, EDGE_GRIP_PX, 448.0));
+        let from = strip.center();
+        let _ = run_frame(&ctx, vp, vec![egui::Event::PointerMoved(from)], &mut state, &input);
+        let _ = run_frame(&ctx, vp, vec![press(from, true)], &mut state, &input);
+        let grew = run_frame(
+            &ctx,
+            vp,
+            vec![egui::Event::PointerMoved(from - egui::vec2(0.0, 16.0))],
+            &mut state,
+            &input,
+        )
+        .0;
+        assert_eq!(grew, vec!["wall.config agentViewHeight 36"]);
     }
 
     #[test]
