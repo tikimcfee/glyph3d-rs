@@ -98,11 +98,150 @@ struct RoutingTable {
     /// thread, held briefly so an initial `REPAINT`/`Modes`/`Title` can never be lost on multicore.
     early: HashMap<u32, Vec<Event>>,
     closed_handles: VecDeque<u32>,
+    /// In-flight `subscribe`/`create_and_subscribe` RPCs whose handles have not yet been
+    /// registered in `inboxes`. While `> 0`, frames for handles in `closed_handles` are stashed
+    /// in `early` rather than dropped, because `g3d-termd` can reuse a recently unsubscribed
+    /// handle and stream its initial `REPAINT` before `register_session` runs.
+    pending_subscribes: usize,
+}
+
+impl RoutingTable {
+    fn prune_closed_early(&mut self) {
+        if self.pending_subscribes == 0 {
+            let closed = &self.closed_handles;
+            self.early.retain(|h, _| !closed.contains(h));
+        }
+    }
+}
+
+struct PendingSubscribeGuard<'a> {
+    inner: &'a HubInner,
+    armed: bool,
+}
+
+impl PendingSubscribeGuard<'_> {
+    fn finish(mut self, handle: u32, inbox: Arc<SessionInbox>) {
+        self.armed = false;
+        let mut table = self.inner.routing.lock().expect("routing mutex poisoned");
+        table.closed_handles.retain(|&h| h != handle);
+        if let Some(stashed) = table.early.remove(&handle) {
+            for ev in stashed {
+                let _ = inbox.push(ev);
+            }
+        }
+        table.inboxes.insert(handle, inbox);
+        table.pending_subscribes = table.pending_subscribes.saturating_sub(1);
+        table.prune_closed_early();
+    }
+}
+
+impl Drop for PendingSubscribeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut table = self.inner.routing.lock().expect("routing mutex poisoned");
+        table.pending_subscribes = table.pending_subscribes.saturating_sub(1);
+        table.prune_closed_early();
+    }
+}
+
+/// Structural fields of `g3d-termd`'s pushed `Event::Status` document whose change should wake
+/// the window even while the Status panel is closed. Volatile telemetry (`at`, `out_bps`,
+/// `daemon.brain.rss`, `daemon.snapshots`, `saved_seq`) is excluded so an idle wall is not woken
+/// once per second while `out_bps` decays or RSS fluctuates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StatusWakeSig {
+    daemon_exiting: bool,
+    daemon_version: Option<String>,
+    daemon_instance: Option<String>,
+    errors: Vec<String>,
+    terminals: Vec<TerminalStatusSig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalStatusSig {
+    id: String,
+    exited: bool,
+    scrollback_rows: u64,
+    title: String,
+    pwd: String,
+    cwd: String,
+    alt: bool,
+}
+
+fn status_wake_sig(doc: &serde_json::Value) -> StatusWakeSig {
+    let daemon = doc.get("daemon");
+    let daemon_exiting = daemon
+        .and_then(|d| d.get("exiting"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let daemon_version = daemon
+        .and_then(|d| d.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let daemon_instance = daemon
+        .and_then(|d| d.get("instance"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let errors = doc
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().map(serde_json::Value::to_string).collect())
+        .unwrap_or_default();
+    let mut terminals: Vec<TerminalStatusSig> = doc
+        .get("terminals")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|t| TerminalStatusSig {
+                    id: t
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    exited: t.get("exit").is_some_and(|e| !e.is_null()),
+                    scrollback_rows: t
+                        .get("scrollback_rows")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    title: t
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    pwd: t
+                        .get("pwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    cwd: t
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    alt: t
+                        .get("alt")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    terminals.sort();
+    StatusWakeSig {
+        daemon_exiting,
+        daemon_version,
+        daemon_instance,
+        errors,
+        terminals,
+    }
 }
 
 struct DaemonTracking {
     state: DaemonState,
     events: VecDeque<DaemonEvent>,
+    last_status_sig: Option<StatusWakeSig>,
 }
 
 pub(crate) struct HubInner {
@@ -114,6 +253,8 @@ pub(crate) struct HubInner {
     async_worker: Mutex<Option<JoinHandle<()>>>,
     router_thread: Mutex<Option<JoinHandle<()>>>,
     closing: AtomicBool,
+    status_wake_all: AtomicBool,
+    theme: Mutex<Theme>,
     options: HubOptions,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -159,19 +300,25 @@ impl HubInner {
         self.closing.load(Ordering::Acquire)
     }
 
+    pub(crate) fn current_theme(&self) -> Theme {
+        self.theme.lock().expect("theme mutex poisoned").clone()
+    }
+
+    pub(crate) fn set_theme(&self, theme: Theme) {
+        *self.theme.lock().expect("theme mutex poisoned") = theme;
+    }
+
     pub(crate) fn send_async(&self, cmd: AsyncCmd) {
         self.async_queue.push(cmd);
     }
 
-    pub(crate) fn register_session(&self, handle: u32, inbox: Arc<SessionInbox>) {
+    fn begin_subscribe(&self) -> PendingSubscribeGuard<'_> {
         let mut table = self.routing.lock().expect("routing mutex poisoned");
-        table.closed_handles.retain(|&h| h != handle);
-        if let Some(stashed) = table.early.remove(&handle) {
-            for ev in stashed {
-                let _ = inbox.push(ev);
-            }
+        table.pending_subscribes += 1;
+        PendingSubscribeGuard {
+            inner: self,
+            armed: true,
         }
-        table.inboxes.insert(handle, inbox);
     }
 
     pub(crate) fn unregister_session(&self, handle: u32) {
@@ -259,6 +406,7 @@ impl SessionHub {
                 inboxes: HashMap::new(),
                 early: HashMap::new(),
                 closed_handles: VecDeque::with_capacity(128),
+                pending_subscribes: 0,
             }),
             daemon: Mutex::new(DaemonTracking {
                 state: DaemonState::Connected {
@@ -266,11 +414,14 @@ impl SessionHub {
                     restarted: false,
                 },
                 events: VecDeque::new(),
+                last_status_sig: None,
             }),
             async_queue,
             async_worker: Mutex::new(Some(async_worker)),
             router_thread: Mutex::new(None),
             closing: AtomicBool::new(false),
+            status_wake_all: AtomicBool::new(false),
+            theme: Mutex::new(options.theme.clone()),
             options,
             wake,
         });
@@ -289,6 +440,16 @@ impl SessionHub {
     /// Underlying `termd-client` request handle (e.g. for `upgrade` or custom RPCs).
     pub fn client(&self) -> TermdHandle {
         self.inner.termd_handle()
+    }
+
+    /// Current default [`Theme`] used for newly spawned or adopted terminals.
+    pub fn theme(&self) -> Theme {
+        self.inner.current_theme()
+    }
+
+    /// Updates the default [`Theme`] applied to newly spawned or adopted terminals.
+    pub fn set_theme(&self, theme: Theme) {
+        self.inner.set_theme(theme);
     }
 
     /// Latest `WELCOME` handshake from `g3d-termd`.
@@ -344,17 +505,19 @@ impl SessionHub {
     /// Subscribes to existing terminal `opts.id` with explicit [`Subscribe`] options (such as
     /// [`Role::Own`] paired with [`Flow::Lossy`] for cross-namespace agent views).
     pub fn attach_with_options(&self, opts: &Subscribe) -> Result<TerminalSession, Error> {
+        let pending = self.inner.begin_subscribe();
         let sub = self.inner.termd_handle().subscribe_with(opts)?;
-        self.start_subscribed_session(&opts.id, sub)
+        self.start_subscribed_session(&opts.id, sub, pending)
     }
 
     fn start_subscribed_session(
         &self,
         id: &str,
         sub: Subscription,
+        pending: PendingSubscribeGuard<'_>,
     ) -> Result<TerminalSession, Error> {
         let inbox = Arc::new(SessionInbox::new(self.inner.options.coalesce.inbox_max_bytes));
-        self.inner.register_session(sub.handle, Arc::clone(&inbox));
+        pending.finish(sub.handle, Arc::clone(&inbox));
         match TerminalSession::spawn_worker(
             Arc::clone(&self.inner),
             id.to_owned(),
@@ -362,7 +525,7 @@ impl SessionHub {
             sub.role,
             sub.cols,
             sub.rows,
-            self.inner.options.theme.clone(),
+            self.inner.current_theme(),
             self.inner.options.coalesce,
             inbox,
             self.inner.wake_fn(),
@@ -402,12 +565,13 @@ impl SessionHub {
             cols: None,
             rows: None,
         };
+        let pending = self.inner.begin_subscribe();
         let (created, sub) = self
             .inner
             .termd_handle()
             .create_and_subscribe(&create_req, &sub_req)?;
         let _ = Flow::Lossy;
-        self.start_subscribed_session(&created.id, sub)
+        self.start_subscribed_session(&created.id, sub, pending)
     }
 
     /// Lists all live terminals in the namespace (sorted by `id`) and attaches to each as its
@@ -444,6 +608,13 @@ impl SessionHub {
     /// Fetches the daemon status document once.
     pub fn status(&self) -> Result<serde_json::Value, Error> {
         self.inner.termd_handle().status()
+    }
+
+    /// Controls whether every pushed `Event::Status` wakes the host (e.g. while a live Status
+    /// panel is open showing `out_bps` and RSS), or only structural status changes (terminal
+    /// list, exit, scrollback, title/pwd/cwd, errors, exiting).
+    pub fn set_status_wake_all(&self, wake_all: bool) {
+        self.inner.status_wake_all.store(wake_all, Ordering::Release);
     }
 
     /// Enables pushed [`DaemonEvent::Status`] updates at `interval_ms`.
@@ -578,11 +749,27 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
             return;
         }
         Event::Status(doc) => {
-            {
+            let sig = status_wake_sig(doc);
+            let should_wake = {
                 let mut guard = inner.daemon.lock().expect("daemon mutex poisoned");
-                guard.events.push_back(DaemonEvent::Status(doc.clone()));
+                // Coalesce queued status snapshots so a sleeping host never accumulates stale docs.
+                if let Some(existing) = guard
+                    .events
+                    .iter_mut()
+                    .rev()
+                    .find(|e| matches!(e, DaemonEvent::Status(_)))
+                {
+                    *existing = DaemonEvent::Status(doc.clone());
+                } else {
+                    guard.events.push_back(DaemonEvent::Status(doc.clone()));
+                }
+                let changed = guard.last_status_sig.as_ref() != Some(&sig);
+                guard.last_status_sig = Some(sig);
+                changed || inner.status_wake_all.load(Ordering::Acquire)
+            };
+            if should_wake {
+                (inner.wake)();
             }
-            (inner.wake)();
             return;
         }
         Event::UpgradeFailed { message } => {
@@ -601,10 +788,10 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
         let mut table = inner.routing.lock().expect("routing mutex poisoned");
         if let Some(inbox) = table.inboxes.get(&handle) {
             Some(Arc::clone(inbox))
-        } else if table.closed_handles.contains(&handle) {
+        } else if table.closed_handles.contains(&handle) && table.pending_subscribes == 0 {
             None
         } else {
-            if table.early.len() < 64 {
+            if table.early.len() < 64 || table.early.contains_key(&handle) {
                 table.early.entry(handle).or_default().push(ev);
             }
             return;
@@ -613,5 +800,62 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
 
     if let Some(inbox) = inbox {
         let _ = inbox.push(ev);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_wake_sig_ignores_volatile_telemetry_and_detects_structural_changes() {
+        let base = serde_json::json!({
+            "at": 1000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false, "brain": { "rss": 6_000_000 }, "snapshots": { "bytes": 0 } },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false, "out_bps": 444, "saved_seq": 100 }
+            ]
+        });
+        let volatile_only = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false, "brain": { "rss": 6_400_000 }, "snapshots": { "bytes": 16384 } },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false, "out_bps": 0, "saved_seq": 425 }
+            ]
+        });
+        assert_eq!(status_wake_sig(&base), status_wake_sig(&volatile_only));
+
+        let with_new_term = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false },
+                { "id": "ext2", "scrollback_rows": 0, "title": "", "pwd": "", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_new_term));
+
+        let with_scrollback = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": [],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 11, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_scrollback));
+
+        let with_error = serde_json::json!({
+            "at": 2000,
+            "daemon": { "ns": "probe", "version": "1.5", "instance": "abc", "exiting": false },
+            "errors": ["holder error"],
+            "terminals": [
+                { "id": "t1", "scrollback_rows": 10, "title": "zsh", "pwd": "/tmp", "cwd": "/tmp", "alt": false }
+            ]
+        });
+        assert_ne!(status_wake_sig(&base), status_wake_sig(&with_error));
     }
 }

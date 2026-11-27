@@ -32,7 +32,7 @@ use wall_core::status::{TermdStatus, chip_look};
 use wall_core::wall::{Wall, WallFrame, help_sections};
 
 use super::panels::{
-    self, bar_buttons, context_menu, help, palette, settings, status, topbar,
+    self, bar_buttons, context_menu, help, palette, selection_bar, settings, status, topbar,
 };
 
 const PALETTE_INPUT_ID: &str = "wall_palette_query_input";
@@ -43,6 +43,7 @@ const SETTINGS_SEARCH_ID: &str = "wall_settings_search_input";
 pub struct Panels {
     pub topbar: topbar::TopbarState,
     pub bar_buttons: bar_buttons::BarButtonsState,
+    pub selection_bar: selection_bar::SelectionBarState,
     pub palette: palette::PaletteState,
     pub sidebar: panels::sidebar::SidebarState,
     pub settings: settings::SettingsState,
@@ -84,6 +85,8 @@ impl Panels {
             return true;
         }
         self.bar_buttons.is_holding()
+            || described.terminals.iter().any(|t| t.close_hold_progress.is_some())
+            || (!described.selection_outlines.is_empty() && described.lasso.is_none())
             || (!self.wall_dragging && described.title_bars.iter().any(|b| b.hovered))
             || described.palette_open
             || self.palette.open
@@ -250,11 +253,17 @@ impl Panels {
             Vec::new()
         };
 
-        // 0a. Hovered terminal title-bar buttons (`panels::bar_buttons`).
+        // 0a. Hovered terminal title-bar buttons (`panels::bar_buttons`), plus
+        //     keyboard close-hold progress ring (`⌘X` / `Ctrl+Alt+X`).
+        let key_hold = described
+            .terminals
+            .iter()
+            .find_map(|t| t.close_hold_progress.map(|p| (t.id.as_str(), p as f32, t.body_rect)));
         let bar_target_id: Option<String> = self
             .bar_buttons
             .hold_target()
             .map(str::to_owned)
+            .or_else(|| key_hold.map(|(id, _, _)| id.to_owned()))
             .or_else(|| {
                 (!self.wall_dragging)
                     .then(|| {
@@ -281,6 +290,23 @@ impl Panels {
                 egui::pos2(sbox.right as f32, sbox.bottom as f32),
             ))
         });
+        let (external_hold_progress, fallback_body_rect) = match key_hold {
+            Some((hid, progress, body)) if bar_target_id.as_deref() == Some(hid) => {
+                let sbox = described.camera.to_screen_box(
+                    body,
+                    described.viewport.w,
+                    described.viewport.h,
+                );
+                (
+                    Some(progress),
+                    Some(egui::Rect::from_min_max(
+                        egui::pos2(sbox.left as f32, sbox.top as f32),
+                        egui::pos2(sbox.right as f32, sbox.bottom as f32),
+                    )),
+                )
+            }
+            _ => (None, None),
+        };
         let is_agent_open = bar_target_id
             .as_deref()
             .is_some_and(|tid| wall.store().agent_view(tid).is_some_and(|av| av.open));
@@ -295,12 +321,48 @@ impl Panels {
                 close_hold_ms: wall.config().close_hold_ms,
                 min_bar_px: wall.config().bar_buttons_min_px as f32,
                 now_secs,
+                external_hold_progress,
+                fallback_body_rect,
             },
             &mut out,
         );
         if let Some(delay) = bar_out.repaint_after {
             ctx.request_repaint_after(delay);
         }
+
+        // 0a2. Floating selection action bar (`group (N)` + `×`, matching `SelectionOverlay.js`).
+        let selection_bounds = if described.selection_outlines.is_empty() || fullscreen {
+            None
+        } else {
+            let mut acc: Option<egui::Rect> = None;
+            for sel in &described.selection_outlines {
+                let sbox = described.camera.to_screen_box(
+                    sel.rect,
+                    described.viewport.w,
+                    described.viewport.h,
+                );
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(sbox.left as f32, sbox.top as f32),
+                    egui::pos2(sbox.right as f32, sbox.bottom as f32),
+                );
+                acc = Some(match acc {
+                    Some(prev) => prev.union(r),
+                    None => r,
+                });
+            }
+            acc
+        };
+        selection_bar::show(
+            ctx,
+            &mut self.selection_bar,
+            &selection_bar::SelectionBarInput {
+                count: described.selection_outlines.len(),
+                selection_bounds,
+                lassoing: described.lasso.is_some(),
+                platform,
+            },
+            &mut out,
+        );
 
         // 0b. Topbar strip (`panels::topbar`), reserving space on the right for `TermdChip`.
         let ns = wall.termd().namespace();
@@ -415,8 +477,9 @@ impl Panels {
                     described.panels.dock.inset.left as f32,
                     described.panels.dock.inset.right as f32,
                 ),
-                // `describe.rs` draws `described.status_notice` on the canvas chrome layer.
-                show_notice: false,
+                // `egui-ui` owns the interactive dismissible outage banner (`×` -> `wall.status.dismiss`);
+                // `app.rs` passes `draw_status_notice = false` to `describe.rs` so only one banner paints.
+                show_notice: true,
                 platform,
             };
             status::show(ctx, &mut self.status, &input, &mut out);
@@ -707,6 +770,16 @@ impl Panels {
             fmt_opt_rect(self.palette.last_rect),
         ));
 
+        if self.selection_bar.count > 0 {
+            lines.push(format!(
+                "panel selection_bar count={} rect={} group={} clear={}",
+                self.selection_bar.count,
+                fmt_opt_rect(self.selection_bar.last_rect),
+                fmt_opt_rect(self.selection_bar.group_rect),
+                fmt_opt_rect(self.selection_bar.clear_rect),
+            ));
+        }
+
         let sb = &described.panels.sidebar;
         let sb_collapsed = if sb.collapsed.is_empty() {
             "none".to_string()
@@ -749,12 +822,13 @@ impl Panels {
             self.status.shown_row_ids.join(",")
         };
         lines.push(format!(
-            "panel status open={} side={} rows={} rect={} header={}",
+            "panel status open={} side={} rows={} rect={} header={} notice_dismiss={}",
             st.open,
             dock_side_name(st.side),
             st_rows,
             fmt_opt_rect(self.status.last_rect),
             fmt_opt_rect(self.status.header_drag_rect),
+            fmt_opt_rect(self.status.notice_dismiss_rect),
         ));
 
         let sp = &described.panels.settings_panel;
@@ -1126,6 +1200,58 @@ mod tests {
     }
 
     #[test]
+    fn settled_canvas_with_topbar_and_hovered_terminal_requests_no_idle_repaint() {
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+
+        // Hover t1's body so `t1.hovered == true` and `topbar` + `bar_buttons` are mounted.
+        let term = wall.frame().terminals[0].clone();
+        let sbox = wall.frame().camera.to_screen_box(term.body_rect, 1400.0, 900.0);
+        let body_pt = Point::new(0.5 * (sbox.left + sbox.right), 0.5 * (sbox.top + sbox.bottom));
+        wall.pointer_move(
+            &PointerEvent {
+                pointer_id: 1,
+                x: body_pt.x,
+                y: body_pt.y,
+                button: None,
+                buttons: Buttons::NONE,
+                mods: Mods::default(),
+                time_ms: 100.0,
+            },
+            &NoScreens,
+        );
+        let described = wall.frame();
+        assert!(described.terminals[0].hovered);
+        assert!(!described.animating, "resting hover must not report wall animating");
+
+        // Run a few frames to finish initial Area sizing, then verify egui asks for no further repaint.
+        let mut last_delay = std::time::Duration::ZERO;
+        for step in 0..5 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                time: Some(1.0 + f64::from(step) * 0.1),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                let _ = panels.show(ui.ctx(), &wall, &described);
+            });
+            last_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+        }
+        assert!(
+            last_delay >= std::time::Duration::from_secs(60 * 60 * 24),
+            "settled canvas with hovered terminal and topbar must sleep idle, got repaint_delay={last_delay:?}"
+        );
+    }
+
+    #[test]
     fn mounts_topbar_bar_buttons_and_all_six_panels_and_closes_on_escape() {
         let ctx = egui::Context::default();
         configure_wall_context(&ctx, &crate::config::settings().wall);
@@ -1293,5 +1419,130 @@ mod tests {
         assert_eq!(sb_in.bus.agents[0].name, "coder");
         assert!(wall.run("wall.palette close").text.starts_with("OK"));
         assert!(!wall.palette_open());
+    }
+
+    #[test]
+    fn keyboard_close_hold_progress_drives_ring_through_mount() {
+        use wall_core::chord::chord_mods;
+        use wall_core::input::KeyEvent;
+
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+        wall.set_now_ms(5_000.0);
+
+        let chord = chord_mods(wall.platform());
+        let _ = wall.key(
+            &KeyEvent {
+                code: "KeyX".to_owned(),
+                key: "x".to_owned(),
+                text: Some("x".to_owned()),
+                mods: chord,
+                repeat: false,
+                pressed: true,
+            },
+            &NoScreens,
+        );
+        // Advance halfway through the 650 ms hold; terminal stays alive with ~0.5 progress.
+        let _ = wall.tick(0.016, 5_350.0);
+        let described = wall.frame();
+        let hold_p = described
+            .terminals
+            .iter()
+            .find(|t| t.id == "t1")
+            .and_then(|t| t.close_hold_progress)
+            .expect("keyboard Chord+X hold should set close_hold_progress");
+        assert!(hold_p > 0.4 && hold_p < 0.7, "expected mid-hold progress, got {hold_p}");
+
+        let want = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(0xe5, 0x53, 0x4b));
+        let full = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1400.0, 900.0),
+                )),
+                time: Some(5.35),
+                ..Default::default()
+            },
+            |ui| {
+                let verbs = panels.show(ui.ctx(), &wall, &described);
+                assert!(verbs.is_empty(), "mount must not emit duplicate wall.close");
+            },
+        );
+        let has_ring = full.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::Path(p) => p.stroke.color == want && p.points.len() >= 3,
+            egui::Shape::Vec(v) => v.iter().any(|s| {
+                matches!(s, egui::Shape::Path(p) if p.stroke.color == want && p.points.len() >= 3)
+            }),
+            _ => false,
+        });
+        assert!(has_ring, "expected #e5534b close-hold ring painted during keyboard Chord+X hold");
+    }
+
+    #[test]
+    fn termd_outage_notice_dismiss_button_clears_red_banner() {
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+
+        // Simulate daemon with a live terminal disappearing -> red dismissible `Lost` banner.
+        let _ = wall.on_termd_status(
+            serde_json::json!({
+                "daemon": { "version": "1.0", "ns": "rs-wall" },
+                "terminals": [{ "id": "t1", "cols": 100, "rows": 30 }],
+            }),
+            1_000,
+        );
+        wall.on_termd_disconnected(false, 2_000);
+        wall.on_termd_socket_absent(3_000);
+        assert!(
+            wall.frame().status_notice.as_ref().is_some_and(|n| n.dismiss),
+            "expected dismissible Lost outage notice"
+        );
+
+        // Two warm-up passes so egui lays out the banner and records `notice_dismiss_rect`.
+        let _ = run_pass_at(&ctx, 1.0, Vec::new(), &mut panels, &mut wall);
+        let _ = run_pass_at(&ctx, 1.1, Vec::new(), &mut panels, &mut wall);
+        let dismiss_pt = panels
+            .status
+            .notice_dismiss_rect
+            .expect("dismiss × rect must be exposed on red outage notice")
+            .center();
+
+        // Clicking × emits `wall.status.dismiss` and clears the banner.
+        let _ = run_pass_at(
+            &ctx,
+            1.2,
+            vec![
+                egui::Event::PointerMoved(dismiss_pt),
+                egui::Event::PointerButton {
+                    pos: dismiss_pt,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut panels,
+            &mut wall,
+        );
+        let (verbs, _) = run_pass_at(
+            &ctx,
+            1.3,
+            vec![egui::Event::PointerButton {
+                pos: dismiss_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut panels,
+            &mut wall,
+        );
+        assert_eq!(verbs, vec!["wall.status.dismiss".to_string()]);
+        assert!(
+            wall.frame().status_notice.is_none(),
+            "clicking × must clear the red outage notice"
+        );
     }
 }

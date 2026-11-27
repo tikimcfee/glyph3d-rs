@@ -25,9 +25,37 @@ if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
 fi
 
 D="/tmp/g3d-keys-$$"
-mkdir -m 700 "$D"
+mkdir -m 700 -p "$D/bin"
 export G3D_TERMD_DIR="$D"
 export GLYPH_WALL_CLIPBOARD="memory"
+
+# Isolate the smoke window from the host's live gomuxai fleet (same pattern as
+# tools/wall-smoke-agents.sh): return an empty snapshot/session list on PATH.
+cat >"$D/bin/agent" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --backend-config) shift; shift ;;
+        -q|--quiet) shift ;;
+        --*) shift ;;
+        *) break ;;
+    esac
+done
+case "${1:-}" in
+    export)
+        printf '{"type":"snapshot","host":"smoke","stores":[],"agents":[]}\n'
+        exec tail -f /dev/null
+        ;;
+    sessions)
+        printf '[]\n'
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+chmod +x "$D/bin/agent"
+export PATH="$D/bin:${HOME}/.local/bin:${PATH}"
 
 SHOT_DIR="$REPO_ROOT/target/glyph-scratch/wall-smoke"
 mkdir -p "$SHOT_DIR"
@@ -185,8 +213,9 @@ for line in sys.stdin:
 ' "$tid" <<<"$w"
 }
 
-# Start scratch wall window in namespace `probe`.
-"$BIN" --wall --wall-ns "$NS" >"$SHOT_DIR/wall.log" 2>&1 &
+# Start scratch wall window in namespace `probe` from `$D` so no repo-local launch_config
+# overrides PATH discovery of the stub `agent`.
+(cd "$D" && "$BIN" --wall --wall-ns "$NS") >"$SHOT_DIR/wall.log" 2>&1 &
 WALL_PID=$!
 
 # Wait for control socket + initial terminal `t1` + shell readiness.
@@ -1302,6 +1331,30 @@ if [[ "$DROP_SEEN" -eq 1 && "$FOC_AFTER_DROP" == "t2" && "$T1_DROP_LEAK" -eq 0 ]
     record_pass "file drop shell-quoting" "focused t2 & pasted /tmp/plain_ok.rs '/tmp/my file'\\''s (1).txt' "
 else
     record_fail "file drop shell-quoting" "seen=$DROP_SEEN focused=$FOC_AFTER_DROP leak=$T1_DROP_LEAK"
+fi
+
+# ── 26. Idle window draws zero frames while pointer rests over a terminal ────
+ctl wall.fit >/dev/null
+wait_settled >/dev/null
+T1_RECT_IDLE="$(ctl app.where | awk '$1=="terminal" && $2=="t1" {for(i=3;i<=NF;i++) if($i~/^rect=/) print substr($i,6)}')"
+if [[ -n "$T1_RECT_IDLE" ]]; then
+    IFS=, read -r IL IT IR IB <<<"$T1_RECT_IDLE"
+    ICX="$(python3 -c "print(f'{($IL + $IR) / 2.0:.2f}')")"
+    ICY="$(python3 -c "print(f'{($IT + $IB) / 2.0:.2f}')")"
+    ctl app.move "$ICX" "$ICY" >/dev/null
+    sleep 0.4
+    ctl app.perf reset >/dev/null
+    sleep 5
+    PERF_IDLE="$(ctl app.perf)"
+    IDLE_FRAMES="$(sed -n 's/.*frames=\([0-9]*\).*/\1/p' <<<"$PERF_IDLE")"
+    IDLE_WAKES="$(sed -n 's/.*wakes:\([0-9]*,wake_hz:[0-9.]*\).*/\1/p' <<<"$PERF_IDLE")"
+    if [[ "$IDLE_FRAMES" == "0" ]]; then
+        record_pass "idle zero frames on hover" "hover at (${ICX},${ICY}) drew 0 frames over 5s (${IDLE_WAKES:-wakes=?})"
+    else
+        record_fail "idle zero frames on hover" "expected frames=0 over 5s resting on t1, got frames=${IDLE_FRAMES:-?} ($PERF_IDLE)"
+    fi
+else
+    record_fail "idle zero frames on hover" "could not locate t1 rect for hover test"
 fi
 
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"

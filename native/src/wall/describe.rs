@@ -164,6 +164,42 @@ pub fn describe_frame_chrome_with_scrollback_hits(
     hovered_pill: Option<&str>,
     pill_hits: &mut Vec<ScrollbackPillHit>,
 ) -> PaperStyle {
+    describe_frame_chrome_with_options(
+        described,
+        camera,
+        viewport,
+        scale_factor,
+        fonts,
+        shapes,
+        labels,
+        scrollback,
+        hovered_pill,
+        pill_hits,
+        true,
+    )
+}
+
+/// Same as [`describe_frame_chrome_with_scrollback_hits`], with `draw_status_notice`
+/// controlling whether `described.status_notice` is painted on the canvas layer
+/// (set `false` when `egui-ui` paints the interactive dismissible banner in `status::show_notice`,
+/// while still reserving top spacing so transient notices stack cleanly underneath it).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "extends describe_frame_chrome_with_scrollback_hits with canvas status-notice toggle"
+)]
+pub fn describe_frame_chrome_with_options(
+    described: &DescribedFrame,
+    camera: &WallCamera,
+    viewport: (u32, u32),
+    scale_factor: f32,
+    fonts: &mut ChromeFonts<'_>,
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    scrollback: impl Fn(&str) -> Option<TerminalScrollback>,
+    hovered_pill: Option<&str>,
+    pill_hits: &mut Vec<ScrollbackPillHit>,
+    draw_status_notice: bool,
+) -> PaperStyle {
     let view = ChromeView::new(camera.zoom, scale_factor);
     let mut style = ChromeStyle {
         bar_max_world: BAR_ROOM as f32,
@@ -176,14 +212,23 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         style.veil_fill = css_color(&veil.background, veil.opacity as f32);
     }
 
+    let visible = camera
+        .visible_world_rect(viewport)
+        .expand(4.0 / camera.zoom.max(1e-3));
+
     let term_by_id: HashMap<&str, &TerminalFrame> = described
         .terminals
         .iter()
         .map(|t| (t.id.as_str(), t))
         .collect();
 
-    // 1. Group frames & headers (behind member terminals).
+    // 1. Group frames & headers (behind member terminals), culled to visible world bounds.
     for group in &described.groups {
+        let backdrop_rect = to_world_rect(group.frame_rect);
+        let group_bounds = backdrop_rect.union(to_world_rect(group.header_rect));
+        if !group_bounds.intersects(visible) {
+            continue;
+        }
         push_group_frame(
             shapes,
             labels,
@@ -191,7 +236,7 @@ pub fn describe_frame_chrome_with_scrollback_hits(
             &style,
             view,
             &GroupFrameDesc {
-                backdrop_rect: to_world_rect(group.frame_rect),
+                backdrop_rect,
                 z: group.z as f32,
                 name: &group.name,
                 focused: group.focused,
@@ -203,6 +248,9 @@ pub fn describe_frame_chrome_with_scrollback_hits(
     // 2. Terminal title bars (always reserving `BAR_BUTTON_ROOM` on the right, matching `WallNames.js`).
     for bar in &described.title_bars {
         let strip_world = to_world_rect(bar.rect);
+        if !strip_world.intersects(visible) {
+            continue;
+        }
 
         let (body_rect, selected) = match term_by_id.get(bar.terminal_id.as_str()) {
             Some(tf) => (to_world_rect(tf.body_rect), tf.selected),
@@ -225,9 +273,13 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         push_title_bar(shapes, labels, fonts, &style, view, &desc);
     }
 
-    // 2b. Per-terminal scrolled-back indicators (silent on live terminals).
+    // 2b. Per-terminal scrolled-back indicators (silent on live or off-screen terminals).
     let inv_sf = 1.0 / f64::from(view.safe_scale());
     for term in &described.terminals {
+        let body_rect = to_world_rect(term.body_rect);
+        if !body_rect.intersects(visible) {
+            continue;
+        }
         if let Some(sb) = scrollback(&term.id) {
             if sb.viewing || sb.offset > 0 {
                 if let Some(world_rect) = push_scrollback_indicator(
@@ -236,7 +288,7 @@ pub fn describe_frame_chrome_with_scrollback_hits(
                     fonts,
                     view,
                     &ScrollbackIndicatorDesc {
-                        body_rect: to_world_rect(term.body_rect),
+                        body_rect,
                         z: term.z as f32,
                         offset: sb.offset,
                         max: sb.max,
@@ -269,14 +321,20 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         }
     }
 
-    // 3. Multi-terminal selection outlines (`3px` outside each selected window).
+    // 3. Multi-terminal selection outlines (`3px` outside each visible selected window).
+    let sel_pad = (style.selection_gap_px + style.selection_stroke_px) * view.safe_scale()
+        / camera.zoom.max(1e-3);
     for (idx, sel) in described.selection_outlines.iter().enumerate() {
+        let window_rect = to_world_rect(sel.rect);
+        if !window_rect.expand(sel_pad).intersects(visible) {
+            continue;
+        }
         push_selection_outline(
             shapes,
             &style,
             view,
             SelectionOutlineDesc {
-                window_rect: to_world_rect(sel.rect),
+                window_rect,
                 z: Z_SELECTION + idx as f32 * 0.01,
             },
         );
@@ -361,14 +419,16 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         .as_ref()
         .filter(|n| !n.text.is_empty())
     {
-        let kind = match sn.tone {
-            StatusTone::Red => NoticeKind::Red,
-            StatusTone::Amber | StatusTone::Ok | StatusTone::Muted => NoticeKind::Amber,
-        };
-        let mut notice = NoticeDesc::new(&sn.text, kind, *camera, viewport, Z_OVERLAY + 10.0);
-        notice.left_inset_css_px = described.panels.dock.inset.left as f32;
-        notice.right_inset_css_px = described.panels.dock.inset.right as f32;
-        push_notice(shapes, labels, fonts, &style, view, &notice);
+        if draw_status_notice {
+            let kind = match sn.tone {
+                StatusTone::Red => NoticeKind::Red,
+                StatusTone::Amber | StatusTone::Ok | StatusTone::Muted => NoticeKind::Amber,
+            };
+            let mut notice = NoticeDesc::new(&sn.text, kind, *camera, viewport, Z_OVERLAY + 10.0);
+            notice.left_inset_css_px = described.panels.dock.inset.left as f32;
+            notice.right_inset_css_px = described.panels.dock.inset.right as f32;
+            push_notice(shapes, labels, fonts, &style, view, &notice);
+        }
         next_notice_top =
             Some(style.notice_top_px + style.notice_font_px + 2.0 * style.notice_pad_y_px + 6.0);
     }
@@ -689,5 +749,67 @@ mod tests {
             s,
             Shape::Rect(r) if r.fill == Some(style.notice_red_fill)
         )));
+    }
+
+    #[test]
+    fn describe_culls_offscreen_groups_bars_scrollback_and_selection_outlines() {
+        let (metrics, mut atlas, family) = load_test_fonts();
+        let mut wall = make_wall(metrics);
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24).with_title("near-term"));
+        wall.terminal_appeared(TerminalAppeared::new("t2", 80, 24).with_title("far-term"));
+        let _ = wall.run("terminal.move t2 5000 0");
+        let _ = wall.run("wall.group t2");
+        let _ = wall.run("wall.select t1 t2");
+        let _ = wall.run("wall.reveal t1");
+        let _ = wall.tick(2.0, 2000.0);
+
+        let described = wall.frame();
+        assert_eq!(described.groups.len(), 1);
+        assert_eq!(described.title_bars.len(), 2);
+        assert_eq!(described.selection_outlines.len(), 2);
+
+        let sf = 2.0_f32;
+        let vp = (3200, 2000);
+        let cam = WallCamera::new(
+            Vec2::new(described.camera.x as f32, described.camera.y as f32),
+            described.camera.zoom as f32 * sf,
+        );
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        let mut hits = Vec::new();
+        {
+            let mut fonts = ChromeFonts::new(metrics, &mut atlas, family);
+            describe_frame_chrome_with_scrollback_hits(
+                &described,
+                &cam,
+                vp,
+                sf,
+                &mut fonts,
+                &mut shapes,
+                &mut labels,
+                |_| {
+                    Some(TerminalScrollback {
+                        offset: 12,
+                        max: 100,
+                        viewing: true,
+                    })
+                },
+                None,
+                &mut hits,
+            );
+        }
+
+        // Only t1's title bar, scrollback pill, and selection outline survive;
+        // t2's group, title bar, scrollback pill, and selection outline are culled.
+        assert_eq!(hits.len(), 1, "only visible terminal's scrollback pill emits");
+        assert_eq!(hits[0].terminal_id, "t1");
+        assert!(labels.iter().any(|l| l.text == "near-term"));
+        assert!(!labels.iter().any(|l| l.text == "far-term"));
+        // 1 title bar + 1 selection outline + t1's scrollback track/thumb/pill shapes (no t2 group/bar/sel).
+        let sel_shapes = shapes
+            .iter()
+            .filter(|s| matches!(s, Shape::Rect(r) if (r.z - Z_SELECTION).abs() < 1.0))
+            .count();
+        assert_eq!(sel_shapes, 1, "offscreen terminal's selection outline must be culled");
     }
 }

@@ -262,6 +262,12 @@ pub const UNDERLINE_RAISE_DEFAULT: f64 = 0.0;
 pub const CURLY_AMPLITUDE_DEFAULT: f64 = 1.5;
 /// Default `dimAlpha` (`GLYPH_LINE_DEFAULTS.dimAlpha`).
 pub const DIM_ALPHA_DEFAULT: f64 = 0.5;
+/// Default `panelOpacity` (`config/defaults.toml` `[wall] panel_opacity`).
+pub const PANEL_OPACITY_DEFAULT: f64 = 1.0;
+/// Default `cursorBlinkMs` (`config/defaults.toml` `[wall] cursor_blink_ms`).
+pub const CURSOR_BLINK_MS_DEFAULT: f64 = 530.0;
+/// Default `greekPx` (`config/defaults.toml` `[wall] greek_px`).
+pub const GREEK_PX_DEFAULT: f64 = 8.0;
 
 /// Knob keys that drive the glyph shader's cell line style (`wallConfig.LINE_STYLE_KNOBS`).
 pub const LINE_STYLE_KNOBS: &[&str] = &[
@@ -275,6 +281,8 @@ pub const LINE_STYLE_KNOBS: &[&str] = &[
 pub const WALL_CONFIG_KEYS: &[&str] = &[
     "closeHoldMs",
     "barButtonsMinPx",
+    "panelOpacity",
+    "cursorBlinkMs",
     "agentViewSide",
     "agentViewWidth",
     "agentViewHeight",
@@ -322,6 +330,7 @@ pub const WALL_CONFIG_KEYS: &[&str] = &[
     "underlineRaise",
     "curlyAmplitude",
     "dimAlpha",
+    "greekPx",
 ];
 
 /// All configurable knobs of the wall (`wallConfig.WALL_CONFIG`), initialized to their defaults.
@@ -332,6 +341,10 @@ pub struct WallConfig {
     pub close_hold_ms: f64,
     /// Minimum title-bar height in CSS px before its button cluster is shown.
     pub bar_buttons_min_px: f64,
+    /// Opacity of each terminal's background panel (`0..=1`, default `1.0`).
+    pub panel_opacity: f64,
+    /// Half-period of a blinking cursor in milliseconds (`0` = steady, default `530`).
+    pub cursor_blink_ms: f64,
     /// Default side of a terminal a newly opened Agent View attaches to.
     pub agent_view_side: AgentSide,
     /// World width of an Agent View on the left or right of a terminal.
@@ -426,6 +439,8 @@ pub struct WallConfig {
     pub curly_amplitude: f64,
     /// Opacity multiplier retained by dim (`SGR 2`) text (`0..=1`).
     pub dim_alpha: f64,
+    /// Cell row height in CSS px below which glyphs simplify to horizontal bars (`0` = off).
+    pub greek_px: f64,
 }
 
 impl Default for WallConfig {
@@ -433,6 +448,8 @@ impl Default for WallConfig {
         WallConfig {
             close_hold_ms: 650.0,
             bar_buttons_min_px: 14.0,
+            panel_opacity: PANEL_OPACITY_DEFAULT,
+            cursor_blink_ms: CURSOR_BLINK_MS_DEFAULT,
             agent_view_side: AgentSide::Right,
             agent_view_width: 76.0,
             agent_view_height: 44.0,
@@ -480,6 +497,7 @@ impl Default for WallConfig {
             underline_raise: UNDERLINE_RAISE_DEFAULT,
             curly_amplitude: CURLY_AMPLITUDE_DEFAULT,
             dim_alpha: DIM_ALPHA_DEFAULT,
+            greek_px: GREEK_PX_DEFAULT,
         }
     }
 }
@@ -490,6 +508,8 @@ impl WallConfig {
         Some(match key {
             "closeHoldMs" => KnobValue::Number(self.close_hold_ms),
             "barButtonsMinPx" => KnobValue::Number(self.bar_buttons_min_px),
+            "panelOpacity" => KnobValue::Number(self.panel_opacity),
+            "cursorBlinkMs" => KnobValue::Number(self.cursor_blink_ms),
             "agentViewSide" => KnobValue::Text(self.agent_view_side.as_str().to_string()),
             "agentViewWidth" => KnobValue::Number(self.agent_view_width),
             "agentViewHeight" => KnobValue::Number(self.agent_view_height),
@@ -537,6 +557,7 @@ impl WallConfig {
             "underlineRaise" => KnobValue::Number(self.underline_raise),
             "curlyAmplitude" => KnobValue::Number(self.curly_amplitude),
             "dimAlpha" => KnobValue::Number(self.dim_alpha),
+            "greekPx" => KnobValue::Number(self.greek_px),
             _ => return None,
         })
     }
@@ -590,6 +611,8 @@ impl WallConfig {
         match key {
             "closeHoldMs" => self.close_hold_ms = num(checked),
             "barButtonsMinPx" => self.bar_buttons_min_px = num(checked),
+            "panelOpacity" => self.panel_opacity = num(checked),
+            "cursorBlinkMs" => self.cursor_blink_ms = num(checked),
             "agentViewSide" => {
                 self.agent_view_side =
                     AgentSide::parse(text(checked)).expect("checked agentViewSide option")
@@ -652,6 +675,7 @@ impl WallConfig {
             "underlineRaise" => self.underline_raise = num(checked),
             "curlyAmplitude" => self.curly_amplitude = num(checked),
             "dimAlpha" => self.dim_alpha = num(checked),
+            "greekPx" => self.greek_px = num(checked),
             other => panic!("check_config accepted unknown wall knob '{other}'"),
         }
     }
@@ -704,8 +728,8 @@ mod tests {
     #[test]
     fn wall_config_and_knobs_bijection_and_line_style_knobs() {
         assert_config_matches_knobs();
-        assert_eq!(WALL_CONFIG_KEYS.len(), 49);
-        assert_eq!(KNOBS.len(), 49);
+        assert_eq!(WALL_CONFIG_KEYS.len(), 52);
+        assert_eq!(KNOBS.len(), 52);
         for &k in LINE_STYLE_KNOBS {
             assert!(WALL_CONFIG_KEYS.contains(&k), "missing line style knob {k}");
         }

@@ -352,6 +352,38 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         },
     ),
     (
+        "panelOpacity",
+        KnobDef {
+            section: "terminals",
+            label: "Panel opacity",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: Some(1.0),
+                step: Some(0.05),
+                whole: false,
+                unit: None,
+            },
+            description: "Opacity of each terminal's background panel: 1 is solid opaque, lower lets the canvas grid show through, 0 is transparent.",
+        },
+    ),
+    (
+        "cursorBlinkMs",
+        KnobDef {
+            section: "terminals",
+            label: "Cursor blink",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: Some(5000.0),
+                step: Some(50.0),
+                whole: true,
+                unit: Some("ms"),
+            },
+            description: "Half-period of a blinking cursor in milliseconds; 0 keeps every cursor steady.",
+        },
+    ),
+    (
         "agentViewSide",
         KnobDef {
             section: "agent",
@@ -570,6 +602,22 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
                 unit: None,
             },
             description: "How much of its opacity dim (faint) text keeps: 1 draws it like plain text, lower lets the background show through it, 0 hides it.",
+        },
+    ),
+    (
+        "greekPx",
+        KnobDef {
+            section: "text",
+            label: "Greek below",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: Some(32.0),
+                step: Some(1.0),
+                whole: false,
+                unit: Some("px"),
+            },
+            description: "Cell row height on screen below which glyphs simplify into horizontal bars; 0 disables greeking.",
         },
     ),
     (

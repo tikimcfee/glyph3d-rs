@@ -277,6 +277,12 @@ impl WallUi {
     /// short-circuits without pushing pointer/key events or requesting repaints
     /// (forwarding only `ScaleFactorChanged` so DPI changes are never lost).
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> UiEventOutcome {
+        // Never feed `RedrawRequested` into `egui_winit`: `egui_winit` always replies
+        // `repaint: true` for it, which would re-arm `window.request_redraw()` on every
+        // frame and spin an idle window at display refresh rate whenever any chrome is active.
+        if matches!(event, WindowEvent::RedrawRequested) {
+            return UiEventOutcome::default();
+        }
         if !self.active {
             if matches!(event, WindowEvent::ScaleFactorChanged { .. }) {
                 let _ = self.state.on_window_event(window, event);

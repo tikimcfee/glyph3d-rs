@@ -77,6 +77,26 @@ impl ScreenView for Screen {
     fn cells_screen(&self) -> &Screen {
         self
     }
+
+    fn hyperlink_at(&self, row: usize, col: usize) -> Option<&str> {
+        let col = u16::try_from(col).ok()?;
+        let row = u16::try_from(row).ok()?;
+        Screen::hyperlink_at(self, col, row)
+    }
+
+    fn hyperlink_span_at(&self, row: usize, col: usize) -> Option<HoveredLink> {
+        let col = u16::try_from(col).ok()?;
+        let row = u16::try_from(row).ok()?;
+        let link = Screen::hyperlink_range_at(self, col, row)?;
+        Some(HoveredLink {
+            start_row: usize::from(link.start_row),
+            start_col: usize::from(link.start_col),
+            end_row: usize::from(link.end_row),
+            end_col: usize::from(link.end_col),
+            url: link.uri.to_owned(),
+            kind: LinkKind::Osc8,
+        })
+    }
 }
 
 /// Whether `url` has an allowed external scheme (`http`, `https`, or `mailto`) and
@@ -674,6 +694,53 @@ mod tests {
             link_at_cell(&view, 2, 2),
             None,
             "disallowed OSC 8 scheme must not open or fall back to plain URL"
+        );
+    }
+
+    #[test]
+    fn screen_impl_forwards_osc8_hyperlinks_and_soft_wrapped_ranges() {
+        let mut screen = make_screen(
+            12,
+            3,
+            &[
+                ("click here!!", true),
+                ("more text   ", false),
+                ("https://a.co", false),
+            ],
+        );
+        screen.hyperlinks.push("https://glyph3d.dev/direct".to_owned());
+        screen.hyperlinks.push("file:///etc/passwd".to_owned());
+        screen.link_spans = vec![
+            term_cells::LinkSpan { row: 0, start_col: 6, end_col: 12, link_id: 0 },
+            term_cells::LinkSpan { row: 1, start_col: 0, end_col: 4, link_id: 0 },
+            term_cells::LinkSpan { row: 2, start_col: 0, end_col: 12, link_id: 1 },
+        ];
+
+        assert_eq!(ScreenView::hyperlink_at(&screen, 0, 5), None);
+        assert_eq!(
+            ScreenView::hyperlink_at(&screen, 0, 6),
+            Some("https://glyph3d.dev/direct")
+        );
+        assert_eq!(
+            ScreenView::hyperlink_at(&screen, 1, 2),
+            Some("https://glyph3d.dev/direct")
+        );
+
+        let expected = HoveredLink {
+            start_row: 0,
+            start_col: 6,
+            end_row: 1,
+            end_col: 4,
+            url: "https://glyph3d.dev/direct".to_owned(),
+            kind: LinkKind::Osc8,
+        };
+        assert_eq!(link_at_cell(&screen, 0, 7), Some(expected.clone()));
+        assert_eq!(link_at_cell(&screen, 1, 1), Some(expected));
+        assert_eq!(link_at_cell(&screen, 1, 4), None);
+        assert_eq!(
+            link_at_cell(&screen, 2, 3),
+            None,
+            "disallowed file:// OSC 8 on Screen suppresses plain URL fallback"
         );
     }
 }

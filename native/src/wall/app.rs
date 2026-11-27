@@ -63,8 +63,8 @@ use super::ui::{show_debug_hud, DebugHudInput, HudTerminalInfo, UiEventOutcome, 
 const WORLD_CELL_HEIGHT: f32 = 2.4;
 /// The panel's padding round its cells, in world units (the JS wall's 0.3).
 const PANEL_PAD: f32 = 0.3;
-/// Two presses this close in time and place are a double click.
-const DOUBLE_CLICK_MS: f64 = 500.0;
+/// Maximum pointer drift in logical px between clicks counted as a double click
+/// (interval comes live from `wall.config().click_repeat_ms`).
 const DOUBLE_CLICK_PX: f64 = 5.0;
 /// Lines scrolled per discrete physical mouse-wheel detent (`MouseScrollDelta::LineDelta`),
 /// matching Firefox's 3-line `deltaMode = 1` notch and Chrome's ~100 CSS px notch (`~3.3` rows).
@@ -244,8 +244,8 @@ struct App {
     buttons: u8,
     /// The last left release: when and where (for double clicks).
     last_release: Option<(f64, Point)>,
-    /// The renderer keys a terminal's GPU buffers by a number.
-    render_ids: HashMap<String, u64>,
+    /// The renderer keys a terminal's GPU buffers by a monotonic number.
+    render_ids: RenderIds,
     start: Instant,
     last_tick: Instant,
     /// The wall said something is still moving: draw again without waiting.
@@ -279,12 +279,12 @@ struct App {
     occluded: bool,
     wakes: Arc<WakeGate>,
     perf: super::perf::WallPerf,
-    /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
-    ime_composing: bool,
-    /// True while `wallctl app.ime preedit` is active; kept separate from [`Self::ime_composing`]
+    /// Active OS dead-key or IME preedit composition string (`WindowEvent::Ime(Ime::Preedit)`).
+    ime_preedit: Option<String>,
+    /// Active `wallctl app.ime preedit` composition string; kept separate from [`Self::ime_preedit`]
     /// because Wayland `zwp_text_input_v3.done` replies to earlier `set_ime_cursor_area` commits
     /// make winit emit `Ime::Preedit("", None)` asynchronously.
-    script_ime_composing: bool,
+    script_ime_preedit: Option<String>,
     /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
@@ -315,6 +315,41 @@ struct App {
 struct WakeGate {
     pending: std::sync::atomic::AtomicBool,
     redraw_armed: std::sync::atomic::AtomicBool,
+}
+
+/// Maps terminal string ids to monotonic `u64` renderer keys so closed terminals can be
+/// freed from [`WallRenderer`] without ever colliding ids across spawn/close cycles.
+#[derive(Default)]
+struct RenderIds {
+    next: u64,
+    ids: HashMap<String, u64>,
+}
+
+impl RenderIds {
+    fn id_for(&mut self, id: &str) -> u64 {
+        if let Some(&existing) = self.ids.get(id) {
+            return existing;
+        }
+        self.next = self.next.saturating_add(1);
+        self.ids.insert(id.to_string(), self.next);
+        self.next
+    }
+
+    /// Forget `id` and free its cached GPU buffers in `renderer`, if present.
+    fn remove_from(&mut self, id: &str, renderer: Option<&mut WallRenderer>) -> bool {
+        let Some(rid) = self.ids.remove(id) else {
+            return false;
+        };
+        renderer.is_some_and(|r| r.remove_terminal(rid))
+    }
+
+    /// Keep only `live_ids`, freeing cached GPU buffers for terminals absent after reconnect.
+    fn retain_live(&mut self, live_ids: &[String], renderer: Option<&mut WallRenderer>) {
+        self.ids.retain(|id, _| live_ids.iter().any(|live| live == id));
+        if let Some(r) = renderer {
+            r.retain_terminals(|rid| self.ids.values().any(|&live_rid| live_rid == rid));
+        }
+    }
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -698,8 +733,7 @@ impl App {
     }
 
     fn render_id(&mut self, id: &str) -> u64 {
-        let next = self.render_ids.len() as u64 + 1;
-        *self.render_ids.entry(id.to_string()).or_insert(next)
+        self.render_ids.id_for(id)
     }
 
     #[cfg(feature = "egui-ui")]
@@ -722,6 +756,7 @@ impl App {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &self.terms) else {
             return;
         };
+        sessions.set_live_status_updates(wall.store().status_window().open);
         if !wall.model().connected() {
             return;
         }
@@ -933,8 +968,11 @@ impl App {
         self.pending_termd = None;
         self.starting_termd = false;
         match res {
-            Ok(ready) => {
+            Ok(mut ready) => {
                 let welcome = ready.sessions.hub().welcome().clone();
+                if let Some(wall) = &self.wall {
+                    ready.sessions.set_bold_is_bright(wall.config().bold_is_bright);
+                }
                 let agents_extra = ready.sessions.is_extra_connected("agents");
                 let mut appeared_list = Vec::with_capacity(ready.adopted.len());
                 for (id, cols, rows) in ready.adopted {
@@ -1027,8 +1065,14 @@ impl App {
         }
     }
 
+    fn active_ime_preedit(&self) -> Option<&str> {
+        self.script_ime_preedit
+            .as_deref()
+            .or(self.ime_preedit.as_deref())
+    }
+
     fn is_ime_composing(&self) -> bool {
-        self.ime_composing || self.script_ime_composing
+        self.active_ime_preedit().is_some()
     }
 
     fn sync_ime_cursor_area(&mut self, described: &Described) {
@@ -1078,10 +1122,17 @@ impl App {
         let family = cfg.font_family.clone();
         let font_size = cfg.font_size;
         let line_height = cfg.line_height;
-        g.renderer.style_mut().line_thickness_scale = cfg.line_thickness as f32;
-        g.renderer.style_mut().underline_raise = cfg.underline_raise as f32;
-        g.renderer.style_mut().curly_amplitude = cfg.curly_amplitude as f32;
-        g.renderer.style_mut().dim_alpha = cfg.dim_alpha as f32;
+        let sf = self.win.scale_factor() as f32;
+        let greek_px = cfg.greek_px as f32;
+        self.win.set_base_greek_px(greek_px);
+        let style = g.renderer.style_mut();
+        style.panel_opacity = cfg.panel_opacity as f32;
+        style.greek_px = greek_px * sf;
+        style.cursor_blink_ms = cfg.cursor_blink_ms.clamp(0.0, f64::from(u32::MAX)).round() as u32;
+        style.line_thickness_scale = cfg.line_thickness as f32;
+        style.underline_raise = cfg.underline_raise as f32;
+        style.curly_amplitude = cfg.curly_amplitude as f32;
+        style.dim_alpha = cfg.dim_alpha as f32;
 
         let font_changed = matches!(changed_key, None | Some("fontFamily" | "fontSize" | "lineHeight"));
         if !font_changed {
@@ -1271,6 +1322,13 @@ impl App {
                 log::debug!("wall knob {key} is now {value:?}");
                 if key == "optionAsAlt" {
                     self.sync_macos_option_as_alt();
+                }
+                if key == "boldIsBright" {
+                    if let (Some(wall), Some(Terminals::Live(sessions))) =
+                        (&self.wall, &mut self.terms)
+                    {
+                        sessions.set_bold_is_bright(wall.config().bold_is_bright);
+                    }
                 }
                 self.sync_font_and_text_knobs(Some(&key));
                 self.redraw();
@@ -1576,6 +1634,9 @@ impl App {
                 wall.set_connected(was_connected);
             }
             self.wall = Some(wall);
+            if let (Some(wall), Some(Terminals::Live(sessions))) = (&self.wall, &mut self.terms) {
+                sessions.set_bold_is_bright(wall.config().bold_is_bright);
+            }
             self.sync_font_and_text_knobs(None);
             self.sync_macos_option_as_alt();
             self.apply_effects();
@@ -1596,11 +1657,14 @@ impl App {
         let mut heard = false;
         let mut ended_any = false;
         if let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) {
+            sessions.set_live_status_updates(wall.store().status_window().open);
             let (sess_changed, news) = sessions.pump();
             changed = sess_changed;
             wall.set_agents_extra_connected(sessions.is_extra_connected("agents"));
             // Catch metadata-only scrollback updates (`ViewReply` offset/max or
             // `status_follow` scrollback_rows arriving after `Event::Repaint`).
+            // Only request a redraw when a visible scrollback indicator (`viewing || offset > 0`)
+            // changes; quiet live-bottom `max` updates must not wake/redraw an idle canvas.
             let mut live_count = 0usize;
             for id in sessions.ids() {
                 live_count += 1;
@@ -1610,15 +1674,29 @@ impl App {
                         max: sb.max,
                         viewing: sb.viewing,
                     };
-                    if self.scrollback_snapshot.get(id).copied() != Some(next) {
+                    let prev = self.scrollback_snapshot.get(id).copied();
+                    if prev != Some(next) {
                         self.scrollback_snapshot.insert(id.to_owned(), next);
-                        changed = true;
+                        let was_visible = prev.is_some_and(|p| p.viewing || p.offset > 0);
+                        let now_visible = next.viewing || next.offset > 0;
+                        if was_visible || now_visible {
+                            changed = true;
+                        }
                     }
                 }
             }
             if self.scrollback_snapshot.len() != live_count {
-                self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
-                changed = true;
+                let mut removed_visible = false;
+                self.scrollback_snapshot.retain(|id, prev| {
+                    let keep = sessions.screen(id).is_some();
+                    if !keep && (prev.viewing || prev.offset > 0) {
+                        removed_visible = true;
+                    }
+                    keep
+                });
+                if removed_visible {
+                    changed = true;
+                }
             }
             for n in news {
                 match n {
@@ -1649,8 +1727,26 @@ impl App {
                     }
                     News::Ended { id } => {
                         wall.terminal_ended(&id);
+                        self.render_ids.remove_from(&id, self.gfx.as_mut().map(|g| &mut g.renderer));
                         heard = true;
                         ended_any = true;
+                    }
+                    News::Status(doc) => {
+                        let status_open = wall.store().status_window().open;
+                        let prev_state = wall.termd().state();
+                        let prev_terms = wall.termd().doc().map_or(0, |d| d.terminals.len());
+                        let prev_errors = wall.termd().doc().map_or(0, |d| d.errors.len());
+                        let _ = wall.on_termd_status(doc, epoch_now_ms());
+                        let next_state = wall.termd().state();
+                        let next_terms = wall.termd().doc().map_or(0, |d| d.terminals.len());
+                        let next_errors = wall.termd().doc().map_or(0, |d| d.errors.len());
+                        if status_open
+                            || next_state != prev_state
+                            || next_terms != prev_terms
+                            || next_errors != prev_errors
+                        {
+                            heard = true;
+                        }
                     }
                     News::Disconnected { message } => {
                         log::error!("termd is gone: {message}");
@@ -1672,6 +1768,7 @@ impl App {
                 if !live_ids.is_empty() {
                     wall.set_live_terminals(&live_ids);
                 }
+                self.render_ids.retain_live(&live_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
                 for id in &live_ids {
                     match sessions.adopt(id) {
                         Ok((cols, rows)) => {
@@ -1750,7 +1847,7 @@ impl App {
         let now_ms = self.now_ms();
         let Some(wall) = &mut self.wall else { return };
         let moving = wall.tick(dt, now_ms);
-        if wall.termd().state() == TermdState::Unreachable
+        if matches!(wall.termd().state(), TermdState::Restarting | TermdState::Unreachable)
             && matches!(&self.terms, Some(Terminals::Live(s)) if s.is_reconnect_socket_absent())
         {
             wall.on_termd_socket_absent(epoch_now_ms());
@@ -1769,6 +1866,11 @@ impl App {
         }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
+        let ime_preedit = self.active_ime_preedit().map(str::to_owned);
+        #[cfg(feature = "egui-ui")]
+        let ime_in_panel = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        #[cfg(not(feature = "egui-ui"))]
+        let ime_in_panel = false;
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -1871,7 +1973,7 @@ impl App {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome_with_scrollback_hits(
+            let paper = super::describe::describe_frame_chrome_with_options(
                 &described,
                 &camera,
                 viewport,
@@ -1882,7 +1984,40 @@ impl App {
                 |id| terms.scrollback(id),
                 self.hovered_scrollback_pill.as_deref(),
                 &mut pill_hits,
-            )
+                !cfg!(feature = "egui-ui"),
+            );
+            if !ime_in_panel {
+                if let Some(preedit_text) = ime_preedit.as_deref() {
+                    if let Some(focused) = described.terminals.iter().find(|t| t.focused) {
+                        if let Some(screen) = terms.screen(&focused.id) {
+                            let scale = g.cell_scale * focused.scale as f32;
+                            let cell_size = Vec2::new(metrics.cell_width * scale, metrics.cell_height * scale);
+                            let cursor_top_left = Vec2::new(
+                                focused.cell_origin.x as f32 + f32::from(screen.cursor.col) * cell_size.x,
+                                focused.cell_origin.y as f32 - f32::from(screen.cursor.row) * cell_size.y,
+                            );
+                            let body_rect = super::metrics::WorldRect::new(
+                                Vec2::new(focused.body_rect.min_x as f32, focused.body_rect.min_y as f32),
+                                Vec2::new(focused.body_rect.max_x as f32, focused.body_rect.max_y as f32),
+                            );
+                            super::chrome::push_ime_preedit(
+                                &mut shapes,
+                                &mut labels,
+                                &mut fonts,
+                                super::chrome::ChromeView::new(camera.zoom, sf),
+                                &super::chrome::ImePreeditDesc {
+                                    text: preedit_text,
+                                    cursor_top_left,
+                                    cell_size,
+                                    body_rect,
+                                    z: focused.z as f32 + 0.05,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            paper
         };
         if let Some(ref hid) = self.hovered_scrollback_pill {
             if !pill_hits.iter().any(|p| p.terminal_id == *hid) {
@@ -2158,6 +2293,19 @@ impl App {
         }
     }
 
+    fn cursor_left(&mut self) {
+        let mut changed = self.hovered_scrollback_pill.take().is_some();
+        if let Some(wall) = &mut self.wall {
+            if wall.pointer_leave() {
+                changed = true;
+            }
+        }
+        self.apply_effects();
+        if changed {
+            self.redraw();
+        }
+    }
+
     fn pinch(&mut self, delta: f64, phase: TouchPhase) {
         let factor = pinch_zoom_factor(delta, phase);
         if let Some(wall) = &mut self.wall {
@@ -2337,14 +2485,20 @@ impl App {
         match ime {
             Ime::Enabled => {}
             Ime::Preedit(text, _) => {
-                self.ime_composing = !text.is_empty();
+                let next = (!text.is_empty()).then(|| text.clone());
+                if self.ime_preedit != next {
+                    self.ime_preedit = next;
+                    self.redraw();
+                }
             }
             Ime::Commit(text) => {
-                self.ime_composing = false;
+                self.ime_preedit = None;
                 self.ime_commit(text);
             }
             Ime::Disabled => {
-                self.ime_composing = false;
+                if self.ime_preedit.take().is_some() {
+                    self.redraw();
+                }
             }
         }
     }
@@ -2388,10 +2542,10 @@ impl App {
         self.win.set_window_focused(focused);
         if !focused {
             self.modifiers = ModifiersState::empty();
-            self.ime_composing = false;
+            self.ime_preedit = None;
             self.hovered_files.clear();
             self.pressed_scrollback_pill = None;
-            self.script_ime_composing = false;
+            self.script_ime_preedit = None;
             self.buttons = 0;
             if let Some(wall) = &mut self.wall {
                 wall.blur();
@@ -2647,6 +2801,12 @@ impl App {
                             "\npaper grid_show={} grid_minor={}",
                             described.paper.grid_show, described.paper.grid.grid_minor
                         ));
+                        if let Some(g) = &self.gfx {
+                            out.push_str(&format!(
+                                "\nrenderer cached_terminals={}",
+                                g.renderer.cached_terminal_count()
+                            ));
+                        }
                         #[cfg(feature = "egui-ui")]
                         {
                             let panel_lines = self.panels.format_where(wall, &described);
@@ -2844,16 +3004,18 @@ impl App {
                 use super::script::ScriptIme;
                 match ime_cmd {
                     ScriptIme::Preedit(text) => {
-                        self.script_ime_composing = !text.is_empty();
+                        self.script_ime_preedit = (!text.is_empty()).then_some(text);
+                        self.redraw();
                         "OK: ime preedit".to_string()
                     }
                     ScriptIme::Commit(text) => {
-                        self.script_ime_composing = false;
+                        self.script_ime_preedit = None;
                         self.ime_commit(&text);
                         "OK: ime commit".to_string()
                     }
                     ScriptIme::Disable => {
-                        self.script_ime_composing = false;
+                        self.script_ime_preedit = None;
+                        self.redraw();
                         "OK: ime disabled".to_string()
                     }
                 }
@@ -3010,7 +3172,8 @@ impl App {
                         }
                     }
                     let here = Point::new(ev.x, ev.y);
-                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
+                    let click_repeat_ms = wall.config().click_repeat_ms;
+                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= click_repeat_ms && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
                     if double {
                         wall.pointer_double_click(&ev);
                         self.last_release = None;
@@ -3073,6 +3236,7 @@ impl ApplicationHandler<Wake> for App {
             || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard);
         #[cfg(feature = "egui-ui")]
         let feed_ui = !wall_chord_bypass
+            && !matches!(event, WindowEvent::RedrawRequested)
             && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
                 || panels_want_keys
                 || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| ui.context().egui_wants_keyboard_input()));
@@ -3146,6 +3310,7 @@ impl ApplicationHandler<Wake> for App {
                 }
                 self.move_cursor(x, y);
             }
+            WindowEvent::CursorLeft { .. } => self.cursor_left(),
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Pressed {
                     if ui_pointer {
@@ -3351,7 +3516,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         cursor: Point::new(0.0, 0.0),
         buttons: 0,
         last_release: None,
-        render_ids: HashMap::new(),
+        render_ids: RenderIds::default(),
         start: now,
         last_tick: now,
         animating: false,
@@ -3375,8 +3540,8 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         occluded: false,
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
-        ime_composing: false,
-        script_ime_composing: false,
+        ime_preedit: None,
+        script_ime_preedit: None,
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
@@ -3406,6 +3571,83 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
                 print!("{}", screen_text(s));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod render_id_tests {
+    use super::*;
+    use crate::wall::renderer::{WallFrame, WallStyle};
+
+    #[test]
+    fn render_ids_free_closed_and_reconnected_terminals_in_renderer() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+        let mut ids = RenderIds::default();
+        let cam = WallCamera::new(Vec2::ZERO, 20.0);
+        let vp = (320, 200);
+        let screen = Screen::new(40, 12);
+
+        let draw = |rid: u64, x: f32| TerminalDraw {
+            id: rid,
+            screen: &screen,
+            position: Vec2::new(x, 0.0),
+            z: 1.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+
+        assert_eq!(renderer.cached_terminal_count(), 0);
+
+        // Two live terminals populate the GPU cache.
+        let r1 = ids.id_for("t1");
+        let r2 = ids.id_for("t2");
+        assert_ne!(r1, r2);
+        let _ = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { terminals: &[draw(r1, -2.0), draw(r2, 2.0)], ..Default::default() },
+        );
+        assert_eq!(renderer.cached_terminal_count(), 2);
+
+        // Closing t1 (News::Ended) frees its GPU buffer and returns count to 1.
+        assert!(ids.remove_from("t1", Some(&mut renderer)));
+        assert_eq!(renderer.cached_terminal_count(), 1);
+        assert!(!ids.remove_from("t1", Some(&mut renderer)));
+
+        // Spawning t3 after t1 closed gets a fresh monotonic id (never collides with t2).
+        let r3 = ids.id_for("t3");
+        assert_ne!(r3, r2);
+        assert_ne!(r3, r1);
+        let _ = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            vp,
+            &cam,
+            &WallFrame { terminals: &[draw(r2, -2.0), draw(r3, 2.0)], ..Default::default() },
+        );
+        assert_eq!(renderer.cached_terminal_count(), 2);
+
+        // Reconnect pruning retains only terminals still alive in termd.
+        ids.retain_live(&["t3".to_string()], Some(&mut renderer));
+        assert_eq!(renderer.cached_terminal_count(), 1);
+        assert_eq!(ids.id_for("t3"), r3);
+
+        // Reconnect with zero live terminals returns cached count all the way to baseline 0.
+        ids.retain_live(&[], Some(&mut renderer));
+        assert_eq!(renderer.cached_terminal_count(), 0);
     }
 }
 

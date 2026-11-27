@@ -485,6 +485,12 @@ impl TerminalSession {
         &self.front_screen
     }
 
+    /// Updates this session's [`Theme`] (including `bold_is_bright`) on its worker thread and
+    /// schedules an immediate re-fill + publish so existing cells reflect the new theme right away.
+    pub fn set_theme(&self, theme: Theme) {
+        self.inbox.set_theme(theme);
+    }
+
     /// Resolved cursor colour (`0xAABBGGRR`).
     pub fn cursor_color(&self) -> u32 {
         self.meta.cursor_color
@@ -521,16 +527,12 @@ impl TerminalSession {
     }
 
     /// Updates known scrollback history length (`max`) from `g3d-termd`'s pushed `status_follow`
-    /// document (`scrollback_rows`), keeping `max >= offset` while scrolled back.
+    /// document (`scrollback_rows`), keeping `max >= offset` while scrolled back without
+    /// fast-forwarding `seen_meta_gen` (which would swallow pending worker metadata updates such
+    /// as `Role`, `Title`, `Modes`, or `Closed`).
     pub(crate) fn note_status_scrollback(&mut self, scrollback_rows: u64) {
         let mut guard = self.shared.published.lock().expect("published mutex poisoned");
-        let next_max = scrollback_rows.max(guard.meta.scrollback.offset);
-        if guard.meta.scrollback.max != next_max {
-            guard.meta.scrollback.max = next_max;
-            guard.meta.meta_gen += 1;
-            self.meta.scrollback = guard.meta.scrollback;
-            self.seen_meta_gen = guard.meta.meta_gen;
-        }
+        apply_status_scrollback(&mut guard.meta, &mut self.meta, scrollback_rows);
     }
 
     /// Cumulative bell count observed on this session.
@@ -831,7 +833,7 @@ fn session_worker_loop(
     session_id: String,
     initial_cols: u16,
     initial_rows: u16,
-    theme: Theme,
+    mut theme: Theme,
     policy: CoalescePolicy,
     vt_mutex: Arc<Mutex<Vt>>,
     inbox: Arc<SessionInbox>,
@@ -864,6 +866,14 @@ fn session_worker_loop(
     let mut grow_repaint_due: Option<Instant> = None;
 
     loop {
+        if let Some(next_theme) = inbox.take_theme() {
+            theme = next_theme;
+            {
+                let mut vt = vt_mutex.lock().expect("vt mutex poisoned");
+                vt.set_theme(&theme);
+            }
+            coalescer.mark_immediate();
+        }
         batch.clear();
         let alive = inbox.drain_batch(&mut batch, policy.feed_quantum_bytes);
 
@@ -972,7 +982,7 @@ fn session_worker_loop(
                     Event::Role { role, .. } => {
                         role_override = Some(role);
                         meta_dirty = true;
-                        coalescer.mark_dirty();
+                        coalescer.mark_immediate();
                     }
                     Event::Lagged { .. } => {
                         // `termd-client` already triggers a repaint and `termd` pushes resync
@@ -1218,6 +1228,8 @@ fn publish_snapshot(
 fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bool {
     let dims_changed = dst.cols != src.cols || dst.rows != src.rows;
     let title_changed = dst.title != effective_title;
+    let links_changed = dst.hyperlinks != src.hyperlinks || dst.link_spans != src.link_spans;
+    let cursor_color_changed = dst.cursor_color != src.cursor_color;
     let grid_changed = dims_changed
         || dst.row_gen != src.row_gen
         || dst.wrapped != src.wrapped
@@ -1225,6 +1237,8 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
         || dst.modes != src.modes
         || dst.default_fg != src.default_fg
         || dst.default_bg != src.default_bg
+        || cursor_color_changed
+        || links_changed
         || dst.clusters.len() != src.clusters.len();
     if !grid_changed && !title_changed {
         return false;
@@ -1255,12 +1269,17 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
     } else if dst.clusters.len() < src.clusters.len() {
         dst.clusters.extend(src.clusters[dst.clusters.len()..].iter().cloned());
     }
+    if links_changed {
+        dst.hyperlinks.clone_from(&src.hyperlinks);
+        dst.link_spans.clone_from(&src.link_spans);
+    }
 
     dst.generation = dst.generation.saturating_add(1).max(src.generation);
     dst.cursor = src.cursor;
     dst.modes = src.modes;
     dst.default_fg = src.default_fg;
     dst.default_bg = src.default_bg;
+    dst.cursor_color = src.cursor_color;
     if title_changed {
         dst.title.clear();
         dst.title.push_str(effective_title);
@@ -1332,6 +1351,21 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, queue: Arc<AsyncCmdQueue>
                 let _ = termd.unsubscribe(handle);
             }
         }
+    }
+}
+
+fn apply_status_scrollback(
+    published_meta: &mut PublishedMeta,
+    front_meta: &mut PublishedMeta,
+    scrollback_rows: u64,
+) {
+    let next_max = scrollback_rows.max(published_meta.scrollback.offset);
+    if published_meta.scrollback.max != next_max {
+        published_meta.scrollback.max = next_max;
+    }
+    let front_max = scrollback_rows.max(front_meta.scrollback.offset);
+    if front_meta.scrollback.max != front_max {
+        front_meta.scrollback.max = front_max;
     }
 }
 
@@ -1491,5 +1525,61 @@ mod tests {
         let d = resized.take().expect("resized");
         assert!(d.resized);
         assert!(d.rewritten_cols.is_empty());
+    }
+
+    #[test]
+    fn sync_screen_into_copies_osc8_links_and_cursor_color_and_bumps_generation() {
+        let mut src = Screen::new(20, 4);
+        let mut dst = Screen::new(20, 4);
+        assert!(sync_screen_into(&src, "", &mut dst) || dst.generation == src.generation);
+        let g0 = dst.generation;
+
+        // No changes -> returns false without bumping generation.
+        assert!(!sync_screen_into(&src, "", &mut dst));
+        assert_eq!(dst.generation, g0);
+
+        // Mutating ONLY OSC 8 links on src must sync into dst and bump generation.
+        src.hyperlinks.push("https://example.org/osc8".to_owned());
+        src.link_spans.push(term_cells::LinkSpan {
+            row: 0,
+            start_col: 2,
+            end_col: 10,
+            link_id: 0,
+        });
+        assert!(sync_screen_into(&src, "", &mut dst));
+        assert!(dst.generation > g0);
+        assert_eq!(dst.hyperlink_at(5, 0), Some("https://example.org/osc8"));
+        let g1 = dst.generation;
+
+        // Mutating ONLY cursor_color (OSC 12) must also sync and bump generation.
+        src.cursor_color = term_cells::rgb(0xff, 0xaa, 0x00);
+        assert!(sync_screen_into(&src, "", &mut dst));
+        assert!(dst.generation > g1);
+        assert_eq!(dst.cursor_color, src.cursor_color);
+    }
+
+    #[test]
+    fn status_scrollback_update_preserves_unread_worker_meta_gen() {
+        let shared = dummy_shared();
+        let mut front = shared.published.lock().unwrap().meta.clone();
+        let seen_meta_gen = front.meta_gen;
+
+        // Simulate worker thread publishing `Role::Attach` (`meta_gen` 0 -> 1) before `pump()`.
+        {
+            let mut slot = shared.published.lock().unwrap();
+            slot.meta.role = Role::Attach;
+            slot.meta.meta_gen += 1;
+        }
+
+        // `DaemonEvent::Status` arrives in the same `Sessions::pump` pass with new `scrollback_rows`.
+        {
+            let mut slot = shared.published.lock().unwrap();
+            apply_status_scrollback(&mut slot.meta, &mut front, 42);
+            assert_eq!(slot.meta.scrollback.max, 42);
+            assert_eq!(front.scrollback.max, 42);
+            // Unread worker metadata change must still be visible (`meta_gen != seen_meta_gen`).
+            assert_ne!(slot.meta.meta_gen, seen_meta_gen);
+            assert_eq!(slot.meta.role, Role::Attach);
+        }
     }
 }

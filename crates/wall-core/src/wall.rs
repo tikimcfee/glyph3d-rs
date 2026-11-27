@@ -5054,6 +5054,32 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
+    /// Handle pointer leaving the window (`WindowEvent::CursorLeft`): clears passive
+    /// terminal, group-header, map-label, and hyperlink hover highlights and restores
+    /// `CursorIcon::Default` when no pointer drag is in flight. Returns `true` if any
+    /// hover state changed.
+    pub fn pointer_leave(&mut self) -> bool {
+        if self.pointer.busy() {
+            return false;
+        }
+        let had_hover = self.router.context.model.hovered_id().is_some()
+            || self.router.context.hovered_group_id.is_some()
+            || self.router.context.hovered_label_id.is_some()
+            || self.router.context.hovered_link.is_some()
+            || self.router.context.cursor != CursorIcon::Default;
+        if !had_hover {
+            return false;
+        }
+        self.router.context.model.set_hovered(None);
+        self.router.context.set_hovered_group(None);
+        self.router.context.set_hovered_label(None);
+        self.router.context.set_hovered_link(None);
+        self.router.context.set_cursor(CursorIcon::Default);
+        self.sync_pointer_flags();
+        self.router.context.model.notify_changed();
+        true
+    }
+
     /// Handle pointer cancellation (window blur, capture lost).
     pub fn pointer_cancel(&mut self, event: &PointerEvent) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
@@ -5119,9 +5145,12 @@ impl Wall {
     }
 
     /// Handle a trackpad pinch gesture zooming by `factor` about logical screen
-    /// point `(screen_x, screen_y)`.
+    /// point `(screen_x, screen_y)`. Ignored while fullscreen is active.
     pub fn pinch(&mut self, screen_x: f64, screen_y: f64, factor: f64) {
         self.router.context.model.close_menu();
+        if self.router.context.fullscreen.active() {
+            return;
+        }
         self.router
             .context
             .model
@@ -5131,7 +5160,7 @@ impl Wall {
     }
 
     /// Evaluate and act on a right-click / context-menu request at logical screen
-    /// coordinates `(screen_x, screen_y)`.
+    /// coordinates `(screen_x, screen_y)` (`WallMenu.js:57-79`).
     pub fn context_menu(
         &mut self,
         screen_x: f64,
@@ -5144,38 +5173,84 @@ impl Wall {
             .model
             .camera()
             .to_world(Point::new(screen_x, screen_y));
-        let hit = self.router.context.hit(world);
-        let (target, mouse_reporting, focused) = match &hit {
-            Some(CanvasHit::Terminal { id, part }) => {
-                let tp = match part {
-                    HitPart::Body => TerminalPart::Body,
-                    HitPart::Title => TerminalPart::Title,
-                    HitPart::Edge(_) => TerminalPart::Edge,
-                };
-                (
-                    Some(MenuTarget::Terminal {
-                        id: id.clone(),
-                        part: tp,
-                    }),
-                    self.router.context.model.mouse_tracking(id) != MouseTracking::None,
-                    self.router.context.model.focused_id() == Some(id.as_str()),
-                )
+        let (target, mouse_reporting, focused) = if let Some(fs_id) =
+            self.router.context.fullscreen.id().map(str::to_owned)
+        {
+            // Solo fullscreen: every click on the canvas (including edge padding) targets the
+            // fullscreen terminal body (`WallMenu.js:62-64`).
+            let mr = self.router.context.model.mouse_tracking(&fs_id) != MouseTracking::None;
+            let foc = self.router.context.model.focused_id() == Some(fs_id.as_str());
+            (
+                Some(MenuTarget::Terminal {
+                    id: fs_id,
+                    part: TerminalPart::Body,
+                }),
+                mr,
+                foc,
+            )
+        } else if let Some(fs_gid) = self.router.context.fullscreen.group_id().map(str::to_owned) {
+            // Group fullscreen: hitting a pane targets that terminal; empty padding or divider
+            // targets the fullscreen group (`WallMenu.js:66-69`).
+            match self.router.context.hit(world) {
+                Some(CanvasHit::Terminal { id, part }) => {
+                    let tp = match part {
+                        HitPart::Body => TerminalPart::Body,
+                        HitPart::Title => TerminalPart::Title,
+                        HitPart::Edge(_) => TerminalPart::Edge,
+                    };
+                    let mr = self.router.context.model.mouse_tracking(&id) != MouseTracking::None;
+                    let foc = self.router.context.model.focused_id() == Some(id.as_str());
+                    (Some(MenuTarget::Terminal { id, part: tp }), mr, foc)
+                }
+                _ => (Some(MenuTarget::Group { id: fs_gid }), false, false),
             }
-            Some(CanvasHit::GroupHeader { group }) => (
-                Some(MenuTarget::Group { id: group.clone() }),
-                false,
-                false,
-            ),
-            Some(CanvasHit::Divider { group, .. }) => (
-                Some(MenuTarget::Group { id: group.clone() }),
-                false,
-                false,
-            ),
-            None => (
-                Some(MenuTarget::Canvas { world: Some(world) }),
-                false,
-                false,
-            ),
+        } else if let Some(label_id) = self.router.context.hit_map_label(screen_x, screen_y) {
+            // Zoomed-out map label pill sits above the canvas and targets its terminal's title
+            // even when the pill extends over empty canvas (`WallMenu.js:74-75`).
+            let mr = self.router.context.model.mouse_tracking(&label_id) != MouseTracking::None;
+            let foc = self.router.context.model.focused_id() == Some(label_id.as_str());
+            (
+                Some(MenuTarget::Terminal {
+                    id: label_id,
+                    part: TerminalPart::Title,
+                }),
+                mr,
+                foc,
+            )
+        } else {
+            let hit = self.router.context.hit(world);
+            match &hit {
+                Some(CanvasHit::Terminal { id, part }) => {
+                    let tp = match part {
+                        HitPart::Body => TerminalPart::Body,
+                        HitPart::Title => TerminalPart::Title,
+                        HitPart::Edge(_) => TerminalPart::Edge,
+                    };
+                    (
+                        Some(MenuTarget::Terminal {
+                            id: id.clone(),
+                            part: tp,
+                        }),
+                        self.router.context.model.mouse_tracking(id) != MouseTracking::None,
+                        self.router.context.model.focused_id() == Some(id.as_str()),
+                    )
+                }
+                Some(CanvasHit::GroupHeader { group }) => (
+                    Some(MenuTarget::Group { id: group.clone() }),
+                    false,
+                    false,
+                ),
+                Some(CanvasHit::Divider { group, .. }) => (
+                    Some(MenuTarget::Group { id: group.clone() }),
+                    false,
+                    false,
+                ),
+                None => (
+                    Some(MenuTarget::Canvas { world: Some(world) }),
+                    false,
+                    false,
+                ),
+            }
         };
         let decision = menu::context_policy(&ContextEvent {
             shift_key: mods.shift,

@@ -17,6 +17,24 @@ use super::{
     OK_GREEN,
 };
 
+/// Browser-only or no-op knobs kept in `WallConfig` / `WallStore` so imported
+/// browser layouts round-trip without error, but hidden from the native Settings UI.
+const NATIVE_HIDDEN_KNOBS: &[&str] = &["renderLoop", "traceInput", "menuHint"];
+
+fn is_native_hidden_knob(key: &str) -> bool {
+    NATIVE_HIDDEN_KNOBS.contains(&key)
+}
+
+fn search_native_settings(query: &str) -> Vec<SettingsGroup<'static>> {
+    search_settings(query)
+        .into_iter()
+        .filter_map(|mut group| {
+            group.items.retain(|it| !is_native_hidden_knob(it.key));
+            (!group.items.is_empty()).then_some(group)
+        })
+        .collect()
+}
+
 /// Plain data read by [`show`] (`<Panel>Input` in `P-panels.md`).
 #[derive(Clone, Debug)]
 pub struct SettingsInput {
@@ -447,7 +465,7 @@ pub fn show(
                     }
                 }
 
-                let groups: Vec<SettingsGroup<'static>> = search_settings(&state.query);
+                let groups: Vec<SettingsGroup<'static>> = search_native_settings(&state.query);
                 let searching = !state.query.trim().is_empty();
                 let is_folded = |section_id: &str| -> bool {
                     !searching && input.placement.collapsed.iter().any(|c| c == section_id)
@@ -1354,5 +1372,38 @@ mod tests {
             "expected refusal for closeHoldMs, got {:?}",
             state.refused
         );
+    }
+
+    #[test]
+    fn native_settings_hides_browser_only_knobs_and_surfaces_live_renderer_knobs() {
+        let ctx = egui::Context::default();
+        let mut state = SettingsState::default();
+        let input = open_input();
+
+        // Browser-only / dead-live knobs stay in WallConfig for browser import round-trip,
+        // but must not appear in the native Settings panel.
+        for hidden in ["renderLoop", "traceInput", "menuHint"] {
+            assert!(
+                wall_core::config::WallConfig::default().get(hidden).is_some(),
+                "{hidden} must remain in WallConfig for store/import compatibility"
+            );
+            state.query = hidden.to_string();
+            let (_, texts) = run_frame(&ctx, Vec::new(), (1280.0, 800.0), &mut state, &input);
+            assert_eq!(state.visible_count, 0, "{hidden} should be hidden in native Settings");
+            assert!(
+                texts.iter().any(|t| t.contains("no setting matches")),
+                "expected empty match for hidden knob {hidden}, got {texts:?}"
+            );
+        }
+
+        // Newly promoted live renderer knobs appear and search cleanly.
+        for live in ["panelOpacity", "greekPx", "cursorBlinkMs"] {
+            state.query = live.to_string();
+            let (_, texts) = run_frame(&ctx, Vec::new(), (1280.0, 800.0), &mut state, &input);
+            assert!(
+                state.visible_count >= 1,
+                "{live} should appear in native Settings (texts={texts:?})"
+            );
+        }
     }
 }

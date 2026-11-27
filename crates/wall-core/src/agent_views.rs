@@ -1823,10 +1823,9 @@ impl AgentViews {
                 cwd: row.cwd.clone(),
                 title: row.title.clone(),
             };
-            let changed = self
-                .term_sync
-                .get(&row.id)
-                .is_none_or(|prev| prev.pwd != next.pwd || prev.cwd != next.cwd);
+            let changed = self.term_sync.get(&row.id).is_none_or(|prev| {
+                prev.pwd != next.pwd || prev.cwd != next.cwd || prev.title != next.title
+            });
             if changed {
                 rebind_needed = true;
             }
@@ -1835,7 +1834,9 @@ impl AgentViews {
         if rebind_needed {
             self.rebind_all(host, false);
         }
-        self.bump_and_redraw();
+        if self.views.values().any(|v| v.open) {
+            self.bump_and_redraw();
+        }
     }
 
     /// Apply a fresh `agent sessions --json` list from `crates/agent-feed`, pairing

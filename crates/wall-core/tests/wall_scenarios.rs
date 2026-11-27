@@ -3644,6 +3644,164 @@ fn osc8_screen_view_link_takes_precedence_and_clears_on_blur_and_scroll() {
 }
 
 #[test]
+fn context_menu_hits_map_labels_and_fullscreen_padding_and_pinch_respects_fullscreen() {
+    use wall_core::menu::{MenuTarget, TerminalPart};
+
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // 1. Zoom far out so map labels appear above each terminal over empty canvas.
+    h.wall.pinch(700.0, 450.0, 0.08);
+    h.settle();
+    let far = h.frame();
+    let ml = far
+        .map_labels
+        .iter()
+        .find(|m| m.terminal_id == t1)
+        .expect("t1 map label at far zoom");
+    let ml_cx = 0.5 * (ml.label_box.left + ml.label_box.right);
+    let ml_cy = 0.5 * (ml.label_box.top + ml.label_box.bottom);
+    // Confirm the map label centre sits over empty canvas (world hit is None),
+    // yet right-click opens t1's terminal title menu!
+    let ml_world = h.wall.camera().to_world(Point::new(ml_cx, ml_cy));
+    assert!(
+        h.wall.hit(ml_world).is_none(),
+        "test setup expects map label pill above empty canvas"
+    );
+    let dec_ml = h.wall.context_menu(ml_cx, ml_cy, MODS_NONE);
+    assert_eq!(dec_ml.verdict, Verdict::Ours);
+    assert_eq!(
+        h.wall.menu().map(|m| m.target.clone()),
+        Some(MenuTarget::Terminal {
+            id: t1.clone(),
+            part: TerminalPart::Title,
+        })
+    );
+    h.run_ok("wall.menu close");
+
+    // 2. Solo fullscreen: right-clicking corner padding targets the solo terminal,
+    //    and pinch zoom is ignored while fullscreen is active.
+    h.run_ok(&format!("wall.fullscreen on {t1}"));
+    h.pump();
+    h.settle();
+    let zoom_solo_before = h.wall.camera().zoom();
+    h.wall.pinch(700.0, 450.0, 0.5);
+    assert!(
+        (h.wall.camera().zoom() - zoom_solo_before).abs() < 1e-9,
+        "pinch must not zoom during solo fullscreen"
+    );
+    let dec_solo = h.wall.context_menu(1.0, 1.0, MODS_NONE);
+    assert_eq!(dec_solo.verdict, Verdict::Ours);
+    assert_eq!(
+        h.wall.menu().map(|m| m.target.clone()),
+        Some(MenuTarget::Terminal {
+            id: t1.clone(),
+            part: TerminalPart::Body,
+        })
+    );
+    // Pinch still closes an open menu even while ignored for zoom.
+    h.wall.pinch(700.0, 450.0, 2.0);
+    assert!(h.wall.menu().is_none());
+    h.run_ok("wall.fullscreen off");
+    h.pump();
+    h.settle();
+
+    // 3. Group fullscreen: right-clicking empty padding targets the group,
+    //    right-clicking a pane targets that terminal, and pinch zoom is ignored.
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h.wall.groups().ids().into_iter().next().expect("group id");
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.pump();
+    h.settle();
+    let zoom_grp_before = h.wall.camera().zoom();
+    h.wall.pinch(700.0, 450.0, 0.5);
+    assert!(
+        (h.wall.camera().zoom() - zoom_grp_before).abs() < 1e-9,
+        "pinch must not zoom during group fullscreen"
+    );
+    let dec_pad = h.wall.context_menu(1.0, 1.0, MODS_NONE);
+    assert_eq!(dec_pad.verdict, Verdict::Ours);
+    assert_eq!(
+        h.wall.menu().map(|m| m.target.clone()),
+        Some(MenuTarget::Group { id: gid.clone() })
+    );
+    h.run_ok("wall.menu close");
+    let t2_rect = h.wall.terminal_rect(&t2).expect("t2 rect");
+    let t2_center = h.wall.camera().to_screen(Point::new(
+        0.5 * (t2_rect.min_x + t2_rect.max_x),
+        0.5 * (t2_rect.min_y + t2_rect.max_y),
+    ));
+    let dec_pane = h.wall.context_menu(t2_center.x, t2_center.y, MODS_NONE);
+    assert_eq!(dec_pane.verdict, Verdict::Ours);
+    assert!(matches!(
+        h.wall.menu().map(|m| &m.target),
+        Some(MenuTarget::Terminal { id, .. }) if id == &t2
+    ));
+}
+
+#[test]
+fn pointer_leave_clears_hover_and_link_without_canceling_active_drag() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    h.set_screen_lines(&t1, &["open https://example.com/docs now"]);
+    h.run_ok("wall.fit");
+    h.settle();
+
+    // Hover over the URL with Cmd held: sets hovered terminal, hovered link, and Pointer cursor.
+    let url_pt = h.cell_world(&t1, 10, 0);
+    let url_screen = h.wall.camera().to_screen(url_pt);
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: url_screen.x,
+            y: url_screen.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    h.pump();
+    let f_hovered = h.frame();
+    assert!(f_hovered.terminals.iter().any(|t| t.id == t1 && t.hovered));
+    assert!(f_hovered.terminals.iter().any(|t| t.id == t1 && t.hovered_link.is_some()));
+
+    // Leaving the window clears hover, link underline, and restores Default cursor.
+    assert!(h.wall.pointer_leave());
+    h.pump();
+    let f_left = h.frame();
+    assert!(f_left.terminals.iter().all(|t| !t.hovered && t.hovered_link.is_none()));
+    assert_eq!(h.cursors.last().copied(), Some(CursorIcon::Default));
+    // Repeated leave while already idle is a no-op (avoids spurious redraws).
+    assert!(!h.wall.pointer_leave());
+
+    // Starting a title-bar drag and crossing the window edge must NOT cancel the drag.
+    let bar = h.frame().title_bars[0].rect;
+    let bar_center = h.wall.camera().to_screen(Point::new(
+        0.5 * (bar.min_x + bar.max_x),
+        0.5 * (bar.min_y + bar.max_y),
+    ));
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: bar_center.x,
+            y: bar_center.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_NONE,
+            time_ms: h.now_ms + 10.0,
+        },
+        &h.screens,
+    );
+    assert!(!h.wall.pointer_leave(), "pointer_leave must not interfere with an active drag");
+    assert!(h.wall.pointer().busy());
+}
+
+#[test]
 fn attach_agent_prefers_local_reattach_when_agents_extra_ns_connected() {
     use wall_core::bus::{GomuxAgent, GomuxSnapshot};
 
@@ -3883,7 +4041,6 @@ fn loose_agent_view_shoves_restores_side_switches_resizes_and_spawn_steps_past_c
         );
     }
 }
-
 
 
 

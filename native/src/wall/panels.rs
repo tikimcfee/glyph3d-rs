@@ -16,6 +16,7 @@ pub mod agent_view;
 // The buttons on a terminal's title bar, and the bar across the top of the window.
 pub mod bar_buttons;
 pub mod palette;
+pub mod selection_bar;
 pub mod sidebar;
 pub mod topbar;
 pub use docked::{settings, status};

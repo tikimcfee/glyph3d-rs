@@ -1416,6 +1416,100 @@ pub fn push_scrollback_indicator(
     Some(pill_rect)
 }
 
+/// Plain-data description of an active inline IME composition preview drawn at
+/// the focused terminal's cursor cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImePreeditDesc<'a> {
+    /// Active uncommitted composition string (e.g. `"´"` or `"你好"`).
+    pub text: &'a str,
+    /// Top-left corner of the focused terminal's cursor cell in world coordinates.
+    pub cursor_top_left: Vec2,
+    /// World-space `(cell_width, cell_height)` already scaled by the terminal's scale.
+    pub cell_size: Vec2,
+    /// World-space terminal body rectangle (clamps and clips the preedit overlay inside it).
+    pub body_rect: WorldRect,
+    /// World depth (`term.z + 0.05` so it renders cleanly above the terminal's cursor).
+    pub z: f32,
+}
+
+/// Append an inline underlined IME preedit overlay at the focused terminal's cursor cell.
+/// Returns the overlay's world rectangle, or `None` when `desc.text` is empty or cell size is invalid.
+pub fn push_ime_preedit(
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    fonts: &mut ChromeFonts<'_>,
+    view: ChromeView,
+    desc: &ImePreeditDesc<'_>,
+) -> Option<WorldRect> {
+    if desc.text.is_empty()
+        || !desc.cell_size.x.is_finite()
+        || !desc.cell_size.y.is_finite()
+        || desc.cell_size.x <= 0.0
+        || desc.cell_size.y <= 0.0
+    {
+        return None;
+    }
+    let cw = desc.cell_size.x;
+    let ch = desc.cell_size.y;
+    let pad_x = (cw * 0.15).min(ch * 0.25);
+    let measured_w = measure_label_width(fonts.metrics, fonts.atlas, fonts.family, desc.text, ch)
+        .max(cw);
+    let max_box_w = desc.body_rect.width().max(cw);
+    let box_w = (measured_w + 2.0 * pad_x).min(max_box_w);
+
+    let mut x0 = desc.cursor_top_left.x;
+    if x0 + box_w > desc.body_rect.max.x {
+        x0 = (desc.body_rect.max.x - box_w).max(desc.body_rect.min.x);
+    }
+    let x1 = (x0 + box_w).min(desc.body_rect.max.x);
+    let y_top = desc.cursor_top_left.y.min(desc.body_rect.max.y);
+    let y_bot = (y_top - ch).max(desc.body_rect.min.y);
+    if x1 <= x0 || y_top <= y_bot {
+        return None;
+    }
+
+    let pill = WorldRect::new(Vec2::new(x0, y_bot), Vec2::new(x1, y_top));
+    // Opaque dark composition backdrop so preedit reads clearly over cursor/cells.
+    shapes.push(Shape::Rect(RectShape {
+        rect: pill,
+        z: desc.z,
+        fill: Some(srgb_hex(0x1b2333, 0.96)),
+        stroke: Some(srgb_hex(0x6ee7a0, 0.45)),
+        stroke_px: view.phys_px(1.0),
+        dash: DashStyle::SOLID,
+        corner_radius_px: view.phys_px(1.5),
+    }));
+    // Crisp underline along the bottom edge of the active composition text.
+    let ul_h = (view.css_to_world(1.75)).max(ch * 0.07).min(ch * 0.2);
+    let ul_x0 = (x0 + pad_x * 0.5).min(x1);
+    let ul_x1 = (x1 - pad_x * 0.5).max(ul_x0);
+    if ul_x1 > ul_x0 {
+        shapes.push(Shape::Rect(RectShape {
+            rect: WorldRect::new(
+                Vec2::new(ul_x0, y_bot + ul_h * 0.25),
+                Vec2::new(ul_x1, (y_bot + ul_h * 1.25).min(y_top)),
+            ),
+            z: desc.z + 0.01,
+            fill: Some(srgb_hex(0x6ee7a0, 0.95)),
+            stroke: None,
+            stroke_px: 0.0,
+            dash: DashStyle::SOLID,
+            corner_radius_px: 0.0,
+        }));
+    }
+    labels.push(
+        Label::new(
+            desc.text.to_string(),
+            Vec2::new(x0 + pad_x, y_top),
+            LabelHeight::World(ch),
+            srgb_hex(0xf0f4fa, 1.0),
+            desc.z + 0.02,
+        )
+        .with_clip(pill),
+    );
+    Some(pill)
+}
+
 /// Standalone scrolled-back indicator builder returning `(Option<WorldRect>, Vec<Shape>, Vec<Label<'static>>)`.
 pub fn build_scrollback_indicator(
     fonts: &mut ChromeFonts<'_>,
@@ -2530,5 +2624,52 @@ mod tests {
                 assert!(ix * iy < 1e-4, "veil strips {a:?} and {b:?} overlap!");
             }
         }
+    }
+
+    #[test]
+    fn ime_preedit_draws_underlined_label_clamped_inside_terminal_body() {
+        let (metrics, mut atlas, family) = load_test_atlas();
+        let mut fonts = ChromeFonts::new(metrics, &mut atlas, family);
+        let view = ChromeView::new(24.0, 2.0);
+        let body = WorldRect::new(Vec2::new(0.0, -50.0), Vec2::new(100.0, 0.0));
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+
+        // Empty text emits nothing.
+        assert!(push_ime_preedit(
+            &mut shapes,
+            &mut labels,
+            &mut fonts,
+            view,
+            &ImePreeditDesc {
+                text: "",
+                cursor_top_left: Vec2::new(10.0, -4.0),
+                cell_size: Vec2::new(1.2, 2.4),
+                body_rect: body,
+                z: 5.05,
+            },
+        )
+        .is_none());
+        assert!(shapes.is_empty() && labels.is_empty());
+
+        // Near right edge clamps inside body_rect and emits backdrop + underline + label.
+        let pill = push_ime_preedit(
+            &mut shapes,
+            &mut labels,
+            &mut fonts,
+            view,
+            &ImePreeditDesc {
+                text: "你好",
+                cursor_top_left: Vec2::new(99.0, -4.0),
+                cell_size: Vec2::new(1.2, 2.4),
+                body_rect: body,
+                z: 5.05,
+            },
+        )
+        .expect("non-empty preedit should emit overlay rect");
+        assert!(pill.min.x >= body.min.x && pill.max.x <= body.max.x);
+        assert_eq!(shapes.len(), 2, "expected backdrop rect + underline bar");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].text, "你好");
     }
 }

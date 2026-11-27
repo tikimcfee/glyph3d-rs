@@ -178,9 +178,7 @@ fn scan_file_into(path: &Path, by_key: &mut HashMap<String, Vec<ScannedFace>>) {
                         keys.push(k);
                     }
                 }
-                name_id::SUBFAMILY | name_id::TYPOGRAPHIC_SUBFAMILY
-                    if subfamily.is_none() =>
-                {
+                name_id::SUBFAMILY | name_id::TYPOGRAPHIC_SUBFAMILY if subfamily.is_none() => {
                     subfamily = Some(trimmed.to_owned());
                 }
                 _ => {}

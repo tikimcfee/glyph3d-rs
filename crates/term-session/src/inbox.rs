@@ -5,6 +5,7 @@
 //! worker thread; backpressure propagates naturally to `termd-client`'s socket reader and
 //! `g3d-termd`'s per-subscription queue.
 
+use glyph_vt::Theme;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use termd_client::Event;
 struct QueueState {
     items: VecDeque<Event>,
     queued_bytes: usize,
+    pending_theme: Option<Theme>,
     closed: bool,
 }
 
@@ -29,6 +31,7 @@ impl SessionInbox {
             state: Mutex::new(QueueState {
                 items: VecDeque::with_capacity(64),
                 queued_bytes: 0,
+                pending_theme: None,
                 closed: false,
             }),
             not_empty: Condvar::new(),
@@ -78,14 +81,31 @@ impl SessionInbox {
         if was_full || guard.items.is_empty() {
             self.not_full.notify_all();
         }
-        !guard.closed || !guard.items.is_empty()
+        !guard.closed || !guard.items.is_empty() || guard.pending_theme.is_some()
     }
 
-    /// Waits for at least one event to arrive, `deadline` (when `Some`) to pass, or closure.
-    /// Returns `false` when closed and empty.
+    /// Queues a live [`Theme`] update for the session worker thread (replacing any older pending
+    /// update) and wakes it immediately without blocking the caller.
+    pub(crate) fn set_theme(&self, theme: Theme) {
+        let mut guard = self.state.lock().expect("inbox mutex poisoned");
+        if guard.closed {
+            return;
+        }
+        guard.pending_theme = Some(theme);
+        self.not_empty.notify_one();
+    }
+
+    /// Takes the latest pending [`Theme`] update queued by the host, if any.
+    pub(crate) fn take_theme(&self) -> Option<Theme> {
+        let mut guard = self.state.lock().expect("inbox mutex poisoned");
+        guard.pending_theme.take()
+    }
+
+    /// Waits for at least one event or theme update to arrive, `deadline` (when `Some`) to pass,
+    /// or closure. Returns `false` when closed and empty.
     pub(crate) fn wait_for_activity(&self, deadline: Option<Instant>) -> bool {
         let mut guard = self.state.lock().expect("inbox mutex poisoned");
-        while guard.items.is_empty() && !guard.closed {
+        while guard.items.is_empty() && guard.pending_theme.is_none() && !guard.closed {
             match deadline {
                 None => {
                     guard = self.not_empty.wait(guard).expect("inbox mutex poisoned");
@@ -103,12 +123,14 @@ impl SessionInbox {
                         .expect("inbox mutex poisoned");
                     guard = next_guard;
                     if timed_out.timed_out() {
-                        return !guard.closed || !guard.items.is_empty();
+                        return !guard.closed
+                            || !guard.items.is_empty()
+                            || guard.pending_theme.is_some();
                     }
                 }
             }
         }
-        !guard.closed || !guard.items.is_empty()
+        !guard.closed || !guard.items.is_empty() || guard.pending_theme.is_some()
     }
 
     /// Marks the inbox closed and wakes both producer and consumer threads immediately.
