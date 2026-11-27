@@ -42,7 +42,7 @@ use crate::bus::{
     is_bus_target, local_bus_name, GomuxSnapshot,
 };
 use crate::camera::{CameraPose, ScreenBox, WallCamera};
-use crate::chord::{self, is_paste_chord};
+use crate::chord::{self, is_link_open_mods, is_paste_chord};
 use crate::commands::{
     self, AgentBulkExpandResult, AgentEarlierResult, AgentJumpResult, AgentOpenResult,
     AgentSideResult, AgentToggleEventResult, AttachOutcome, BusAgentEntry, BusHostGroup, BusView,
@@ -61,7 +61,7 @@ use crate::groups::{
     CreateGroupOptions, Group, GroupConfig, GroupDrag, Groups, PaneInset, SetLayoutOptions,
     SplitInsertDir, TerminalGeometry, TileMetrics, WallHost,
 };
-use crate::input::{KeyEvent, Mods, Platform};
+use crate::input::{Button, KeyEvent, Mods, Platform};
 use crate::keymap::{
     self, FieldFocus, KeyContext, KeyDecision, PressedKeys, WallCommand,
 };
@@ -70,6 +70,7 @@ use crate::layout::{
     cycle, hit_test, reading_order, union_rect, Edges, GridSize, HitPart, HitTarget, ReadingItem,
     Size, BAR_ROOM, DEFAULT_FIT_MARGIN, FULLSCREEN_Z,
 };
+use crate::links::{is_allowed_url_scheme, link_at_cell, HoveredLink, ScreenView};
 use crate::menu::{
     self, ContextDecision, ContextEvent, MenuTarget, TerminalPart, Verdict,
 };
@@ -84,7 +85,7 @@ use crate::names::{
 use crate::pointer::{
     cell_at_point, CanvasHit, CellPoint, CursorIcon, DropPreview,
     FullscreenState as PointerFullscreenState, PointerConfig, PointerEvent, PointerHost,
-    SelectionMode, SplitEdge, TerminalMouseEvent, WallPointer, WheelEvent, ZoomKeys,
+    SelectionMode, SplitEdge, TerminalMouseEvent, WallPointer, WheelEvent, ZoomKeys, DRAG_SLOP_PX,
 };
 use crate::router::{CommandInput, CommandMeta, CommandReply, CommandRouter, RegisterMeta};
 use crate::selection::TerminalSelection;
@@ -121,6 +122,12 @@ const FULLSCREEN_BACKDROP_Z: f64 = FULLSCREEN_Z - 1.0;
 /// verbs that inspect cell text (text selection drag, double/triple-click, copy).
 pub trait ScreenLookup {
     fn screen(&self, id: &str) -> Option<&Screen>;
+
+    /// Optional [`ScreenView`] providing `OSC 8` hyperlinks alongside [`Self::screen`].
+    /// Defaults to forwarding [`Self::screen`] (`term_cells::Screen` implements [`ScreenView`]).
+    fn screen_view(&self, id: &str) -> Option<&dyn ScreenView> {
+        self.screen(id).map(|s| s as &dyn ScreenView)
+    }
 }
 
 /// Empty [`ScreenLookup`] returning `None` for every terminal id.
@@ -136,6 +143,10 @@ impl ScreenLookup for NoScreens {
 impl<T: ScreenLookup + ?Sized> ScreenLookup for &T {
     fn screen(&self, id: &str) -> Option<&Screen> {
         (**self).screen(id)
+    }
+
+    fn screen_view(&self, id: &str) -> Option<&dyn ScreenView> {
+        (**self).screen_view(id)
     }
 }
 
@@ -448,6 +459,8 @@ pub struct TerminalFrame {
     pub selected: bool,
     pub border: BorderState,
     pub text_selection: Option<TextSelectionFrame>,
+    /// Active link span under the pointer when the link-open modifier (`⌘` / `Ctrl`) is held.
+    pub hovered_link: Option<HoveredLink>,
     pub fullscreen: bool,
     /// Fill fraction (`0.0..=1.0`) while hold-to-close is active on this terminal.
     pub close_hold_progress: Option<f64>,
@@ -625,9 +638,14 @@ struct WallCore {
     default_rows: u32,
     scale_factor: f64,
     now_ms: f64,
+    base_cursor: CursorIcon,
     cursor: CursorIcon,
     hovered_group_id: Option<String>,
     hovered_label_id: Option<String>,
+    hovered_link: Option<(String, HoveredLink)>,
+    pending_link_click: Option<(String, Point, String)>,
+    last_pointer_screen: Option<Point>,
+    last_pointer_mods: Mods,
     last_map_labels: Vec<(String, ScreenBox)>,
     lasso_screen: Option<Vec<Point>>,
     active_group_drag: Option<GroupDrag>,
@@ -1261,9 +1279,14 @@ impl WallCore {
             default_rows: opts.default_rows,
             scale_factor: opts.scale_factor.max(0.1),
             now_ms: 0.0,
+            base_cursor: CursorIcon::Default,
             cursor: CursorIcon::Default,
             hovered_group_id: None,
             hovered_label_id: None,
+            hovered_link: None,
+            pending_link_click: None,
+            last_pointer_screen: None,
+            last_pointer_mods: Mods::default(),
             last_map_labels: Vec::new(),
             lasso_screen: None,
             active_group_drag: None,
@@ -2171,6 +2194,14 @@ impl WallCore {
         }
 
         if changed {
+            if self
+                .hovered_link
+                .as_ref()
+                .is_some_and(|(tid, _)| tid == id)
+                && (delta.resized || delta.scrolled_top > 0 || !delta.rewritten_cols.is_empty())
+            {
+                self.set_hovered_link(None);
+            }
             self.model.notify_changed();
         }
         changed
@@ -2188,6 +2219,16 @@ impl WallCore {
         self.agent_stick_bottom.remove(id);
         if self.hovered_label_id.as_deref() == Some(id) {
             self.hovered_label_id = None;
+        }
+        if self.hovered_link.as_ref().is_some_and(|(tid, _)| tid == id) {
+            self.set_hovered_link(None);
+        }
+        if self
+            .pending_link_click
+            .as_ref()
+            .is_some_and(|(tid, _, _)| tid == id)
+        {
+            self.pending_link_click = None;
         }
         self.names.prune(|tid| self.model.terminal(tid).is_some());
         if self.fullscreen.active() {
@@ -2400,11 +2441,81 @@ impl WallCore {
         Some(next)
     }
 
-    fn set_cursor(&mut self, cursor: CursorIcon) {
-        if self.cursor != cursor {
-            self.cursor = cursor;
-            self.model.push_effect(WallEffect::SetCursor { cursor });
+    fn sync_effective_cursor(&mut self) {
+        let desired = if self.hovered_link.is_some() {
+            CursorIcon::Pointer
+        } else {
+            self.base_cursor
+        };
+        if self.cursor != desired {
+            self.cursor = desired;
+            self.model.push_effect(WallEffect::SetCursor { cursor: desired });
         }
+    }
+
+    fn set_cursor(&mut self, cursor: CursorIcon) {
+        self.base_cursor = cursor;
+        self.sync_effective_cursor();
+    }
+
+    fn set_hovered_link(&mut self, next: Option<(String, HoveredLink)>) {
+        if self.hovered_link != next {
+            self.hovered_link = next;
+            self.sync_effective_cursor();
+            self.model.notify_changed();
+        }
+    }
+
+    fn exact_cell_at(&self, id: &str, screen_x: f64, screen_y: f64) -> Option<(usize, usize)> {
+        let entry = self.model.terminal(id)?;
+        let geom = self.model.geometry();
+        let world = self.model.camera().to_world(Point::new(screen_x, screen_y));
+        let origin = entry.cell_origin(geom);
+        let scale = entry.scale.max(1e-9);
+        let cx = (world.x - origin.x) / (scale * geom.stride.x.max(1e-9));
+        let cy = (origin.y - world.y) / (scale * geom.stride.y.max(1e-9));
+        if cx < 0.0 || cy < 0.0 || cx >= f64::from(entry.cols) || cy >= f64::from(entry.rows) {
+            return None;
+        }
+        Some((cy.floor() as usize, cx.floor() as usize))
+    }
+
+    fn link_at_screen_point(
+        &self,
+        screen_x: f64,
+        screen_y: f64,
+        screens: &dyn ScreenLookup,
+    ) -> Option<(String, HoveredLink)> {
+        let world = self.model.camera().to_world(Point::new(screen_x, screen_y));
+        let CanvasHit::Terminal {
+            id,
+            part: HitPart::Body,
+        } = self.hit(world)?
+        else {
+            return None;
+        };
+        if self.fullscreen.active() {
+            let fs_view = self.read_fs_view();
+            let elevated = self.fullscreen.elevated_ids(&fs_view);
+            if !elevated.iter().any(|e| e == &id) {
+                return None;
+            }
+        }
+        let (row, col) = self.exact_cell_at(&id, screen_x, screen_y)?;
+        let view = screens.screen_view(&id)?;
+        let link = link_at_cell(view, row, col)?;
+        Some((id, link))
+    }
+
+    fn update_hovered_link(&mut self, mods: Mods, screens: &dyn ScreenLookup) {
+        self.last_pointer_mods = mods;
+        let next = if is_link_open_mods(self.platform, mods) {
+            self.last_pointer_screen
+                .and_then(|pt| self.link_at_screen_point(pt.x, pt.y, screens))
+        } else {
+            None
+        };
+        self.set_hovered_link(next);
     }
 
     fn refresh_selection_text(&mut self, id: &str, screens: &dyn ScreenLookup) -> String {
@@ -2617,6 +2728,11 @@ impl WallCore {
                         hovered,
                     },
                     text_selection,
+                    hovered_link: self
+                        .hovered_link
+                        .as_ref()
+                        .filter(|(tid, _)| tid == id)
+                        .map(|(_, link)| link.clone()),
                     fullscreen: elevated_set.contains(id.as_str()),
                     close_hold_progress,
                 })
@@ -4580,7 +4696,27 @@ impl Wall {
     /// Handle a pointer button press.
     pub fn pointer_down(&mut self, event: &PointerEvent, screens: &dyn ScreenLookup) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
+        self.router.context.last_pointer_screen = Some(Point::new(event.x, event.y));
+        self.router.context.last_pointer_mods = event.mods;
         self.router.context.model.close_menu();
+        if event.button == Some(Button::Left)
+            && is_link_open_mods(self.router.context.platform, event.mods)
+        {
+            if let Some((tid, link)) = self
+                .router
+                .context
+                .link_at_screen_point(event.x, event.y, screens)
+            {
+                self.router.context.pending_link_click =
+                    Some((tid.clone(), Point::new(event.x, event.y), link.url.clone()));
+                self.router.context.set_hovered_link(Some((tid, link)));
+                self.sync_pointer_flags();
+                self.router.context.model.notify_changed();
+                return;
+            }
+        }
+        self.router.context.pending_link_click = None;
+        self.router.context.set_hovered_link(None);
         {
             let mut bridge = PointerBridge {
                 router: &mut self.router,
@@ -4592,9 +4728,16 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
-    /// Handle pointer movement (hover cursor, drags, lasso, text selection, mouse tracking).
+    /// Handle pointer movement (hover cursor, drags, lasso, text selection, mouse tracking, links).
     pub fn pointer_move(&mut self, event: &PointerEvent, screens: &dyn ScreenLookup) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
+        self.router.context.last_pointer_screen = Some(Point::new(event.x, event.y));
+        self.router.context.last_pointer_mods = event.mods;
+        if let Some((_, start, _)) = &self.router.context.pending_link_click {
+            if (event.x - start.x).hypot(event.y - start.y) > DRAG_SLOP_PX {
+                self.router.context.pending_link_click = None;
+            }
+        }
         {
             let mut bridge = PointerBridge {
                 router: &mut self.router,
@@ -4605,6 +4748,9 @@ impl Wall {
         if !self.pointer.busy() {
             let hit_label = self.router.context.hit_map_label(event.x, event.y);
             self.router.context.set_hovered_label(hit_label.as_deref());
+            self.router.context.update_hovered_link(event.mods, screens);
+        } else {
+            self.router.context.set_hovered_link(None);
         }
         self.sync_pointer_flags();
     }
@@ -4612,6 +4758,25 @@ impl Wall {
     /// Handle a pointer button release.
     pub fn pointer_up(&mut self, event: &PointerEvent, screens: &dyn ScreenLookup) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
+        self.router.context.last_pointer_screen = Some(Point::new(event.x, event.y));
+        self.router.context.last_pointer_mods = event.mods;
+        if event.button == Some(Button::Left) {
+            if let Some((tid, start, url)) = self.router.context.pending_link_click.take() {
+                if (event.x - start.x).hypot(event.y - start.y) <= DRAG_SLOP_PX
+                    && is_allowed_url_scheme(&url)
+                    && self.router.context.model.terminal(&tid).is_some()
+                {
+                    self.router
+                        .context
+                        .model
+                        .push_effect(WallEffect::OpenUrl { url });
+                }
+                self.router.context.update_hovered_link(event.mods, screens);
+                self.sync_pointer_flags();
+                self.router.context.model.notify_changed();
+                return;
+            }
+        }
         {
             let mut bridge = PointerBridge {
                 router: &mut self.router,
@@ -4619,8 +4784,22 @@ impl Wall {
             };
             self.pointer.on_up(&mut bridge, event);
         }
+        if !self.pointer.busy() {
+            self.router.context.update_hovered_link(event.mods, screens);
+        }
         self.sync_pointer_flags();
         self.router.context.model.notify_changed();
+    }
+
+    /// Re-evaluate hovered link underline and cursor when modifier keys change
+    /// without pointer movement (e.g. pressing or releasing `⌘` / `Ctrl` over a URL).
+    pub fn modifiers_changed(&mut self, mods: Mods, screens: &dyn ScreenLookup) {
+        if !self.pointer.busy() {
+            self.router.context.update_hovered_link(mods, screens);
+        } else {
+            self.router.context.last_pointer_mods = mods;
+            self.router.context.set_hovered_link(None);
+        }
     }
 
     /// Handle window focus loss (`WindowEvent::Focused(false)` / browser `blur` &
@@ -4630,6 +4809,8 @@ impl Wall {
     pub fn blur(&mut self) {
         self.router.context.pressed_keys.clear();
         self.router.context.cancel_close_hold();
+        self.router.context.pending_link_click = None;
+        self.router.context.last_pointer_mods = Mods::default();
         {
             let mut bridge = PointerBridge {
                 router: &mut self.router,
@@ -4640,6 +4821,7 @@ impl Wall {
         self.router.context.model.set_hovered(None);
         self.router.context.set_hovered_group(None);
         self.router.context.set_hovered_label(None);
+        self.router.context.set_hovered_link(None);
         self.sync_pointer_flags();
         self.router.context.model.notify_changed();
     }
@@ -4647,6 +4829,7 @@ impl Wall {
     /// Handle pointer cancellation (window blur, capture lost).
     pub fn pointer_cancel(&mut self, event: &PointerEvent) {
         self.router.context.now_ms = event.time_ms.max(self.router.context.now_ms);
+        self.router.context.pending_link_click = None;
         {
             let mut bridge = PointerBridge {
                 router: &mut self.router,
@@ -4656,6 +4839,7 @@ impl Wall {
         }
         self.router.context.set_hovered_group(None);
         self.router.context.set_hovered_label(None);
+        self.router.context.set_hovered_link(None);
         self.sync_pointer_flags();
         self.router.context.model.notify_changed();
     }
@@ -4943,6 +5127,9 @@ impl Wall {
                     }
                 }
             }
+        }
+        if !self.pointer.busy() {
+            self.router.context.update_hovered_link(event.mods, screens);
         }
         self.sync_pointer_flags();
         decision

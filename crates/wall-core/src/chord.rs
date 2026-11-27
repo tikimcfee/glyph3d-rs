@@ -309,6 +309,25 @@ pub const fn block_select_label(platform: Platform) -> &'static str {
     }
 }
 
+/// Whether `mods` carry the link-open hover/click modifier (`⌘` alone on macOS,
+/// `Ctrl` alone elsewhere), matching standard native terminal conventions without
+/// conflicting with `Alt` move-drag, `Shift` selection/lasso, `⌘⌥`/`Ctrl+Alt`
+/// block-select, or macOS `Ctrl+click` context menu.
+pub const fn is_link_open_mods(platform: Platform, mods: Mods) -> bool {
+    match platform {
+        Platform::Mac => mods.meta && !mods.ctrl && !mods.alt && !mods.shift,
+        Platform::Other => mods.ctrl && !mods.alt && !mods.meta && !mods.shift,
+    }
+}
+
+/// Display label for the link-open click gesture (`"⌘-click"` on macOS, `"Ctrl-click"` elsewhere).
+pub const fn link_open_label(platform: Platform) -> &'static str {
+    match platform {
+        Platform::Mac => "⌘-click",
+        Platform::Other => "Ctrl-click",
+    }
+}
+
 /// Whether `mods` carry the platform's wall chord (`⌘` on macOS, `Ctrl+Alt` without `Meta`
 /// elsewhere; `Shift` may ride along).
 pub const fn is_chord_mods(platform: Platform, mods: Mods) -> bool {

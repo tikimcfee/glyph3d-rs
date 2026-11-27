@@ -48,7 +48,7 @@ use winit::window::{Window, WindowId};
 use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
-use super::cell::CellSelection;
+use super::cell::{CellLinkHover, CellSelection};
 use super::labels::Label;
 use super::renderer::{TerminalDraw, WallFrame, WallRenderer, WallStyle, WallTarget, WALL_DEPTH_FORMAT};
 use super::session::{News, Sessions};
@@ -359,6 +359,29 @@ fn epoch_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Launch a scheme-checked external URL (`http`, `https`, `mailto`) via the OS handler
+/// (`open` on macOS, `xdg-open` on other Unix platforms) without blocking the event loop.
+fn open_external_url(url: &str) {
+    if !wall_core::links::is_allowed_url_scheme(url) {
+        log::warn!("refused to open URL with disallowed scheme: {url:?}");
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    match std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => log::debug!("opened external URL via {program}: {url}"),
+        Err(err) => log::warn!("could not launch {program} for {url}: {err}"),
+    }
 }
 
 /// A screen as text, a line a row, trailing blanks and blank rows dropped.
@@ -804,6 +827,10 @@ impl App {
                 }
                 return;
             }
+            WallEffect::OpenUrl { url } => {
+                open_external_url(&url);
+                return;
+            }
             WallEffect::ConfigKnobChanged { key, value } => {
                 log::debug!("wall knob {key} is now {value:?}");
                 if key == "optionAsAlt" {
@@ -1181,7 +1208,14 @@ impl App {
                         foreground: fg,
                     }
                 }),
-                hover_link: None,
+                hover_link: t.hovered_link.as_ref().map(|link| {
+                    CellLinkHover::new(
+                        link.start_row.min(usize::from(u16::MAX)) as u16,
+                        link.start_col.min(usize::from(u16::MAX)) as u16,
+                        link.end_row.min(usize::from(u16::MAX)) as u16,
+                        link.end_col.min(usize::from(u16::MAX)) as u16,
+                    )
+                }),
             });
         }
 
@@ -1868,7 +1902,15 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(true),
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                let mods = self.mods();
+                if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    wall.modifiers_changed(mods, &lookup);
+                }
+                self.apply_effects();
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.scale_factor();
                 let (x, y) = (position.x / sf, position.y / sf);
