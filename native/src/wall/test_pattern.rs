@@ -331,7 +331,7 @@ pub fn build_primary_screen() -> Screen {
 
     // Row 20: prompt + cursor on 'w'
     c = 1;
-    c = write_run(&mut s, 20, c, "lugo@wall", RunStyle::fg(green));
+    c = write_run(&mut s, 20, c, "user@wall", RunStyle::fg(green));
     c = write_run(&mut s, 20, c, ":", RunStyle::fg(fg));
     c = write_run(&mut s, 20, c, "~/glyph3d-rs", RunStyle::fg(cyan));
     c = write_run(&mut s, 20, c, "$ ", RunStyle::fg(yellow));

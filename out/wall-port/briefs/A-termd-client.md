@@ -16,10 +16,10 @@ today over a complete one.
 
 ## What to read
 
-- `/Users/lugo/localdev/viz-web/glyph3d-js/docs/termd/PROTOCOL.md` — the whole
+- `~/localdev/viz-web/glyph3d-js/docs/termd/PROTOCOL.md` — the whole
   contract (version 1.5). If the daemon and that page disagree, the daemon has a bug:
   write it down for the lead.
-- `/Users/lugo/localdev/viz-web/glyph3d-js/docs/termd/MACOS.md` — socket path limits
+- `~/localdev/viz-web/glyph3d-js/docs/termd/MACOS.md` — socket path limits
   on macOS.
 - The reference client, same repo: `crates/g3d-wire/src/{frame,msg,lib}.rs` (codec and
   message types) and `crates/g3d/src/{client,start,paths}.rs` (a blocking client,

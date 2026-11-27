@@ -12,7 +12,7 @@
 # creating or destroying a scratch daemon (respecting any caller-set G3D_TERMD_DIR).
 #
 # Environment:
-#   GLYPH_RELAX           Path to relax binary (default: /Users/lugo/localdev/makepad/target/release/relax, else `relax`)
+#   GLYPH_RELAX           Path to relax binary (default: ~/localdev/makepad/target/release/relax, else `relax`)
 #   GLYPH_WALL_SHADER_DIR Directory for disk-loaded WGSL shaders (default: <repo>/native/src/shaders)
 #   G3D_BIN               Path to g3d CLI for scratch daemon teardown (default: ~/.local/bin/g3d, else `g3d`)
 #   RELAX_BG_TYPECK       Background typecheck toggle (default: 0; set to 1 to re-enable). It was
@@ -27,8 +27,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [[ -n "${GLYPH_RELAX:-}" ]]; then
     RELAX="$GLYPH_RELAX"
-elif [[ -x "/Users/lugo/localdev/makepad/target/release/relax" ]]; then
-    RELAX="/Users/lugo/localdev/makepad/target/release/relax"
+elif [[ -x "${HOME}/localdev/makepad/target/release/relax" ]]; then
+    RELAX="${HOME}/localdev/makepad/target/release/relax"
 else
     RELAX="relax"
 fi

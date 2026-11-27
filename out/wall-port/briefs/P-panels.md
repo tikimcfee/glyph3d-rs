@@ -13,7 +13,7 @@ the scene. Their LOGIC is already ported and tested in `crates/wall-core` (`pale
 missing is the drawing.
 
 The JS panels are the look and behaviour to match:
-`/Users/lugo/localdev/viz-web/glyph3d-js/wall/{Palette,Sidebar,SettingsPanel,StatusWindow,HelpPanel,ContextMenu,Panel}.jsx`,
+`~/localdev/viz-web/glyph3d-js/wall/{Palette,Sidebar,SettingsPanel,StatusWindow,HelpPanel,ContextMenu,Panel}.jsx`,
 described in `docs/architecture/wall.md` there.
 
 ## The contract every panel follows

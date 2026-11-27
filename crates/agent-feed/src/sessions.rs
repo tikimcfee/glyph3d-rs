@@ -2,7 +2,7 @@
 //! resolver (`agent sessions --json`).
 //!
 //! Direct port of the session list and resolver in
-//! `/Users/lugo/localdev/viz-web/glyph3d-js/cli/agentevents.go` (`refreshSessions`,
+//! `glyph3d-js/cli/agentevents.go` (`refreshSessions`,
 //! `sessionShape`, `resolve`, `lookup`), plus `nest_subagents` from
 //! `native/src/agent_transcript/agent_cli.rs`.
 

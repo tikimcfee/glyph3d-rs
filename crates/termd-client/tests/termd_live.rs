@@ -24,10 +24,10 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const FORBIDDEN_NAMESPACES: [&str; 3] = ["wall", "agents", "default"];
 
 fn require_termd_bin() -> Option<PathBuf> {
-    let default_bin = PathBuf::from("/Users/lugo/.local/bin/g3d-termd");
-    if default_bin.is_file() {
-        return Some(default_bin);
-    }
+    // `find_termd` looks in `$G3D_TERMD_BIN`, beside this binary, in `~/.local/bin` and
+    // `~/.cargo/bin`, then on PATH. (Until 2026-11-27 one person's `~/.local/bin` was tried
+    // first, by its absolute path, which also made `$G3D_TERMD_BIN` unable to choose another
+    // daemon on that machine.)
     match find_termd() {
         Ok(path) => Some(path),
         Err(why) => {

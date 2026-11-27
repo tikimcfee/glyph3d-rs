@@ -104,10 +104,7 @@ fn locate_termd_bin(override_bin: Option<&Path>) -> PathBuf {
         assert!(p.is_file(), "--termd-bin {} does not exist", p.display());
         return p.to_path_buf();
     }
-    let local = PathBuf::from("/Users/lugo/.local/bin/g3d-termd");
-    if local.is_file() {
-        return local;
-    }
+    // `$G3D_TERMD_BIN`, beside this binary, `~/.local/bin`, `~/.cargo/bin`, then PATH.
     find_termd().expect("locate g3d-termd binary")
 }
 
@@ -1195,10 +1192,17 @@ fn scenario_tabs(
 const CLAUDE_TUI_FIXTURE: &str = "native/fixtures/wall-replay/claude-tui.vt";
 
 fn record_offline_claude_tui(harness: &ScratchHarness, client: &Termd, out_path: &Path) {
-    let claude_bin = Path::new("/Users/lugo/.local/bin/claude");
+    // Claude Code as its installer leaves it: `~/.local/bin/claude`.
+    let home = std::env::var_os("HOME").expect("HOME names where claude is installed");
+    let claude_bin = PathBuf::from(home).join(".local/bin/claude");
     assert!(
         claude_bin.is_file(),
         "{} is not installed",
+        claude_bin.display()
+    );
+    assert!(
+        !claude_bin.to_string_lossy().contains('\''),
+        "{} cannot be quoted for the shell",
         claude_bin.display()
     );
     let scratch_home = PathBuf::from(format!("/tmp/g3d-claude-rec-{}", std::process::id()));
@@ -1216,8 +1220,9 @@ fn record_offline_claude_tui(harness: &ScratchHarness, client: &Termd, out_path:
          ANTHROPIC_BASE_URL='http://127.0.0.1:1' \
          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
          DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1; \
-         exec /Users/lugo/.local/bin/claude --bare --tools ''",
-        h = scratch_home.display()
+         exec '{claude}' --bare --tools ''",
+        h = scratch_home.display(),
+        claude = claude_bin.display()
     );
     let mut sess = LiveSession::spawn(
         harness,

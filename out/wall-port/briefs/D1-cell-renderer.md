@@ -38,7 +38,7 @@ position at all.
   made), `native/src/cli/` (how a flag is added), `native/src/scene.rs` (the quad demo
   is a small scene with its own renderer).
 - How the JS app draws the same thing (read-only):
-  `/Users/lugo/localdev/viz-web/glyph3d-js/docs/architecture/rendering.md`, "Cells:
+  `~/localdev/viz-web/glyph3d-js/docs/architecture/rendering.md`, "Cells:
   fills, styles, sprites" and "Colour"; `packages/glyph3d-core/src/core/glyphMaterial.js`
   (the fill pass, the style byte, the line bands, the greek tier);
   `packages/glyph3d-core/src/collections/TerminalGrid.js` (the cursor, the panel and

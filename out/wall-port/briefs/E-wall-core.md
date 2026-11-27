@@ -13,8 +13,8 @@ file. Those modules are the specification of how the wall behaves, and the perso
 uses it every day expects the native app to behave the same. You are carrying a few of
 them across, tests and all.
 
-- The JS, read-only: `/Users/lugo/localdev/viz-web/glyph3d-js/wall/` and its tests in
-  `/Users/lugo/localdev/viz-web/glyph3d-js/tools/`. `docs/architecture/wall.md` there
+- The JS, read-only: `~/localdev/viz-web/glyph3d-js/wall/` and its tests in
+  `~/localdev/viz-web/glyph3d-js/tools/`. `docs/architecture/wall.md` there
   describes the behaviour in prose.
 - The Rust: `crates/wall-core/src/<module>.rs` in this worktree. `lib.rs` already
   declares every module; `geom.rs` (`Rect`, `Point`: world units, **y up**, min and max

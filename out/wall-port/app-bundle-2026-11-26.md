@@ -93,7 +93,7 @@ When macOS Finder launches `Glyph3D Wall.app`, the process has no controlling TT
 
 ### What `g3d-termd` Does (Verified Against `g3d-termd/src/env.rs` & Live `g3d env`)
 
-- **Working directory (`cwd` / `PWD`)**: when `create.cwd` is `None`, `g3d-termd` resolves the user's home directory from `getpwuid` (`account.home`, e.g. `/Users/lugo`), never inheriting the daemon's own `/` CWD.
+- **Working directory (`cwd` / `PWD`)**: when `create.cwd` is `None`, `g3d-termd` resolves the user's home directory from `getpwuid` (`account.home`, e.g. `/Users/<name>`), never inheriting the daemon's own `/` CWD.
 - **Session & login environment (`--env-source auto`, `--login-shell true`, `--fill-locale true`)**:
   1. Queries the desktop session source (`launchd` on macOS for `SSH_AUTH_SOCK`, `TMPDIR`, etc.; `systemd --user` on Linux for `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_*`, `SSH_AUTH_SOCK`, etc.).
   2. Scrubs launcher/multiplexer/agent vars (`__CFBundleIdentifier`, `XPC_SERVICE_NAME`, `G3D_TERMD_*`, `AGENT_*`, `CLAUDE*`, `TMUX`, etc.).

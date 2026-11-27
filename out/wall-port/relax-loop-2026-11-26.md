@@ -1,6 +1,6 @@
 # Native Wall Fast Loop Under `relax` (2026-11-26)
 
-Measured on `laptop-2` (Apple M2, macOS, Metal `PresentMode::Fifo` 60 Hz) on branch `wall-font` (merged `wall` at `00bff8e`, including `d93fa82`), using stock upstream `/Users/lugo/localdev/makepad/target/release/relax` (read-only; unmodified).
+Measured on `laptop-2` (Apple M2, macOS, Metal `PresentMode::Fifo` 60 Hz) on branch `wall-font` (merged `wall` at `00bff8e`, including `d93fa82`), using stock upstream `~/localdev/makepad/target/release/relax` (read-only; unmodified).
 
 > **Note on repo tooling:** `glyph/src/prove_relax.rs` and `MAKEPAD_RUN_OVERLAY` were retired on 2026-11-24 (`AGENTS.md` § "The tool"). The repo now invokes stock `relax` via `glyph/src/relax.rs` using `GLYPH_RELAX` (default `relax` on `PATH`) and `--allow-c`, with no overlay or makepad patch.
 

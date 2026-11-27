@@ -2,10 +2,10 @@
 
 **Evidence legend**
 - **Repo roots**:
-  - `js:` = `/Users/lugo/localdev/viz-web/glyph3d-js` (branch `wall`, HEAD `0db92d5b` + 12 uncommitted modified files)
-  - `rs:` = `/Users/lugo/localdev/glyph3d-rs/.claude/worktrees/work` (branch `work`)
-  - `mp:` = `/Users/lugo/localdev/makepad` (branch `work`)
-  - `survey.md` = `/private/tmp/claude-501/-Users-lugo-localdev-glyph3d-rs/be544915-3925-4176-abd7-f71faca80827/scratchpad/wall-port/survey.md`
+  - `js:` = `~/localdev/viz-web/glyph3d-js` (branch `wall`, HEAD `0db92d5b` + 12 uncommitted modified files)
+  - `rs:` = `~/localdev/glyph3d-rs/.claude/worktrees/work` (branch `work`)
+  - `mp:` = `~/localdev/makepad` (branch `work`)
+  - `survey.md` = `<session scratchpad>/wall-port/survey.md`
 - **Tags**: `[verified: <path>:<lines>]`, `[measured: <what was run>]`, or `[inferred]`.
 - `part1.md` was written in full before `survey.md` was opened and has not been modified since.
 

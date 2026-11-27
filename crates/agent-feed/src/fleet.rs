@@ -3,7 +3,7 @@
 //! only when the published fleet changes, and restarts a departed child process with exponential
 //! backoff.
 //!
-//! Direct port of `/Users/lugo/localdev/viz-web/glyph3d-js/cli/gomux.go` and the host/status
+//! Direct port of `glyph3d-js/cli/gomux.go` and the host/status
 //! ordering of `wall/WallBus.js` (`crates/wall-core/src/bus.rs`).
 
 use std::cmp::Ordering;

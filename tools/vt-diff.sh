@@ -15,7 +15,7 @@ cd "$ROOT"
 
 D="/tmp/g3d-vt-$$"
 NS="probe"
-G3D_BIN="${G3D_BIN:-/Users/lugo/.local/bin/g3d}"
+G3D_BIN="${G3D_BIN:-${HOME}/.local/bin/g3d}"
 
 cleanup() {
     if [[ -x "$G3D_BIN" && -d "$D" ]]; then

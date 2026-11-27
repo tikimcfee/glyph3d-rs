@@ -552,7 +552,7 @@ mod tests {
                     status: "processing".to_string(),
                     attached: Some(true),
                     detail: "merging panels".to_string(),
-                    cwd: "/Users/lugo/localdev/glyph3d-rs".to_string(),
+                    cwd: "/Users/user/localdev/glyph3d-rs".to_string(),
                     ..BusAgentInput::default()
                 },
                 BusAgentInput {

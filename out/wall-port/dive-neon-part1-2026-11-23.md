@@ -2,9 +2,9 @@
 
 **Evidence legend**
 - **Repo roots**:
-  - `js:` = `/Users/lugo/localdev/viz-web/glyph3d-js` (branch `wall`, HEAD `0db92d5b`, with 12 uncommitted modified files)
-  - `rs:` = `/Users/lugo/localdev/glyph3d-rs/.claude/worktrees/work` (branch `work`)
-  - `mp:` = `/Users/lugo/localdev/makepad` (branch `work`; symlinked at `rs:../makepad`)
+  - `js:` = `~/localdev/viz-web/glyph3d-js` (branch `wall`, HEAD `0db92d5b`, with 12 uncommitted modified files)
+  - `rs:` = `~/localdev/glyph3d-rs/.claude/worktrees/work` (branch `work`)
+  - `mp:` = `~/localdev/makepad` (branch `work`; symlinked at `rs:../makepad`)
 - **Tags**: every claim is tagged `[verified: <path>:<lines>]`, `[measured: <what was run>]`, or `[inferred]`.
 
 ---
@@ -62,7 +62,7 @@ The wall is an infinite-canvas, keyboard-first terminal and agent-session worksp
 
 #### Gomuxai Agents & Agent Views
 - In JS, the Go relay spawns `agent export --json --follow --all` (`js:cli/gomux.go`), polls `agent sessions --json`, and tails individual transcripts via `agent transcript <path> --follow` / `--until` (`js:cli/agentevents.go`), streaming JSON events over the WebSocket to `WallBus` and `WallAgentViews` `[verified: js:cli/gomux.go:1-582, js:cli/agentevents.go:1-800]`.
-- **Crucial for the native port**: a native Rust wall needs **zero Go relay**. It speaks `g3d-wire` directly over Unix sockets to `g3d-termd` (including cross-namespace `--ns agents` for local gomuxai agents) and spawns `/Users/lugo/.local/bin/agent` directly—matching `rs:AGENTS.md`'s rule that `agent` CLI is the single reader of agent transcripts `[verified: js:crates/g3d/src/client.rs:1-200, rs:AGENTS.md:85-95]`.
+- **Crucial for the native port**: a native Rust wall needs **zero Go relay**. It speaks `g3d-wire` directly over Unix sockets to `g3d-termd` (including cross-namespace `--ns agents` for local gomuxai agents) and spawns `~/.local/bin/agent` directly—matching `rs:AGENTS.md`'s rule that `agent` CLI is the single reader of agent transcripts `[verified: js:crates/g3d/src/client.rs:1-200, rs:AGENTS.md:85-95]`.
 
 ---
 

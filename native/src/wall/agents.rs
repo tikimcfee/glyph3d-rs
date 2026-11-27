@@ -1787,7 +1787,7 @@ mod tests {
                     "path": transcript_file,
                     "size": 1200,
                     "mtime": "2026-11-26T18:00:00Z",
-                    "cwd": "/Users/lugo/work",
+                    "cwd": "/Users/user/work",
                     "project": "glyph3d-rs",
                     "title": "Build native WallAgents",
                     "status": "processing",
@@ -1806,7 +1806,7 @@ mod tests {
                 "type": "session",
                 "session_id": "sess-coder-1",
                 "harness": "claude",
-                "cwd": "/Users/lugo/work",
+                "cwd": "/Users/user/work",
                 "title": "Build native WallAgents",
                 "status": "processing"
             })
@@ -1891,7 +1891,7 @@ mod tests {
                 "store": "/tmp/fake-store",
                 "backend": "claude",
                 "session": "coder",
-                "cwd": "/Users/lugo/work",
+                "cwd": "/Users/user/work",
                 "created_at": "2026-11-26T17:55:00Z",
                 "live": true,
                 "attached": true,
@@ -2015,7 +2015,7 @@ mod tests {
                 view: 0,
                 cursor_row: 14,
                 alt_screen: false,
-                pwd: "/Users/lugo/work".to_string(),
+                pwd: "/Users/user/work".to_string(),
                 title: "claude".to_string(),
             },
         );
@@ -2117,7 +2117,7 @@ mod tests {
                 view: 0,
                 cursor_row: 5,
                 alt_screen: false,
-                pwd: "/Users/lugo/work".to_string(),
+                pwd: "/Users/user/work".to_string(),
                 title: "claude".to_string(),
             },
         );
@@ -2246,7 +2246,7 @@ mod tests {
         );
 
         let mut wall = Wall::in_memory(RulesOptions::default());
-        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24).with_title("lugo@laptop-2:~"));
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24).with_title("user@laptop-2:~"));
         let _ = wall.drain_effects();
         // Simulate a live News::Status push populating wall.termd() with zsh's initial shell title.
         let _ = wall.on_termd_status(
@@ -2256,9 +2256,9 @@ mod tests {
                     "id": "t1",
                     "cols": 80,
                     "rows": 24,
-                    "title": "lugo@laptop-2:~",
-                    "cwd": "/Users/lugo",
-                    "pwd": "/Users/lugo",
+                    "title": "user@laptop-2:~",
+                    "cwd": "/Users/user",
+                    "pwd": "/Users/user",
                     "scrollback_rows": 0
                 }]
             }),
@@ -2283,9 +2283,9 @@ mod tests {
                     "id": "t1",
                     "cols": 80,
                     "rows": 24,
-                    "title": "lugo@laptop-2:~",
-                    "cwd": "/Users/lugo",
-                    "pwd": "/Users/lugo",
+                    "title": "user@laptop-2:~",
+                    "cwd": "/Users/user",
+                    "pwd": "/Users/user",
                     "scrollback_rows": 5
                 }]
             }),
@@ -2296,7 +2296,7 @@ mod tests {
             "background termd status updates with zero open Agent Views must not trigger redraws"
         );
 
-        // Open Agent View on t1 while title is still shell default -> falls through to /Users/lugo.
+        // Open Agent View on t1 while title is still shell default -> falls through to /Users/user.
         let _ = agents.run_verb(&mut wall, "wall.agent t1 open");
         assert!(wait_until(Duration::from_secs(3), || {
             let _ = agents.pump(&mut wall);
@@ -2305,13 +2305,13 @@ mod tests {
         assert_eq!(agents.views().resolved_session_of("t1"), None);
 
         // Now live glyph-vt OSC 0 title updates to `gx-coder` while wall.termd() STILL holds the
-        // stale shell title `lugo@laptop-2:~`: live.title must override and rebind immediately!
+        // stale shell title `user@laptop-2:~`: live.title must override and rebind immediately!
         wall.terminal_title("t1", "gx-coder");
         agents.set_live_terminal_meta(
             "t1",
             LiveTerminalMeta {
                 title: "gx-coder".to_string(),
-                pwd: "/Users/lugo".to_string(),
+                pwd: "/Users/user".to_string(),
                 ..LiveTerminalMeta::default()
             },
         );

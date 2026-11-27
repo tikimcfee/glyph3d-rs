@@ -1210,7 +1210,7 @@ mod tests {
                 "proto": [1, 5],
                 "ns": "rs-wall",
                 "socket": "/tmp/g3d-501/termd-rs-wall.sock",
-                "log": "/Users/lugo/.local/state/g3d/termd-rs-wall.log",
+                "log": "/Users/user/.local/state/g3d/termd-rs-wall.log",
                 "exiting": false,
                 "instance": "8c1f0e7a9b2d4c55",
                 "started_at": 1794518713751,
