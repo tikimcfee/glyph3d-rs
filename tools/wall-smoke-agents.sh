@@ -574,7 +574,10 @@ for i in $(seq -w 1 35); do
     printf 'BOOT_HISTORY_LINE_%s\r\n' "$i" >&3
 done
 printf 'AGENT_READY_PROMPT\r\n' >&3
-if ! wait_for_text t1 "AGENT_READY_PROMPT" 60; then
+# Up to 20 s: `cat` only starts once t1's login shell has, and under a load average of 14
+# (another build beside this one) that took longer than the 3 s this waited until
+# 2026-11-27. It returns as soon as the line is there.
+if ! wait_for_text t1 "AGENT_READY_PROMPT" 400; then
     record_fail "agent pty setup" "t1 never printed AGENT_READY_PROMPT"
     exit 1
 fi
