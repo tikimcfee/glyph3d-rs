@@ -990,7 +990,8 @@ impl Termd {
     }
 }
 
-/// Strips inherited per-terminal/relay variables so a spawned `g3d-termd` starts cleanly.
+/// Strips inherited per-terminal/relay variables so a spawned `g3d-termd` starts cleanly,
+/// and supplies a baseline system `PATH` when the parent GUI process has none (`env -i`).
 fn scrub_spawn_env(cmd: &mut Command) {
     cmd.env_remove("G3D_TERMD_SOCKET");
     cmd.env_remove("G3D_TERMD_ID");
@@ -1000,6 +1001,9 @@ fn scrub_spawn_env(cmd: &mut Command) {
                 cmd.env_remove(name);
             }
         }
+    }
+    if std::env::var_os("PATH").is_none_or(|p| p.is_empty()) {
+        cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }
 }
 

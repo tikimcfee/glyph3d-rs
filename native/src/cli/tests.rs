@@ -909,3 +909,98 @@ fn wall_test_pattern_and_replay_flags_parse_and_validate() {
     }
 }
 
+#[test]
+fn runtime_asset_lookup_orders_explicit_then_bundle_then_repo() {
+    let root = std::env::temp_dir().join(format!("glyph3d-asset-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let missing_repo = root.join("missing-repo-assets");
+    let app_macos = root.join("Glyph3D Wall.app/Contents/MacOS/glyph3d-native");
+    let app_resources = root.join("Glyph3D Wall.app/Contents/Resources");
+    std::fs::create_dir_all(app_macos.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(app_resources.join("atlas")).unwrap();
+    std::fs::create_dir_all(app_resources.join("fonts")).unwrap();
+
+    let bundled_sheet = app_resources.join("atlas/emoji-sheet.bin");
+    let bundled_font = app_resources.join("fonts/Cousine-Regular.ttf");
+    std::fs::write(&bundled_sheet, b"bundle-sheet").unwrap();
+    std::fs::write(&bundled_font, b"bundle-font").unwrap();
+
+    // 1. Explicit flag beats bundle Resources and repo checkout.
+    let explicit = PathBuf::from("/custom/override-sheet.bin");
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            Some(&explicit),
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        explicit
+    );
+    let cli = parse(&["--emoji-sheet", "/custom/override-sheet.bin"]);
+    match cli.action() {
+        CliCommand::Wall { emoji_sheet, .. } => assert_eq!(emoji_sheet, explicit),
+        other => panic!("expected Wall, got {other:?}"),
+    }
+
+    // 2. Inside a macOS .app bundle with no repo checkout, Contents/Resources wins.
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        bundled_sheet
+    );
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "fonts/Cousine-Regular.ttf",
+        ),
+        bundled_font
+    );
+    // Code-scene atlas files not placed in Contents/Resources/atlas still fall back to repo_assets.
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/codepoints.bin",
+        ),
+        missing_repo.join("atlas/codepoints.bin")
+    );
+
+    // 3. On Linux/XDG prefix installs (<prefix>/bin/glyph3d-native), <prefix>/share/glyph3d-wall wins.
+    let xdg_exe = root.join("local/bin/glyph3d-native");
+    let xdg_sheet = root.join("local/share/glyph3d-wall/atlas/emoji-sheet.bin");
+    std::fs::create_dir_all(xdg_exe.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(xdg_sheet.parent().unwrap()).unwrap();
+    std::fs::write(&xdg_sheet, b"xdg-sheet").unwrap();
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&xdg_exe),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        xdg_sheet
+    );
+
+    // 4. Unbundled dev binary (target/release/glyph3d-native) falls back to repo assets.
+    let dev_exe = root.join("target/release/glyph3d-native");
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&dev_exe),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        missing_repo.join("atlas/emoji-sheet.bin")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+

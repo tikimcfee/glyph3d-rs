@@ -5,7 +5,7 @@ use crate::repo::{self, RepoParams, Strategy};
 use crate::{SceneChoice, SceneCullOptions};
 use super::args::{default_text_file, Cli, PresentMode};
 use super::ops::Op;
-use crate::default_emoji_sheet;
+use crate::resolve_emoji_sheet;
 
 /// Top-level action requested via the CLI.
 #[derive(Debug)]
@@ -173,7 +173,7 @@ impl Cli {
             };
         }
 
-        let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
+        let emoji_sheet = resolve_emoji_sheet(self.emoji_sheet.as_deref());
         if self.wall {
             return CliCommand::Wall {
                 emoji_sheet,
