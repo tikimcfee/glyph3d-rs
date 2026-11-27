@@ -53,9 +53,9 @@ pub use encode::{
     EncodedGlyph, OutlineCollector, PackedCurve,
 };
 pub use families::{
-    bundled_family_spec, cousine_family_spec, default_font_chain, fallback_font_chain,
-    monaspace_family_spec, FaceSpec, FontSource, FontSpec, Variation, DEFAULT_FONT_FAMILY,
-    MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
+    bundled_family_spec, cousine_family_spec, default_font_chain, default_font_chain_lazy,
+    fallback_font_chain, monaspace_family_spec, FaceSpec, FontSource, FontSpec, Variation,
+    DEFAULT_FONT_FAMILY, MONASPACE_ARGON_FAMILY, MONASPACE_NEON_FAMILY,
 };
 pub use system::{
     normalize_family_key, resolve_family_chain, resolve_family_spec, system_font_dirs,
