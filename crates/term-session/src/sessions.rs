@@ -918,6 +918,17 @@ impl Sessions {
             for id in lingering {
                 news.insert(0, News::Ended { id });
             }
+            // Wire order: a namespace ends its terminals, then says it is leaving, then
+            // closes. A terminal's own end reaches this pump through its session's worker
+            // thread, the document and the close through the hub, so when all three land
+            // in one pump the end could be handed over last (seen 2026-11-27 against a
+            // daemon whose stop tells its connections at once; the one before it took
+            // 200 ms, which hid this). Every end goes first.
+            let (ended, rest): (Vec<News>, Vec<News>) = std::mem::take(&mut news)
+                .into_iter()
+                .partition(|n| matches!(n, News::Ended { .. }));
+            news = ended;
+            news.extend(rest);
             self.start_passive_reconnect_watcher();
         }
 

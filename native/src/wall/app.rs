@@ -1751,9 +1751,10 @@ impl App {
                     News::Disconnected { message } => {
                         log::error!("termd is gone: {message}");
                         wall.set_connected(false);
-                        // A namespace that left on purpose is an outage now, with its
-                        // reason, not a restart to wait out.
-                        wall.on_termd_gone(&message, epoch_now_ms());
+                        // A namespace that left on purpose is an outage now, not a
+                        // restart to wait out; its last status document (handed over
+                        // just before this) said which way it left.
+                        wall.on_termd_gone(epoch_now_ms());
                         heard = true;
                     }
                 }
@@ -2802,6 +2803,15 @@ impl App {
                         out.push_str(&format!(
                             "\npaper grid_show={} grid_minor={}",
                             described.paper.grid_show, described.paper.grid.grid_minor
+                        ));
+                        // The daemon as the Status window has it: its state, which way a
+                        // namespace that left on purpose went, and the window's own words
+                        // (to the end of the line).
+                        out.push_str(&format!(
+                            "\ntermd state={} left={} says={}",
+                            wall.termd().state().as_str(),
+                            wall.termd().left().map_or("none", wall_core::status::ExitReason::as_str),
+                            wall_core::status::empty_daemon_message(wall.termd()),
                         ));
                         if let Some(g) = &self.gfx {
                             out.push_str(&format!(

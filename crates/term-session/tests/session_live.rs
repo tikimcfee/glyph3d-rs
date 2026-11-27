@@ -2103,8 +2103,9 @@ fn sessions_pump_surfaces_live_news_status_updates() {
 #[test]
 fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
     // A namespace that leaves on purpose (protocol 1.6) tells a status follower with a last
-    // document, `daemon.exiting: true`, and then closes. `Sessions` follows status, and the
-    // wall reads the close by what that document said: the news must come in wire order.
+    // document, `daemon.exiting: true` (and, from a daemon that has it, `daemon.exit_reason`),
+    // and then closes. `Sessions` follows status, and the wall reads the close by what that
+    // document said: the news must come in wire order.
     use term_session::News;
 
     let scratch = ScratchDaemon::new("stexit");
@@ -2121,6 +2122,9 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
 
     let mut seen = wake.current();
     let mut order: Vec<String> = Vec::new();
+    // What the daemon under test says of its way out: `stop` from one that has
+    // `daemon.exit_reason`, nothing from one before it.
+    let mut said: Option<String> = None;
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(10), || {
             let (_, news) = sessions.pump();
@@ -2129,6 +2133,7 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
                     News::Ended { id } => order.push(format!("ended {id}")),
                     News::Status(doc) => {
                         if doc["daemon"]["exiting"] == true {
+                            said = doc["daemon"]["exit_reason"].as_str().map(str::to_owned);
                             order.push("exiting document".into());
                         }
                     }
@@ -2140,12 +2145,17 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
         }),
         "no News::Disconnected within 10 s of the stop: {order:?}"
     );
+    assert!(
+        matches!(said.as_deref(), None | Some("stop")),
+        "a stop's exit_reason is `stop`, or absent before the field: {said:?}"
+    );
     assert_eq!(
         order,
         vec![
             format!("ended {id}"),
             "exiting document".to_string(),
-            format!("disconnected: {}", termd_client::NAMESPACE_LEFT),
+            format!("disconnected: {}", termd_client::namespace_left(said.as_deref())),
         ]
     );
+    eprintln!("the daemon under test said exit_reason = {said:?}");
 }

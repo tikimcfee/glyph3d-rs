@@ -5593,12 +5593,13 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
-    /// Notify that the `termd` connection ended for good, with the client's reason: `Lost`
-    /// at once when the namespace left on purpose with shells in it, else as
+    /// Notify that the `termd` connection ended for good: `Lost` at once, saying which way
+    /// it left, when the namespace left on purpose with shells in it (its last status
+    /// document said so: [`Self::on_termd_status`] comes first), else as
     /// [`Self::on_termd_disconnected`] ([`TermdStatus::on_gone`]).
-    pub fn on_termd_gone(&mut self, reason: &str, now_ms: u64) {
+    pub fn on_termd_gone(&mut self, now_ms: u64) {
         self.router.context.record_termd_now_ms(now_ms);
-        self.router.context.termd.on_gone(reason, now_ms);
+        self.router.context.termd.on_gone(now_ms);
         self.router.context.model.notify_changed();
     }
 

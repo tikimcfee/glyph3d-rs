@@ -165,10 +165,27 @@ pub enum Event {
     Disconnected { restart: bool, message: String },
 }
 
-/// What [`Event::Disconnected`] says for a status follower whose namespace left on purpose:
-/// its notice is a last document with `daemon.exiting: true`, which names no cause.
+/// What [`Event::Disconnected`] says for a status follower whose namespace left on purpose
+/// without saying which way: its notice is a last document with `daemon.exiting: true`, and
+/// a daemon from before `daemon.exit_reason` names no cause.
 pub const NAMESPACE_LEFT: &str =
     "the namespace left on purpose: its terminals are ended and nothing listens there now";
+
+/// What [`Event::Disconnected`] says for a status follower whose namespace left on purpose:
+/// [`NAMESPACE_LEFT`] with the last document's `daemon.exit_reason` (`stop`, `sigterm`,
+/// `idle`) in parentheses, as the daemon's own `ERROR` `exiting` message carries it for a
+/// connection that does not follow status. A reason that is not one short word is left out.
+pub fn namespace_left(exit_reason: Option<&str>) -> String {
+    let word = exit_reason.filter(|r| {
+        !r.is_empty()
+            && r.len() <= 32
+            && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    match (word, NAMESPACE_LEFT.split_once(':')) {
+        (Some(word), Some((head, tail))) => format!("{head} ({word}):{tail}"),
+        _ => NAMESPACE_LEFT.to_owned(),
+    }
+}
 
 /// Optional tuning for connection startup, timeouts and reconnect window.
 #[derive(Clone, Debug)]
@@ -225,6 +242,8 @@ struct Shared {
     /// A status document said `daemon.exiting: true`: the close that follows is the
     /// namespace leaving, not a restart to ride.
     namespace_exiting: AtomicBool,
+    /// That document's `daemon.exit_reason`, when it gave one (protocol 1.6).
+    namespace_exit_reason: Mutex<Option<String>>,
     request_timeout_ms: AtomicU64,
     reconnect_window_ms: AtomicU64,
 }
@@ -980,6 +999,7 @@ impl Termd {
             subs: Mutex::new(SubTable { by_handle: BTreeMap::new(), status_follow: None }),
             closed_by_client: AtomicBool::new(false),
             namespace_exiting: AtomicBool::new(false),
+            namespace_exit_reason: Mutex::new(None),
             request_timeout_ms: AtomicU64::new(req_ms),
             reconnect_window_ms: AtomicU64::new(reconn_ms),
         });
@@ -1167,7 +1187,12 @@ fn reader_loop(
                 let (planned, recoverable, reason) = match classify_drop(&drop_err) {
                     // A status follower was told by its last document, and gets no `ERROR`.
                     (_, true, _) if shared.namespace_exiting.load(Ordering::Acquire) => {
-                        (false, false, NAMESPACE_LEFT.to_owned())
+                        let why = shared
+                            .namespace_exit_reason
+                            .lock()
+                            .map(|r| r.clone())
+                            .unwrap_or_default();
+                        (false, false, namespace_left(why.as_deref()))
                     }
                     verdict => verdict,
                 };
@@ -1715,6 +1740,12 @@ fn route_json_event(
                 // (1.6) A follower's notice that the namespace is leaving; the close is next.
                 if doc.pointer("/daemon/exiting").and_then(serde_json::Value::as_bool) == Some(true)
                 {
+                    if let Ok(mut why) = shared.namespace_exit_reason.lock() {
+                        *why = doc
+                            .pointer("/daemon/exit_reason")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned);
+                    }
                     shared.namespace_exiting.store(true, Ordering::Release);
                 }
                 return push_event(events_tx, wake, Event::Status(doc));
@@ -2173,16 +2204,24 @@ mod tests {
     }
 
     /// A connection that follows the status document, closed after a document whose
-    /// `daemon.exiting` is `exiting`: the events after the documents, and the reconnects tried.
-    fn follower_closed_after_a_document(tag: &str, exiting: bool) -> (Vec<Event>, usize) {
+    /// `daemon.exiting` is `exiting` (with `exit_reason`, when given, beside it): the events
+    /// after the documents, and the reconnects tried.
+    fn follower_closed_after_a_document(
+        tag: &str,
+        exiting: bool,
+        exit_reason: Option<&'static str>,
+    ) -> (Vec<Event>, usize) {
         let scratch = ScratchDir::new(tag);
         let listener = UnixListener::bind(scratch.socket()).unwrap();
         let server = leaving_daemon(listener, 2, move |stream| {
             for last in [false, exiting] {
-                let doc = serde_json::json!({
+                let mut doc = serde_json::json!({
                     "ev": "status", "at": 1, "terminals": [], "errors": [],
                     "daemon": {"ns": "mock", "instance": "inst-1", "exiting": last},
                 });
+                if let (true, Some(why)) = (last, exit_reason) {
+                    doc["daemon"]["exit_reason"] = serde_json::json!(why);
+                }
                 stream.write_all(&frame::encode_json(ty::EVENT, 0, &doc)).unwrap();
             }
         });
@@ -2206,15 +2245,34 @@ mod tests {
     #[test]
     fn a_status_follower_ends_on_the_close_after_its_exiting_document() {
         // The follower's notice is its last document: no `ERROR` follows it, only the close.
-        let (after, reconnects) = follower_closed_after_a_document("exitdoc", true);
+        // A daemon from before `daemon.exit_reason` says it is leaving and not which way.
+        let (after, reconnects) = follower_closed_after_a_document("exitdoc", true, None);
         assert_eq!(
             after,
             vec![Event::Disconnected { restart: false, message: NAMESPACE_LEFT.to_owned() }]
         );
         assert_eq!(reconnects, 0, "a namespace that said it was leaving is not redialled");
 
+        // With the reason, the message carries it as the daemon's own `ERROR` does.
+        for (tag, why) in [("exitstop", "stop"), ("exitterm", "sigterm"), ("exitidle", "idle")] {
+            let (after, reconnects) = follower_closed_after_a_document(tag, true, Some(why));
+            assert_eq!(
+                after,
+                vec![Event::Disconnected {
+                    restart: false,
+                    message: format!(
+                        "the namespace left on purpose ({why}): its terminals are ended and nothing listens there now"
+                    ),
+                }]
+            );
+            assert_eq!(reconnects, 0, "{why}");
+        }
+        // Not a word: left out, and still an end on purpose.
+        assert_eq!(namespace_left(Some("two words")), NAMESPACE_LEFT);
+        assert_eq!(namespace_left(Some("")), NAMESPACE_LEFT);
+
         // The same close after a document that did not say so is a crash: ride it.
-        let (after, reconnects) = follower_closed_after_a_document("crashdoc", false);
+        let (after, reconnects) = follower_closed_after_a_document("crashdoc", false, None);
         assert_eq!(after, Vec::new(), "no verdict while the reconnect window is open");
         assert!(reconnects >= 1, "a bare close is redialled: {reconnects} attempt(s)");
     }
