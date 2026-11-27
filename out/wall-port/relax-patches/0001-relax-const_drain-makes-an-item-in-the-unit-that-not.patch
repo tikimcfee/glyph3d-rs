@@ -1,0 +1,315 @@
+From 1c27565914b30209f0db128910094f1e7216ff7c Mon Sep 17 00:00:00 2001
+From: Ivan Lugo <ivan.lugo.dev@pm.me>
+Date: Fri, 27 Nov 2026 01:02:07 -0600
+Subject: [PATCH] relax: const_drain makes an item in the unit that noted it
+
+The owner's constant drain took the process-wide queue of what background
+fronts found unevaluated (CONSTS_WANTED) and made every item in cur_unit():
+the unit whose code the draining thread runs. That is the program's unit
+between requests, but const_drain is also a Job request (prefront_slot), and
+a Job is served inside any wait the owner pumps. A proc macro's call runs
+on the owner inside the macro world's unit (pmhost::call -> call_jit_in sets
+the thread's unit to it); a lazy compile in there waits on a type check
+another thread runs, the pump serves a program front's const_drain, and the
+program's DefIds / TyIds / FnKeys were read in the macro world's program.
+The epoch check does not catch it: both units' collect epochs are equal.
+On a warm start that builds the macro world beside the running program this
+ended the process on the owner thread: a host SIGSEGV in Unit::vtable,
+Unit::const_addr or Unit::promoted_addr (an id past the macro world's
+tables), or an illegal instruction in constant-evaluation code (an id that
+names another item there).
+
+Each queued item now names the unit that noted it, and the drain makes it
+there. An item whose unit is none the thread can name as alive (its own, the
+runtime's, the booted program's, a live auxiliary unit) is made by no drain,
+and retire_unit takes a retiring unit's items out of the queue with its other
+address-keyed state. wanted_key holds the unit too, so equal ids of two
+units are two items for the left-out builds.
+
+tier_stuck_tests: the_drain_makes_an_item_in_the_unit_that_noted_it drains
+while the owner's thread unit is another unit's.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ libs/relax/compiler/src/jit.rs              | 79 +++++++++++++--------
+ libs/relax/compiler/src/tier_stuck_tests.rs | 71 +++++++++++++++++-
+ 2 files changed, 120 insertions(+), 30 deletions(-)
+
+diff --git a/libs/relax/compiler/src/jit.rs b/libs/relax/compiler/src/jit.rs
+index c434e2fb0..c16ab74b7 100644
+--- a/libs/relax/compiler/src/jit.rs
++++ b/libs/relax/compiler/src/jit.rs
+@@ -1994,6 +1994,18 @@ pub(crate) fn cur_unit() -> *mut Unit {
+ static AUX_UNITS_ANY: AtomicBool = AtomicBool::new(false);
+ static AUX_UNITS: relax_session::sync::Mutex<Vec<usize>> = relax_session::sync::Mutex::new(Vec::new());
+ 
++/// `up` is a unit the calling thread can name as alive: the one whose code it runs, the runtime's,
++/// the booted program's (before its first call the runtime's is still the macro world's), or a
++/// live auxiliary one. What the owner holds by address only (const_drain's items) is checked here
++/// before it is used.
++fn unit_live(up: *mut Unit) -> bool {
++    !up.is_null()
++        && (up == cur_unit()
++            || up == unsafe { UNIT }
++            || up == crate::run::running_unit()
++            || (AUX_UNITS_ANY.load(Ordering::Acquire) && AUX_UNITS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(up as usize))))
++}
++
+ /// Makes `u` the runtime's unit unless that would put an auxiliary unit (the macro world) in
+ /// place of a program's.
+ unsafe fn adopt_runtime_unit(u: *mut Unit) {
+@@ -6146,7 +6158,7 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
+             return crate::valtrees::const_to_valtree(u, addr, ty);
+         }
+         if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+-            want(Wanted::Const(def, compact.clone()), u.tcx.collect_epoch.load(Ordering::SeqCst));
++            want(u, Wanted::Const(def, compact.clone()), u.tcx.collect_epoch.load(Ordering::SeqCst));
+         }
+     }
+     // a unit call: the value, and whether this evaluation (not an earlier one of the same
+@@ -7393,7 +7405,7 @@ pub fn thread_local_place_shared(&self, d: DefId) -> Option<TlsPlace> {
+             }
+             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+-                want(Wanted::Tls(d), epoch);
++                want(self, Wanted::Tls(d), epoch);
+             }
+         }
+         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).thread_local_place(d) })
+@@ -8630,7 +8642,7 @@ pub fn entry(&self, id: u32) -> u64 {
+             if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                 let key = if (id as usize) < self.fns.len() { Some(self.fns[id as usize].key.clone()) } else { lower_ahead_fn_key(id) };
+                 if let Some(key) = key.filter(|k| self.closed_key(k)) {
+-                    want(Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
++                    want(self, Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
+                 }
+             }
+             lower_ahead_needs_unit();
+@@ -9004,7 +9016,7 @@ pub fn const_addr_shared(&self, d: DefId, args: Vec<TyId>) -> Option<u64> {
+             // requests (const_drain) and the build's next take finds it
+             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+-                want(Wanted::Const(d, args.clone()), epoch);
++                want(self, Wanted::Const(d, args.clone()), epoch);
+             }
+         }
+         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
+@@ -9131,7 +9143,7 @@ pub fn static_addr_shared(&self, d: DefId) -> u64 {
+             // warm run's disk-cache code initializes without publishing: core::heap::alloc & co
+             // failed their fronts for the whole run, and their hot callers' O3 builds left them out)
+             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
+-                want(Wanted::Static(d), self.tcx.collect_epoch.load(Ordering::SeqCst));
++                want(self, Wanted::Static(d), self.tcx.collect_epoch.load(Ordering::SeqCst));
+             }
+             lower_ahead_needs_unit();
+         }
+@@ -20003,6 +20015,8 @@ pub unsafe fn retire_unit(up: *mut Unit) {
+         // unit: a unit allocated at its address later must not take them
+         queue::retain(|job| !matches!(job, queue::Job::Spec(unit, _) | queue::Job::Reach(unit, _, _) | queue::Job::O2(unit, _, _) if *unit == up as usize));
+         forget_unit_slots(up as usize);
++        // ... and what its fronts noted for the owner's drain (const_drain makes an item in its unit)
++        CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != up as usize);
+         if UNIT == up {
+             UNIT = std::ptr::null_mut();
+         }
+@@ -31851,7 +31865,7 @@ fn statics_ready(u: &Unit, body: &Body) -> bool {
+                 if !want_them {
+                     break;
+                 }
+-                want(Wanted::Static(*d), epoch);
++                want(u, Wanted::Static(*d), epoch);
+             }
+         }
+     }
+@@ -37218,17 +37232,18 @@ fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
+     for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
+         if let Res::Def(d) = r {
+             if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
+-                want(Wanted::Const(*d, Vec::new()), epoch);
++                want(u, Wanted::Const(*d, Vec::new()), epoch);
+                 missing = true;
+             }
+         }
+     }
+     missing
+ }
+-/// Notes `w` for the owner's const_drain (and for the O3 build that asked: BUILD_WANTS).
+-fn want(w: Wanted, epoch: u64) {
+-    let _ = BUILD_WANTS.try_with(|b| if let Some(v) = b.borrow_mut().as_mut() { v.push(wanted_key(&w, epoch)) });
+-    crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((w, epoch)));
++/// Notes `w` of unit `u` for the owner's const_drain (and for the O3 build that asked: BUILD_WANTS).
++fn want(u: &Unit, w: Wanted, epoch: u64) {
++    let unit = u as *const Unit as usize;
++    let _ = BUILD_WANTS.try_with(|b| if let Some(v) = b.borrow_mut().as_mut() { v.push(wanted_key(unit, &w, epoch)) });
++    crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((unit, w, epoch)));
+     let _ = WANT_NOTES.try_with(|n| n.set(n.get().wrapping_add(1)));
+ }
+ struct WantConsts(bool);
+@@ -37251,12 +37266,15 @@ fn drop(&mut self) {
+ /// CTFE on the owner: it evaluates them between requests (const_drain), nobody waits for it.
+ /// The same holds for a `#[thread_local]` static nobody placed in this run (Unit::thread_local_place
+ /// allocates its TLS: csg_boolean's CURRENT_CANCEL getter ran baseline).
+-static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
++/// Each item names the unit that noted it (its address): its ids are that unit's program's, and
++/// the drain makes it there. The process holds more than one unit (the program's, the proc-macro
++/// world's), and the owner drains inside either one's code.
++static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(usize, Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+ 
+-/// Item `w` of epoch `epoch` as a left-out build waits on it (LeftOut::items): one of another
+-/// epoch is another item.
+-fn wanted_key(w: &Wanted, epoch: u64) -> u64 {
+-    std::hash::BuildHasher::hash_one(&crate::fxhash::FxBuild::default(), (w, epoch))
++/// Item `w` of unit `unit` and epoch `epoch` as a left-out build waits on it (LeftOut::items): one
++/// of another unit or epoch is another item.
++fn wanted_key(unit: usize, w: &Wanted, epoch: u64) -> u64 {
++    std::hash::BuildHasher::hash_one(&crate::fxhash::FxBuild::default(), (unit, w, epoch))
+ }
+ 
+ /// What a background build's front found missing (CONSTS_WANTED)
+@@ -37330,7 +37348,7 @@ fn want_in_front(u: &Unit, body: Option<&Body>, w: impl FnOnce(Option<std::sync:
+     if held.is_none() {
+         return false;
+     }
+-    want(w(body.and(held)), u.tcx.collect_epoch.load(Ordering::SeqCst));
++    want(u, w(body.and(held)), u.tcx.collect_epoch.load(Ordering::SeqCst));
+     true
+ }
+ 
+@@ -37343,23 +37361,28 @@ pub(crate) fn const_drain() {
+     if want.is_empty() {
+         return;
+     }
+-    let up = cur_unit();
+-    if up.is_null() {
+-        return;
+-    }
+     let _span = crate::inspect::timeline::span("owner const drain");
+-    let u = unsafe { &mut *up };
+-    let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
+-    let mut seen: crate::fxhash::HashSet<Wanted> = Default::default();
+-    for (w, e) in want {
++    let mut seen: crate::fxhash::HashSet<(usize, Wanted)> = Default::default();
++    for (unit, w, e) in want {
+         // (what it makes, or finds made, ends the waits of the left-out builds that asked for it;
+         // an item of an earlier epoch is made by no drain)
+-        let item = wanted_key(&w, e);
+-        if e != epoch {
++        let item = wanted_key(unit, &w, e);
++        // made in the unit that noted it, never in the one this thread runs code of: a drain
++        // served inside a wait of a proc macro's call (the owner inside the macro world, its
++        // unit this thread's) took a program front's item, read its ids in the macro world's
++        // program and faulted in Unit::vtable / Unit::const_addr. An item of a unit that is gone
++        // (retire_unit) is made by no drain.
++        let up = unit as *mut Unit;
++        if !unit_live(up) {
++            left_out_drained(item, false);
++            continue;
++        }
++        let u = unsafe { &mut *up };
++        if e != u.tcx.collect_epoch.load(Ordering::SeqCst) {
+             left_out_drained(item, false);
+             continue;
+         }
+-        if !seen.insert(w.clone()) {
++        if !seen.insert((unit, w.clone())) {
+             continue;
+         }
+         // each item's builds a caught panic left open are closed after it: the next item's
+diff --git a/libs/relax/compiler/src/tier_stuck_tests.rs b/libs/relax/compiler/src/tier_stuck_tests.rs
+index ba9808eea..422a13ab5 100644
+--- a/libs/relax/compiler/src/tier_stuck_tests.rs
++++ b/libs/relax/compiler/src/tier_stuck_tests.rs
+@@ -1164,14 +1164,14 @@ fn a_left_out_build_is_built_again_once_per_thing_it_waited_on() {
+     let retiers = |id: u32| crate::inspect::tierlog::history(id).0.map_or(0, |h| h.n[crate::inspect::tierlog::ev::RETIER as usize]);
+     let drain = |w: Wanted| {
+         let epoch = crate::owner::call(crate::owner::Class::Program, || u.tcx.collect_epoch.load(Ordering::SeqCst));
+-        want(w, epoch);
++        want(unsafe { &*up }, w, epoch);
+         crate::owner::call(crate::owner::Class::Job, const_drain);
+         crate::owner::call(crate::owner::Class::Program, || ());
+     };
+     let epoch = crate::owner::call(crate::owner::Class::Program, || u.tcx.collect_epoch.load(Ordering::SeqCst));
+ 
+     // root's build left mid out, its fronts having asked the drain for K1
+-    assert!(o3_left_out(up, root, mid, &[mid], &HashMap::new(), &[wanted_key(&Wanted::Const(k1, Vec::new()), epoch)]), "mid has no RIR: its build waits on K1");
++    assert!(o3_left_out(up, root, mid, &[mid], &HashMap::new(), &[wanted_key(up as usize, &Wanted::Const(k1, Vec::new()), epoch)]), "mid has no RIR: its build waits on K1");
+     crate::owner::call(crate::owner::Class::Program, || ());
+     assert_eq!(retiers(root), 0, "built again before the item it waits on was made");
+     drain(Wanted::Const(k2, Vec::new()));
+@@ -1206,6 +1206,73 @@ fn a_left_out_build_is_built_again_once_per_thing_it_waited_on() {
+     std::fs::remove_dir_all(dir).unwrap();
+ }
+ 
++const DRAIN_UNIT_SOURCE: &str = r#"
++const K1: u32 = 40 + 2;
++pub fn root(x: u32) -> u32 { x.wrapping_add(K1) }
++fn main() {
++    let _ = root(1);
++}
++"#;
++
++const DRAIN_OTHER_SOURCE: &str = r#"
++fn main() {}
++"#;
++
++/// The owner's drain makes an item in the unit that noted it, whichever unit's code the owner runs
++/// when the drain is served. A proc macro's call puts the owner inside the macro world's unit
++/// (call_jit_in: that unit is the thread's), a wait in there serves the const_drain request of a
++/// program front, and the drain read the program's ids in the macro world's program: a host
++/// SIGSEGV in Unit::vtable / Unit::const_addr while a warm start built the macro world beside the
++/// running program (2026-11-26).
++#[test]
++fn the_drain_makes_an_item_in_the_unit_that_noted_it() {
++    isolated_test!(the_drain_makes_an_item_in_the_unit_that_noted_it);
++    crate::borrowck::lazy::disable_gandalf();
++    if std::env::var_os("RELAX_STD").is_none() {
++        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
++    }
++    let dir = std::env::temp_dir().join(format!("relax-drain-unit-{}", std::process::id()));
++    std::fs::create_dir_all(&dir).unwrap();
++    let unit_of = |name: &str, source: &str| {
++        let path = dir.join(format!("{name}.rs"));
++        std::fs::write(&path, source).unwrap();
++        let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), name, false).unwrap();
++        let k1 = prog.defs.iter().enumerate().find_map(|(i, d)| {
++            let id = DefId(i as u32);
++            (d.krate == krate && d.kind == DefKind::Const && prog.name(id) == "K1").then_some(id)
++        });
++        let mut tcx = Tcx::new();
++        tcx.collect(&prog);
++        assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
++        (Unit::new(prog, tcx, core), k1)
++    };
++    // the program's unit, the runtime's
++    let (mut u, k1) = unit_of("drain_unit", DRAIN_UNIT_SOURCE);
++    let k1 = k1.unwrap();
++    let up = &mut *u as *mut Unit;
++    unsafe { UNIT = up };
++    // another unit with a program of its own, as the proc-macro world's is: K1's id is none of its
++    let (mut w, _) = unit_of("drain_other", DRAIN_OTHER_SOURCE);
++    w.aux = true;
++    let wp = &mut *w as *mut Unit as usize;
++    assert!((k1.0 as usize) >= w.prog.defs.len() || w.prog.def(k1).kind != DefKind::Const, "the fixture's constant is one in the other program too");
++    let (epoch, other_epoch) = crate::owner::call(crate::owner::Class::Program, || (u.tcx.collect_epoch.load(Ordering::SeqCst), w.tcx.collect_epoch.load(Ordering::SeqCst)));
++    assert_eq!(epoch, other_epoch, "the epochs differ: the drain's epoch check alone would drop the item");
++    assert!(crate::owner::call(crate::owner::Class::Program, || u.front.consts.get(&(k1, Vec::new())).is_none()), "K1 was evaluated before the drain");
++    // a program front notes K1; the owner's drain is served while it runs the other unit's code
++    want(unsafe { &*up }, Wanted::Const(k1, Vec::new()), epoch);
++    crate::owner::call(crate::owner::Class::Job, move || {
++        let prev = CUR_UNIT.with(|c| c.replace(wp as *mut Unit));
++        const_drain();
++        CUR_UNIT.with(|c| c.set(prev));
++    });
++    assert!(crate::owner::call(crate::owner::Class::Program, || u.front.consts.get(&(k1, Vec::new())).is_some()), "the drain did not make K1 in the unit that noted it");
++    // (process exit owns the runtime's teardown)
++    std::mem::forget(u);
++    std::mem::forget(w);
++    std::fs::remove_dir_all(dir).unwrap();
++}
++
+ const TWIN_SOURCE: &str = r#"
+ pub struct S { a: Vec<u32> }
+ pub fn inner(s: &mut S, t: &S) -> u32 {
+-- 
+2.54.0 (Apple Git-157)
+
