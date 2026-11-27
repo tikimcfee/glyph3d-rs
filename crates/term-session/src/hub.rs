@@ -98,6 +98,52 @@ struct RoutingTable {
     /// thread, held briefly so an initial `REPAINT`/`Modes`/`Title` can never be lost on multicore.
     early: HashMap<u32, Vec<Event>>,
     closed_handles: VecDeque<u32>,
+    /// In-flight `subscribe`/`create_and_subscribe` RPCs whose handles have not yet been
+    /// registered in `inboxes`. While `> 0`, frames for handles in `closed_handles` are stashed
+    /// in `early` rather than dropped, because `g3d-termd` can reuse a recently unsubscribed
+    /// handle and stream its initial `REPAINT` before `register_session` runs.
+    pending_subscribes: usize,
+}
+
+impl RoutingTable {
+    fn prune_closed_early(&mut self) {
+        if self.pending_subscribes == 0 {
+            let closed = &self.closed_handles;
+            self.early.retain(|h, _| !closed.contains(h));
+        }
+    }
+}
+
+struct PendingSubscribeGuard<'a> {
+    inner: &'a HubInner,
+    armed: bool,
+}
+
+impl PendingSubscribeGuard<'_> {
+    fn finish(mut self, handle: u32, inbox: Arc<SessionInbox>) {
+        self.armed = false;
+        let mut table = self.inner.routing.lock().expect("routing mutex poisoned");
+        table.closed_handles.retain(|&h| h != handle);
+        if let Some(stashed) = table.early.remove(&handle) {
+            for ev in stashed {
+                let _ = inbox.push(ev);
+            }
+        }
+        table.inboxes.insert(handle, inbox);
+        table.pending_subscribes = table.pending_subscribes.saturating_sub(1);
+        table.prune_closed_early();
+    }
+}
+
+impl Drop for PendingSubscribeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut table = self.inner.routing.lock().expect("routing mutex poisoned");
+        table.pending_subscribes = table.pending_subscribes.saturating_sub(1);
+        table.prune_closed_early();
+    }
 }
 
 struct DaemonTracking {
@@ -172,15 +218,13 @@ impl HubInner {
         self.async_queue.push(cmd);
     }
 
-    pub(crate) fn register_session(&self, handle: u32, inbox: Arc<SessionInbox>) {
+    fn begin_subscribe(&self) -> PendingSubscribeGuard<'_> {
         let mut table = self.routing.lock().expect("routing mutex poisoned");
-        table.closed_handles.retain(|&h| h != handle);
-        if let Some(stashed) = table.early.remove(&handle) {
-            for ev in stashed {
-                let _ = inbox.push(ev);
-            }
+        table.pending_subscribes += 1;
+        PendingSubscribeGuard {
+            inner: self,
+            armed: true,
         }
-        table.inboxes.insert(handle, inbox);
     }
 
     pub(crate) fn unregister_session(&self, handle: u32) {
@@ -268,6 +312,7 @@ impl SessionHub {
                 inboxes: HashMap::new(),
                 early: HashMap::new(),
                 closed_handles: VecDeque::with_capacity(128),
+                pending_subscribes: 0,
             }),
             daemon: Mutex::new(DaemonTracking {
                 state: DaemonState::Connected {
@@ -364,17 +409,19 @@ impl SessionHub {
     /// Subscribes to existing terminal `opts.id` with explicit [`Subscribe`] options (such as
     /// [`Role::Own`] paired with [`Flow::Lossy`] for cross-namespace agent views).
     pub fn attach_with_options(&self, opts: &Subscribe) -> Result<TerminalSession, Error> {
+        let pending = self.inner.begin_subscribe();
         let sub = self.inner.termd_handle().subscribe_with(opts)?;
-        self.start_subscribed_session(&opts.id, sub)
+        self.start_subscribed_session(&opts.id, sub, pending)
     }
 
     fn start_subscribed_session(
         &self,
         id: &str,
         sub: Subscription,
+        pending: PendingSubscribeGuard<'_>,
     ) -> Result<TerminalSession, Error> {
         let inbox = Arc::new(SessionInbox::new(self.inner.options.coalesce.inbox_max_bytes));
-        self.inner.register_session(sub.handle, Arc::clone(&inbox));
+        pending.finish(sub.handle, Arc::clone(&inbox));
         match TerminalSession::spawn_worker(
             Arc::clone(&self.inner),
             id.to_owned(),
@@ -422,12 +469,13 @@ impl SessionHub {
             cols: None,
             rows: None,
         };
+        let pending = self.inner.begin_subscribe();
         let (created, sub) = self
             .inner
             .termd_handle()
             .create_and_subscribe(&create_req, &sub_req)?;
         let _ = Flow::Lossy;
-        self.start_subscribed_session(&created.id, sub)
+        self.start_subscribed_session(&created.id, sub, pending)
     }
 
     /// Lists all live terminals in the namespace (sorted by `id`) and attaches to each as its
@@ -621,10 +669,10 @@ fn dispatch_wire_event(inner: &HubInner, ev: Event) {
         let mut table = inner.routing.lock().expect("routing mutex poisoned");
         if let Some(inbox) = table.inboxes.get(&handle) {
             Some(Arc::clone(inbox))
-        } else if table.closed_handles.contains(&handle) {
+        } else if table.closed_handles.contains(&handle) && table.pending_subscribes == 0 {
             None
         } else {
-            if table.early.len() < 64 {
+            if table.early.len() < 64 || table.early.contains_key(&handle) {
                 table.early.entry(handle).or_default().push(ev);
             }
             return;
