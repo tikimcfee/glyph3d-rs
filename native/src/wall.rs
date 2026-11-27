@@ -8,6 +8,7 @@
 //! under `--no-default-features`; the GPU renderer (`renderer`) is gated on
 //! the `wgpu` feature.
 
+pub mod agents;
 #[cfg(feature = "windowed")]
 pub mod app;
 pub mod camera;
@@ -24,6 +25,8 @@ pub mod mount;
 #[cfg(feature = "egui-ui")]
 pub mod panels;
 pub mod paper;
+#[cfg(feature = "windowed")]
+pub mod perf;
 #[cfg(feature = "wgpu")]
 pub mod renderer;
 pub mod replay;
