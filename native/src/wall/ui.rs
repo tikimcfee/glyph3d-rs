@@ -196,6 +196,16 @@ impl WallUi {
         }
     }
 
+    /// Feed a synthetic [`egui::Event`] (from `wallctl` `app.move` / `app.click`)
+    /// into the next UI frame when any panel is active.
+    pub fn push_egui_event(&mut self, event: egui::Event) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.state.egui_input_mut().events.push(event);
+        true
+    }
+
     /// **Call 2 of 3:** run one frame of UI given a closure over `&egui::Context`.
     ///
     /// Returns `painted: None` and `repaint_after: None` when the closure emits

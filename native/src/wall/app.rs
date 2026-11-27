@@ -135,6 +135,7 @@ struct App {
     proxy: EventLoopProxy<Wake>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
+    agents: Option<super::agents::WallAgents>,
     /// The socket `wallctl` reaches this wall by; None if it could not bind
     /// (another wall holds the namespace) or the wall has no namespace.
     control: Option<wall_control::Server>,
@@ -518,7 +519,7 @@ impl App {
         });
         let terms = match &opts.namespace {
             Some(ns) => {
-                let mut sessions = match Sessions::open(ns, session_wake) {
+                let mut sessions = match Sessions::open(ns, session_wake.clone()) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("error: the wall could not reach its terminals: {e}");
@@ -567,8 +568,17 @@ impl App {
             window,
             cell_scale,
         });
+        let launch_cfg = crate::launch_config::LaunchConfig::load_or_default();
+        let agents = match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
+            Ok(agent_opts) => super::agents::WallAgents::with_options(agent_opts, session_wake),
+            Err(e) => {
+                log::warn!("{e}");
+                super::agents::WallAgents::new(session_wake)
+            }
+        };
         self.wall = Some(wall);
         self.terms = Some(terms);
+        self.agents = Some(agents);
         self.sync_font_and_text_knobs(None);
         self.apply_effects();
         self.refresh_termd_status();
@@ -608,6 +618,7 @@ impl App {
                 #[cfg(feature = "egui-ui")]
                 {
                     self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+                        || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard)
                         || g.ui.context().egui_wants_keyboard_input()
                 }
                 #[cfg(not(feature = "egui-ui"))]
@@ -952,7 +963,19 @@ impl App {
                 continue;
             }
             let reply = match (&mut self.wall, &self.terms) {
-                (Some(wall), Some(terms)) => wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text,
+                (Some(wall), Some(terms)) => {
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    match &mut self.agents {
+                        Some(agents) => {
+                            let r = agents.run_verb_with_screens(wall, line.as_str(), &lookup);
+                            if let Some(msg) = agents.take_notice() {
+                                wall.notify(&msg);
+                            }
+                            r.text
+                        }
+                        None => wall.run_with_screens(line.as_str(), &lookup).text,
+                    }
+                }
                 _ => "ERR: the wall is not open yet".to_string(),
             };
             responder.send(reply);
@@ -975,6 +998,9 @@ impl App {
             match n {
                 News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
                     if let Some(screen) = sessions.screen(&id) {
+                        if let Some(agents) = &mut self.agents {
+                            agents.note_terminal_scrolled(&id, scrolled_top, resized, within_margins, screen.modes.alt_screen);
+                        }
                         heard |= wall.terminal_screen_filled(
                             &id,
                             screen,
@@ -1046,7 +1072,20 @@ impl App {
         if heard {
             self.apply_effects();
         }
-        if request_redraw && (changed || heard) {
+        let mut agents_changed = false;
+        if let (Some(wall), Some(agents)) = (&mut self.wall, &mut self.agents) {
+            if let Some(Terminals::Live(sessions)) = &self.terms {
+                agents.sync_sessions(sessions);
+            }
+            agents_changed = agents.pump(wall);
+            if let Some(msg) = agents.take_notice() {
+                wall.notify(&msg);
+            }
+        }
+        if agents_changed {
+            self.apply_effects();
+        }
+        if request_redraw && (changed || heard || agents_changed) {
             self.redraw();
         }
     }
@@ -1209,9 +1248,13 @@ impl App {
         #[cfg(feature = "egui-ui")]
         let mut panel_verbs: Vec<String> = Vec::new();
         #[cfg(feature = "egui-ui")]
+        let mut agent_verbs: Vec<String> = Vec::new();
+        #[cfg(feature = "egui-ui")]
         let mut panel_egui_keys = false;
         #[cfg(feature = "egui-ui")]
-        let mut ui_painted = if self.hud_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
+        let agents_open = self.wall.as_ref().zip(self.agents.as_ref()).is_some_and(|(w, a)| a.has_open_views(w));
+        #[cfg(feature = "egui-ui")]
+        let mut ui_painted = if self.hud_open || agents_open || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described)) || g.ui.is_active() {
             let hud_terms: Vec<HudTerminalInfo<'_>> = described
                 .terminals
                 .iter()
@@ -1225,7 +1268,13 @@ impl App {
             let hud_open = &mut self.hud_open;
             let panels = &mut self.panels;
             let wall_ref = self.wall.as_ref();
+            let mut agents_ref = self.agents.as_mut();
+            let window_sf = g.window.scale_factor();
             let mut ui_frame = g.ui.run(&g.window, viewport, |ctx| {
+                agent_verbs.clear();
+                if let (Some(w), Some(ag)) = (wall_ref, agents_ref.as_deref_mut()) {
+                    ag.show_panel(ctx, w, viewport, window_sf, &mut agent_verbs);
+                }
                 if let Some(w) = wall_ref {
                     panel_verbs = panels.show(ctx, w, &described);
                 }
@@ -1297,10 +1346,19 @@ impl App {
                         if verb.starts_with("wall.status") {
                             status_opened = true;
                         }
-                        let reply = wall.run_with_screens(verb.as_str(), &lookup);
+                        let reply = match &mut self.agents {
+                            Some(agents) => agents.run_verb_with_screens(wall, verb.as_str(), &lookup),
+                            None => wall.run_with_screens(verb.as_str(), &lookup),
+                        };
                         self.panels.record_verb_reply(verb, &reply.text);
                     }
                     changed = true;
+                }
+                if let Some(agents) = &mut self.agents {
+                    changed |= agents.apply_own_panel_outputs(wall, &agent_verbs);
+                    if let Some(msg) = agents.take_notice() {
+                        wall.notify(&msg);
+                    }
                 }
             }
             if status_opened {
@@ -1308,6 +1366,7 @@ impl App {
             }
             if changed {
                 self.apply_effects();
+                self.redraw();
             }
         }
         self.sync_ime_cursor_area(&described);
@@ -1596,7 +1655,7 @@ impl App {
                 None => "ERR: the wall is not open yet".to_string(),
             },
             ScriptCommand::Move { x, y } => {
-                self.move_cursor(x, y);
+                self.script_move(x, y);
                 format!("OK: moved to ({x:.2}, {y:.2})")
             }
             ScriptCommand::Down { button, mods } => {
@@ -1604,7 +1663,7 @@ impl App {
                 if let Some(m) = mods {
                     self.modifiers = m;
                 }
-                self.mouse(ElementState::Pressed, button);
+                self.script_mouse(ElementState::Pressed, button);
                 if mods.is_some() {
                     self.modifiers = prev;
                 }
@@ -1615,7 +1674,7 @@ impl App {
                 if let Some(m) = mods {
                     self.modifiers = m;
                 }
-                self.mouse(ElementState::Released, button);
+                self.script_mouse(ElementState::Released, button);
                 if mods.is_some() {
                     self.modifiers = prev;
                 }
@@ -1625,9 +1684,9 @@ impl App {
                 let prev = self.modifiers;
                 self.modifiers = mods;
                 self.last_release = None;
-                self.move_cursor(x, y);
-                self.mouse(ElementState::Pressed, button);
-                self.mouse(ElementState::Released, button);
+                self.script_move(x, y);
+                self.script_mouse(ElementState::Pressed, button);
+                self.script_mouse(ElementState::Released, button);
                 self.modifiers = prev;
                 format!("OK: clicked {} at ({x:.2}, {y:.2})", button_label(button))
             }
@@ -1775,6 +1834,76 @@ impl App {
         }
     }
 
+    fn script_move(&mut self, x: f64, y: f64) {
+        self.cursor = Point::new(x, y);
+        #[cfg(feature = "egui-ui")]
+        if let Some(g) = &mut self.gfx {
+            g.ui.push_egui_event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
+            if pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+                == PointerTarget::Ui
+            {
+                return;
+            }
+        }
+        self.move_cursor(x, y);
+    }
+
+    fn script_mouse(&mut self, state: ElementState, button: MouseButton) {
+        #[cfg(feature = "egui-ui")]
+        {
+            let egui_btn = match button {
+                MouseButton::Left => Some(egui::PointerButton::Primary),
+                MouseButton::Right => Some(egui::PointerButton::Secondary),
+                MouseButton::Middle => Some(egui::PointerButton::Middle),
+                MouseButton::Back => Some(egui::PointerButton::Extra1),
+                MouseButton::Forward => Some(egui::PointerButton::Extra2),
+                MouseButton::Other(_) => None,
+            };
+            let m = self.mods();
+            let modifiers = egui::Modifiers {
+                alt: m.alt,
+                ctrl: m.ctrl,
+                shift: m.shift,
+                mac_cmd: cfg!(target_os = "macos") && m.meta,
+                command: if cfg!(target_os = "macos") { m.meta } else { m.ctrl },
+            };
+            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
+            if state == ElementState::Pressed {
+                let to_ui = self.buttons == 0
+                    && self.gfx.as_ref().is_some_and(|g| {
+                        pointer_target(g.ui.is_active(), g.ui.context(), self.cursor, self.buttons)
+                            == PointerTarget::Ui
+                    });
+                if to_ui {
+                    if let (Some(g), Some(btn)) = (&mut self.gfx, egui_btn) {
+                        g.ui.push_egui_event(egui::Event::PointerButton {
+                            pos,
+                            button: btn,
+                            pressed: true,
+                            modifiers,
+                        });
+                    }
+                    return;
+                }
+            } else {
+                let wall_held = button_of(button)
+                    .is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0);
+                if !wall_held {
+                    if let (Some(g), Some(btn)) = (&mut self.gfx, egui_btn) {
+                        g.ui.push_egui_event(egui::Event::PointerButton {
+                            pos,
+                            button: btn,
+                            pressed: false,
+                            modifiers,
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+        self.mouse(state, button);
+    }
+
     fn mouse(&mut self, state: ElementState, button: MouseButton) {
         let Some(b) = button_of(button) else { return };
         let bit = Buttons::from_button(b).0;
@@ -1864,7 +1993,8 @@ impl ApplicationHandler<Wake> for App {
             _ => false,
         };
         #[cfg(feature = "egui-ui")]
-        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+            || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard);
         #[cfg(feature = "egui-ui")]
         let feed_ui = !wall_chord_bypass
             && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
@@ -1942,6 +2072,7 @@ impl ApplicationHandler<Wake> for App {
         // The egui layer, the surface and the window go while the event
         // loop's display connection is still alive (see `Gfx`).
         self.perf.clear_gpu();
+        self.agents = None;
         self.control = None;
         self.gfx = None;
     }
@@ -2069,6 +2200,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         proxy: event_loop.create_proxy(),
         wall: None,
         terms: None,
+        agents: None,
         control: None,
         pending_shot: None,
         quit: false,
