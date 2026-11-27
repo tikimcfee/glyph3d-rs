@@ -4,11 +4,10 @@
 use std::collections::HashMap;
 
 use glam::Vec2;
-use wall_core::config::GroupLayout;
 use wall_core::geom::{Point, Rect};
 use wall_core::labels::{Candidate, Placement};
 use wall_core::layout::BAR_ROOM;
-use wall_core::store::FullscreenMode;
+use wall_core::status::StatusTone;
 use wall_core::wall::{TerminalFrame, WallFrame as DescribedFrame};
 
 use super::camera::WallCamera;
@@ -86,62 +85,10 @@ fn to_vec2(p: Point) -> Vec2 {
     Vec2::new(p.x as f32, p.y as f32)
 }
 
-/// Reconstruct the uncovered cutout holes for the fullscreen veil from
-/// `described`, matching `WallFullscreen._cutoutBoxes` in `wall/WallFullscreen.js`:
-/// - `Single`: the fullscreen terminal's `body_rect` (solo fullscreen hides its bar).
-/// - `Group` (`Split`): the union of all elevated split panes' window rects
-///   (`body_rect` + visible `title_bar`, so `splitGap` stays inside the cutout).
-/// - `Group` (`Tile` / `Freeform`): each elevated member's individual window rect
-///   (`fullscreen_veil_rects` decomposes multiple or overlapping rects into
-///   mutually disjoint strips without alpha seam overlap).
-fn fullscreen_holes(
-    described: &DescribedFrame,
-    bar_rects: &HashMap<&str, WorldRect>,
-) -> Vec<WorldRect> {
-    let Some(veil) = &described.fullscreen_backdrop else {
-        return Vec::new();
-    };
-    match veil.mode {
-        FullscreenMode::Single => described
-            .terminals
-            .iter()
-            .filter(|t| t.fullscreen || t.id == veil.target)
-            .map(|t| to_world_rect(t.body_rect))
-            .collect(),
-        FullscreenMode::Group => {
-            let is_split = described
-                .groups
-                .iter()
-                .find(|g| g.id == veil.target)
-                .is_some_and(|g| g.layout == GroupLayout::Split);
-            let member_windows: Vec<WorldRect> = described
-                .terminals
-                .iter()
-                .filter(|t| t.fullscreen)
-                .map(|t| {
-                    let body = to_world_rect(t.body_rect);
-                    match bar_rects.get(t.id.as_str()) {
-                        Some(&bar) if bar.height() > 0.0 => body.union(bar),
-                        _ => body,
-                    }
-                })
-                .collect();
-            if is_split {
-                let mut iter = member_windows.into_iter();
-                match iter.next() {
-                    Some(first) => vec![iter.fold(first, |acc, r| acc.union(r))],
-                    None => Vec::new(),
-                }
-            } else {
-                member_windows
-            }
-        }
-    }
-}
-
 /// Append all in-scene chrome (`groups`, `title_bars`, `selection_outlines`,
-/// `lasso`, `drop_preview`, `fullscreen_backdrop`, `map_labels`, and `notice`)
-/// from `described` into `shapes` and `labels`, and return the frame's [`PaperStyle`].
+/// `lasso`, `drop_preview`, `fullscreen_backdrop`, `map_labels`, `status_notice`,
+/// and `notice`) from `described` into `shapes` and `labels`, and return the
+/// frame's [`PaperStyle`].
 ///
 /// `camera.zoom` is in physical screen pixels per world unit (`described.camera.zoom * scale_factor`),
 /// `viewport` is physical `(width, height)`, and world units follow `wall_core`
@@ -226,7 +173,7 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         ..ChromeStyle::default()
     };
     if let Some(veil) = &described.fullscreen_backdrop {
-        style.veil_fill = css_color(&veil.background, style.veil_fill[3]);
+        style.veil_fill = css_color(&veil.background, veil.opacity as f32);
     }
 
     let term_by_id: HashMap<&str, &TerminalFrame> = described
@@ -248,16 +195,14 @@ pub fn describe_frame_chrome_with_scrollback_hits(
                 z: group.z as f32,
                 name: &group.name,
                 focused: group.focused,
-                hovered: false,
+                hovered: group.hovered,
             },
         );
     }
 
     // 2. Terminal title bars (always reserving `BAR_BUTTON_ROOM` on the right, matching `WallNames.js`).
-    let mut bar_rects: HashMap<&str, WorldRect> = HashMap::with_capacity(described.title_bars.len());
     for bar in &described.title_bars {
         let strip_world = to_world_rect(bar.rect);
-        bar_rects.insert(bar.terminal_id.as_str(), strip_world);
 
         let (body_rect, selected) = match term_by_id.get(bar.terminal_id.as_str()) {
             Some(tf) => (to_world_rect(tf.body_rect), tf.selected),
@@ -269,7 +214,8 @@ pub fn describe_frame_chrome_with_scrollback_hits(
                 false,
             ),
         };
-        let mut desc = TitleBarDesc::new(body_rect, bar.z as f32, &bar.text);
+        let mut desc = TitleBarDesc::new(body_rect, bar.z as f32, &bar.name);
+        desc.agent_status = bar.agent_status;
         desc.focused = bar.focused;
         desc.hovered = bar.hovered;
         desc.selected = selected;
@@ -368,7 +314,7 @@ pub fn describe_frame_chrome_with_scrollback_hits(
 
     // 6. Fullscreen dimming veil with disjoint cutout strips around the active pane(s).
     if let Some(veil) = &described.fullscreen_backdrop {
-        let holes = fullscreen_holes(described, &bar_rects);
+        let holes: Vec<WorldRect> = veil.cutouts.iter().copied().map(to_world_rect).collect();
         push_fullscreen_veil(
             shapes,
             &style,
@@ -382,9 +328,6 @@ pub fn describe_frame_chrome_with_scrollback_hits(
 
     // 7. Screen-placed map labels & leader lines for zoomed-out / narrow terminals.
     for (idx, ml) in described.map_labels.iter().enumerate() {
-        let hovered = term_by_id
-            .get(ml.terminal_id.as_str())
-            .is_some_and(|t| t.hovered);
         let placement = Placement {
             label_box: ml.label_box,
             cand: Candidate::Above,
@@ -399,7 +342,7 @@ pub fn describe_frame_chrome_with_scrollback_hits(
             &MapLabelDesc {
                 text: &ml.text,
                 focused: ml.focused,
-                hovered,
+                hovered: ml.hovered,
                 z: Z_OVERLAY + 2.0 + idx as f32 * 0.02,
                 geometry: MapLabelGeometry::Placed {
                     placement,
@@ -410,11 +353,30 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         );
     }
 
-    // 8. Top-of-wall notice banner, centered between any docked side panels.
-    if let Some(text) = described.notice.as_deref().filter(|s| !s.is_empty()) {
-        let mut notice = NoticeDesc::new(text, NoticeKind::Amber, *camera, viewport, Z_OVERLAY + 10.0);
+    // 8. Top-of-wall daemon status notice and/or transient wall notice, centered
+    //    between any docked side panels.
+    let mut next_notice_top: Option<f32> = None;
+    if let Some(sn) = described
+        .status_notice
+        .as_ref()
+        .filter(|n| !n.text.is_empty())
+    {
+        let kind = match sn.tone {
+            StatusTone::Red => NoticeKind::Red,
+            StatusTone::Amber | StatusTone::Ok | StatusTone::Muted => NoticeKind::Amber,
+        };
+        let mut notice = NoticeDesc::new(&sn.text, kind, *camera, viewport, Z_OVERLAY + 10.0);
         notice.left_inset_css_px = described.panels.dock.inset.left as f32;
         notice.right_inset_css_px = described.panels.dock.inset.right as f32;
+        push_notice(shapes, labels, fonts, &style, view, &notice);
+        next_notice_top =
+            Some(style.notice_top_px + style.notice_font_px + 2.0 * style.notice_pad_y_px + 6.0);
+    }
+    if let Some(text) = described.notice.as_deref().filter(|s| !s.is_empty()) {
+        let mut notice = NoticeDesc::new(text, NoticeKind::Amber, *camera, viewport, Z_OVERLAY + 10.5);
+        notice.left_inset_css_px = described.panels.dock.inset.left as f32;
+        notice.right_inset_css_px = described.panels.dock.inset.right as f32;
+        notice.top_css_px = next_notice_top;
         push_notice(shapes, labels, fonts, &style, view, &notice);
     }
 
@@ -640,5 +602,92 @@ mod tests {
         assert!(hits[0].contains_screen(0.5 * (x0 + x1), 0.5 * (y0 + y1)));
         assert!(!hits[0].contains_screen(x0 - 5.0, y0));
         assert!(labels.iter().any(|l| l.text == "↑25 · live"));
+    }
+
+    #[test]
+    fn describe_wires_group_hover_agent_three_span_map_hover_and_status_notice() {
+        use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+        use wall_core::input::Mods;
+        use wall_core::pointer::{Buttons, PointerEvent};
+        use wall_core::wall::NoScreens;
+
+        let (metrics, mut atlas, family) = load_test_fonts();
+        let mut wall = make_wall(metrics);
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24).with_title("one"));
+        wall.terminal_appeared(TerminalAppeared::new("t2", 80, 24).with_title("two"));
+        let _ = wall.run("wall.group t1 t2");
+        wall.set_bus_snapshot(
+            Some(GomuxSnapshot {
+                gen: 1,
+                host: Some("local".to_owned()),
+                agents: vec![GomuxAgent {
+                    name: "helper".to_owned(),
+                    host: Some("local".to_owned()),
+                    live: true,
+                    status: Some("waiting".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            "",
+        );
+        let _ = wall.run("wall.attach helper");
+        wall.terminal_appeared(TerminalAppeared::new("t3", 80, 24));
+        let _ = wall.run("wall.fit");
+        let _ = wall.tick(2.0, 2000.0);
+
+        // Hover group header.
+        let f0 = wall.frame();
+        let hdr = f0.groups[0].header_rect;
+        let hdr_pt = f0.camera.to_screen(
+            Point::new(0.5 * (hdr.min_x + hdr.max_x), 0.5 * (hdr.min_y + hdr.max_y)),
+            f0.viewport.w,
+            f0.viewport.h,
+        );
+        wall.pointer_move(
+            &PointerEvent {
+                pointer_id: 1,
+                x: hdr_pt.x,
+                y: hdr_pt.y,
+                button: None,
+                buttons: Buttons::NONE,
+                mods: Mods::default(),
+                time_ms: 2100.0,
+            },
+            &NoScreens,
+        );
+        // Trigger a Red daemon status notice alongside the group hover and agent-attached title bar.
+        wall.on_termd_brain_failed(2100);
+        let f1 = wall.frame();
+        assert!(f1.groups[0].hovered);
+        assert!(f1.status_notice.is_some());
+
+        let sf = 2.0_f32;
+        let vp = (3200, 2000);
+        let cam = WallCamera::new(
+            Vec2::new(f1.camera.x as f32, f1.camera.y as f32),
+            f1.camera.zoom as f32 * sf,
+        );
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        {
+            let mut fonts = ChromeFonts::new(metrics, &mut atlas, family);
+            describe_frame_chrome(&f1, &cam, vp, sf, &mut fonts, &mut shapes, &mut labels);
+        }
+        // Three-span agent title emits separate `helper@local`, ` · `, and `waiting` labels.
+        assert!(labels.iter().any(|l| l.text == "helper@local"));
+        assert!(labels.iter().any(|l| l.text == " · "));
+        assert!(labels.iter().any(|l| l.text == "waiting"));
+        // Red status notice emits a label with the daemon outage text and red notice fill shape.
+        assert!(labels.iter().any(|l| l.text.contains("termd's engine is down")));
+        let style = ChromeStyle::default();
+        assert!(shapes.iter().any(|s| matches!(
+            s,
+            Shape::Rect(r) if r.fill == Some(style.group_header_fill_hovered)
+        )));
+        assert!(shapes.iter().any(|s| matches!(
+            s,
+            Shape::Rect(r) if r.fill == Some(style.notice_red_fill)
+        )));
     }
 }
