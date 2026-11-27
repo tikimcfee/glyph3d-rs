@@ -156,6 +156,14 @@ impl WallUi {
         &self.ctx
     }
 
+    /// Surrender focus from any currently focused egui widget (e.g. when the user
+    /// clicks on the wall canvas or a global navigation chord blurs panel search).
+    pub fn surrender_focus(&self) {
+        if let Some(id) = self.ctx.memory(|m| m.focused()) {
+            self.ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+    }
+
     /// True if scripted or window events are queued in `RawInput` awaiting [`Self::run`].
     pub fn has_pending_input(&self) -> bool {
         !self.state.egui_input().events.is_empty()
@@ -251,7 +259,6 @@ impl WallUi {
         }
         self.pending_free.extend(painted.textures_delta.free.drain());
     }
-
     /// The system clipboard's text, through the window's own clipboard
     /// (`smithay-clipboard` on Wayland, where a fresh `arboard` speaks only
     /// X11 and fails; `arboard` elsewhere).
@@ -311,6 +318,11 @@ impl WallUi {
         } = full_output;
 
         self.state.handle_platform_output(window, platform_output);
+        if !self.state.allow_ime() {
+            // Keep window IME enabled for terminals even after an egui `TextEdit`
+            // surrenders focus and `egui-winit` toggles `set_ime_allowed(false)`.
+            window.set_ime_allowed(true);
+        }
 
         let has_shapes = !shapes.is_empty();
         self.active = has_shapes;

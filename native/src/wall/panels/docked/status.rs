@@ -46,6 +46,10 @@ pub struct StatusInput {
     /// Horizontal `(left, right)` chrome insets from `wall_core::dock::dock_layout` used to center
     /// the under-topbar notice between docked panels.
     pub chrome_inset: (f32, f32),
+    /// Whether `show` should render its own `egui` outage notice banner (`true` by default;
+    /// callers whose canvas chrome renders `WallFrame::status_notice` set `false` to avoid
+    /// drawing two stacked banners).
+    pub show_notice: bool,
     /// Host platform (`Mac` vs `Linux`/`Other`) for `⌘S` / `Ctrl+Alt+S` tooltips.
     pub platform: Platform,
 }
@@ -63,6 +67,7 @@ impl Default for StatusInput {
             dock_rect: None,
             chip_pos: Some(egui::pos2(12.0, 10.0)),
             chrome_inset: (12.0, 12.0),
+            show_notice: true,
             platform: Platform::host(),
         }
     }
@@ -159,9 +164,12 @@ pub fn show(
     } else {
         state.trouble_since_ms.unwrap_or(input.now_ms)
     };
-    if let Some(notice) = notice_for(&input.status, since_ms, input.now_ms, input.restart_notice_ms)
-    {
-        show_notice(ctx, &notice, input.chrome_inset, out);
+    if input.show_notice {
+        if let Some(notice) =
+            notice_for(&input.status, since_ms, input.now_ms, input.restart_notice_ms)
+        {
+            show_notice(ctx, &notice, input.chrome_inset, out);
+        }
     }
 
     if input.placement.open {
