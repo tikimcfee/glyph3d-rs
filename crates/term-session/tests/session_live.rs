@@ -1210,18 +1210,15 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         );
     }
 
-    // The rows above are back on the screen, and that is the claim. Who brought them is the
-    // daemon's business: since the T2 fix (PROTOCOL.md `resize`: a primary-screen resize that
+    // The rows above are back on the screen, and that is the claim. Who brought them is by
+    // the daemon's protocol. A 1.6 daemon (PROTOCOL.md `resize`: a primary-screen resize that
     // grows while the terminal holds scrollback sends each raw subscriber a live `REPAINT`
-    // right after `size`), g3d-termd pulls them itself, and the session's own debounced
-    // request is no longer what does it. Until 2026-11-27 this asserted `repaints_sent == 1`
-    // here, true of a daemon that sent `size` alone; against one that repaints, the screen is
-    // right before the session's settle timer has run, and the count read 0 or 1 by timing.
-    //
-    // What stays the session's to hold: at most ONE request for the whole 14-step drag, never
-    // one per step. (Against this daemon it still sends that one: the drag's last steps have no
-    // scrollback left to pull, so their `size` comes with no `REPAINT` to cancel the timer.)
-    // Let the timer run out, then count, and see the screen is still right.
+    // right after `size`) pulls them itself, and the session asks for nothing: not even after
+    // the drag's last steps, whose `size` comes alone because no scrollback was left to pull.
+    // A 1.5 daemon sends `size` alone, and the session asks ONCE for the whole 14-step drag,
+    // after it settles. (`grow_repaint.rs` holds both against a mock; this is whichever the
+    // daemon under test speaks.) Let the settle time run out, then count, and see the screen
+    // is still right.
     std::thread::sleep(term_session::DEFAULT_GROW_REPAINT_SETTLE * 4);
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(5), || {
@@ -1235,14 +1232,16 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         screen_lines(&session)
     );
     let grow_stats = session.stats();
+    let proto = hub.welcome().proto;
+    let want_repaints = u64::from(proto < [1, 6]);
     println!(
-        "[bench T2 14-step primary grow 80x24->132x40] resizes_sent={} (of 14) · repaints_sent={} (at most 1 for the drag)",
-        grow_stats.resizes_sent, grow_stats.repaints_sent
+        "[bench T2 14-step primary grow 80x24->132x40] protocol {}.{} · resizes_sent={} (of 14) · repaints_sent={} (want {want_repaints})",
+        proto[0], proto[1], grow_stats.resizes_sent, grow_stats.repaints_sent
     );
-    assert!(
-        grow_stats.repaints_sent <= 1,
-        "a 14-step primary grow asks termd for a repaint at most once, after it settles, got {}",
-        grow_stats.repaints_sent
+    assert_eq!(
+        grow_stats.repaints_sent, want_repaints,
+        "a 14-step primary grow asks a protocol {}.{} termd for {want_repaints} repaint(s)",
+        proto[0], proto[1]
     );
     let asked_for_the_grow = grow_stats.repaints_sent;
 
