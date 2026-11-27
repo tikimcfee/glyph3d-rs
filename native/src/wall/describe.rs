@@ -164,6 +164,42 @@ pub fn describe_frame_chrome_with_scrollback_hits(
     hovered_pill: Option<&str>,
     pill_hits: &mut Vec<ScrollbackPillHit>,
 ) -> PaperStyle {
+    describe_frame_chrome_with_options(
+        described,
+        camera,
+        viewport,
+        scale_factor,
+        fonts,
+        shapes,
+        labels,
+        scrollback,
+        hovered_pill,
+        pill_hits,
+        true,
+    )
+}
+
+/// Same as [`describe_frame_chrome_with_scrollback_hits`], with `draw_status_notice`
+/// controlling whether `described.status_notice` is painted on the canvas layer
+/// (set `false` when `egui-ui` paints the interactive dismissible banner in `status::show_notice`,
+/// while still reserving top spacing so transient notices stack cleanly underneath it).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "extends describe_frame_chrome_with_scrollback_hits with canvas status-notice toggle"
+)]
+pub fn describe_frame_chrome_with_options(
+    described: &DescribedFrame,
+    camera: &WallCamera,
+    viewport: (u32, u32),
+    scale_factor: f32,
+    fonts: &mut ChromeFonts<'_>,
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    scrollback: impl Fn(&str) -> Option<TerminalScrollback>,
+    hovered_pill: Option<&str>,
+    pill_hits: &mut Vec<ScrollbackPillHit>,
+    draw_status_notice: bool,
+) -> PaperStyle {
     let view = ChromeView::new(camera.zoom, scale_factor);
     let mut style = ChromeStyle {
         bar_max_world: BAR_ROOM as f32,
@@ -383,14 +419,16 @@ pub fn describe_frame_chrome_with_scrollback_hits(
         .as_ref()
         .filter(|n| !n.text.is_empty())
     {
-        let kind = match sn.tone {
-            StatusTone::Red => NoticeKind::Red,
-            StatusTone::Amber | StatusTone::Ok | StatusTone::Muted => NoticeKind::Amber,
-        };
-        let mut notice = NoticeDesc::new(&sn.text, kind, *camera, viewport, Z_OVERLAY + 10.0);
-        notice.left_inset_css_px = described.panels.dock.inset.left as f32;
-        notice.right_inset_css_px = described.panels.dock.inset.right as f32;
-        push_notice(shapes, labels, fonts, &style, view, &notice);
+        if draw_status_notice {
+            let kind = match sn.tone {
+                StatusTone::Red => NoticeKind::Red,
+                StatusTone::Amber | StatusTone::Ok | StatusTone::Muted => NoticeKind::Amber,
+            };
+            let mut notice = NoticeDesc::new(&sn.text, kind, *camera, viewport, Z_OVERLAY + 10.0);
+            notice.left_inset_css_px = described.panels.dock.inset.left as f32;
+            notice.right_inset_css_px = described.panels.dock.inset.right as f32;
+            push_notice(shapes, labels, fonts, &style, view, &notice);
+        }
         next_notice_top =
             Some(style.notice_top_px + style.notice_font_px + 2.0 * style.notice_pad_y_px + 6.0);
     }

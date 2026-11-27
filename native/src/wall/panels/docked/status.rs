@@ -105,6 +105,8 @@ pub struct StatusState {
     pub header_drag_rect: Option<egui::Rect>,
     /// Terminal ids rendered in the status table on the last open pass.
     pub shown_row_ids: Vec<String>,
+    /// Hit rectangle of the clickable `×` dismiss button on a red outage notice, if visible.
+    pub notice_dismiss_rect: Option<egui::Rect>,
 }
 
 /// Alias matching `StatusPanel` naming.
@@ -142,6 +144,7 @@ pub fn show(
     out: &mut Vec<String>,
 ) -> bool {
     state.wants_keyboard = false;
+    state.notice_dismiss_rect = None;
 
     if !input.status.state().is_trouble() {
         state.trouble_since_ms = None;
@@ -168,7 +171,7 @@ pub fn show(
         if let Some(notice) =
             notice_for(&input.status, since_ms, input.now_ms, input.restart_notice_ms)
         {
-            show_notice(ctx, &notice, input.chrome_inset, out);
+            state.notice_dismiss_rect = show_notice_impl(ctx, &notice, input.chrome_inset, out);
         }
     }
 
@@ -273,12 +276,22 @@ pub fn show_notice(
     chrome_inset: (f32, f32),
     out: &mut Vec<String>,
 ) {
+    let _ = show_notice_impl(ctx, notice, chrome_inset, out);
+}
+
+fn show_notice_impl(
+    ctx: &egui::Context,
+    notice: &StatusNotice,
+    chrome_inset: (f32, f32),
+    out: &mut Vec<String>,
+) -> Option<egui::Rect> {
     let viewport = panel_viewport_rect(ctx);
     let span_left = viewport.left() + chrome_inset.0;
     let span_right = (viewport.right() - chrome_inset.1).max(span_left + 80.0);
     let center_x = (span_left + span_right) * 0.5;
     let max_w = (span_right - span_left).max(80.0).min((viewport.width() - 32.0).max(80.0));
     let color = tone_color(notice.tone);
+    let mut dismiss_rect = None;
 
     egui::Area::new(egui::Id::new("wall_termd_notice"))
         .anchor(
@@ -305,6 +318,7 @@ pub fn show_notice(
                         );
                         if notice.dismiss {
                             let (_id, rect) = ui.allocate_space(egui::vec2(16.0, 16.0));
+                            dismiss_rect = Some(rect);
                             let resp = ui
                                 .interact(
                                     rect,
@@ -339,6 +353,7 @@ pub fn show_notice(
                     });
                 });
         });
+    dismiss_rect
 }
 
 /// Render the `StatusWindow` panel (`StatusWindow` in `StatusWindow.jsx`).

@@ -68,6 +68,8 @@ pub enum News {
     Modes { id: String, modes: Modes },
     /// Its program exited and the terminal closed: nothing more arrives.
     Ended { id: String },
+    /// Updated daemon status snapshot pushed by the primary `g3d-termd` (`status_follow`).
+    Status(serde_json::Value),
     /// The daemon connection is gone for good.
     Disconnected { message: String },
 }
@@ -141,6 +143,7 @@ pub struct Sessions {
     detached_ended: Vec<String>,
     reconnected_hub: Arc<Mutex<Option<SessionHub>>>,
     watching_reconnect: Arc<AtomicBool>,
+    reconnect_socket_absent: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -244,6 +247,7 @@ impl Sessions {
             detached_ended: Vec::new(),
             reconnected_hub: Arc::new(Mutex::new(None)),
             watching_reconnect: Arc::new(AtomicBool::new(false)),
+            reconnect_socket_absent: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicBool::new(false)),
         };
         for idx in 0..sessions.extras.len() {
@@ -259,10 +263,12 @@ impl Sessions {
         &self.hub
     }
 
-    /// Whether the passive reconnect watcher is active and the namespace socket is currently absent.
+    /// Whether the passive reconnect watcher is active and the namespace socket is absent
+    /// or refusing connections (`ENOENT` / `ECONNREFUSED`).
     pub fn is_reconnect_socket_absent(&self) -> bool {
         self.watching_reconnect.load(Ordering::Acquire)
-            && self.target.resolve_socket().is_ok_and(|p| !p.exists())
+            && (self.reconnect_socket_absent.load(Ordering::Acquire)
+                || self.target.resolve_socket().is_ok_and(|p| !p.exists()))
     }
 
     /// Underlying [`TerminalSession`] for `id`, if currently adopted.
@@ -326,6 +332,7 @@ impl Sessions {
     }
 
     fn start_passive_reconnect_watcher(&self) {
+        self.reconnect_socket_absent.store(false, Ordering::Release);
         Self::spawn_reconnect_thread(
             "term-reconnect",
             self.target.clone(),
@@ -333,6 +340,7 @@ impl Sessions {
             Arc::clone(&self.wake),
             Arc::clone(&self.reconnected_hub),
             Arc::clone(&self.watching_reconnect),
+            Some(Arc::clone(&self.reconnect_socket_absent)),
             Arc::clone(&self.dropped),
         );
     }
@@ -346,10 +354,12 @@ impl Sessions {
             Arc::clone(&self.wake),
             Arc::clone(&extra.reconnected_hub),
             Arc::clone(&extra.watching_reconnect),
+            None,
             Arc::clone(&self.dropped),
         );
     }
 
+    #[expect(clippy::too_many_arguments, reason = "internal passive reconnect thread helper")]
     fn spawn_reconnect_thread(
         thread_name: &str,
         target: Target,
@@ -357,6 +367,7 @@ impl Sessions {
         wake: Arc<dyn Fn() + Send + Sync>,
         slot: Arc<Mutex<Option<SessionHub>>>,
         watching: Arc<AtomicBool>,
+        socket_absent: Option<Arc<AtomicBool>>,
         dropped: Arc<AtomicBool>,
     ) {
         if dropped.load(Ordering::Acquire) {
@@ -378,14 +389,30 @@ impl Sessions {
                     if dropped.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Ok(new_hub) =
-                        SessionHub::connect_with(&target, opts.clone(), Arc::clone(&wake))
-                    {
-                        let _ = new_hub.status_follow(Some(500));
-                        *slot.lock().expect("reconnected_hub mutex poisoned") = Some(new_hub);
-                        watching.store(false, Ordering::Release);
-                        wake();
-                        return;
+                    match SessionHub::connect_with(&target, opts.clone(), Arc::clone(&wake)) {
+                        Ok(new_hub) => {
+                            let _ = new_hub.status_follow(Some(500));
+                            *slot.lock().expect("reconnected_hub mutex poisoned") = Some(new_hub);
+                            if let Some(flag) = &socket_absent {
+                                flag.store(false, Ordering::Release);
+                            }
+                            watching.store(false, Ordering::Release);
+                            wake();
+                            return;
+                        }
+                        Err(termd_client::Error::Io(ref err))
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                            ) =>
+                        {
+                            if let Some(flag) = &socket_absent {
+                                if !flag.swap(true, Ordering::AcqRel) {
+                                    wake();
+                                }
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
                 watching.store(false, Ordering::Release);
@@ -600,6 +627,7 @@ impl Sessions {
             news.push(News::Ended { id });
         }
         let mut daemon_gone = false;
+        let mut latest_status: Option<serde_json::Value> = None;
 
         for ev in self.hub.poll_daemon_events() {
             match ev {
@@ -633,8 +661,12 @@ impl Sessions {
                             }
                         }
                     }
+                    latest_status = Some(doc);
                 }
             }
+        }
+        if let Some(doc) = latest_status {
+            news.push(News::Status(doc));
         }
 
         let mut extra_gone_indices = Vec::new();

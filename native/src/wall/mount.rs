@@ -477,8 +477,9 @@ impl Panels {
                     described.panels.dock.inset.left as f32,
                     described.panels.dock.inset.right as f32,
                 ),
-                // `describe.rs` draws `described.status_notice` on the canvas chrome layer.
-                show_notice: false,
+                // `egui-ui` owns the interactive dismissible outage banner (`×` -> `wall.status.dismiss`);
+                // `app.rs` passes `draw_status_notice = false` to `describe.rs` so only one banner paints.
+                show_notice: true,
                 platform,
             };
             status::show(ctx, &mut self.status, &input, &mut out);
@@ -821,12 +822,13 @@ impl Panels {
             self.status.shown_row_ids.join(",")
         };
         lines.push(format!(
-            "panel status open={} side={} rows={} rect={} header={}",
+            "panel status open={} side={} rows={} rect={} header={} notice_dismiss={}",
             st.open,
             dock_side_name(st.side),
             st_rows,
             fmt_opt_rect(self.status.last_rect),
             fmt_opt_rect(self.status.header_drag_rect),
+            fmt_opt_rect(self.status.notice_dismiss_rect),
         ));
 
         let sp = &described.panels.settings_panel;
@@ -1476,5 +1478,71 @@ mod tests {
             _ => false,
         });
         assert!(has_ring, "expected #e5534b close-hold ring painted during keyboard Chord+X hold");
+    }
+
+    #[test]
+    fn termd_outage_notice_dismiss_button_clears_red_banner() {
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+
+        // Simulate daemon with a live terminal disappearing -> red dismissible `Lost` banner.
+        let _ = wall.on_termd_status(
+            serde_json::json!({
+                "daemon": { "version": "1.0", "ns": "rs-wall" },
+                "terminals": [{ "id": "t1", "cols": 100, "rows": 30 }],
+            }),
+            1_000,
+        );
+        wall.on_termd_disconnected(false, 2_000);
+        wall.on_termd_socket_absent(3_000);
+        assert!(
+            wall.frame().status_notice.as_ref().is_some_and(|n| n.dismiss),
+            "expected dismissible Lost outage notice"
+        );
+
+        // Two warm-up passes so egui lays out the banner and records `notice_dismiss_rect`.
+        let _ = run_pass_at(&ctx, 1.0, Vec::new(), &mut panels, &mut wall);
+        let _ = run_pass_at(&ctx, 1.1, Vec::new(), &mut panels, &mut wall);
+        let dismiss_pt = panels
+            .status
+            .notice_dismiss_rect
+            .expect("dismiss × rect must be exposed on red outage notice")
+            .center();
+
+        // Clicking × emits `wall.status.dismiss` and clears the banner.
+        let _ = run_pass_at(
+            &ctx,
+            1.2,
+            vec![
+                egui::Event::PointerMoved(dismiss_pt),
+                egui::Event::PointerButton {
+                    pos: dismiss_pt,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut panels,
+            &mut wall,
+        );
+        let (verbs, _) = run_pass_at(
+            &ctx,
+            1.3,
+            vec![egui::Event::PointerButton {
+                pos: dismiss_pt,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut panels,
+            &mut wall,
+        );
+        assert_eq!(verbs, vec!["wall.status.dismiss".to_string()]);
+        assert!(
+            wall.frame().status_notice.is_none(),
+            "clicking × must clear the red outage notice"
+        );
     }
 }

@@ -1654,6 +1654,23 @@ impl App {
                     heard = true;
                     ended_any = true;
                 }
+                News::Status(doc) => {
+                    let status_open = wall.store().status_window().open;
+                    let prev_state = wall.termd().state();
+                    let prev_terms = wall.termd().doc().map_or(0, |d| d.terminals.len());
+                    let prev_errors = wall.termd().doc().map_or(0, |d| d.errors.len());
+                    let _ = wall.on_termd_status(doc, epoch_now_ms());
+                    let next_state = wall.termd().state();
+                    let next_terms = wall.termd().doc().map_or(0, |d| d.terminals.len());
+                    let next_errors = wall.termd().doc().map_or(0, |d| d.errors.len());
+                    if status_open
+                        || next_state != prev_state
+                        || next_terms != prev_terms
+                        || next_errors != prev_errors
+                    {
+                        heard = true;
+                    }
+                }
                 News::Disconnected { message } => {
                     log::error!("termd is gone: {message}");
                     wall.set_connected(false);
@@ -1739,7 +1756,7 @@ impl App {
         let now_ms = self.now_ms();
         let Some(wall) = &mut self.wall else { return };
         let moving = wall.tick(dt, now_ms);
-        if wall.termd().state() == TermdState::Unreachable
+        if matches!(wall.termd().state(), TermdState::Restarting | TermdState::Unreachable)
             && matches!(&self.terms, Some(Terminals::Live(s)) if s.is_reconnect_socket_absent())
         {
             wall.on_termd_socket_absent(epoch_now_ms());
@@ -1860,7 +1877,7 @@ impl App {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome_with_scrollback_hits(
+            super::describe::describe_frame_chrome_with_options(
                 &described,
                 &camera,
                 viewport,
@@ -1871,6 +1888,7 @@ impl App {
                 |id| terms.scrollback(id),
                 self.hovered_scrollback_pill.as_deref(),
                 &mut pill_hits,
+                !cfg!(feature = "egui-ui"),
             )
         };
         if let Some(ref hid) = self.hovered_scrollback_pill {

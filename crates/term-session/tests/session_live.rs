@@ -2019,3 +2019,39 @@ fn set_bold_is_bright_updates_live_and_new_sessions() {
         "bold_is_bright=false did not restore standard red on live terminals"
     );
 }
+
+#[test]
+fn sessions_pump_surfaces_live_news_status_updates() {
+    let scratch = ScratchDaemon::new("stpush");
+    let wake = Arc::new(WakeSignal::default());
+
+    let mut sessions =
+        term_session::Sessions::open_target(&scratch.target(), wake.waker()).expect("open");
+    let (id, _, _) = sessions
+        .spawn(Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()]), 80, 24)
+        .expect("spawn");
+
+    let mut seen = wake.current();
+    let mut got_status = false;
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            let (_, news) = sessions.pump();
+            for n in news {
+                if let term_session::News::Status(doc) = n {
+                    if doc
+                        .get("terminals")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter()
+                                .any(|t| t.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                        })
+                    {
+                        got_status = true;
+                    }
+                }
+            }
+            got_status
+        }),
+        "Sessions::pump must emit News::Status containing the spawned terminal"
+    );
+}
