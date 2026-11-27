@@ -563,6 +563,9 @@ pub struct AgentPart {
 /// in, or an agent with no terminal on the wall.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryRow {
+    /// The terminal's name, or the agent's when it has no terminal, without an
+    /// `@host` ending that names the row's own host (the list says the host by
+    /// where the row is, or by its `host_tag`).
     pub name: String,
     /// `Some` for a terminal on the wall.
     pub terminal: Option<TerminalPart>,
@@ -669,6 +672,21 @@ fn host_label(host: &str) -> String {
         "this host".to_string()
     } else {
         host.to_string()
+    }
+}
+
+/// A row's name without an `@host` ending that names the row's own host. The
+/// wall names an attach terminal after its target (`coder@laptop-2`), and the
+/// list says the host elsewhere: a host section's header in host mode; in group
+/// mode nothing for this machine, and the row's host tag for another. Any other
+/// `@` in a name (an ssh title, `me@elsewhere`) is the terminal's own and stays.
+fn row_name(name: &str, host: &str) -> String {
+    if host.is_empty() {
+        return name.to_string();
+    }
+    match name.strip_suffix(host).and_then(|rest| rest.strip_suffix('@')) {
+        Some(bare) if !bare.is_empty() => bare.to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -900,7 +918,7 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
         };
         drafts.push(Draft {
             row: EntryRow {
-                name: t.name.clone(),
+                name: row_name(&t.name, &host),
                 terminal: Some(build_terminal_part(t, group.is_some())),
                 agent: agent.map(|a| build_agent_part(a, Some(&t.id))),
                 host_tag: (by_group && !local).then(|| host_label.clone()),
@@ -1140,11 +1158,13 @@ mod tests {
         SidebarInput {
             terminals: vec![
                 term("t1", "shell", Some("g-1"), None),
-                term("gx-lead", "lead", Some("g-1"), None),
-                term("t3", "gate", Some("g-1"), Some("linux-gate@workstation")),
+                // The wall names an attach terminal after its target.
+                term("gx-lead", "lead@laptop-2", Some("g-1"), None),
+                term("t3", "linux-gate@workstation", Some("g-1"), Some("linux-gate@workstation")),
                 logs,
                 term("t5", "bench", Some("g-2"), Some("bench@workstation")),
-                term("t6", "scratch", None, None),
+                // An `@` that is not this row's host is the terminal's own name.
+                term("t6", "me@elsewhere", None, None),
                 term("t7", "remote shell", None, Some("worker@workstation")),
             ],
             groups: vec![
@@ -1251,11 +1271,16 @@ mod tests {
         assert!(entry(&model, "t:t6").chip.is_none());
         assert!(entry(&model, "a:probe@laptop-2").chip.is_none());
 
-        // Rows from another machine say so.
+        // Rows from another machine say so, in the tag and not twice: a name's
+        // `@host` ending goes when it names the row's own host.
         let gate = entry(&model, "t:t3+linux-gate@workstation");
         assert_eq!(gate.host, "workstation");
         assert_eq!(gate.host_tag.as_deref(), Some("workstation"));
+        assert_eq!(gate.name, "linux-gate");
         assert!(!gate.local);
+        // On this machine nothing says the host, and nothing needs to.
+        assert_eq!(entry(&model, "t:gx-lead+lead@laptop-2").name, "lead");
+        assert_eq!(entry(&model, "t:t6").name, "me@elsewhere");
         let bench = entry(&model, "t:t5");
         assert_eq!(bench.host, "workstation");
         assert!(bench.agent.is_none());
@@ -1321,6 +1346,11 @@ mod tests {
             ("build", group_color("g-1"), true)
         );
         assert!(gate.host_tag.is_none(), "the host section says the host");
+        // So no row repeats it: not this machine's, not another's.
+        assert_eq!(gate.name, "linux-gate");
+        assert_eq!(entry(&model, "t:gx-lead+lead@laptop-2").name, "lead");
+        assert_eq!(entry(&model, "a:zeta@alpha-box").name, "zeta");
+        assert_eq!(entry(&model, "t:t6").name, "me@elsewhere");
         assert_eq!(
             entry(&model, "t:t4").chip.as_ref().map(|c| c.name.as_str()),
             Some("docs")
@@ -1660,6 +1690,20 @@ mod tests {
         }
         assert_eq!(SidebarMode::parse("hosts"), None);
         assert_eq!(SidebarMode::Host.verb(), vec!["wall.sidebar", "mode", "host"]);
+    }
+
+    #[test]
+    fn a_rows_name_drops_only_an_ending_that_names_its_own_host() {
+        assert_eq!(row_name("coder@laptop-2", "laptop-2"), "coder");
+        assert_eq!(row_name("coder@laptop-2", "workstation"), "coder@laptop-2");
+        assert_eq!(row_name("a@b@workstation", "workstation"), "a@b");
+        // Not a suffix of a longer host, not without the `@`, never down to nothing.
+        assert_eq!(row_name("coder@big-workstation", "workstation"), "coder@big-workstation");
+        assert_eq!(row_name("workstation", "workstation"), "workstation");
+        assert_eq!(row_name("@workstation", "workstation"), "@workstation");
+        // An unnamed local host ends no name.
+        assert_eq!(row_name("coder@", ""), "coder@");
+        assert_eq!(row_name("zsh", "laptop-2"), "zsh");
     }
 
     fn relative_luminance(hex: &str) -> f64 {
