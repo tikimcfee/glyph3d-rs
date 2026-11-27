@@ -613,10 +613,10 @@ struct WallCore {
     /// Latest clock timestamp (ms) observed on `termd` status transitions or ticks,
     /// supporting callers that pass either monotonic or Unix epoch ms into `on_termd_*`.
     termd_now_ms: Option<u64>,
-    /// `WallCore::now_ms` at the previous `advance_termd_clock` step after an out-of-band
-    /// epoch-ms `on_termd_*` update, so unclamped real elapsed time drives grace escalation
-    /// even when the window caps `dt_secs` at `1/30 s`.
-    termd_tick_wall_ms: Option<f64>,
+    /// Anchor `(epoch_ms, wall_ms)` linking an out-of-band epoch-ms `on_termd_*` timestamp
+    /// to `WallCore::now_ms` once `tick()` begins advancing, so real elapsed time drives
+    /// grace escalation without sub-ms rounding drift or clamped-`dt_secs` lag.
+    termd_epoch_anchor: Option<(u64, f64)>,
     bus: Option<GomuxSnapshot>,
     bus_reason: String,
     platform: Platform,
@@ -1252,7 +1252,7 @@ impl WallCore {
             pressed_keys: PressedKeys::new(),
             termd: TermdStatus::new(opts.namespace),
             termd_now_ms: None,
-            termd_tick_wall_ms: None,
+            termd_epoch_anchor: None,
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
             platform: opts.platform,
@@ -1526,7 +1526,7 @@ impl WallCore {
 
     fn record_termd_now_ms(&mut self, now_ms: u64) {
         self.termd_now_ms = Some(self.termd_now_ms.map_or(now_ms, |prev| prev.max(now_ms)));
-        self.termd_tick_wall_ms = None;
+        self.termd_epoch_anchor = None;
     }
 
     fn effective_termd_now_ms(&self) -> u64 {
@@ -1558,15 +1558,22 @@ impl WallCore {
         let wall_ms = now_ms.max(0.0) as u64;
         if let Some(t) = self.termd_now_ms {
             if t > wall_ms.saturating_add(60_000) {
-                let delta = match self.termd_tick_wall_ms {
-                    Some(prev_wall) => (now_ms - prev_wall).max(0.0).round() as u64,
-                    None => (dt_secs.max(0.0) * 1000.0).round() as u64,
+                let advanced = match self.termd_epoch_anchor {
+                    Some((base_epoch, base_wall)) => {
+                        let elapsed = (now_ms - base_wall).max(0.0).floor() as u64;
+                        base_epoch.saturating_add(elapsed)
+                    }
+                    None => {
+                        let first_delta = (dt_secs.max(0.0) * 1000.0).round() as u64;
+                        let base_epoch = t.saturating_add(first_delta);
+                        self.termd_epoch_anchor = Some((base_epoch, now_ms));
+                        base_epoch
+                    }
                 };
-                self.termd_now_ms = Some(t.saturating_add(delta));
-                self.termd_tick_wall_ms = Some(now_ms);
+                self.termd_now_ms = Some(advanced.max(t));
             } else {
                 self.termd_now_ms = Some(wall_ms.max(t));
-                self.termd_tick_wall_ms = Some(now_ms);
+                self.termd_epoch_anchor = None;
             }
         }
         let effective = self.effective_termd_now_ms();

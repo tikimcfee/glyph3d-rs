@@ -396,6 +396,8 @@ impl Panels {
                     described.panels.dock.inset.left as f32,
                     described.panels.dock.inset.right as f32,
                 ),
+                // `describe.rs` draws `described.status_notice` on the canvas chrome layer.
+                show_notice: false,
                 platform,
             };
             status::show(ctx, &mut self.status, &input, &mut out);

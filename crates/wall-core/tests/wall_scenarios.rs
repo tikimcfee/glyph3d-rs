@@ -2566,6 +2566,38 @@ fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice(
         .expect("epoch-ms disconnect must escalate to Unreachable after 5 s even with clamped dt");
     assert_eq!(red.kind, NoticeKind::Unreachable);
     assert_eq!(red.tone, StatusTone::Red);
+
+    // High-frequency sub-millisecond ticks must not lose fractional ms to rounding drift.
+    let epoch_fast = epoch_base + 100_000;
+    let ok_doc3 = serde_json::json!({
+        "daemon": { "version": "g3d-termd/0.2.0", "engine": "glyph-vt/0.1", "ns": "test", "started_at": epoch_fast },
+        "terminals": [{ "id": t1, "cols": 100, "rows": 30, "flow": "ok", "subscribers": [] }]
+    });
+    h.wall.on_termd_status(ok_doc3, epoch_fast).expect("status ok");
+    h.wall.on_termd_disconnected(false, epoch_fast);
+    let mut saw_subms_amber = false;
+    let mut t_ms = 20_000.0_f64;
+    for _ in 0..20_000 {
+        t_ms += 0.3; // 0.3 ms per tick -> 6_000 ms total
+        h.wall.tick(0.0003, t_ms);
+        if !saw_subms_amber {
+            if let Some(n) = h.wall.status_notice() {
+                if n.kind == NoticeKind::Restarting && n.tone == StatusTone::Amber {
+                    saw_subms_amber = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_subms_amber,
+        "sub-ms ticks totaling 6 s must show Amber Restarting before escalating"
+    );
+    let red_subms = h
+        .frame()
+        .status_notice
+        .expect("sub-ms ticks totaling 6 s must escalate to Red Unreachable");
+    assert_eq!(red_subms.kind, NoticeKind::Unreachable);
+    assert_eq!(red_subms.tone, StatusTone::Red);
 }
 
 #[test]

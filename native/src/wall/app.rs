@@ -394,15 +394,23 @@ impl App {
     }
 
     /// Pull the connected daemon's live `status` document (or `WELCOME` metadata
-    /// if `status` is unavailable) into [`Wall::on_termd_status`].
+    /// on first connect if `status` is unavailable) into [`Wall::on_termd_status`].
     fn refresh_termd_status(&mut self) {
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &self.terms) else {
             return;
         };
+        if !wall.model().connected() {
+            return;
+        }
         let now_ms = epoch_now_ms();
         let doc = match sessions.hub().status() {
             Ok(val) => val,
             Err(_) => {
+                // Never overwrite a real status document (or `had_terminals`) with an empty
+                // synthetic doc when the daemon is disconnecting or shutting down.
+                if wall.termd().doc().is_some() {
+                    return;
+                }
                 let welcome = sessions.hub().welcome();
                 let terms: Vec<serde_json::Value> = sessions
                     .ids()
@@ -623,6 +631,9 @@ impl App {
             f64::from(PANEL_PAD),
         );
         wall.set_geometry_preserving_panels(geom);
+        wall.set_char_widths(CharWidths::from_unit_width(f64::from(
+            metrics.cell_width / metrics.cell_height.max(1e-6),
+        )));
     }
 
     /// Carry out what the wall asked for, until it asks for nothing more.
@@ -968,7 +979,7 @@ impl App {
         {
             wall.on_termd_socket_absent(epoch_now_ms());
         }
-        let described: Described = wall.frame();
+        let mut described: Described = wall.frame();
         let termd_state = wall.termd().state();
         self.animating = moving || described.animating;
         self.termd_tick_at = match termd_state {
@@ -1594,7 +1605,7 @@ impl ApplicationHandler<Wake> for App {
                 self.ui_repaint_at = None;
                 self.redraw();
             } else {
-                next_repaint = Some(deadline);
+                next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
         if let Some(deadline) = self.blink_repaint_at {
