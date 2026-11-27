@@ -932,7 +932,7 @@ impl GlyphSource {
     )]
     fn load_with_source(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
         fonts_dir: &Path,
         sparse_source: Arc<SparseEmojiSource>,
         curve_rows: u32,
@@ -952,16 +952,22 @@ impl GlyphSource {
             .family_id(MONASPACE_NEON_FAMILY)
             .unwrap_or_else(|| atlas.default_family());
 
-        // Drain any initial clean state and upload the zero-initialised initial textures so
-        // every texel on the device starts defined (slot 0 = [0, 0, 0, 0]).
+        // Drain any initial clean state; newly created wgpu textures are spec-guaranteed
+        // zero-initialized (slot 0 = [0, 0, 0, 0]), avoiding a redundant 1 MiB zero upload.
         let _ = atlas.take_dirty();
-        let (curves_tex, curves_view) =
-            create_and_upload_full(device, queue, "wall slug curves", atlas.curve_texture());
-        let (glyphmap_tex, glyphmap_view) = create_and_upload_full(
+        let curves_backing = atlas.curve_texture();
+        let (curves_tex, curves_view) = create_uint_texture(
             device,
-            queue,
+            "wall slug curves",
+            curves_backing.width,
+            curves_backing.height,
+        );
+        let map_backing = atlas.glyphmap_texture();
+        let (glyphmap_tex, glyphmap_view) = create_uint_texture(
+            device,
             "wall slug glyphmap",
-            atlas.glyphmap_texture(),
+            map_backing.width,
+            map_backing.height,
         );
         let emoji = SparseEmojiGpu::new(
             device,

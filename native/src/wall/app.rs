@@ -554,11 +554,13 @@ impl App {
         self.pending_termd = pending_termd;
         self.sync_font_and_text_knobs(None);
         self.apply_effects();
-        self.poll_pending_termd();
         self.serve_control();
-        // Paint and present Frame 1 (drafting paper) immediately so the window appears at once;
-        // egui, background pipelines, and any cold termd startup fill in on the next wake.
-        self.draw(true);
+        // Paint and present Frame 1 (drafting paper) immediately — before waiting on any
+        // `termd` spawn/adopt/status RPC, egui init, or background shapes/cells pipelines.
+        if self.exit_after.is_none() {
+            self.draw(true);
+        }
+        self.poll_pending_termd();
         self.redraw();
     }
 
@@ -1011,6 +1013,7 @@ impl App {
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = if to_surface {
+            let _s = (self.frames == 0).then(|| super::startup::span("first_surface_acquire"));
             match g.surface.get_current_texture() {
                 Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
                 Cst::Lost | Cst::Outdated => {
