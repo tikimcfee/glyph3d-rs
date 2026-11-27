@@ -460,8 +460,8 @@ impl App {
         let mut renderer = WallRenderer::new(&self.ctx.device, &self.ctx.queue, &opts.emoji_sheet, format, WallStyle::default());
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
-        let base_style = WallStyle { panel_padding: PANEL_PAD / cell_scale, ..WallStyle::default() };
-        let sf = self.win.finish_open(&window, base_style, renderer.style_mut());
+        renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
+        let sf = self.win.finish_open(&window, WallStyle::default(), renderer.style_mut());
         #[cfg(feature = "egui-ui")]
         let ui = WallUi::new(&self.ctx.device, &window, format);
 

@@ -244,10 +244,10 @@ pub fn sanitize_scale_factor(scale_factor: f64) -> f64 {
 
 /// Scale every physical-pixel field in [`WallStyle`] from logical-px `base`
 /// values by `scale_factor` (`border_width_px`, `cursor_border_px`, `greek_px`),
-/// leaving world-space fields (`panel_padding`, line metrics) untouched.
+/// leaving live-tuned world-space fields (`panel_padding`, `line_thickness_scale`,
+/// `underline_raise`, `curly_amplitude`, `dim_alpha`) untouched.
 pub fn apply_scale_to_wall_style(style: &mut WallStyle, base: &WallStyle, scale_factor: f32) {
     let sf = sanitize_scale_factor(f64::from(scale_factor)) as f32;
-    *style = base.clone();
     style.border_width_px = base.border_width_px * sf;
     style.cursor_border_px = base.cursor_border_px * sf;
     style.greek_px = base.greek_px * sf;
@@ -936,8 +936,12 @@ mod tests {
         let _ = wall.tick(1.0, 2000.0);
         let _ = wall.drain_effects();
 
-        let base_style = WallStyle { panel_padding: 0.3 / 2.4, ..WallStyle::default() };
-        let mut renderer_style = base_style.clone();
+        let base_style = WallStyle::default();
+        let mut renderer_style = WallStyle {
+            panel_padding: 0.3 / 3.2,
+            line_thickness_scale: 1.4,
+            ..WallStyle::default()
+        };
 
         let (metrics, mut atlas, family) = load_test_fonts();
         assert!(
@@ -1021,11 +1025,12 @@ mod tests {
         // 2. Renderer camera physical zoom doubles for the same logical camera zoom.
         assert!((cam_2x.zoom - cam_1x.zoom * 2.0).abs() < 1e-4);
 
-        // 3. WallRenderer style physical-px fields double; world-space padding and Slug font metrics stay unchanged.
+        // 3. WallRenderer style physical-px fields double; live-tuned world-space padding/knobs and Slug font metrics stay untouched.
         assert!((renderer_style.border_width_px - style_1x.border_width_px * 2.0).abs() < 1e-6);
         assert!((renderer_style.cursor_border_px - style_1x.cursor_border_px * 2.0).abs() < 1e-6);
         assert!((renderer_style.greek_px - style_1x.greek_px * 2.0).abs() < 1e-6);
-        assert!((renderer_style.panel_padding - style_1x.panel_padding).abs() < 1e-6);
+        assert!((renderer_style.panel_padding - 0.3 / 3.2).abs() < 1e-6);
+        assert!((renderer_style.line_thickness_scale - 1.4).abs() < 1e-6);
         assert!((fm_after_2x - fm_after_1x).abs() < 1e-9);
 
         // 4. Chrome physical pixels (paper grid, shape strokes/radii, screen-px labels) double.

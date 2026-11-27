@@ -265,6 +265,8 @@ for line in sys.stdin:
 ' <<<"$W")
 ctl app.drag "$EDGE_X" "$EDGE_Y" "$EDGE_X1" "$EDGE_Y" 14 >/dev/null
 C1="$C0"
+PREV_C1=""
+STABLE_C1=0
 for _ in $(seq 1 40); do
     W="$(ctl app.where)"
     C1="$(python3 -c '
@@ -273,7 +275,13 @@ for line in sys.stdin:
     if line.startswith("terminal t1 "):
         print([p[5:] for p in line.split() if p.startswith("cols=")][0])
 ' <<<"$W")"
-    [[ "$C1" != "$C0" ]] && break
+    if [[ "$C1" != "$C0" && "$C1" == "$PREV_C1" ]]; then
+        STABLE_C1=$((STABLE_C1 + 1))
+        [[ "$STABLE_C1" -ge 2 ]] && break
+    else
+        STABLE_C1=0
+    fi
+    PREV_C1="$C1"
     sleep 0.05
 done
 
@@ -290,6 +298,8 @@ for line in sys.stdin:
 ctl app.drag "$CRN_X" "$CRN_Y" "$CRN_X1" "$CRN_Y1" 14 >/dev/null
 C2="$C1"
 R2="$R1"
+PREV_CR2=""
+STABLE_CR2=0
 for _ in $(seq 1 40); do
     W="$(ctl app.where)"
     read -r C2 R2 < <(python3 -c '
@@ -301,7 +311,13 @@ for line in sys.stdin:
         r = [p[5:] for p in parts if p.startswith("rows=")][0]
         print(f"{c} {r}")
 ' <<<"$W")
-    [[ "$C2" != "$C1" && "$R2" != "$R1" ]] && break
+    if [[ "$C2" != "$C1" && "$R2" != "$R1" && "${C2}x${R2}" == "$PREV_CR2" ]]; then
+        STABLE_CR2=$((STABLE_CR2 + 1))
+        [[ "$STABLE_CR2" -ge 2 ]] && break
+    else
+        STABLE_CR2=0
+    fi
+    PREV_CR2="${C2}x${R2}"
     sleep 0.05
 done
 
