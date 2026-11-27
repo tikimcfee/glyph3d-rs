@@ -32,6 +32,7 @@ struct Config {
     verbose: bool,
     only: Option<String>,
     skip_flood: bool,
+    record_claude_out: Option<PathBuf>,
 }
 
 fn parse_args() -> Config {
@@ -46,6 +47,7 @@ fn parse_args() -> Config {
     let mut verbose = false;
     let mut only: Option<String> = None;
     let mut skip_flood = false;
+    let mut record_claude_out: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -63,6 +65,11 @@ fn parse_args() -> Config {
             }
             "--only" => {
                 only = Some(args.next().expect("--only requires filter"));
+            }
+            "--record-claude-tui" => {
+                record_claude_out = Some(PathBuf::from(
+                    args.next().expect("--record-claude-tui requires output path"),
+                ));
             }
             "--skip-flood" => skip_flood = true,
             "-v" | "--verbose" => verbose = true,
@@ -88,6 +95,7 @@ fn parse_args() -> Config {
         verbose,
         only,
         skip_flood,
+        record_claude_out,
     }
 }
 
@@ -1184,6 +1192,138 @@ fn scenario_tabs(
     sess.finish()
 }
 
+const CLAUDE_TUI_FIXTURE: &str = "native/fixtures/wall-replay/claude-tui.vt";
+
+fn record_offline_claude_tui(harness: &ScratchHarness, client: &Termd, out_path: &Path) {
+    let claude_bin = Path::new("/Users/lugo/.local/bin/claude");
+    assert!(
+        claude_bin.is_file(),
+        "{} is not installed",
+        claude_bin.display()
+    );
+    let scratch_home = PathBuf::from(format!("/tmp/g3d-claude-rec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch_home);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(scratch_home.join(".claude"))
+        .expect("create scratch claude home");
+
+    let script = format!(
+        "stty -echo; IFS= read -r _; stty echo; \
+         export HOME='{h}' CLAUDE_CONFIG_DIR='{h}/.claude' \
+         ANTHROPIC_API_KEY='sk-ant-api03-offline-dummy-key' \
+         ANTHROPIC_BASE_URL='http://127.0.0.1:1' \
+         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+         DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1; \
+         exec /Users/lugo/.local/bin/claude --bare --tools ''",
+        h = scratch_home.display()
+    );
+    let mut sess = LiveSession::spawn(
+        harness,
+        client,
+        SpawnSpec {
+            scenario: "record-claude-tui",
+            id: "rec-claude",
+            cols: 80,
+            rows: 24,
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+            env: None,
+            verbose: true,
+        },
+    );
+    sess.wait_quiet(150, 2_000);
+    sess.frames.clear();
+
+    // Release gate and wait for initial Claude Code Ink TUI (theme picker + RGB syntax diff).
+    sess.send_bytes(b"\n");
+    sess.wait_quiet(1_500, 8_000);
+    sess.vt.fill(&mut sess.screen);
+    eprintln!(
+        "record-claude-tui stage 1 screen:\n{}",
+        format_vt_plain(&sess.screen)
+    );
+
+    // Accept default theme (`Enter`) -> advances to main prompt (or workspace trust dialog).
+    sess.send_bytes(b"\r");
+    sess.wait_quiet(1_200, 6_000);
+    sess.vt.fill(&mut sess.screen);
+    let stage2_plain = format_vt_plain(&sess.screen);
+    eprintln!("record-claude-tui stage 2 screen:\n{stage2_plain}");
+
+    // If a trust/API-key confirmation screen appeared, press Enter once more to enter prompt.
+    if stage2_plain.contains("trust") || stage2_plain.contains("Yes") || stage2_plain.contains("API key") {
+        sess.send_bytes(b"\r");
+        sess.wait_quiet(1_200, 6_000);
+        sess.vt.fill(&mut sess.screen);
+        eprintln!(
+            "record-claude-tui stage 2b screen:\n{}",
+            format_vt_plain(&sess.screen)
+        );
+    }
+
+    // Type a multi-word wrapped prompt into the Ink input box without submitting to any backend.
+    sess.send_bytes(
+        b"inspect crates/glyph-vt/src/lib.rs and verify soft-wrap preservation across termd REPAINT frames at 80x24 -> 132x40 -> 60x20",
+    );
+    sess.wait_quiet(900, 5_000);
+    sess.vt.fill(&mut sess.screen);
+    eprintln!(
+        "record-claude-tui final screen:\n{}",
+        format_vt_plain(&sess.screen)
+    );
+
+    let mut raw_bytes = Vec::new();
+    for f in &sess.frames {
+        if let RecordedFrame::Output(b) = f {
+            raw_bytes.extend_from_slice(b);
+        }
+    }
+    let _ = sess.finish();
+    let _ = std::fs::remove_dir_all(&scratch_home);
+
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixture parent dir");
+    }
+    std::fs::write(out_path, &raw_bytes).expect("write claude-tui fixture");
+    println!(
+        "Recorded {} bytes of offline `claude --bare` TUI output to {}",
+        raw_bytes.len(),
+        out_path.display()
+    );
+}
+
+fn scenario_claude_tui_recorded(
+    harness: &ScratchHarness,
+    client: &Termd,
+    verbose: bool,
+) -> (usize, Vec<CheckFinding>) {
+    let fixture_bytes = std::fs::read(CLAUDE_TUI_FIXTURE)
+        .unwrap_or_else(|e| panic!("read {CLAUDE_TUI_FIXTURE}: {e}"));
+    let payload_path = harness.dir.join("s-claude-tui.vt");
+    std::fs::write(&payload_path, &fixture_bytes).expect("write claude-tui payload");
+
+    let script = format!(
+        "stty raw -echo; cat '{}'; exec sleep 60",
+        payload_path.display()
+    );
+    let mut sess = LiveSession::spawn(
+        harness,
+        client,
+        SpawnSpec {
+            scenario: "claude-tui-recorded",
+            id: "s-claude",
+            cols: 80,
+            rows: 24,
+            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+            env: None,
+            verbose,
+        },
+    );
+    run_resize_trio(&mut sess, "claude-tui");
+    sess.finish()
+}
+
 // ── Flood Throughput Benchmarks ──────────────────────────────────────────────
 
 struct FloodResult {
@@ -1524,14 +1664,20 @@ fn main() {
         "vt-diff connected to scratch daemon {} (engine: {}, ns: {:?})",
         welcome.daemon, welcome.engine, welcome.ns
     );
-    println!("claude/agy TUI: skipped (`claude` binary not installed; `agy` interactive TUI connects to live backend & mutates user conversations)");
+    if let Some(out_path) = cfg.record_claude_out.as_deref() {
+        record_offline_claude_tui(&harness, &client, out_path);
+        return;
+    }
+    println!(
+        "agent TUI: replaying recorded offline `claude --bare` TUI ({CLAUDE_TUI_FIXTURE}); `agy` interactive TUI skipped (connects to live backend)"
+    );
     println!();
 
     let mut total_checkpoints = 0usize;
     let mut all_findings: Vec<CheckFinding> = Vec::new();
 
     type Runner<'h> = (&'static str, Box<dyn FnOnce() -> (usize, Vec<CheckFinding>) + 'h>);
-    let scenarios: Vec<Runner<'_>> = vec![
+    let mut scenarios: Vec<Runner<'_>> = vec![
         (
             "zsh-wrapped-prompt",
             Box::new(|| scenario_zsh_wrapped_prompt(&harness, &client, cfg.verbose)),
@@ -1575,6 +1721,12 @@ fn main() {
             Box::new(|| scenario_tabs(&harness, &client, cfg.verbose)),
         ),
     ];
+    if Path::new(CLAUDE_TUI_FIXTURE).is_file() {
+        scenarios.push((
+            "claude-tui-recorded",
+            Box::new(|| scenario_claude_tui_recorded(&harness, &client, cfg.verbose)),
+        ));
+    }
 
     println!("Differential scenarios (80x24 -> 132x40 -> 60x20 + mid-session REPAINT):");
     for (name, run) in scenarios {

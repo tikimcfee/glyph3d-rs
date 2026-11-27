@@ -652,20 +652,23 @@ impl Vt {
 
         let mut out = String::new();
         let mut row_buf = String::new();
+        let mut line_start = 0usize;
         for y in start_row..=end_row {
             let lo = if y == start_row { start_col } else { 0 };
             let hi = if y == end_row { end_col } else { cols };
             row_buf.clear();
             let row = active.row(y);
             push_row_slice(row, lo, hi, &mut row_buf);
+            out.push_str(&row_buf);
 
             let joined = y < end_row && hi >= cols && row.wrapped;
-            if joined {
-                out.push_str(&row_buf);
-            } else {
-                out.push_str(row_buf.trim_end_matches([' ', '\t']));
+            if !joined {
+                let trimmed_len =
+                    line_start + out[line_start..].trim_end_matches([' ', '\t']).len();
+                out.truncate(trimmed_len);
                 if y < end_row {
                     out.push('\n');
+                    line_start = out.len();
                 }
             }
         }

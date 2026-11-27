@@ -44,4 +44,4 @@ EXTRA_ARGS=()
 if [[ -n "${G3D_TERMD_BIN:-}" ]]; then
     EXTRA_ARGS+=(--termd-bin "$G3D_TERMD_BIN")
 fi
-"$ROOT/target/release/examples/vt_diff" --termd-dir "$D" --ns "$NS" --tmux-label "vt-diff-$$" "${EXTRA_ARGS[@]}" "$@"
+"$ROOT/target/release/examples/vt_diff" --termd-dir "$D" --ns "$NS" --tmux-label "vt-diff-$$" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$@"

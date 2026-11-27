@@ -427,6 +427,7 @@ impl TerminalSelection {
         let cols = screen.cols as usize;
         let mut out = String::new();
         let mut row_buf = String::new();
+        let mut line_start = 0usize;
 
         for y in self.r0..=self.r1 {
             let a = self.lo(y);
@@ -442,15 +443,16 @@ impl TerminalSelection {
                 }
                 continue;
             }
+            out.push_str(&row_buf);
             let joined = y < self.r1 && b >= cols && row_wraps_into_next(screen, y);
-            let slice = if joined {
-                row_buf.as_str()
-            } else {
-                row_buf.trim_end_matches([' ', '\t'])
-            };
-            out.push_str(slice);
-            if y < self.r1 && !joined {
-                out.push('\n');
+            if !joined {
+                let trimmed_len =
+                    line_start + out[line_start..].trim_end_matches([' ', '\t']).len();
+                out.truncate(trimmed_len);
+                if y < self.r1 {
+                    out.push('\n');
+                    line_start = out.len();
+                }
             }
         }
         out
@@ -799,6 +801,15 @@ mod tests {
         assert_eq!(
             select_between(&src, (4.0, 0.5), (4.0, 2.5), SelectionMode::Cell, false).text(&src),
             "quick brown fox\nnext"
+        );
+
+        // When a full-width background bar wraps trailing spaces onto a continuation row,
+        // trimming the logical line removes trailing spaces across the soft-wrap boundary.
+        let padded = screen_from_lines(&["diff;     ", "    ", "after"], 10, &[0], |_| false);
+        assert_eq!(
+            select_between(&padded, (0.0, 0.5), (10.0, 2.5), SelectionMode::Cell, false)
+                .text(&padded),
+            "diff;\nafter"
         );
     }
 
