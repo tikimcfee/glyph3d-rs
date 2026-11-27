@@ -505,9 +505,9 @@ documentation.
   on Linux when present, else `/tmp/g3d-<uid>`) for `termd-client`
   (`termd-<ns>.sock`), `wall-control` (`wall-<ns>.sock`), daemon logs, and
   `wall_core::store::default_store_dir` (`wall-<ns>.json`). Tests and scratch
-  probes set this to a short path under `/tmp` so they never touch live
-  namespaces or `~/Library/Application Support/glyph3d/wall` /
-  `${XDG_STATE_HOME:-~/.local/state}/glyph3d/wall`.
+  probes set this to a short path under `/tmp` so they run against a daemon
+  and a store of their own, not the live ones or `~/Library/Application
+  Support/glyph3d/wall` / `${XDG_STATE_HOME:-~/.local/state}/glyph3d/wall`.
 - `G3D_TERMD_BIN=<path>` — explicit path to the `g3d-termd` executable used by
   `termd_client::paths::find_termd` before searching sibling binaries, sibling
   `glyph3d-js/bin/g3d-termd`, or `PATH`.

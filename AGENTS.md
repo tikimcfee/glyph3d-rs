@@ -161,17 +161,21 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
     `Sessions::pump()`, and non-blocking IO writer. Depends on `termd-client`,
     `glyph-vt`, `term-cells`, `wall-core`, `log`, and `serde_json`: must not
     depend on winit or wgpu.
-  - **Control socket and scratch-daemon rule:** `wallctl [--ns NAME | --socket
+  - **Control socket and scratch daemons:** `wallctl [--ns NAME | --socket
     PATH] <verb...>` reaches a running wall window on `wall-<ns>.sock` in the
     same directory as `termd-<ns>.sock` (`$G3D_TERMD_DIR`, else
     `/run/user/<uid>/g3d`, else `/tmp/g3d-<uid>`; default namespace `rs-wall`).
-    Every test, smoke script, or probe **must** set `G3D_TERMD_DIR` to a short
-    private directory under `/tmp` (Unix socket paths cap at ~100 bytes on
-    macOS, so `$TMPDIR` under `/var/folders/...` overflows; setting
-    `G3D_TERMD_DIR` also redirects `wall-<ns>.json` via
-    `wall_core::store::default_store_dir`), **never** touch live namespaces
-    `wall`, `agents`, `default`, or live `rs-wall`, and tear down **only** the
-    exact PIDs it started (never `pkill` by command line).
+    The smoke scripts start a daemon of their own in a short private
+    `G3D_TERMD_DIR` under `/tmp`, because they spawn, resize and kill
+    terminals and want an empty store (Unix socket paths cap at ~100 bytes on
+    macOS, so `$TMPDIR` under `/var/folders/...` overflows; the variable also
+    redirects `wall-<ns>.json` via `wall_core::store::default_store_dir`), and
+    they stop the exact PIDs they started rather than `pkill` by command line,
+    which would take other runs' windows with them. Reading or driving the
+    live wall and its namespaces (`wallctl`, `g3d --ns rs-wall capture …`) is
+    allowed. Until 2026-11-27 this said never to touch the live namespaces
+    `wall`, `agents`, `default` or `rs-wall`: a caution agents wrote for
+    themselves, which Ivan lifted that day.
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
