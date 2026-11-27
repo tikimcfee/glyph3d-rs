@@ -725,12 +725,14 @@ fn cli_action_dispatch_variants() {
                 emoji_sheet: sheet_a,
                 pattern: pat_a,
                 namespace: ns_a,
+                extra_namespaces: extra_a,
                 frames: frames_a,
             },
             CliCommand::Wall {
                 emoji_sheet: sheet_b,
                 pattern: pat_b,
                 namespace: ns_b,
+                extra_namespaces: extra_b,
                 frames: frames_b,
             },
         ) => {
@@ -739,10 +741,22 @@ fn cli_action_dispatch_variants() {
             assert_eq!(pat_a, pat_b);
             assert_eq!(ns_a, "rs-wall");
             assert_eq!(ns_a, ns_b);
+            assert!(extra_a.is_empty());
+            assert_eq!(extra_a, extra_b);
             assert_eq!(frames_a, None);
             assert_eq!(frames_a, frames_b);
         }
         other => panic!("expected Wall for both bare and --wall, got {other:?}"),
+    }
+
+    // 9b. --wall-extra-ns accepts comma-separated and repeated names (off by default)
+    let with_extra = parse(&["--wall", "--wall-ns", "probe", "--wall-extra-ns", "probe2,probe3", "--wall-extra-ns", "agents"]);
+    match with_extra.action() {
+        CliCommand::Wall { namespace, extra_namespaces, .. } => {
+            assert_eq!(namespace, "probe");
+            assert_eq!(extra_namespaces, vec!["probe2", "probe3", "agents"]);
+        }
+        other => panic!("expected Wall with extra_namespaces, got {other:?}"),
     }
 
     // 10. Windowed glyph scene when a scene flag IS given (`--render-file` with `--frames`)
