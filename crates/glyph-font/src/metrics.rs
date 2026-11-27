@@ -50,6 +50,26 @@ impl FontExtents {
     pub fn em_height(self) -> f64 {
         self.ascender - self.descender
     }
+
+    /// Scale the cell's vertical em by `line_height_scale` (`1.0` = unchanged), distributing
+    /// extra leading (or tightening) symmetrically above the ascender and below the descender
+    /// so glyph outlines keep their true aspect ratio and stay vertically centered.
+    pub fn with_line_height(self, line_height_scale: f64) -> Self {
+        let scale = if line_height_scale.is_finite() && line_height_scale > 0.0 {
+            line_height_scale
+        } else {
+            1.0
+        };
+        if (scale - 1.0).abs() <= 1e-6 {
+            return self;
+        }
+        let extra = self.em_height() * (scale - 1.0);
+        Self {
+            ascender: self.ascender + extra * 0.5,
+            descender: self.descender - extra * 0.5,
+            line_gap: self.line_gap,
+        }
+    }
 }
 
 /// Raw underline / strikethrough / x-height values read from a font's `post` and `OS/2` tables,
@@ -156,8 +176,18 @@ pub struct FamilyMetrics {
 impl FamilyMetrics {
     /// Extract a family's metrics from its primary font face.
     pub fn from_face(face: &Face<'_>, include_line_gap: bool) -> Self {
+        Self::from_face_scaled(face, include_line_gap, 1.0)
+    }
+
+    /// Extract a family's metrics from its primary font face with a vertical line-height multiplier.
+    pub fn from_face_scaled(
+        face: &Face<'_>,
+        include_line_gap: bool,
+        line_height_scale: f64,
+    ) -> Self {
         let upem = face.units_per_em();
-        let extents = FontExtents::from_face(face, include_line_gap);
+        let extents =
+            FontExtents::from_face(face, include_line_gap).with_line_height(line_height_scale);
         let advance_fu = face
             .glyph_index('M')
             .and_then(|gid| face.glyph_hor_advance(gid))

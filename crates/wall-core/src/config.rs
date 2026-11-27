@@ -246,6 +246,12 @@ pub const SELECTION_COLOR_DEFAULT: &str = "#cccccc";
 pub const SELECTION_FOREGROUND_DEFAULT: &str = "#0a0a1e";
 /// Default word-boundary characters besides whitespace (`TERMINAL_SELECTION_DEFAULTS.wordChars`).
 pub const SELECTION_WORD_CHARS_DEFAULT: &str = "'\"│`|:;,()[]{}<>$";
+/// Default `fontFamily` (`"monaspace-neon"`).
+pub const FONT_FAMILY_DEFAULT: &str = "monaspace-neon";
+/// Default `fontSize` in points (`14.0`).
+pub const FONT_SIZE_DEFAULT: f64 = 14.0;
+/// Default `lineHeight` multiplier (`1.0`).
+pub const LINE_HEIGHT_DEFAULT: f64 = 1.0;
 /// Default `boldIsBright` value (`BOLD_IS_BRIGHT_DEFAULT`).
 pub const BOLD_IS_BRIGHT_DEFAULT: bool = false;
 /// Default `lineThickness` (`GLYPH_LINE_DEFAULTS.lineThickness`).
@@ -309,6 +315,8 @@ pub const WALL_CONFIG_KEYS: &[&str] = &[
     "menuHint",
     "menuSizes",
     "fontFamily",
+    "fontSize",
+    "lineHeight",
     "boldIsBright",
     "lineThickness",
     "underlineRaise",
@@ -402,8 +410,12 @@ pub struct WallConfig {
     pub menu_hint: bool,
     /// Space-separated `COLSxROWS` size presets offered in a terminal's right-click menu.
     pub menu_sizes: String,
-    /// Active font family drawn across terminals.
-    pub font_family: FontFamily,
+    /// Active font family drawn across terminals (bundled id or system family name).
+    pub font_family: String,
+    /// Base font size in points (`14.0` default).
+    pub font_size: f64,
+    /// Vertical cell pitch multiplier (`1.0` default).
+    pub line_height: f64,
     /// Whether bold text in standard SGR colours 30–37 shifts to bright 90–97.
     pub bold_is_bright: bool,
     /// Thickness multiplier for underline, strikethrough, and overline relative to the font.
@@ -460,7 +472,9 @@ impl Default for WallConfig {
             snap: true,
             menu_hint: true,
             menu_sizes: "80x24 120x36 160x48".to_string(),
-            font_family: FontFamily::MonaspaceNeon,
+            font_family: FONT_FAMILY_DEFAULT.to_string(),
+            font_size: FONT_SIZE_DEFAULT,
+            line_height: LINE_HEIGHT_DEFAULT,
             bold_is_bright: BOLD_IS_BRIGHT_DEFAULT,
             line_thickness: LINE_THICKNESS_DEFAULT,
             underline_raise: UNDERLINE_RAISE_DEFAULT,
@@ -515,7 +529,9 @@ impl WallConfig {
             "snap" => KnobValue::Bool(self.snap),
             "menuHint" => KnobValue::Bool(self.menu_hint),
             "menuSizes" => KnobValue::Text(self.menu_sizes.clone()),
-            "fontFamily" => KnobValue::Text(self.font_family.as_str().to_string()),
+            "fontFamily" => KnobValue::Text(self.font_family.clone()),
+            "fontSize" => KnobValue::Number(self.font_size),
+            "lineHeight" => KnobValue::Number(self.line_height),
             "boldIsBright" => KnobValue::Bool(self.bold_is_bright),
             "lineThickness" => KnobValue::Number(self.line_thickness),
             "underlineRaise" => KnobValue::Number(self.underline_raise),
@@ -628,10 +644,9 @@ impl WallConfig {
             "snap" => self.snap = flag(checked),
             "menuHint" => self.menu_hint = flag(checked),
             "menuSizes" => self.menu_sizes = text(checked).to_string(),
-            "fontFamily" => {
-                self.font_family =
-                    FontFamily::parse(text(checked)).expect("checked fontFamily option")
-            }
+            "fontFamily" => self.font_family = text(checked).to_string(),
+            "fontSize" => self.font_size = num(checked),
+            "lineHeight" => self.line_height = num(checked),
             "boldIsBright" => self.bold_is_bright = flag(checked),
             "lineThickness" => self.line_thickness = num(checked),
             "underlineRaise" => self.underline_raise = num(checked),
@@ -689,8 +704,8 @@ mod tests {
     #[test]
     fn wall_config_and_knobs_bijection_and_line_style_knobs() {
         assert_config_matches_knobs();
-        assert_eq!(WALL_CONFIG_KEYS.len(), 47);
-        assert_eq!(KNOBS.len(), 47);
+        assert_eq!(WALL_CONFIG_KEYS.len(), 49);
+        assert_eq!(KNOBS.len(), 49);
         for &k in LINE_STYLE_KNOBS {
             assert!(WALL_CONFIG_KEYS.contains(&k), "missing line style knob {k}");
         }
