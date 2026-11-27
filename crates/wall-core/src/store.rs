@@ -22,6 +22,31 @@ use crate::split::{self, SplitNode};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Default directory where the native wall stores `wall-<namespace>.json` files.
+///
+/// Follows the scratch-daemon rule: when `$G3D_TERMD_DIR` is set and non-empty,
+/// the store lives inside that directory beside `termd-<ns>.sock` and `wall-<ns>.sock`
+/// so tests and probes never touch a user's saved wall. Otherwise uses
+/// `~/Library/Application Support/glyph3d/wall` on macOS and
+/// `${XDG_STATE_HOME:-~/.local/state}/glyph3d/wall` on Linux/Unix.
+pub fn default_store_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("G3D_TERMD_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/glyph3d/wall")
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/state"))
+            .join("glyph3d/wall")
+    }
+}
+
 /// Backing persistence seam for [`WallStore`], allowing disk directories in production and
 /// temporary directories or custom in-memory/failing backends in tests.
 pub trait Storage {
@@ -595,6 +620,12 @@ impl WallStore {
     }
 
     fn persist(&self) {
+        // Matching WallStore.js: when storage is blocked or read-only, in-memory state keeps working.
+        let _ = self.save_checked();
+    }
+
+    /// Serialize and write the store document immediately, surfacing any I/O failure.
+    pub fn save_checked(&self) -> io::Result<()> {
         let positions: BTreeMap<String, StoredPoint> = self
             .positions
             .iter()
@@ -619,8 +650,25 @@ impl WallStore {
         let mut bytes =
             serde_json::to_vec_pretty(&doc).expect("WallStore document always serializes");
         bytes.push(b'\n');
-        // Matching WallStore.js: when storage is blocked or read-only, in-memory state keeps working.
-        let _ = self.storage.save(&self.scope, &bytes);
+        self.storage.save(&self.scope, &bytes)
+    }
+
+    /// Clear all sections in memory without writing to storage yet (used by [`crate::import`]
+    /// before populating a clean store and calling [`Self::save_checked`]).
+    pub(crate) fn reset_in_memory(&mut self) {
+        self.positions.clear();
+        self.names.clear();
+        self.attached.clear();
+        self.hidden.clear();
+        self.groups.clear();
+        self.sidebar = SidebarState::default();
+        self.status = StatusWindowState::default();
+        self.config.clear();
+        self.settings = SettingsPanelState::default();
+        self.help = HelpPanelState::default();
+        self.fullscreen = None;
+        self.fullscreen_text.clear();
+        self.agent_views.clear();
     }
 
     // ── terminals ────────────────────────────────────────────────────────────
