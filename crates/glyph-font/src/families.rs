@@ -116,6 +116,9 @@ pub struct FontSpec {
     pub include_line_gap: bool,
     /// Vertical line-height multiplier (`1.0` = natural cell height; >1.0 adds symmetric leading).
     pub line_height_scale: f64,
+    /// When `true`, defer reading and parsing this font (and its faces) until a glyph lookup
+    /// or family metric query actually reaches it.
+    pub lazy: bool,
     pub bold: Option<FaceSpec>,
     pub italic: Option<FaceSpec>,
     pub bold_italic: Option<FaceSpec>,
@@ -132,10 +135,17 @@ impl FontSpec {
             variations: Vec::new(),
             include_line_gap: false,
             line_height_scale: 1.0,
+            lazy: false,
             bold: None,
             italic: None,
             bold_italic: None,
         }
+    }
+
+    /// Defer reading and parsing this font until a lookup actually reaches it.
+    pub fn with_lazy(mut self, lazy: bool) -> Self {
+        self.lazy = lazy;
+        self
     }
 
     /// Select face index inside a `.ttc`/`.otc` collection.
@@ -289,4 +299,16 @@ pub fn default_font_chain(fonts_dir: &Path) -> Vec<FontSpec> {
         fonts_dir.join("MonaspaceArgonVar.ttf"),
     ));
     chain
+}
+
+/// Like [`default_font_chain`], but marks every fallback font and every family other than
+/// `eager_family` as [`FontSpec::lazy`] so startup reads and parses only the active family.
+pub fn default_font_chain_lazy(fonts_dir: &Path, eager_family: &str) -> Vec<FontSpec> {
+    default_font_chain(fonts_dir)
+        .into_iter()
+        .map(|spec| {
+            let is_eager = spec.family.as_deref() == Some(eager_family);
+            spec.with_lazy(!is_eager)
+        })
+        .collect()
 }
