@@ -4938,7 +4938,7 @@ mod tests {
             128,
         );
         assert!(
-            px_paper.chunks_exact(4).any(|p| p[2] > 60),
+            px_paper.as_chunks::<4>().0.iter().any(|p| p[2] > 60),
             "paper grid lines must render immediately on frame 1"
         );
 
@@ -5059,10 +5059,12 @@ mod tests {
     #[test]
     fn gpu_far_lod_skips_cell_passes_and_tints_panel_below_show_glyphs_px() {
         let ctx = crate::gpu::test_device::context();
-        let mut style = WallStyle::default();
-        style.show_glyphs_px = 1.0;
-        style.far_backdrop_gain = 0.7;
-        style.border_width_px = 0.0;
+        let style = WallStyle {
+            show_glyphs_px: 1.0,
+            far_backdrop_gain: 0.7,
+            border_width_px: 0.0,
+            ..Default::default()
+        };
         let mut renderer = WallRenderer::new(
             &ctx.device,
             &ctx.queue,
