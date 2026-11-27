@@ -790,25 +790,115 @@ ctl app.key Escape >/dev/null
 ctl app.key "${CHORD}+b" >/dev/null
 wait_settled >/dev/null
 
-if [[ "$WALL_SMOKE_SHOTS" == "1" ]]; then
-    # Capture loose-canvas neighbour placement (`t2` spawned right of `t1` while `t1`'s Agent View is open).
-    ctl wall.spawn >/dev/null
-    sleep 0.25
-    ctl wall.fit >/dev/null
-    wait_settled >/dev/null
-    maybe_shot "$SHOT_DIR/12-neighbour-overlap.png"
-    ctl wall.close t2 >/dev/null 2>&1 || true
-fi
-
 if [[ "$BUS_OUT" == *"laptop-2"* && "$BUS_OUT" == *"coder"* && "$BUS_OUT" == *"reviewer"* && "$BUS_OUT" == *"workstation"* && "$BUS_OUT" == *"linux-gate"* ]]; then
     record_pass "bus snapshot in sidebar & palette" "hosts laptop-2 + workstation (4 live agents) populated"
 else
     record_fail "bus snapshot in sidebar & palette" "wall.bus output: $(tr '\n' ' ' <<<"$BUS_OUT")"
 fi
 
-# ── 12. Extra namespace (`probe2` playing `agents`): `gx-coder` pair, detach & reattach ─
-# Close `t1`'s Agent View first so `gx-coder` pairs cleanly on its own.
-ctl wall.agent t1 close >/dev/null 2>&1 || true
+# ── 12. Loose-canvas neighbour shove-aside, restore & spawn past open card ────
+world_bounds_of() {
+    local tid="$1"
+    local w="$2"
+    python3 -c '
+import sys
+tid = sys.argv[1]
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) >= 2 and parts[0] == "terminal" and parts[1] == tid:
+        for tok in parts[2:]:
+            if tok.startswith("world="):
+                vals = tok[6:].split(",")
+                print(vals[0], vals[1], vals[2], vals[3])
+                sys.exit(0)
+print("0 0 0 0")
+' "$tid" <<<"$w"
+}
+
+# 12a. `t1` currently has its right-side Agent View open (`width=76`, `gap=1.5`):
+#      spawning a new loose terminal (`t2`) must step past `t1 + card` (`t1_max_x + 77.5`).
+ctl wall.spawn >/dev/null
+W_SPAWN_OPEN=""
+for _ in $(seq 1 60); do
+    W_SPAWN_OPEN="$(ctl app.where 2>/dev/null || true)"
+    if grep -q "^terminal t2 " <<<"$W_SPAWN_OPEN"; then
+        break
+    fi
+    sleep 0.04
+done
+W_SPAWN_OPEN="$(wait_settled)"
+read -r _ _ T1_MAX_X _ < <(world_bounds_of t1 "$W_SPAWN_OPEN")
+read -r T2_OPEN_SPAWN_MIN_X _ _ _ < <(world_bounds_of t2 "$W_SPAWN_OPEN")
+ctl wall.close t2 >/dev/null 2>&1 || true
+for _ in $(seq 1 60); do
+    if ! ctl app.where 2>/dev/null | grep -q "^terminal t2 "; then
+        break
+    fi
+    sleep 0.04
+done
+
+# 12b. Close `t1`'s Agent View, spawn a right-hand neighbour (`t3`) directly beside `t1`,
+#      then open `t1`'s Agent View (`t3` shoves clear of the card) and close it (`t3` returns).
+ctl wall.agent t1 close >/dev/null
+ctl wall.reveal t1 >/dev/null
+wait_settled >/dev/null
+ctl wall.spawn >/dev/null
+NB_ID=""
+W_NB_START=""
+for _ in $(seq 1 60); do
+    W_NB_START="$(ctl app.where 2>/dev/null || true)"
+    NB_ID="$(awk '$1 == "terminal" && $2 != "t1" { print $2; exit }' <<<"$W_NB_START")"
+    if [[ -n "$NB_ID" ]]; then
+        break
+    fi
+    sleep 0.04
+done
+W_NB_START="$(wait_settled)"
+read -r NB_START_MIN_X _ _ _ < <(world_bounds_of "$NB_ID" "$W_NB_START")
+
+ctl wall.agent t1 open >/dev/null
+ctl wall.fit >/dev/null
+W_NB_SHOVED="$(wait_settled)"
+maybe_shot "$SHOT_DIR/12-neighbour-shoved.png"
+read -r NB_SHOVED_MIN_X _ _ _ < <(world_bounds_of "$NB_ID" "$W_NB_SHOVED")
+
+ctl wall.agent t1 close >/dev/null
+W_NB_RESTORED="$(wait_settled)"
+read -r NB_RESTORED_MIN_X _ _ _ < <(world_bounds_of "$NB_ID" "$W_NB_RESTORED")
+ctl wall.close "$NB_ID" >/dev/null 2>&1 || true
+if [[ -n "$NB_ID" ]]; then
+    for _ in $(seq 1 60); do
+        if ! ctl app.where 2>/dev/null | grep -q "^terminal ${NB_ID} "; then
+            break
+        fi
+        sleep 0.04
+    done
+fi
+
+SHOVE_CHECK="$(python3 -c "
+t1_r = float('$T1_MAX_X')
+card_r = t1_r + 1.5 + 76.0
+spawn_x = float('$T2_OPEN_SPAWN_MIN_X')
+start_x = float('$NB_START_MIN_X')
+shoved_x = float('$NB_SHOVED_MIN_X')
+restored_x = float('$NB_RESTORED_MIN_X')
+ok = (
+    spawn_x > card_r
+    and start_x > t1_r and start_x < card_r
+    and shoved_x >= card_r + 2.0 - 1e-3
+    and abs(restored_x - start_x) < 1e-3
+)
+print('1' if ok else '0', f'card_r={card_r:.1f} spawn_x={spawn_x:.1f} {start_x:.1f}->{shoved_x:.1f}->{restored_x:.1f}')
+")"
+SHOVE_OK="${SHOVE_CHECK%% *}"
+SHOVE_DETAIL="${SHOVE_CHECK#* }"
+if [[ "$SHOVE_OK" == "1" ]]; then
+    record_pass "loose neighbour shove & spawn" "$SHOVE_DETAIL"
+else
+    record_fail "loose neighbour shove & spawn" "$SHOVE_DETAIL"
+fi
+
+# ── 13. Extra namespace (`probe2` playing `agents`): `gx-coder` pair, detach & reattach ─
 
 # Start scratch `probe2` daemon in `$D` (`G3D_TERMD_DIR="$D"`) and create `agent-coder`
 # via `g3d-termd` wire protocol 1.5 with NO OSC title and NO OSC 7 pwd.
@@ -932,7 +1022,7 @@ W_AFTER_REATTACH="$(ctl app.where)"
 if [[ "$GX_MOUNTED" -eq 1 && "$GX_PAIRED_EXP" -ge 5 ]] \
     && ! grep -q "^terminal gx-coder " <<<"$W_AFTER_CLOSE" \
     && [[ "$STILL_IN_PROBE2" == "1" && "$GX_REATTACHED" -eq 1 ]] \
-    && ! grep -q "^terminal t2 " <<<"$W_AFTER_REATTACH"; then
+    && ! grep -q "^terminal t[2-9] " <<<"$W_AFTER_REATTACH"; then
     record_pass "extra-ns gx-coder detach & reattach" "mounted gx-coder, paired ($GX_PAIRED_EXP rows), detached cleanly, reattached via wall.attach without wrapper"
 else
     record_fail "extra-ns gx-coder detach & reattach" "mounted=$GX_MOUNTED exp=$GX_PAIRED_EXP alive=$STILL_IN_PROBE2 reattached=$GX_REATTACHED attach_reply='$R_REATTACH'"
