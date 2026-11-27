@@ -1607,7 +1607,7 @@ impl App {
         use super::script::{button_label, keys_for_typed_text, ScriptCommand};
         match cmd {
             ScriptCommand::Where => match &mut self.wall {
-                Some(wall) => super::script::format_where(&wall.frame(), self.cursor),
+                Some(wall) => super::script::format_where(&wall.frame(), self.cursor, wall.platform()),
                 None => "ERR: the wall is not open yet".to_string(),
             },
             ScriptCommand::Move { x, y } => {
