@@ -871,7 +871,24 @@ lineage, which computes the stop itself) and to the oracle-backed one-cell
 fold over the spaces a tab stands for. A TABBED line long enough to be cut
 into chunks reaches no gate corpus; `hyper_oracle::tests::tab_stops_agree_on_every_tier`
 (cargo-test) carries a 135 KB one, asserted to cut where its line is off a
-stop. Mutations: `hyper-device-tab-stop-ignored` here;
+stop. **An item past a Derived lane** (2026-11-27). The device tier applies the
+load's own rule before it emits (`layout_hyper::derived_lane_overflow`, the
+same code): an item past a lane is laid out EMPTY, and the tier holds the
+emitter to exactly that (no slot, the empty item's placement, the items after
+it where the stream then has them), counted apart (`device_lane_items`). Until
+then it emitted every item as given, which no load does. In release
+`glyph_field_derived::pack_row` clamps a lane it cannot hold, and the
+reference slot was built through the same `pack_row`, so the two agreed on
+the clamp: the tab-stop grid's column-paged shape (six cells a page over a
+135 KB line: tens of thousands of column pages against a lane of 255) passed
+having compared nothing true about that lane, and in a debug build the
+assertion in `pack_row` failed the test instead. Neither the paging nor the
+assertion was wrong. No gate corpus holds such an item (the gate's volumes
+did not move), and the grid has a second column-paged shape, 2,048 cells a
+page, where the long line turns its pages inside the lane across its chunk
+cuts. `hyper_oracle::tests::the_device_tier_holds_an_item_past_a_lane_to_laid_out_empty`
+is the small form.
+Mutations: `hyper-device-tab-stop-ignored` here;
 `hyper-tab-chunk-rewalk-skipped`, `fold-tab-line-advance-rounded` and
 `tab-cells-always-a-whole-stop` on cargo-test. `native/tests/tab_stops.rs`
 renders the `tab-stops` frame at widths 1, 4 and 8 in every field (Derived

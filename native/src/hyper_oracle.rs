@@ -467,6 +467,16 @@ pub struct CorpusDiff {
     pub device_slots: usize,
     pub device_derived_bad: usize,
     pub device_placement_bad: usize,
+    /// Items past a Derived lane (`layout_hyper::derived_lane_overflow`),
+    /// which a load lays out EMPTY: the device tier holds each to exactly
+    /// that (no slot, the empty item's placement), and the reference
+    /// instances it therefore has no slot for. The other tiers carry
+    /// absolute positions and no lane, and compare such an item whole.
+    pub device_lane_items: usize,
+    pub device_lane_instances: usize,
+    /// The highest column page among the slots the device tier compared: a
+    /// column-paged corpus that never turns a page compared no page lane.
+    pub device_max_x_page: u32,
     /// Tabs the reference laid out wider than the one cell the trie gives
     /// them (tab stops, 2026-10-11) — anti-vacuity for a `--tab-width` run.
     pub expanded_tabs: usize,
@@ -474,6 +484,15 @@ pub struct CorpusDiff {
     pub firsts: Vec<(String, String)>,
     /// diff_backends' verdict over the whole corpus (the seam's own differ).
     pub seam: Result<(), String>,
+}
+
+impl CorpusDiff {
+    /// Whether the device tier answered for every reference instance: a slot
+    /// compared, or an item the load lays out empty (and nothing else). The
+    /// anti-vacuity check every caller makes of this tier.
+    pub fn device_tier_is_whole(&self) -> bool {
+        self.device_slots + self.device_lane_instances == self.instances
+    }
 }
 
 impl Default for CorpusDiff {
@@ -489,6 +508,9 @@ impl Default for CorpusDiff {
             ascii_heads: 0,
             leader_mode_record_bad: 0,
             device_slots: 0,
+            device_lane_items: 0,
+            device_lane_instances: 0,
+            device_max_x_page: 0,
             device_derived_bad: 0,
             device_placement_bad: 0,
             expanded_tabs: 0,
@@ -519,7 +541,7 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
 
     // HyperLayout, production DEVICE Pass 2 (what a GPU load runs), written
     // into host memory (see the module header).
-    let (derived_slots, derived_places) = device_pass2_derived_on_host(&items, trie);
+    let (derived_slots, derived_places, past_a_lane) = device_pass2_derived_on_host(&items, trie);
 
     // The reference: the fold per item, compacted by the seam.
     let mut ref_arena = GlyphArena::new();
@@ -534,6 +556,28 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
         // `VerifyLayout::layout_items_recording` concatenates.
         hyper_recs.push(rederive_item_records(&c.bytes, &c.params, trie));
     }
+
+    // The device tier's reference placements. A load lays an item past a
+    // Derived lane out EMPTY, so in its slot stream that item holds nothing
+    // and every item after it starts earlier than in the whole reference:
+    // compact the reference again as the load sees it (only when some item
+    // is past a lane; otherwise the device tier's placements are `ref_places`).
+    let device_ref_places: Option<Vec<ItemPlacement>> = (!past_a_lane.is_empty()).then(|| {
+        let mut arena = GlyphArena::new();
+        corpus
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if past_a_lane.binary_search(&i).is_ok() {
+                    let empty = reference_item(&[], &c.params, trie);
+                    compact_records_into(&empty.records, Paint::Flat(DEFAULT_COLOR_PACKED), i as u32, &mut arena)
+                } else {
+                    compact_records_into(&refs[i].records, Paint::Flat(DEFAULT_COLOR_PACKED), i as u32, &mut arena)
+                }
+            })
+            .collect()
+    });
 
     let mut out = CorpusDiff { items: items.len(), ..Default::default() };
     let (ri, hi) = (ref_arena.instances(), hyper_arena.instances());
@@ -568,15 +612,31 @@ pub fn diff_corpus(corpus: &Corpus, trie: &Arc<TrieTable>) -> Result<CorpusDiff,
             let s = (p.slot_base as usize).min(len);
             s..(s + p.slot_count as usize).min(len)
         };
-        let dd = diff_device_item(
-            &c.bytes,
-            &c.params,
-            &refs[i],
-            &ref_inst,
-            rp,
-            &derived_slots[span(ddp, derived_slots.len())],
-            ddp,
-        );
+        let device_rp = device_ref_places.as_ref().map_or(rp, |places| &places[i]);
+        let dd = if past_a_lane.binary_search(&i).is_ok() {
+            // Past a Derived lane: the load lays this item out empty, so the
+            // device tier is held to the EMPTY item's reference: no slot, and
+            // the placement an item with no bytes gets, where the stream
+            // has it.
+            out.device_lane_items += 1;
+            out.device_lane_instances += ref_inst.len();
+            let empty = reference_item(&[], &c.params, trie);
+            diff_device_item(
+                &[],
+                &c.params,
+                &empty,
+                &[],
+                device_rp,
+                &derived_slots[span(ddp, derived_slots.len())],
+                ddp,
+            )
+        } else {
+            let slots = &derived_slots[span(ddp, derived_slots.len())];
+            for slot in slots {
+                out.device_max_x_page = out.device_max_x_page.max(glyph_field_derived::x_page_of(slot.row));
+            }
+            diff_device_item(&c.bytes, &c.params, &refs[i], &ref_inst, device_rp, slots, ddp)
+        };
         out.device_derived_bad += dd.derived_bad;
         out.device_placement_bad += dd.placement_bad;
         if let Some(f) = d.first.or(dd.first) {
@@ -667,6 +727,8 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         total.ascii_heads += d.ascii_heads;
         total.leader_mode_record_bad += d.leader_mode_record_bad;
         total.device_slots += d.device_slots;
+        total.device_lane_items += d.device_lane_items;
+        total.device_lane_instances += d.device_lane_instances;
         total.device_derived_bad += d.device_derived_bad;
         total.device_placement_bad += d.device_placement_bad;
         total.expanded_tabs += d.expanded_tabs;
@@ -724,6 +786,12 @@ pub fn run_hyper_oracle_check(paths: &[PathBuf], cluster_mode: ClusterMode, tab_
         total.heads,
         total.ascii_heads,
     );
+    if total.device_lane_items > 0 {
+        println!(
+            "hyper-oracle: {} item(s) past a Derived lane, which a load lays out empty: the device tier held each to that (no slot, the empty item's placement), so {} of the instances above have no device slot",
+            total.device_lane_items, total.device_lane_instances
+        );
+    }
     if tab_width.expands() {
         println!(
             "hyper-oracle: tab stops every {tab_width} cells on the directory and text inputs; {} tabs laid out wider than one cell, on every tier (no oracle has tab stops: the reference is this tree's own serial fold)",
@@ -756,6 +824,7 @@ mod tests {
         let d = diff_corpus(&corpus_of(text, params), &crate::default_trie()).expect("layout");
         assert!(d.records > 0 && d.instances > 0, "compared nothing");
         assert_eq!(d.device_slots, d.instances, "the device tier emitted a different survivor count");
+        assert_eq!(d.device_lane_items, 0, "nothing here is past a Derived lane");
         assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{:?}", d.firsts);
         assert_eq!((d.device_derived_bad, d.device_placement_bad), (0, 0), "{:?}", d.firsts);
         assert!(d.seam.is_ok(), "{:?}", d.seam);
@@ -777,7 +846,7 @@ mod tests {
             let rp = repo_params(mode, fold::TabWidth::ONE_CELL);
             let params = crate::repo::file_item_params(&rp, text.len(), 2);
             let d = diff_corpus(&corpus_of(text.as_bytes(), params), &trie).expect("layout");
-            assert!(d.records > 0 && d.device_slots == d.instances, "{mode:?}: compared nothing");
+            assert!(d.records > 0 && d.device_tier_is_whole(), "{mode:?}: compared nothing");
             assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{mode:?}: {:?}", d.firsts);
             assert_eq!(
                 (d.device_derived_bad, d.device_placement_bad),
@@ -853,7 +922,7 @@ mod tests {
                 };
                 let d = diff_corpus(&corpus, &trie).expect("layout");
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
-                assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert!(d.records > 0 && d.device_tier_is_whole(), "{at}: compared nothing");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
                     (d.device_derived_bad, d.device_placement_bad),
@@ -944,7 +1013,8 @@ mod tests {
                     compact_records_into(&r.records, Paint::Flat(DEFAULT_COLOR_PACKED), i as u32, &mut arena);
                 }
                 let reference = arena.instances();
-                let (derived, _) = device_pass2_derived_on_host(&items, &trie);
+                let (derived, _, past_a_lane) = device_pass2_derived_on_host(&items, &trie);
+                assert!(past_a_lane.is_empty(), "these short texts fit every Derived lane: {past_a_lane:?}");
                 assert_eq!(reference.len(), derived.len());
                 let gpu = glyph_field::ItemParamsGpu::from(&params);
                 let at = format!("{mode:?} rows {rows} cols {cols} scroll {scroll} wide {wide} wrap {wrap}");
@@ -1023,6 +1093,54 @@ mod tests {
         assert!(got.is_err(), "an empty corpus must be refused");
     }
 
+    /// AN ITEM PAST A DERIVED LANE, on the device tier: a load lays it out
+    /// empty and leaves every other item where it would have been
+    /// (`layout_hyper::derived_lane_overflow`), and the device tier holds the
+    /// emitter to exactly that. Here the middle item's one line reaches column
+    /// page 256 at one cell a page, past the lane's 255. Until 2026-11-27
+    /// the device tier emitted it regardless, and agreed with a reference
+    /// that clamped the lane the same way.
+    #[test]
+    fn the_device_tier_holds_an_item_past_a_lane_to_laid_out_empty() {
+        let trie = crate::default_trie();
+        let params = ItemParams {
+            origin_x: 0.5,
+            line_height: 1.1,
+            has_page: true,
+            page_cols: 1,
+            pages_wide: 1,
+            page_gap_x: 0.8,
+            depth_per_col: 0.75,
+            ..ItemParams::default()
+        };
+        let lane = glyph_field_derived::X_PAGE_MAX as usize;
+        // At one cell a page a glyph's column page is its column. The load's
+        // rule reads the widest line's leader COUNT against the lane, so
+        // `lane` leaders fit (the last on page `lane - 1`), and `lane + 2`
+        // put a glyph on page `lane + 1`, past it by any reading.
+        let fits = "x".repeat(lane);
+        let past = "y".repeat(lane + 2);
+        let corpus = Corpus {
+            name: "lane".into(),
+            items: [fits.as_str(), past.as_str(), "after\n"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| CorpusItem { label: format!("text {i}"), bytes: t.as_bytes().to_vec(), params })
+                .collect(),
+        };
+        let d = diff_corpus(&corpus, &trie).expect("layout");
+        // The host tiers carry no lane and compare all three items whole.
+        assert_eq!(d.instances, fits.len() + past.len() + 5);
+        assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{:?}", d.firsts);
+        // The device tier: the middle item is empty, the other two are
+        // compared slot for slot, the last one where the stream now has it.
+        assert_eq!((d.device_lane_items, d.device_lane_instances), (1, past.len()));
+        assert_eq!(d.device_slots, fits.len() + 5);
+        assert!(d.device_tier_is_whole());
+        assert_eq!((d.device_derived_bad, d.device_placement_bad), (0, 0), "{:?}", d.firsts);
+        assert_eq!(d.device_max_x_page as usize, lane - 1, "the item that fits turns every page it has");
+    }
+
     /// A line of `target_bytes` or more with no newline: words of every
     /// width class (ASCII, two-byte, a CJK miss of one cell, a bitmap
     /// emoji, a ZWJ family that clusters to one head) between runs of one to
@@ -1054,6 +1172,19 @@ mod tests {
     /// line past twice the chunk threshold with no newline), where a chunk
     /// must start from the line's true cells — the per-chunk walk measures
     /// from its own start, and the aggregation walks a tabbed chunk again.
+    ///
+    /// COLUMN PAGES come in two shapes, because the Derived slot's column-page
+    /// lane holds 255 (`glyph_field_derived::X_PAGE_MAX`). At six cells a
+    /// page, the short text turns its pages inside the lane, and the two long
+    /// lines reach tens of thousands of pages: a load lays those out EMPTY
+    /// (`layout_hyper::derived_lane_overflow`), and the device tier holds them
+    /// to that. At 2,048 cells a page, the long line turns its pages inside
+    /// the lane, across its chunk cuts. Until 2026-11-27 there was only the
+    /// six-cell shape, and the device tier emitted the long lines anyway: in
+    /// release both sides clamped the lane through the same `pack_row` and
+    /// agreed, and in a debug build `pack_row`'s assertion failed this test
+    /// ("Derived column page 256 exceeds 255"). The paging and the assertion
+    /// were both right; the instrument skipped the load's rule.
     #[test]
     fn tab_stops_agree_on_every_tier() {
         use crate::layout_hyper::chunk::{slice_byte_buffers_into_chunk_defs, CHUNK_THRESHOLD_BYTES};
@@ -1076,20 +1207,21 @@ mod tests {
         let cut_then_ends = format!("{cut}\tthe\tline\tends\nnext\tline\t|\n");
         let texts: [&str; 3] = [small, &cut, &cut_then_ends];
         // (wrap, mode, page_rows, page_cols, pages_wide)
-        let shapes: [(i32, fold::WrapMode, i32, i32, i32); 6] = [
+        let shapes: [(i32, fold::WrapMode, i32, i32, i32); 7] = [
             (0, fold::WrapMode::Back, 0, 0, 1),
             (7, fold::WrapMode::Back, 0, 0, 1),
             (7, fold::WrapMode::Down, 0, 0, 1),
             (100, fold::WrapMode::Back, 0, 0, 1),
             (5, fold::WrapMode::Down, 3, 0, 2),
             (0, fold::WrapMode::Back, 0, 6, 1),
+            (0, fold::WrapMode::Back, 0, 2048, 1),
         ];
         // The chunk-cut text must really cut inside its line where the line
         // is off a stop and the chunk holds a tab, or the case above is not
         // the one it claims to be.
         let (defs, _) = slice_byte_buffers_into_chunk_defs(&[cut.as_bytes()]);
         assert!(defs.len() >= 3, "the cut text is {} chunk(s)", defs.len());
-        // The 24 cases run at once: one after another they were 11 s of
+        // The 28 cases run at once: one after another they were 11 s of
         // the renderer's 13 s unit-test run, the long pole of cargo-test
         // (2026-10-26). Each case is independent; the tallies are summed.
         use rayon::prelude::*;
@@ -1136,7 +1268,7 @@ mod tests {
                 };
                 let d = diff_corpus(&corpus, &trie).expect("layout");
                 let at = format!("width {width} {cluster:?} wrap {wrap} {mode:?} rows {rows} cols {cols}");
-                assert!(d.records > 0 && d.device_slots == d.instances, "{at}: compared nothing");
+                assert!(d.records > 0 && d.device_tier_is_whole(), "{at}: compared nothing");
                 assert_eq!((d.record_bad, d.instance_bad, d.placement_bad), (0, 0, 0), "{at}: {:?}", d.firsts);
                 assert_eq!(
                     (d.device_derived_bad, d.device_placement_bad),
@@ -1145,6 +1277,21 @@ mod tests {
                     d.firsts
                 );
                 assert!(d.seam.is_ok(), "{at}: {:?}", d.seam);
+                // What the device tier compared of the column-page lane, and
+                // what it held to "laid out empty" instead.
+                let lane = glyph_field_derived::X_PAGE_MAX;
+                match cols {
+                    6 => {
+                        assert_eq!(d.device_lane_items, 2, "{at}: both long lines are past the lane at six cells a page");
+                        assert!(d.device_lane_instances > 20_000, "{at}: {}", d.device_lane_instances);
+                        assert!((1..=lane).contains(&d.device_max_x_page), "{at}: the short text turned {} page(s)", d.device_max_x_page);
+                    }
+                    2048 => {
+                        assert_eq!(d.device_lane_items, 0, "{at}: every item fits the lane");
+                        assert!((8..=lane).contains(&d.device_max_x_page), "{at}: the long line turned {} page(s)", d.device_max_x_page);
+                    }
+                    _ => assert_eq!((d.device_lane_items, d.device_max_x_page), (0, 0), "{at}"),
+                }
                 // The cut text's chunks, read off the reference: a chunk
                 // holding a tab whose line is off a stop where it starts.
                 if wrap == 0 && cols == 0 {

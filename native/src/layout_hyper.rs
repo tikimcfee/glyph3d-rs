@@ -165,10 +165,7 @@ impl HyperLayout {
                 for (item, why) in &over {
                     log::warn!("item {item}: {why}; laid out empty, the rest of the load is unaffected");
                 }
-                let mut kept: Vec<LayoutItem<'_>> = items.to_vec();
-                for (item, _) in &over {
-                    kept[*item].bytes = &[];
-                }
+                let kept = emptied_past_a_lane(items, &over);
                 // An emptied item has no survivors, so the second Pass 1
                 // finds nothing past a lane and this runs once.
                 return self.layout_items_internal(&kept, arena, allow_device);
@@ -313,6 +310,18 @@ pub fn derived_lane_overflow(prepasses: &[ItemPrepass], params: &[crate::layout:
         }
     }
     over
+}
+
+/// `items` with every item [`derived_lane_overflow`] named laid out EMPTY (no
+/// bytes): what a load packs instead of a lane it cannot hold. The one copy,
+/// so the load and the instrument that holds its device Pass 2 to the oracle
+/// (`device_pass2_derived_on_host`) empty the same items the same way.
+fn emptied_past_a_lane<'a>(items: &[LayoutItem<'a>], over: &[(usize, String)]) -> Vec<LayoutItem<'a>> {
+    let mut kept: Vec<LayoutItem<'a>> = items.to_vec();
+    for (item, _) in over {
+        kept[*item].bytes = &[];
+    }
+    kept
 }
 
 /// Prepass aggregation output holding per-item prepasses and per-chunk starting offsets.
@@ -1122,12 +1131,37 @@ where
     (slots, out.placements)
 }
 
-/// [`device_pass2_on_host`] in the Derived field's format (20 B `DerivedSlot`).
+/// [`device_pass2_on_host`] in the Derived field's format (20 B `DerivedSlot`),
+/// as a load runs it: an item past a Derived lane ([`derived_lane_overflow`])
+/// is laid out EMPTY first, by the load's own code, and named in the third
+/// return (ascending).
+///
+/// Until 2026-11-27 this called the emitter on every item as given, which no
+/// load does. An item past a lane then packed a clamped lane in release
+/// (`glyph_field_derived::pack_row` saturates; its limits are asserted in
+/// debug builds only), and `hyper_oracle` built its expectation through the
+/// same `pack_row`: the two agreed on the clamp, and the instrument passed
+/// having compared nothing true about those glyphs. In a debug build the
+/// assertion fired instead, which is how it was found.
 pub(crate) fn device_pass2_derived_on_host(
     items: &[LayoutItem<'_>],
     trie: &TrieTable,
-) -> (Vec<glyph_field_derived::DerivedSlot>, Vec<ItemPlacement>) {
-    device_pass2_on_host::<DerivedEmit>(items, trie)
+) -> (Vec<glyph_field_derived::DerivedSlot>, Vec<ItemPlacement>, Vec<usize>) {
+    // Pass 1 as the load runs it, for the lanes alone: `device_pass2_on_host`
+    // runs its own over the items that are left.
+    let em_height_fu = trie.metrics.em_height_fu;
+    let bitmap_adv = fu_to_world(trie.bitmap_advance_fu, em_height_fu);
+    let (chunks, item_chunk_ranges) = chunk::slice_items_into_chunks(items);
+    let agg = pass1_prepass_chunks(&chunks, &item_chunk_ranges, items, trie, bitmap_adv, em_height_fu);
+    let params: Vec<crate::layout::ItemParams> = items.iter().map(|it| it.params).collect();
+    let over = derived_lane_overflow(&agg.prepasses, &params);
+    let past: Vec<usize> = over.iter().map(|(item, _)| *item).collect();
+    let (slots, placements) = if over.is_empty() {
+        device_pass2_on_host::<DerivedEmit>(items, trie)
+    } else {
+        device_pass2_on_host::<DerivedEmit>(&emptied_past_a_lane(items, &over), trie)
+    };
+    (slots, placements, past)
 }
 
 impl crate::layout::VerifyLayout for HyperLayout {
