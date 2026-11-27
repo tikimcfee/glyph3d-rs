@@ -3830,6 +3830,73 @@ fn pointer_leave_clears_hover_and_link_without_canceling_active_drag() {
     assert!(h.wall.pointer().busy());
 }
 
+/// A target the fleet holds as cleaned up opens no terminal: the verb says it is gone. One
+/// the fleet does not know at all still gets its terminal (the fleet may simply not have
+/// arrived), where the attach program finds out and says so.
+#[test]
+fn attach_refuses_an_agent_the_fleet_holds_as_cleaned_up() {
+    use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+
+    let mut h = Harness::new();
+    let agent = |name: &str, host: &str, live: bool| GomuxAgent {
+        name: name.into(),
+        host: Some(host.into()),
+        live,
+        attached: Some(live),
+        status: Some(if live { "idle" } else { "ended" }.into()),
+        end_reason: (!live).then(|| "quit".to_owned()),
+        ..GomuxAgent::default()
+    };
+    h.wall.set_bus_snapshot(
+        Some(GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                agent("helper", "laptop-2", false),
+                agent("lead", "laptop-2", true),
+                agent("bench", "far-host", false),
+            ],
+        }),
+        "",
+    );
+
+    for target in ["helper@laptop-2", "helper", "bench@far-host"] {
+        let reply = h.wall.run(format!("wall.attach {target}"));
+        assert!(reply.is_err(), "{target}: {}", reply.text);
+        assert!(
+            reply.text.contains(&format!(
+                "{target} is not an agent any more: it ended (quit) and was cleaned up"
+            )),
+            "{target}: {}",
+            reply.text
+        );
+        let effects = h.wall.drain_effects();
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                WallEffect::SpawnTerminal { .. } | WallEffect::ReattachTerminal { .. }
+            )),
+            "{target} must open no terminal: {effects:?}"
+        );
+    }
+    assert!(h.wall.model().order().is_empty(), "no terminal was made");
+
+    // A bare name on another host is not this host's `bench`: unknown, so it is tried.
+    let unknown = h.wall.run("wall.attach bench");
+    assert!(!unknown.is_err(), "{}", unknown.text);
+    // And a live agent attaches as before.
+    let live = h.wall.run("wall.attach lead@laptop-2");
+    assert!(!live.is_err(), "{}", live.text);
+    let spawned = h
+        .wall
+        .drain_effects()
+        .iter()
+        .filter(|e| matches!(e, WallEffect::SpawnTerminal { argv: Some(_), .. }))
+        .count();
+    assert_eq!(spawned, 2);
+}
+
 #[test]
 fn attach_agent_prefers_local_reattach_when_agents_extra_ns_connected() {
     use wall_core::bus::{GomuxAgent, GomuxSnapshot};

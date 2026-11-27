@@ -38,7 +38,8 @@ use term_cells::{Modes, Screen};
 
 use crate::agent_view::{self, AgentViewDims};
 use crate::bus::{
-    attach_argv, bus_attachable, bus_hosts, find_bus_agent, gomux_screen_id,
+    attach_argv, bus_attachable, bus_hosts, find_bus_agent, find_departed_bus_agent,
+    gomux_screen_id,
     is_bus_target, local_bus_name, GomuxSnapshot,
 };
 use crate::camera::{CameraPose, ScreenBox, WallCamera};
@@ -3939,6 +3940,16 @@ impl WallApi for WallCore {
                 };
                 return Err(format!("{target} has no live session to attach to ({why})"));
             }
+        } else if let Some(gone) = find_departed_bus_agent(self.bus.as_ref(), target) {
+            // The fleet holds the record of its end: a terminal for it could only say
+            // `agent "x" not found` (2026-11-27, a click on a stale row did exactly that).
+            let how = match gone.end_reason.as_deref() {
+                Some(r) if !r.is_empty() => format!("ended ({r})"),
+                _ => "ended".to_owned(),
+            };
+            return Err(format!(
+                "{target} is not an agent any more: it {how} and was cleaned up"
+            ));
         }
         let argv = attach_argv(target)?;
         let zoom = self.model.camera().zoom();

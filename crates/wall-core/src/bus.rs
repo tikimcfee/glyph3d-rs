@@ -340,12 +340,46 @@ pub fn find_bus_agent(snap: Option<&GomuxSnapshot>, target: &str) -> Option<BusA
     None
 }
 
+/// Find the DEPARTED agent (cleaned up: `live: false`) `target` names in `snap`, matched as
+/// [`find_bus_agent`] matches a live one. `None` when the target is live, unknown to the
+/// snapshot, or there is no snapshot: only a record of its end says an agent is gone.
+pub fn find_departed_bus_agent<'a>(
+    snap: Option<&'a GomuxSnapshot>,
+    target: &str,
+) -> Option<&'a GomuxAgent> {
+    let snap = snap?;
+    if target.is_empty() || find_bus_agent(Some(snap), target).is_some() {
+        return None;
+    }
+    let local = local_bus_name(target, Some(snap));
+    let local_host = snap.host.as_deref().unwrap_or("");
+    snap.agents.iter().find(|a| {
+        !a.live
+            && (bus_target(a) == target
+                || local.is_some_and(|name| {
+                    a.name == name && a.host.as_deref().unwrap_or("") == local_host
+                }))
+    })
+}
+
 const ATTACH_RESET: &str = "\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?1015l\\033[?1004l\\033[?2004l\\033[?1049l\\033[?25h\\033[0m";
+
+/// What the attach terminal says, once, when its agent is not an agent any more. `%s` is the
+/// target.
+pub const ATTACH_GONE_NOTE: &str =
+    "[%s is not an agent any more (it was cleaned up), so there is nothing to attach to. Enter closes.]";
 
 /// Build the `sh -c` argv a remote `wall.attach <name>@<host>` terminal runs (`WallBus.attachArgv`).
 ///
 /// Validated with [`is_bus_target`] first; `target` is passed exclusively as positional `$1`,
 /// never interpolated into the shell script text.
+///
+/// A clean detach closes the terminal. A failed attach offers another try, since most
+/// failures pass (the bus or ssh was down, the agent's session is gone until it is resumed).
+/// One does not: the agent was cleaned up. Until 2026-11-27 that looped: every Enter ran
+/// `agent attach` again, which said `agent "x" not found` again. `agent attach` exits 1 for
+/// every failure, so after one the script asks `agent status` (which needs no terminal) and,
+/// when the answer is that there is no such agent, says so and closes on the next Enter.
 pub fn attach_argv(target: &str) -> Result<Vec<String>, String> {
     if !is_bus_target(target) {
         return Err(format!(
@@ -354,11 +388,18 @@ pub fn attach_argv(target: &str) -> Result<Vec<String>, String> {
     }
     let script = [
         "command -v agent >/dev/null 2>&1 || PATH=\"$(\"${SHELL:-/bin/sh}\" -lc 'printf %s \"$PATH\"' 2>/dev/null):$PATH\"".to_string(),
+        "n=\"${1%%@*}\"".to_string(),
         "while :; do".to_string(),
         "  agent attach \"$1\"; s=$?".to_string(),
         "  [ \"$s\" -eq 0 ] && exit 0".to_string(),
         format!("  printf '{ATTACH_RESET}'"),
         "  stty sane 2>/dev/null".to_string(),
+        // Both agent CLIs (Go and Rust) word a missing agent `agent "<name>" not found`.
+        "  w=\"$(agent status \"$1\" 2>&1 </dev/null)\"".to_string(),
+        "  case \"$w\" in *\"agent \\\"$n\\\" not found\"*)".to_string(),
+        format!("    printf '\\r\\n{ATTACH_GONE_NOTE}\\r\\n' \"$1\""),
+        "    read -r a; exit 0;;".to_string(),
+        "  esac".to_string(),
         "  printf '\\r\\n[agent attach %s ended with status %d. Enter attaches again; q then Enter closes.]\\r\\n' \"$1\" \"$s\"".to_string(),
         "  read -r a || exit 0".to_string(),
         "  [ \"$a\" = q ] && exit 0".to_string(),
@@ -543,8 +584,9 @@ mod tests {
         let dir = ScratchDir::new("sh");
         let log_path = dir.0.join("args");
         let agent_path = dir.0.join("agent");
+        // `attach` exits `$AGENT_EXIT`; `status` answers a live agent.
         let stub_script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit \"${{AGENT_EXIT:-0}}\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n[ \"$1\" = status ] && {{ echo 'helper: idle'; exit 0; }}\nexit \"${{AGENT_EXIT:-0}}\"\n",
             log_path.display()
         );
         fs::write(&agent_path, stub_script).unwrap();
@@ -583,9 +625,10 @@ mod tests {
         assert_eq!(closed.status.code(), Some(0));
         let closed_out = String::from_utf8_lossy(&closed.stdout);
         assert_eq!(closed_out.matches(reason).count(), 1);
+        // After a failed attach the script asks once whether the agent still exists.
         assert_eq!(
             fs::read_to_string(&log_path).unwrap(),
-            "attach\nhelper@workstation\n"
+            "attach\nhelper@workstation\nstatus\nhelper@workstation\n"
         );
         let reason_pos = closed_out.find(reason).unwrap();
         let before = &closed_out[..reason_pos];
@@ -603,7 +646,7 @@ mod tests {
         assert_eq!(again.status.code(), Some(0));
         assert_eq!(
             fs::read_to_string(&log_path).unwrap(),
-            "attach\nhelper@workstation\nattach\nhelper@workstation\n"
+            "attach\nhelper@workstation\nstatus\nhelper@workstation\nattach\nhelper@workstation\nstatus\nhelper@workstation\n"
         );
         let again_out = String::from_utf8_lossy(&again.stdout);
         assert_eq!(again_out.matches("ended with status 1.").count(), 2);
@@ -634,6 +677,85 @@ mod tests {
         let via_login = child.wait_with_output().unwrap();
         assert_eq!(via_login.status.code(), Some(0));
         assert_eq!(fs::read_to_string(&log_path).unwrap(), "attach\nhelper\n");
+    }
+
+    /// The bug of 2026-11-27: a row for a cleaned-up agent was clicked, and its terminal
+    /// printed `agent "x" not found` and "Enter attaches again" for as long as Enter was
+    /// pressed. A missing agent is said once and never tried again; any other failure still
+    /// offers the retry.
+    #[test]
+    fn attach_program_never_retries_an_agent_that_is_gone_and_still_retries_other_failures() {
+        let dir = ScratchDir::new("gone");
+        let log_path = dir.0.join("args");
+        let agent_path = dir.0.join("agent");
+        // `attach` always fails, printing `$AGENT_SAYS` as the real CLI prints its error;
+        // `status` prints the same and fails too.
+        let stub_script = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> \"{log}\"\nprintf '\\n' >> \"{log}\"\nprintf '%s\\n' \"$AGENT_SAYS\" >&2\nexit 1\n",
+            log = log_path.display()
+        );
+        fs::write(&agent_path, stub_script).unwrap();
+        fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |target: &str, says: &str, input: &str| -> (String, String) {
+            let _ = fs::remove_file(&log_path);
+            let argv = attach_argv(target).unwrap();
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.0.display()))
+                .env("AGENT_SAYS", says)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "the wrapper itself always ends cleanly");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                fs::read_to_string(&log_path).unwrap(),
+            )
+        };
+        let gone_note = |target: &str| ATTACH_GONE_NOTE.replace("%s", target);
+        let retry = "Enter attaches again";
+
+        // Another host's agent, as the Rust CLI words it. Three Enters: one attach, no more.
+        let (out, log) = run(
+            "helper@workstation",
+            r#"Error: agent "helper" not found on host workstation (3 agents there: agent list --host workstation)"#,
+            "\n\n\n",
+        );
+        assert_eq!(log, "attach helper@workstation \nstatus helper@workstation \n");
+        assert_eq!(out.matches(&gone_note("helper@workstation")).count(), 1, "{out}");
+        assert!(!out.contains(retry), "a missing agent offers no retry: {out}");
+
+        // This host's, as the Go CLI words it (no host), and `q` closes it as well.
+        let (out, log) = run("helper", r#"Error: agent "helper" not found"#, "q\n");
+        assert_eq!(log, "attach helper \nstatus helper \n");
+        assert_eq!(out.matches(&gone_note("helper")).count(), 1, "{out}");
+        assert!(!out.contains(retry));
+
+        // The terminal going away (EOF) closes it too.
+        let (out, log) = run("helper", r#"Error: agent "helper" not found"#, "");
+        assert_eq!(log.matches("attach").count(), 1);
+        assert!(out.contains(&gone_note("helper")));
+
+        // Anything else can pass, so Enter tries again: the bus down, the session gone
+        // until `agent resume`, and a not-found that names ANOTHER agent.
+        for says in [
+            "Error: asking workstation where its agent binary is: the bus is not running",
+            "Error: helper has ended (quit): its session agent-helper is gone, so there is nothing to attach to. agent resume helper --attach starts it again",
+            r#"Error: agent "helper-2" not found on host workstation"#,
+        ] {
+            let (out, log) = run("helper@workstation", says, "\n");
+            assert_eq!(log.matches("attach helper@workstation").count(), 2, "{says}: {log}");
+            assert_eq!(out.matches(retry).count(), 2, "{says}: {out}");
+            assert!(!out.contains("is not an agent any more"), "{says}: {out}");
+        }
     }
 
     #[test]
