@@ -173,7 +173,9 @@ struct App {
     pending_termd: Option<super::startup::PendingTermd>,
     /// True while waiting for initial `g3d-termd` startup (shows `"starting termd..."` notice).
     starting_termd: bool,
-    perf: WallPerf,
+    occluded: bool,
+    wakes: Arc<WakeGate>,
+    perf: super::perf::WallPerf,
     /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
     ime_composing: bool,
     /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
@@ -191,58 +193,9 @@ struct App {
 }
 
 #[derive(Default)]
-struct WallPerf {
-    log_enabled: bool,
-    last_log: Option<Instant>,
-    draw_us: Vec<u64>,
-    pump_us: Vec<u64>,
-    rows_uploaded: u64,
-}
-
-impl WallPerf {
-    fn summary(&mut self, reset: bool) -> String {
-        self.draw_us.sort_unstable();
-        self.pump_us.sort_unstable();
-        let pct = |v: &[u64], p: usize| -> f64 {
-            if v.is_empty() {
-                0.0
-            } else {
-                v[((v.len() - 1) * p) / 100] as f64
-            }
-        };
-        let draw_mean_ms = if self.draw_us.is_empty() {
-            0.0
-        } else {
-            (self.draw_us.iter().sum::<u64>() as f64 / self.draw_us.len() as f64) / 1000.0
-        };
-        let pump_total_us: u64 = self.pump_us.iter().sum();
-        let pump_mean_us = if self.pump_us.is_empty() {
-            0.0
-        } else {
-            pump_total_us as f64 / self.pump_us.len() as f64
-        };
-        let s = format!(
-            "frames={} draw_ms(mean={:.2} p50={:.2} p95={:.2} max={:.2}) pump(calls={} total_ms={:.2} mean_us={:.1} p50_us={:.1} p95_us={:.1} max_us={:.1}) rows_uploaded={}",
-            self.draw_us.len(),
-            draw_mean_ms,
-            pct(&self.draw_us, 50) / 1000.0,
-            pct(&self.draw_us, 95) / 1000.0,
-            pct(&self.draw_us, 100) / 1000.0,
-            self.pump_us.len(),
-            pump_total_us as f64 / 1000.0,
-            pump_mean_us,
-            pct(&self.pump_us, 50),
-            pct(&self.pump_us, 95),
-            pct(&self.pump_us, 100),
-            self.rows_uploaded,
-        );
-        if reset {
-            self.draw_us.clear();
-            self.pump_us.clear();
-            self.rows_uploaded = 0;
-        }
-        s
-    }
+struct WakeGate {
+    pending: std::sync::atomic::AtomicBool,
+    redraw_armed: std::sync::atomic::AtomicBool,
 }
 
 fn parse_css_hex(s: &str) -> Option<u32> {
@@ -414,6 +367,9 @@ impl App {
 
     fn redraw(&self) {
         if let Some(g) = &self.gfx {
+            if !self.occluded {
+                self.wakes.redraw_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             g.window.request_redraw();
         }
     }
@@ -487,17 +443,19 @@ impl App {
         let opts = self.opts.take().expect("the window opens once");
         self.exit_after = opts.exit_after;
 
-        let proxy = self.proxy.clone();
-        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            // The loop may be gone at shutdown; nothing is left to wake.
-            let _ = proxy.send_event(Wake);
+        let proxy_ctl = self.proxy.clone();
+        let gate_ctl = self.wakes.clone();
+        let control_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_ctl.pending.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = proxy_ctl.send_event(Wake);
+            }
         });
         // Single-owner gate per namespace: refuse before creating a second GPU
         // window, opening a second `WallStore` writer, or stealing `Role::Own`
         // size ownership from the running wall window.
         if let Some(ns) = &opts.namespace {
             let _s = super::startup::span("control_socket_bind");
-            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), wake.clone()) {
+            match wall_control::Server::bind(&wall_control::Target::namespace(ns.clone()), control_wake.clone()) {
                 Ok(server) => self.control = Some(server),
                 Err(wall_control::Error::AlreadyRunning { path, .. }) => {
                     eprintln!(
@@ -510,12 +468,23 @@ impl App {
             }
         }
 
+        // The terminals: coalesce duplicate queued `Wake`s and suppress wakes
+        // while a surface redraw is already armed (`draw` pumps before building).
+        let proxy_sess = self.proxy.clone();
+        let gate_sess = self.wakes.clone();
+        let session_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if !gate_sess.redraw_armed.load(std::sync::atomic::Ordering::SeqCst)
+                && !gate_sess.pending.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = proxy_sess.send_event(Wake);
+            }
+        });
         // Start `g3d-termd` connect/spawn/list/adopt off the window thread right away so it
         // overlaps macOS AppKit window creation and never blocks Frame 1.
         let pending_termd = opts
             .namespace
             .as_ref()
-            .map(|ns| super::startup::PendingTermd::spawn(ns.clone(), wake.clone()));
+            .map(|ns| super::startup::PendingTermd::spawn(ns.clone(), session_wake));
 
         let window = {
             let _s = super::startup::span("window_create");
@@ -559,7 +528,7 @@ impl App {
                 &opts.emoji_sheet,
                 format,
                 WallStyle::default(),
-                wake,
+                control_wake,
             )
         };
         let metrics = renderer.metrics();
@@ -616,6 +585,7 @@ impl App {
         }
         self.poll_pending_termd();
         self.sync_macos_option_as_alt();
+        self.perf.mark_opened(&self.proxy);
         self.redraw();
     }
 
@@ -651,7 +621,7 @@ impl App {
                 }
                 self.apply_effects();
                 self.refresh_termd_status();
-                self.pump();
+                self.pump(false);
                 if let Ok(hover_id) = std::env::var("GLYPH_WALL_HOVER") {
                     let hover_pt = self.wall.as_mut().and_then(|wall| {
                         let f = wall.frame();
@@ -941,8 +911,15 @@ impl App {
                     continue;
                 }
                 Some("app.perf") => {
-                    let reset = argv.get(1).map(String::as_str) == Some("reset");
-                    responder.send(self.perf.summary(reset));
+                    let reset = match argv.get(1).map(String::as_str) {
+                        None => false,
+                        Some("reset") if argv.len() == 2 => true,
+                        _ => {
+                            responder.send("ERR: usage: app.perf [reset]");
+                            continue;
+                        }
+                    };
+                    responder.send(self.perf.control_summary(reset));
                     continue;
                 }
                 Some("app.state") => {
@@ -1041,9 +1018,9 @@ impl App {
     }
 
     /// Take in what the terminals' reader thread queued.
-    fn pump(&mut self) {
+    fn pump(&mut self, request_redraw: bool) {
+        let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let t_pump = Instant::now();
         let (changed, news) = sessions.pump();
         let mut heard = false;
         let mut ended_any = false;
@@ -1117,14 +1094,13 @@ impl App {
                 Err(e) => log::error!("{e}"),
             }
         }
-        self.perf.pump_us.push(t_pump.elapsed().as_micros() as u64);
         if ended_any {
             self.refresh_termd_status();
         }
         if heard {
             self.apply_effects();
         }
-        if changed || heard {
+        if request_redraw && (changed || heard) {
             self.redraw();
         }
     }
@@ -1149,6 +1125,8 @@ impl App {
     /// The wall's description of a frame as the renderer's draw lists.
     #[expect(clippy::too_many_lines, reason = "one arm per kind of thing the wall describes; splitting it scatters the mapping")]
     fn draw(&mut self, to_surface: bool) {
+        self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.pump(false);
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(1.0 / 30.0);
         self.last_tick = now;
@@ -1174,17 +1152,24 @@ impl App {
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
+        let t_acq = Instant::now();
         let frame = if to_surface {
             let _s = (self.frames == 0).then(|| super::startup::span("first_surface_acquire"));
             match g.surface.get_current_texture() {
-                Cst::Success(f) | Cst::Suboptimal(f) => Some(f),
+                Cst::Success(f) | Cst::Suboptimal(f) => {
+                    self.occluded = false;
+                    Some(f)
+                }
                 Cst::Lost | Cst::Outdated => {
                     g.surface.configure(&self.ctx.device, &g.config);
                     g.window.request_redraw();
                     None
                 }
                 // Covered or asleep: skip surface present, unless an offscreen shot is waiting.
-                Cst::Occluded | Cst::Timeout => None,
+                Cst::Occluded | Cst::Timeout => {
+                    self.occluded = true;
+                    None
+                }
                 Cst::Validation => {
                     log::error!("the wall's surface failed validation; skipping the frame");
                     None
@@ -1193,9 +1178,15 @@ impl App {
         } else {
             None
         };
+        let t_post_acq = Instant::now();
         let need_offscreen = self.pending_shot.is_some()
+            || self.perf.is_enabled()
             || (self.exit_after == Some(self.frames + 1) && std::env::var_os("GLYPH_WALL_SHOT").is_some());
         if frame.is_none() && !need_offscreen {
+            if !to_surface && self.exit_after.is_some() {
+                self.frames += 1;
+                self.scripted();
+            }
             return;
         }
         let sf = g.window.scale_factor() as f32;
@@ -1258,7 +1249,10 @@ impl App {
         };
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
-        let view = frame.as_ref().map(|f| f.texture.create_view(&Default::default()));
+        let view = frame
+            .as_ref()
+            .map(|f| f.texture.create_view(&Default::default()))
+            .or_else(|| self.perf.occluded_view(&self.ctx.device, g.config.format, g.config.width, g.config.height));
         let mut encoder = view.as_ref().map(|_| self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("wall frame") }));
         let stats = match (&view, &mut encoder) {
             (Some(v), Some(enc)) => {
@@ -1267,7 +1261,6 @@ impl App {
             }
             _ => super::renderer::UploadStats::default(),
         };
-        self.perf.rows_uploaded += stats.rows_uploaded as u64;
 
         #[cfg(feature = "egui-ui")]
         self.panels.set_wall_dragging(self.buttons != 0);
@@ -1327,19 +1320,13 @@ impl App {
                 None
             }
         };
-        if let (Some(enc), Some(frame)) = (encoder, frame) {
-            self.ctx.queue.submit([enc.finish()]);
-            self.ctx.queue.present(frame);
-            super::startup::mark_once("first_frame_presented");
-            if !draws.is_empty() && g.renderer.pipelines_ready() {
-                super::startup::mark_once("first_terminal_frame_presented");
-            }
-            self.perf.draw_us.push(now.elapsed().as_micros() as u64);
-            if self.perf.log_enabled {
-                let due = self.perf.last_log.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0);
-                if due {
-                    self.perf.last_log = Some(Instant::now());
-                    log::info!("[wall-perf] {}", self.perf.summary(true));
+        if let Some(enc) = encoder {
+            let presented = frame.is_some();
+            self.perf.submit_and_record(&self.ctx, enc, frame, (now, t_acq, t_post_acq), stats);
+            if presented {
+                super::startup::mark_once("first_frame_presented");
+                if !draws.is_empty() && g.renderer.pipelines_ready() {
+                    super::startup::mark_once("first_terminal_frame_presented");
                 }
             }
         }
@@ -1925,13 +1912,19 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _wake: Wake) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _wake: Wake) {
+        self.wakes.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.perf.record_wake();
+        if self.perf.should_exit_on_wake(self.quit) {
+            event_loop.exit();
+            return;
+        }
         self.poll_pending_termd();
         if self.gfx.as_mut().is_some_and(|g| g.renderer.poll_ready_pipelines()) {
             self.redraw();
         }
         self.serve_control();
-        self.pump();
+        self.pump(true);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1980,6 +1973,14 @@ impl ApplicationHandler<Wake> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Focused(focused) => self.focused(focused),
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if occluded {
+                    self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    self.redraw();
+                }
+            }
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(g) = &self.gfx {
@@ -2022,51 +2023,90 @@ impl ApplicationHandler<Wake> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // The egui layer, the surface and the window go while the event
         // loop's display connection is still alive (see `Gfx`).
+        self.perf.clear_gpu();
         self.control = None;
         self.gfx = None;
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        const COVERED_TICK: std::time::Duration = std::time::Duration::from_millis(32);
         self.poll_pending_termd();
         if self.gfx.as_mut().is_some_and(|g| g.renderer.poll_ready_pipelines()) {
             self.redraw();
         }
         self.serve_control();
-        if self.quit {
+        if self.quit || self.perf.should_exit_on_wake(false) {
             event_loop.exit();
             return;
         }
-        match self.exit_after {
-            Some(n) if self.frames >= n => event_loop.exit(),
-            // A counted run draws without waiting to be asked.
-            Some(_) => self.redraw(),
-            None => {}
+        let (shader_dirty, shader_repaint_at) = match self.gfx.as_mut() {
+            Some(g) => g.renderer.poll_shaders(&self.ctx.device, Instant::now()),
+            None => (false, None),
+        };
+        if shader_dirty {
+            self.redraw();
         }
-        let now = Instant::now();
-        let shader_repaint_at = self.gfx.as_mut().and_then(|g| {
-            let (dirty, next) = g.renderer.poll_shaders(&self.ctx.device, now);
-            if dirty { g.window.request_redraw(); }
-            next
-        });
-        // Something is still moving (an eased camera, a glide) or an offscreen
-        // shot is pending: ask for a redraw, and fall back to a surface-free
-        // tick/shot if macOS suppresses RedrawRequested while occluded.
+        // Something is still moving (an eased camera, a glide), a counted run
+        // is advancing, or an offscreen shot is pending: ask for a redraw, and
+        // when covered tick at a low rate (~31 Hz) instead of spinning.
         if self.pending_shot.is_some() {
             self.draw(false);
         }
-        if self.animating {
-            self.redraw();
-            if self.last_tick.elapsed() >= std::time::Duration::from_millis(32) {
-                self.draw(false);
-            }
-            if self.animating {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + std::time::Duration::from_millis(16),
-                ));
-                return;
+        if self.exit_after.is_some_and(|n| self.frames >= n) {
+            event_loop.exit();
+            return;
+        }
+        let counted = self.exit_after.is_some();
+        if counted || self.animating {
+            if self.occluded && !self.perf.is_enabled() {
+                if self.last_tick.elapsed() >= COVERED_TICK {
+                    self.draw(false);
+                    if self.exit_after.is_some_and(|n| self.frames >= n) {
+                        event_loop.exit();
+                        return;
+                    }
+                    self.redraw();
+                }
+                if self.exit_after.is_some() || self.animating {
+                    let wait = COVERED_TICK.saturating_sub(self.last_tick.elapsed());
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+                    return;
+                }
+            } else {
+                self.redraw();
+                if self.last_tick.elapsed() >= COVERED_TICK {
+                    self.occluded = true;
+                    self.draw(false);
+                    if self.exit_after.is_some_and(|n| self.frames >= n) {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if self.animating || counted {
+                    let (perf_exit, cf) = self.perf.control_flow(
+                        self.frames,
+                        self.animating,
+                        Some(Instant::now() + std::time::Duration::from_millis(16)),
+                    );
+                    if perf_exit {
+                        event_loop.exit();
+                    } else {
+                        event_loop.set_control_flow(cf);
+                    }
+                    return;
+                }
             }
         }
+        let now = Instant::now();
         let mut next_repaint: Option<Instant> = shader_repaint_at;
+        if self.wakes.redraw_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.last_tick.elapsed() >= COVERED_TICK {
+                self.wakes.redraw_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                let arm_deadline = now + COVERED_TICK;
+                next_repaint = Some(next_repaint.map_or(arm_deadline, |d| d.min(arm_deadline)));
+            }
+        }
         #[cfg(feature = "egui-ui")]
         if let Some(deadline) = self.ui_repaint_at {
             if now >= deadline {
@@ -2095,11 +2135,12 @@ impl ApplicationHandler<Wake> for App {
                 next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
         }
-        if let Some(deadline) = next_repaint {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            return;
+        let (perf_exit, cf) = self.perf.control_flow(self.frames, self.animating, next_repaint);
+        if perf_exit {
+            event_loop.exit();
+        } else {
+            event_loop.set_control_flow(cf);
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
@@ -2137,10 +2178,9 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         termd_tick_at: None,
         pending_termd: None,
         starting_termd: false,
-        perf: WallPerf {
-            log_enabled: std::env::var("GLYPH_WALL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"),
-            ..WallPerf::default()
-        },
+        occluded: false,
+        wakes: Arc::new(WakeGate::default()),
+        perf: super::perf::WallPerf::from_env(),
         ime_composing: false,
         last_ime_area: None,
         #[cfg(target_os = "macos")]
@@ -2153,6 +2193,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
+    app.perf.print_summary(app.frames);
     if app.exit_after.is_some() {
         // A counted run says what its terminals showed, as text, and where
         // the wall put them.
