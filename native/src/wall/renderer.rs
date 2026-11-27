@@ -4826,7 +4826,17 @@ mod tests {
         // Wait for background shapes + cells pipelines, then verify terminals draw normally.
         renderer.wait_for_pipelines();
         assert!(renderer.pipelines_ready());
-        assert!(wakes.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while wakes.load(std::sync::atomic::Ordering::Relaxed) < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            wakes.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "expected >= 2 pipeline wakes within deadline, got {}",
+            wakes.load(std::sync::atomic::Ordering::Relaxed)
+        );
 
         let mut screen = Screen::new(4, 2);
         screen.default_bg = rgb(0x10, 0x80, 0x20);
