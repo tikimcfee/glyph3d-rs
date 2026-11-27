@@ -109,10 +109,9 @@ impl WallAgentsOptions {
             agy_brain_dir: cfg.agy_brain_dir.clone(),
             kimi_sessions_dir: cfg.kimi_sessions_dir.clone(),
         })?;
-        Ok(Self {
-            cli,
-            ..Self::default()
-        })
+        let mut options = Self { cli, ..Self::default() };
+        options.fleet_options.hosts = cfg.agent_hosts.clone().unwrap_or_else(|| "all".to_string());
+        Ok(options)
     }
 }
 
@@ -2391,5 +2390,17 @@ mod tests {
         assert!(session_count > 0, "expected real host to report >= 1 session");
 
         agents.shutdown();
+    }
+
+    #[test]
+    fn fleet_follows_every_host_unless_the_config_says_otherwise() {
+        use crate::launch_config::LaunchConfig;
+        let hosts = |agent_hosts: Option<&str>| {
+            let cfg = LaunchConfig { agent_hosts: agent_hosts.map(str::to_string), ..LaunchConfig::default() };
+            WallAgentsOptions::from_launch_config(&cfg).expect("options").fleet_options.hosts
+        };
+        assert_eq!(hosts(None), "all", "unset follows every host, as the JS relay did");
+        assert_eq!(hosts(Some("")), "", "an empty value keeps this machine only");
+        assert_eq!(hosts(Some("workstation,tinybot")), "workstation,tinybot");
     }
 }

@@ -78,6 +78,10 @@ pub struct LaunchConfig {
     /// gomuxai's `agent`, which lists and reads agent sessions
     /// (`agent_transcript::agent_cli`); unset is `agent` on PATH.
     pub agent_binary: Option<PathBuf>,
+    /// The hosts whose agents the wall lists, passed to `agent export` as `--hosts`:
+    /// `"all"` (every host on the bus), `"h1,h2"`, or `""` for this machine only. Unset is
+    /// `"all"`, as the JS wall's relay ran (`serve --gomuxai-hosts all`).
+    pub agent_hosts: Option<String>,
     /// Where gomuxai looks for each harness's sessions: a path is the only
     /// place it looks, `""` turns the harness off, unset is the app's own
     /// default locations that exist. Passed to gomuxai as its app config

@@ -87,6 +87,10 @@ no_ui = false
 # The `agent` binary, if it isn't on PATH (optional):
 # agent_binary = "~/.local/bin/agent"
 
+# The hosts whose agents the wall lists (optional): "all" (every host on the
+# gomuxai bus, the default), "workstation,tinybot", or "" for this machine only.
+# agent_hosts = "all"
+
 # The agent session to load at startup (optional): a session id (or the start
 # of only one), a gomuxai agent's name, or a transcript's path.
 # agent_session = "3f34adff-9ebe-405a-aac0-8f69e8fd85f5"
