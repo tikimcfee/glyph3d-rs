@@ -2160,6 +2160,7 @@ impl ApplicationHandler<Wake> for App {
         let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
         #[cfg(feature = "egui-ui")]
         let feed_ui = !wall_chord_bypass
+            && !matches!(event, WindowEvent::RedrawRequested)
             && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
                 || panels_want_keys
                 || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| ui.context().egui_wants_keyboard_input()));

@@ -926,6 +926,29 @@ else
     record_fail "window blur resets mods & hold" "terms=${N_BEFORE_BLUR}->${N_AFTER_D} hold=${HOLD_ON}->${HOLD_AFTER_BLUR}"
 fi
 
+# ── 21. Idle window draws zero frames while pointer rests over a terminal ────
+ctl wall.fit >/dev/null
+wait_settled >/dev/null
+T1_RECT_IDLE="$(ctl app.where | awk '$1=="terminal" && $2=="t1" {for(i=3;i<=NF;i++) if($i~/^rect=/) print substr($i,6)}')"
+if [[ -n "$T1_RECT_IDLE" ]]; then
+    IFS=, read -r IL IT IR IB <<<"$T1_RECT_IDLE"
+    ICX="$(python3 -c "print(f'{($IL + $IR) / 2.0:.2f}')")"
+    ICY="$(python3 -c "print(f'{($IT + $IB) / 2.0:.2f}')")"
+    ctl app.move "$ICX" "$ICY" >/dev/null
+    sleep 0.4
+    ctl app.perf reset >/dev/null
+    sleep 5
+    PERF_IDLE="$(ctl app.perf)"
+    IDLE_FRAMES="$(sed -n 's/.*frames=\([0-9]*\).*/\1/p' <<<"$PERF_IDLE")"
+    if [[ "$IDLE_FRAMES" == "0" ]]; then
+        record_pass "idle zero frames on hover" "hover at (${ICX},${ICY}) drew 0 frames over 5s"
+    else
+        record_fail "idle zero frames on hover" "expected frames=0 over 5s resting on t1, got frames=${IDLE_FRAMES:-?} ($PERF_IDLE)"
+    fi
+else
+    record_fail "idle zero frames on hover" "could not locate t1 rect for hover test"
+fi
+
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"
 echo ""
 echo "=== SMOKE SUMMARY: ${PASS_COUNT} passed, ${FAIL_COUNT} failed in ${ELAPSED}s ==="

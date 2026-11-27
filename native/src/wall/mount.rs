@@ -880,6 +880,58 @@ mod tests {
     }
 
     #[test]
+    fn settled_canvas_with_topbar_and_hovered_terminal_requests_no_idle_repaint() {
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+
+        // Hover t1's body so `t1.hovered == true` and `topbar` + `bar_buttons` are mounted.
+        let term = wall.frame().terminals[0].clone();
+        let sbox = wall.frame().camera.to_screen_box(term.body_rect, 1400.0, 900.0);
+        let body_pt = Point::new(0.5 * (sbox.left + sbox.right), 0.5 * (sbox.top + sbox.bottom));
+        wall.pointer_move(
+            &PointerEvent {
+                pointer_id: 1,
+                x: body_pt.x,
+                y: body_pt.y,
+                button: None,
+                buttons: Buttons::NONE,
+                mods: Mods::default(),
+                time_ms: 100.0,
+            },
+            &NoScreens,
+        );
+        let described = wall.frame();
+        assert!(described.terminals[0].hovered);
+        assert!(!described.animating, "resting hover must not report wall animating");
+
+        // Run a few frames to finish initial Area sizing, then verify egui asks for no further repaint.
+        let mut last_delay = std::time::Duration::ZERO;
+        for step in 0..5 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                time: Some(1.0 + f64::from(step) * 0.1),
+                ..Default::default()
+            };
+            let out = ctx.run_ui(raw, |ui| {
+                let _ = panels.show(ui.ctx(), &wall, &described);
+            });
+            last_delay = out
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+        }
+        assert!(
+            last_delay >= std::time::Duration::from_secs(60 * 60 * 24),
+            "settled canvas with hovered terminal and topbar must sleep idle, got repaint_delay={last_delay:?}"
+        );
+    }
+
+    #[test]
     fn mounts_topbar_bar_buttons_and_all_six_panels_and_closes_on_escape() {
         let ctx = egui::Context::default();
         configure_wall_context(&ctx, &crate::config::settings().wall);
