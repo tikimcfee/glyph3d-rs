@@ -43,8 +43,10 @@ pub(crate) fn settings_panel_bg() -> egui::Color32 {
     egui::Color32::from_rgb(14, 17, 24)
 }
 
+/// Opaque `#141821`, for the same reason: the JS window's 97 % let what was
+/// under it show through its table.
 pub(crate) fn status_panel_bg() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(20, 24, 33, 247)
+    egui::Color32::from_rgb(20, 24, 33)
 }
 
 pub(crate) const fn tone_color(tone: StatusTone) -> egui::Color32 {
@@ -589,6 +591,21 @@ mod tests {
     use super::settings::{self, SettingsInput, SettingsState};
     use super::status::{self, StatusInput, StatusState};
     use super::*;
+
+    #[test]
+    fn every_panels_fill_is_opaque() {
+        // On the wall's linear-blended target a few percent of alpha lets a
+        // bright terminal behind a dark panel ghost through its text.
+        for (name, fill) in [
+            ("settings", settings_panel_bg()),
+            ("status", status_panel_bg()),
+            ("sidebar", crate::wall::panels::sidebar::PANEL_BG),
+            ("notice", NOTICE_BG),
+            ("field", FIELD_BG),
+        ] {
+            assert!(fill.is_opaque(), "the {name} fill is see-through: {fill:?}");
+        }
+    }
 
     #[test]
     fn renders_settings_and_status_panels_offscreen_to_png() {

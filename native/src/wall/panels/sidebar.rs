@@ -399,6 +399,10 @@ const FG_HEAD: egui::Color32 = egui::Color32::from_rgb(0xae, 0xb7, 0xc6);
 const FG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x8e, 0xf0, 0xb8);
 const FG_DIM: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x73, 0x83);
 const FG_FAINT: egui::Color32 = egui::Color32::from_rgb(0x5d, 0x65, 0x74);
+/// The panel's fill: opaque `#0c0e14` (`Sidebar.jsx` drew it at 96 %, which
+/// on the wall's linear-blended target let a terminal behind a floating
+/// sidebar ghost through its rows).
+pub(crate) const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(12, 14, 20);
 const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(0x15, 0x1a, 0x24);
 const BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x16, 0x25, 0x1e);
 
@@ -1205,7 +1209,7 @@ pub fn show(
             };
 
             let frame_resp = egui::Frame::NONE
-                .fill(egui::Color32::from_rgba_unmultiplied(12, 14, 20, 245))
+                .fill(PANEL_BG)
                 .stroke(stroke)
                 .corner_radius(corner)
                 .shadow(shadow)
