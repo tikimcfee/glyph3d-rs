@@ -1863,6 +1863,25 @@ fn part2_extra_namespaces_lossy_flow_detach_on_kill_and_isolation() {
         "detaching gx-planner on the wall must NOT kill agent-planner in its daemon"
     );
     assert_eq!(still_alive[0].id, "agent-planner");
+    assert!(sessions.is_extra_connected("agents"));
+
+    // Verify `Sessions::reattach("gx-planner")` removes `agent-planner` from `detached_raw_ids`
+    // and re-subscribes directly (`Role::Own`, `Flow::Lossy`) with its preserved screen!
+    assert_eq!(
+        sessions.reattach("gx-planner").expect("reattach gx-planner"),
+        (88, 22)
+    );
+    seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || {
+            let _ = sessions.pump();
+            sessions
+                .text("gx-planner", 0, 0, 88, 21)
+                .unwrap_or_default()
+                .contains("AGENT_PLANNER>hello-agent")
+        }),
+        "reattach(gx-planner) did not restore live screen from scratch agents daemon"
+    );
 
     // Start `probe_late` dynamically after `Sessions` opened -> passive watcher discovers it!
     let late_hub = SessionHub::open_with(&late_target, HubOptions::default(), wake.waker())

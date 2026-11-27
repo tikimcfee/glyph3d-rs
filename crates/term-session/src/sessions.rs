@@ -170,10 +170,19 @@ impl Sessions {
         let mut extra_targets = Vec::new();
         for raw in extra_namespaces {
             let trimmed = raw.trim();
-            if trimmed.is_empty() || trimmed == namespace || !seen.insert(trimmed.to_owned()) {
+            if trimmed.is_empty() {
                 continue;
             }
-            extra_targets.push((trimmed.to_owned(), Target::namespace(trimmed)));
+            let (role_name, target_ns) = match trimmed.split_once('=') {
+                Some((role, ns)) if !role.trim().is_empty() && !ns.trim().is_empty() => {
+                    (role.trim(), ns.trim())
+                }
+                _ => (trimmed, trimmed),
+            };
+            if target_ns == namespace || !seen.insert(format!("{role_name}={target_ns}")) {
+                continue;
+            }
+            extra_targets.push((role_name.to_owned(), Target::namespace(target_ns)));
         }
         Self::open_targets_with(&target, &extra_targets, default_wall_hub_options(), wake)
             .map_err(|e| format!("termd namespace `{namespace}`: {e}"))
@@ -263,6 +272,11 @@ impl Sessions {
     pub fn is_reconnect_socket_absent(&self) -> bool {
         self.watching_reconnect.load(Ordering::Acquire)
             && self.target.resolve_socket().is_ok_and(|p| !p.exists())
+    }
+
+    /// Whether an extra namespace named `name` (such as `"agents"`) is currently connected.
+    pub fn is_extra_connected(&self, name: &str) -> bool {
+        self.extras.iter().any(|e| e.name == name && e.hub.is_some())
     }
 
     /// Underlying [`TerminalSession`] for `id`, if currently adopted.
@@ -468,6 +482,29 @@ impl Sessions {
         self.live
             .insert(id.to_owned(), TrackedSession::new(session, None));
         Ok(dims)
+    }
+
+    /// Re-attaches an extra-namespace terminal `id` (such as `gx-<name>` when a user picks a
+    /// closed agent from the sidebar or palette), clearing its raw id from `detached_raw_ids` and
+    /// adopting it with `Role::Own` and `Flow::Lossy`. Returns its `(cols, rows)`.
+    pub fn reattach(&mut self, id: &str) -> Result<(u16, u16), String> {
+        if let Some(tracked) = self.live.get(id) {
+            let s = tracked.session.screen();
+            return Ok((s.cols, s.rows));
+        }
+        let (idx, raw_id) = self
+            .resolve_extra_id(id)
+            .ok_or_else(|| format!("'{id}' does not belong to an attached extra namespace"))?;
+        let was_detached = self.extras[idx].detached_raw_ids.remove(&raw_id);
+        match self.adopt(id) {
+            Ok(dims) => Ok(dims),
+            Err(e) => {
+                if was_detached {
+                    self.extras[idx].detached_raw_ids.insert(raw_id);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Starts a terminal (the account's login shell when `argv` is `None`) in the primary

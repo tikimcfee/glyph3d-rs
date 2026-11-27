@@ -632,6 +632,9 @@ struct WallCore {
     termd_epoch_anchor: Option<(u64, f64)>,
     bus: Option<GomuxSnapshot>,
     bus_reason: String,
+    /// True when the local `agents` extra `termd` namespace is connected (`--wall-extra-ns agents`),
+    /// so `wall.attach` prefers direct local subscription (`gx-<name>`) over spawning a shell wrapper.
+    agents_extra_connected: bool,
     platform: Platform,
     char_widths: CharWidths,
     default_cols: u32,
@@ -1273,6 +1276,7 @@ impl WallCore {
             termd_epoch_anchor: None,
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
+            agents_extra_connected: false,
             platform: opts.platform,
             char_widths: opts.char_widths.sanitized(),
             default_cols: opts.default_cols,
@@ -1504,7 +1508,12 @@ impl WallCore {
 
     fn title_parts(&self, id: &str) -> (String, Option<String>, Option<AgentStatus>, String) {
         let name = self.model.name_of(id);
-        let attached_agent = self.model.store().attached(id).map(str::to_owned);
+        let attached_agent = self
+            .model
+            .store()
+            .attached(id)
+            .map(str::to_owned)
+            .or_else(|| id.strip_prefix("gx-").filter(|s| !s.is_empty()).map(str::to_owned));
         let agent_status = attached_agent
             .as_deref()
             .and_then(|target| find_bus_agent(self.bus.as_ref(), target))
@@ -3735,6 +3744,23 @@ impl WallApi for WallCore {
             split: None,
             attach_target: Some(canonical_target),
         });
+        if self.agents_extra_connected {
+            if let Some(ref ln) = local_name {
+                let gx_id = gomux_screen_id(ln);
+                self.model.push_effect(WallEffect::ReattachTerminal {
+                    id: gx_id.clone(),
+                    fallback_argv: argv,
+                    cols: self.default_cols,
+                    rows: self.default_rows,
+                });
+                self.termd.dismiss_lost();
+                self.model.notify_changed();
+                return Ok(AttachOutcome {
+                    id: gx_id,
+                    existing: false,
+                });
+            }
+        }
         self.model.push_effect(WallEffect::SpawnTerminal {
             window_top_left: None,
             argv: Some(argv),
@@ -5320,6 +5346,18 @@ impl Wall {
         self.router.context.bus = snapshot;
         self.router.context.bus_reason = reason.into();
         self.router.context.model.notify_changed();
+    }
+
+    /// Record whether the local `agents` extra `termd` namespace is currently connected
+    /// (`--wall-extra-ns agents`), so `wall.attach` prefers direct local subscription (`gx-<name>`)
+    /// over spawning an `agent attach` shell wrapper.
+    pub fn set_agents_extra_connected(&mut self, connected: bool) {
+        self.router.context.agents_extra_connected = connected;
+    }
+
+    /// Whether the local `agents` extra `termd` namespace is marked connected.
+    pub fn agents_extra_connected(&self) -> bool {
+        self.router.context.agents_extra_connected
     }
 
     // ── Verbs ────────────────────────────────────────────────────────────────

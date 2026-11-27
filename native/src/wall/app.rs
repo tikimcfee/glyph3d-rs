@@ -230,6 +230,7 @@ struct App {
     proxy: EventLoopProxy<Wake>,
     wall: Option<Wall>,
     terms: Option<Terminals>,
+    agents: Option<super::agents::WallAgents>,
     /// The socket `wallctl` reaches this wall by; None if it could not bind
     /// (another wall holds the namespace) or the wall has no namespace.
     control: Option<wall_control::Server>,
@@ -804,7 +805,7 @@ impl App {
             super::startup::PendingTermd::spawn_with_extra(
                 ns.clone(),
                 opts.extra_namespaces.clone(),
-                session_wake,
+                session_wake.clone(),
             )
         });
 
@@ -910,6 +911,14 @@ impl App {
         if self.exit_after.is_none() {
             self.draw(true);
         }
+        let launch_cfg = crate::launch_config::LaunchConfig::load_or_default();
+        self.agents = Some(match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
+            Ok(agent_opts) => super::agents::WallAgents::with_options(agent_opts, session_wake),
+            Err(e) => {
+                log::warn!("{e}");
+                super::agents::WallAgents::new(session_wake)
+            }
+        });
         self.poll_pending_termd();
         self.sync_macos_option_as_alt();
         self.perf.mark_opened(&self.proxy);
@@ -926,6 +935,7 @@ impl App {
         match res {
             Ok(ready) => {
                 let welcome = ready.sessions.hub().welcome().clone();
+                let agents_extra = ready.sessions.is_extra_connected("agents");
                 let mut appeared_list = Vec::with_capacity(ready.adopted.len());
                 for (id, cols, rows) in ready.adopted {
                     let mut appeared =
@@ -937,6 +947,7 @@ impl App {
                 }
                 self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
                 if let Some(wall) = &mut self.wall {
+                    wall.set_agents_extra_connected(agents_extra);
                     wall.on_termd_welcome(
                         welcome.instance.as_deref().unwrap_or(""),
                         &welcome.features,
@@ -997,6 +1008,7 @@ impl App {
                 #[cfg(feature = "egui-ui")]
                 {
                     self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+                        || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard)
                         || g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input())
                 }
                 #[cfg(not(feature = "egui-ui"))]
@@ -1288,6 +1300,31 @@ impl App {
                         }
                         self.refresh_termd_status();
                     }
+                    WallEffect::ReattachTerminal { id, fallback_argv, cols, rows } => {
+                        match sessions.reattach(&id) {
+                            Ok((c, r)) => {
+                                let mut appeared = TerminalAppeared::new(id.clone(), u32::from(c), u32::from(r));
+                                if let Some(title) = sessions.default_title_for(&id) {
+                                    appeared = appeared.with_title(title);
+                                }
+                                wall.terminal_appeared(appeared);
+                            }
+                            Err(e) => {
+                                log::info!("local reattach of {id} unavailable ({e}); falling back to attach shell wrapper");
+                                match sessions.spawn(
+                                    Some(fallback_argv),
+                                    cols.min(u32::from(u16::MAX)) as u16,
+                                    rows.min(u32::from(u16::MAX)) as u16,
+                                ) {
+                                    Ok((spawn_id, c, r)) => {
+                                        wall.terminal_appeared(TerminalAppeared::new(spawn_id, u32::from(c), u32::from(r)));
+                                    }
+                                    Err(err) => log::error!("the wall could not attach terminal: {err}"),
+                                }
+                            }
+                        }
+                        self.refresh_termd_status();
+                    }
                     WallEffect::KillTerminal { id } => {
                         sessions.kill(&id);
                         self.refresh_termd_status();
@@ -1443,7 +1480,17 @@ impl App {
             let reply = match (&mut self.wall, &self.terms) {
                 (Some(wall), Some(terms)) => {
                     wall.set_now_ms(now_ms);
-                    wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text
+                    let lookup = screen_lookup(|id| terms.screen(id));
+                    match &mut self.agents {
+                        Some(agents) => {
+                            let r = agents.run_verb_with_screens(wall, line.as_str(), &lookup);
+                            if let Some(msg) = agents.take_notice() {
+                                wall.notify(&msg);
+                            }
+                            r.text
+                        }
+                        None => wall.run_with_screens(line.as_str(), &lookup).text,
+                    }
                 }
                 _ => "ERR: the wall is not open yet".to_string(),
             };
@@ -1545,107 +1592,114 @@ impl App {
     /// Take in what the terminals' reader thread queued.
     fn pump(&mut self, request_redraw: bool) {
         let _perf = self.perf.pump_scope();
-        let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let (mut changed, news) = sessions.pump();
-        // Catch metadata-only scrollback updates (`ViewReply` offset/max or
-        // `status_follow` scrollback_rows arriving after `Event::Repaint`).
-        let mut live_count = 0usize;
-        for id in sessions.ids() {
-            live_count += 1;
-            if let Some(sb) = sessions.scrollback(id) {
-                let next = super::describe::TerminalScrollback {
-                    offset: sb.offset,
-                    max: sb.max,
-                    viewing: sb.viewing,
-                };
-                if self.scrollback_snapshot.get(id).copied() != Some(next) {
-                    self.scrollback_snapshot.insert(id.to_owned(), next);
-                    changed = true;
-                }
-            }
-        }
-        if self.scrollback_snapshot.len() != live_count {
-            self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
-            changed = true;
-        }
+        let mut changed = false;
         let mut heard = false;
         let mut ended_any = false;
-        for n in news {
-            match n {
-                News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
-                    super::startup::mark_once("first_repaint_applied");
-                    if let Some(screen) = sessions.screen(&id) {
-                        heard |= wall.terminal_screen_filled(
-                            &id,
-                            screen,
-                            ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
-                        );
+        if let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) {
+            let (sess_changed, news) = sessions.pump();
+            changed = sess_changed;
+            wall.set_agents_extra_connected(sessions.is_extra_connected("agents"));
+            // Catch metadata-only scrollback updates (`ViewReply` offset/max or
+            // `status_follow` scrollback_rows arriving after `Event::Repaint`).
+            let mut live_count = 0usize;
+            for id in sessions.ids() {
+                live_count += 1;
+                if let Some(sb) = sessions.scrollback(id) {
+                    let next = super::describe::TerminalScrollback {
+                        offset: sb.offset,
+                        max: sb.max,
+                        viewing: sb.viewing,
+                    };
+                    if self.scrollback_snapshot.get(id).copied() != Some(next) {
+                        self.scrollback_snapshot.insert(id.to_owned(), next);
+                        changed = true;
                     }
                 }
-                News::Resized { id, cols, rows } => {
-                    wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
-                    heard = true;
-                }
-                News::Title { id, title } => {
-                    wall.terminal_title(&id, title);
-                    heard = true;
-                }
-                News::Modes { id, modes } => {
-                    wall.terminal_modes(&id, modes);
-                    heard = true;
-                }
-                News::Ended { id } => {
-                    wall.terminal_ended(&id);
-                    heard = true;
-                    ended_any = true;
-                }
-                News::Disconnected { message } => {
-                    log::error!("termd is gone: {message}");
-                    wall.set_connected(false);
-                    wall.on_termd_disconnected(false, epoch_now_ms());
-                    heard = true;
+            }
+            if self.scrollback_snapshot.len() != live_count {
+                self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
+                changed = true;
+            }
+            for n in news {
+                match n {
+                    News::Filled { id, resized, scrolled_top, within_margins, rewritten_cols } => {
+                        super::startup::mark_once("first_repaint_applied");
+                        if let Some(screen) = sessions.screen(&id) {
+                            if let Some(agents) = &mut self.agents {
+                                agents.note_terminal_scrolled(&id, scrolled_top, resized, within_margins, screen.modes.alt_screen);
+                            }
+                            heard |= wall.terminal_screen_filled(
+                                &id,
+                                screen,
+                                ScreenFillDelta { resized, scrolled_top, within_margins, rewritten_cols: &rewritten_cols },
+                            );
+                        }
+                    }
+                    News::Resized { id, cols, rows } => {
+                        wall.terminal_resized(&id, u32::from(cols), u32::from(rows));
+                        heard = true;
+                    }
+                    News::Title { id, title } => {
+                        wall.terminal_title(&id, title);
+                        heard = true;
+                    }
+                    News::Modes { id, modes } => {
+                        wall.terminal_modes(&id, modes);
+                        heard = true;
+                    }
+                    News::Ended { id } => {
+                        wall.terminal_ended(&id);
+                        heard = true;
+                        ended_any = true;
+                    }
+                    News::Disconnected { message } => {
+                        log::error!("termd is gone: {message}");
+                        wall.set_connected(false);
+                        wall.on_termd_disconnected(false, epoch_now_ms());
+                        heard = true;
+                    }
                 }
             }
-        }
-        if let Some(live_ids) = sessions.take_reconnected() {
-            log::info!("termd came back ({} terminal(s))", live_ids.len());
-            let welcome = sessions.hub().welcome();
-            wall.on_termd_welcome(
-                welcome.instance.as_deref().unwrap_or(""),
-                &welcome.features,
-                epoch_now_ms(),
-            );
-            wall.dismiss_termd_lost();
-            if !live_ids.is_empty() {
-                wall.set_live_terminals(&live_ids);
+            if let Some(live_ids) = sessions.take_reconnected() {
+                log::info!("termd came back ({} terminal(s))", live_ids.len());
+                let welcome = sessions.hub().welcome();
+                wall.on_termd_welcome(
+                    welcome.instance.as_deref().unwrap_or(""),
+                    &welcome.features,
+                    epoch_now_ms(),
+                );
+                wall.dismiss_termd_lost();
+                if !live_ids.is_empty() {
+                    wall.set_live_terminals(&live_ids);
+                }
+                for id in &live_ids {
+                    match sessions.adopt(id) {
+                        Ok((cols, rows)) => {
+                            let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                            if let Some(title) = sessions.default_title_for(id) {
+                                appeared = appeared.with_title(title);
+                            }
+                            wall.terminal_appeared(appeared);
+                        }
+                        Err(e) => log::error!("{e}"),
+                    }
+                }
+                wall.set_connected(true);
+                heard = true;
+                ended_any = true;
             }
-            for id in &live_ids {
-                match sessions.adopt(id) {
+            for id in sessions.take_external_appeared() {
+                match sessions.adopt(&id) {
                     Ok((cols, rows)) => {
                         let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
-                        if let Some(title) = sessions.default_title_for(id) {
+                        if let Some(title) = sessions.default_title_for(&id) {
                             appeared = appeared.with_title(title);
                         }
                         wall.terminal_appeared(appeared);
+                        heard = true;
                     }
                     Err(e) => log::error!("{e}"),
                 }
-            }
-            wall.set_connected(true);
-            heard = true;
-            ended_any = true;
-        }
-        for id in sessions.take_external_appeared() {
-            match sessions.adopt(&id) {
-                Ok((cols, rows)) => {
-                    let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
-                    if let Some(title) = sessions.default_title_for(&id) {
-                        appeared = appeared.with_title(title);
-                    }
-                    wall.terminal_appeared(appeared);
-                    heard = true;
-                }
-                Err(e) => log::error!("{e}"),
             }
         }
         if ended_any {
@@ -1654,7 +1708,20 @@ impl App {
         if heard {
             self.apply_effects();
         }
-        if request_redraw && (changed || heard) {
+        let mut agents_changed = false;
+        if let (Some(wall), Some(agents)) = (&mut self.wall, &mut self.agents) {
+            if let Some(Terminals::Live(sessions)) = &self.terms {
+                agents.sync_sessions(sessions);
+            }
+            agents_changed = agents.pump(wall);
+            if let Some(msg) = agents.take_notice() {
+                wall.notify(&msg);
+            }
+        }
+        if agents_changed {
+            self.apply_effects();
+        }
+        if request_redraw && (changed || heard || agents_changed) {
             self.redraw();
         }
     }
@@ -1843,7 +1910,11 @@ impl App {
         #[cfg(feature = "egui-ui")]
         let mut panel_verbs: Vec<String> = Vec::new();
         #[cfg(feature = "egui-ui")]
+        let mut agent_verbs: Vec<String> = Vec::new();
+        #[cfg(feature = "egui-ui")]
         let mut panel_egui_keys = false;
+        #[cfg(feature = "egui-ui")]
+        let agents_open = self.wall.as_ref().zip(self.agents.as_ref()).is_some_and(|(w, a)| a.has_open_views(w));
         #[cfg(feature = "egui-ui")]
         let mut ui_painted_on_gpu = false;
         #[cfg(feature = "egui-ui")]
@@ -1852,8 +1923,10 @@ impl App {
                 self.frames == 0 && to_surface && self.exit_after.is_none() && self.pending_shot.is_none();
             let ui_needed = !skip_bootstrap_ui
                 && (self.hud_open
+                    || agents_open
                     || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described))
-                    || g.ui.as_ref().is_some_and(WallUi::is_active));
+                    || g.ui.as_ref().is_some_and(WallUi::is_active)
+                    || g.ui.as_ref().is_some_and(WallUi::has_pending_input));
             if ui_needed {
                 let hud_terms: Vec<HudTerminalInfo<'_>> = described
                     .terminals
@@ -1868,9 +1941,15 @@ impl App {
                 let hud_open = &mut self.hud_open;
                 let panels = &mut self.panels;
                 let wall_ref = self.wall.as_ref();
+                let mut agents_ref = self.agents.as_mut();
+                let window_sf = self.win.scale_factor();
                 let window_arc = g.window.clone();
                 let ui = g.ensure_ui(&self.ctx.device);
                 let mut ui_frame = ui.run(&window_arc, viewport, |ctx| {
+                    agent_verbs.clear();
+                    if let (Some(w), Some(ag)) = (wall_ref, agents_ref.as_deref_mut()) {
+                        ag.show_panel(ctx, w, viewport, window_sf, &mut agent_verbs);
+                    }
                     if let Some(w) = wall_ref {
                         panel_verbs = panels.show(ctx, w, &described);
                     }
@@ -1962,10 +2041,19 @@ impl App {
                         if verb.starts_with("wall.status") {
                             status_opened = true;
                         }
-                        let reply = wall.run_with_screens(verb.as_str(), &lookup);
+                        let reply = match &mut self.agents {
+                            Some(agents) => agents.run_verb_with_screens(wall, verb.as_str(), &lookup),
+                            None => wall.run_with_screens(verb.as_str(), &lookup),
+                        };
                         self.panels.record_verb_reply(verb, &reply.text);
                     }
                     changed = true;
+                }
+                if let Some(agents) = &mut self.agents {
+                    changed |= agents.apply_own_panel_outputs(wall, &agent_verbs);
+                    if let Some(msg) = agents.take_notice() {
+                        wall.notify(&msg);
+                    }
                 }
             }
             if status_opened {
@@ -2422,6 +2510,7 @@ impl App {
                 !menu_open && chord_bypasses_panel_input(Platform::host(), &mapped);
             !wall_chord_bypass
                 && (self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+                    || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard)
                     || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| {
                         ui.is_active() && ui.context().egui_wants_keyboard_input()
                     }))
@@ -2470,9 +2559,9 @@ impl App {
                     if let Some(bit) = modifier_bit_of_physical(k.physical) {
                         self.modifiers |= bit;
                     }
-                    let eff = self.modifiers | k.mods;
                     #[cfg(feature = "egui-ui")]
                     if let Some(g) = &mut self.gfx {
+                        let eff = self.modifiers | k.mods;
                         let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
                         let emods = super::ui::winit_mods_to_egui(eff);
                         g.ensure_ui(&self.ctx.device)
@@ -2980,7 +3069,8 @@ impl ApplicationHandler<Wake> for App {
             _ => false,
         };
         #[cfg(feature = "egui-ui")]
-        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+            || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard);
         #[cfg(feature = "egui-ui")]
         let feed_ui = !wall_chord_bypass
             && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
@@ -3109,6 +3199,7 @@ impl ApplicationHandler<Wake> for App {
         // The egui layer, the surface and the window go while the event
         // loop's display connection is still alive (see `Gfx`).
         self.perf.clear_gpu();
+        self.agents = None;
         self.control = None;
         self.gfx = None;
     }
@@ -3252,6 +3343,7 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         proxy: event_loop.create_proxy(),
         wall: None,
         terms: None,
+        agents: None,
         control: None,
         pending_shot: None,
         quit: false,

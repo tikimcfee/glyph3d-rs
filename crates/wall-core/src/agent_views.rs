@@ -2627,11 +2627,12 @@ impl AgentViews {
         let sync = self.term_sync.get(id);
         let grid = host.terminal(id);
         let attached = host.attached_target(id).unwrap_or_default();
-        let bus_agent = if attached.is_empty() {
-            None
+        let bus_lookup = if !attached.is_empty() {
+            Some(attached.as_str())
         } else {
-            host.bus_agent(&attached)
+            id.strip_prefix("gx-").filter(|s| !s.is_empty())
         };
+        let bus_agent = bus_lookup.and_then(|target| host.bus_agent(target));
         let pwd = sync.map(|s| s.pwd.clone()).unwrap_or_default();
         let cwd = sync
             .map(|s| s.cwd.clone())
