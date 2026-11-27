@@ -105,8 +105,17 @@ impl Panels {
         wall.menu().is_some()
             || wall.palette_open()
             || self.palette.open
-            || wall.store().settings_panel().open
+            || (wall.store().settings_panel().open
+                && (!self.settings_was_open || self.settings.wants_keyboard()))
             || (wall.store().help_panel().open && (!self.help_was_open || self.help_wants_keys))
+    }
+
+    /// Surrender keyboard focus from docked/floating Settings and Help search boxes
+    /// when the user clicks on the wall canvas or a global nav chord blurs them.
+    pub fn blur_docked_inputs(&mut self) {
+        self.settings.blur();
+        self.help.blur();
+        self.help_wants_keys = false;
     }
 
     /// Draw the topbar, hovered title-bar buttons, and every open panel into
@@ -546,8 +555,10 @@ impl Panels {
                 mutated = true;
             }
         }
-        let field_focus = if egui_wants_keyboard || self.wants_keyboard(wall) {
+        let field_focus = if wall.menu().is_some() || wall.palette_open() || self.palette.open {
             FieldFocus::Input
+        } else if egui_wants_keyboard || self.wants_keyboard(wall) {
+            FieldFocus::PanelControl
         } else {
             FieldFocus::None
         };
@@ -591,10 +602,19 @@ impl Panels {
             return true;
         }
         if wall.store().help_panel().open {
+            if !self.help.query.is_empty() {
+                self.help.query.clear();
+                return true;
+            }
             let _ = wall.run("wall.help close");
             return true;
         }
         if wall.store().settings_panel().open {
+            if !self.settings.query.is_empty() {
+                self.settings.query.clear();
+                self.settings.active = 0;
+                return true;
+            }
             let _ = wall.run("wall.settings close");
             return true;
         }

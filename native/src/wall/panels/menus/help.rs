@@ -123,6 +123,11 @@ impl HelpPanelState {
     pub const fn last_rect(&self) -> Option<egui::Rect> {
         self.last_rect
     }
+
+    /// Surrender keyboard focus from the help search field when the user clicks the canvas.
+    pub fn blur(&mut self) {
+        self.search_focused = false;
+    }
 }
 
 /// JavaScript `Math.round` semantics (ties toward `+∞`) as an integer coordinate.
