@@ -6,7 +6,7 @@
 - **At a glance**:
   - **Verbs**: 53/54 JS `wall.*` verbs ported (`wall.token` deliberately disabled on native) + 3 Rust additions (`wall.focus`, `wall.palette`, `wall.agent.follow`) + 7 `terminal.*` + 2 router built-ins. Five `wall.agent.*` verbs (`expand`, `collapse`, `show`, `earlier`, `jump <eventId>`) are currently stubs in `wall.rs` pending `WallAgents` hook-up.
   - **Chords & plain keys**: 31/31 `KEYMAP` chords + 5/5 plain keys ported and live-wired.
-  - **Config knobs**: 47/47 JS knobs ported + 2 native additions (`fontSize`, `lineHeight`) = 49 total. 41 are live-wired end-to-end; 4 (`agentView*`) are dormant pending Agent View mounting; 4 (`boldIsBright`, `renderLoop`, `traceInput`, `menuHint`) are stored/validated only (dead live).
+  - **Config knobs**: 47/47 JS knobs ported + 5 native additions (`fontSize`, `lineHeight`, `panelOpacity`, `greekPx`, `cursorBlinkMs`) = 52 total. 45 are live-wired end-to-end; 4 (`agentView*`) are dormant pending Agent View mounting; 3 browser-only knobs (`renderLoop`, `traceInput`, `menuHint`) stay in `WallConfig`/`WallStore` for browser import round-tripping and are hidden from the native Settings panel.
   - **Smoke coverage**: `tools/wall-smoke.sh` (20 live checks) + `tools/wall-smoke-text.sh` (6 live checks) + 280 `wall-core` tests (37 scenario + 24 pointer + 219 unit) + `wall::describe` / `wall::mount` / panel offscreen unit tests.
 
 ---
@@ -35,10 +35,7 @@
 
 8. ~~**Right-click on map labels & fullscreen background, and fullscreen pinch guard**~~ — **Closed**: `Wall::context_menu` now resolves solo fullscreen to the fullscreen terminal, group fullscreen empty padding to the group, and zoomed-out map label pills (`hit_map_label`) to `MenuTarget::Terminal { part: Title }` (`WallMenu.js:61-75`); `Wall::pinch` returns early while fullscreen is active (`wall_scenarios::context_menu_hits_map_labels_and_fullscreen_padding_and_pinch_respects_fullscreen` + live scratch check).
 
-9. **Other dead or split-source settings (`renderLoop`, `traceInput`, `menuHint`, `clickRepeatMs`, static `[wall]` knobs)**
-   - `renderLoop` (`always` ignored; `app.rs` always runs on-demand), `traceInput` (no `[input]` debug capture log), `menuHint` (listed in Settings even though native deliberately has no browser menu).
-   - `clickRepeatMs` governs text double/triple-click inside `wall-core`, but `app.rs:66, 1825` hardcodes `DOUBLE_CLICK_MS = 500.0` for title-bar/canvas double-click.
-   - `panelOpacity`, `greekPx`, `cursorBlinkMs` live in startup `config/defaults.toml` `[wall]` rather than live `WallConfig` / Settings.
+9. ~~**Other dead or split-source settings (`renderLoop`, `traceInput`, `menuHint`, `clickRepeatMs`, static `[wall]` knobs)**~~ — **Closed**: `panelOpacity`, `greekPx`, and `cursorBlinkMs` are now live `WallConfig`/`KNOBS` settings synced into `WallRenderer::style_mut()` (with `greekPx` surviving resize/DPI changes via `WindowLifecycle::set_base_greek_px`); `app.rs` reads `wall.config().click_repeat_ms` for title-bar/canvas double-click instead of hardcoded `DOUBLE_CLICK_MS`; `renderLoop`, `traceInput`, and `menuHint` are hidden from the native Settings panel while remaining in `WallConfig`/`WallStore` so browser imports round-trip cleanly.
 
 10. **Minor polish & unhandled window/session hooks**
     - `WindowEvent::CursorLeft` is unhandled (moving pointer outside the window leaves the last `hovered_id` highlighted).

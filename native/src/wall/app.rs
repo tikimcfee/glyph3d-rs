@@ -63,8 +63,8 @@ use super::ui::{show_debug_hud, DebugHudInput, HudTerminalInfo, UiEventOutcome, 
 const WORLD_CELL_HEIGHT: f32 = 2.4;
 /// The panel's padding round its cells, in world units (the JS wall's 0.3).
 const PANEL_PAD: f32 = 0.3;
-/// Two presses this close in time and place are a double click.
-const DOUBLE_CLICK_MS: f64 = 500.0;
+/// Maximum pointer drift in logical px between clicks counted as a double click
+/// (interval comes live from `wall.config().click_repeat_ms`).
 const DOUBLE_CLICK_PX: f64 = 5.0;
 /// Lines scrolled per discrete physical mouse-wheel detent (`MouseScrollDelta::LineDelta`),
 /// matching Firefox's 3-line `deltaMode = 1` notch and Chrome's ~100 CSS px notch (`~3.3` rows).
@@ -1103,10 +1103,17 @@ impl App {
         let family = cfg.font_family.clone();
         let font_size = cfg.font_size;
         let line_height = cfg.line_height;
-        g.renderer.style_mut().line_thickness_scale = cfg.line_thickness as f32;
-        g.renderer.style_mut().underline_raise = cfg.underline_raise as f32;
-        g.renderer.style_mut().curly_amplitude = cfg.curly_amplitude as f32;
-        g.renderer.style_mut().dim_alpha = cfg.dim_alpha as f32;
+        let sf = self.win.scale_factor() as f32;
+        let greek_px = cfg.greek_px as f32;
+        self.win.set_base_greek_px(greek_px);
+        let style = g.renderer.style_mut();
+        style.panel_opacity = cfg.panel_opacity as f32;
+        style.greek_px = greek_px * sf;
+        style.cursor_blink_ms = cfg.cursor_blink_ms.clamp(0.0, f64::from(u32::MAX)).round() as u32;
+        style.line_thickness_scale = cfg.line_thickness as f32;
+        style.underline_raise = cfg.underline_raise as f32;
+        style.curly_amplitude = cfg.curly_amplitude as f32;
+        style.dim_alpha = cfg.dim_alpha as f32;
 
         let font_changed = matches!(changed_key, None | Some("fontFamily" | "fontSize" | "lineHeight"));
         if !font_changed {
@@ -2976,7 +2983,8 @@ impl App {
                         }
                     }
                     let here = Point::new(ev.x, ev.y);
-                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
+                    let click_repeat_ms = wall.config().click_repeat_ms;
+                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= click_repeat_ms && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
                     if double {
                         wall.pointer_double_click(&ev);
                         self.last_release = None;

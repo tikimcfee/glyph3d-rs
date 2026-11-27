@@ -604,6 +604,12 @@ impl WindowLifecycle {
         self.scale_factor = sanitize_scale_factor(scale_factor);
     }
 
+    /// Update the logical-px `greek_px` baseline so subsequent resizes or DPI
+    /// scale-factor changes preserve the user's live `greekPx` setting.
+    pub fn set_base_greek_px(&mut self, greek_px: f32) {
+        self.base_style.greek_px = greek_px;
+    }
+
     /// Load `window-<ns>.json` (if any), match against connected monitors, and
     /// build initial [`WindowAttributes`] plus whether OS fullscreen should be
     /// entered right after window creation (preserving the normal windowed frame).
