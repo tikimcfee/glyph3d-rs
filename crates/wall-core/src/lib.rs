@@ -27,6 +27,7 @@ pub mod import;
 pub mod keymap;
 pub mod labels;
 pub mod layout;
+pub mod links;
 pub mod menu;
 pub mod model;
 pub mod mouse;
