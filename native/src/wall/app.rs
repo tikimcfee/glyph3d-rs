@@ -3600,7 +3600,7 @@ mod render_id_tests {
             &ctx.queue,
             vp,
             &cam,
-            &WallFrame { terminals: &[draw(r1, 0.0), draw(r2, 50.0)], ..Default::default() },
+            &WallFrame { terminals: &[draw(r1, -2.0), draw(r2, 2.0)], ..Default::default() },
         );
         assert_eq!(renderer.cached_terminal_count(), 2);
 
@@ -3618,7 +3618,7 @@ mod render_id_tests {
             &ctx.queue,
             vp,
             &cam,
-            &WallFrame { terminals: &[draw(r2, 0.0), draw(r3, 50.0)], ..Default::default() },
+            &WallFrame { terminals: &[draw(r2, -2.0), draw(r3, 2.0)], ..Default::default() },
         );
         assert_eq!(renderer.cached_terminal_count(), 2);
 
