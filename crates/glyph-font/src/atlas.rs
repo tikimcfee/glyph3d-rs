@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use icu_normalizer::{ComposingNormalizer, DecomposingNormalizer};
 use term_cells::{attrs, Cell, Screen, CLUSTER_BASE};
@@ -175,24 +175,74 @@ struct LoadedFont {
     variations: Vec<Variation>,
     upem: u16,
     extents: FontExtents,
-    /// Unicode scalar -> non-zero glyph id. Shared via `Arc` across variable instances of one file.
-    cmap: Arc<HashMap<u32, u16>>,
     /// Index of the font whose bytes this one shares (`None` if it owns its own file).
     instance_of: Option<usize>,
+}
+
+impl LoadedFont {
+    #[inline]
+    fn glyph_id(&self, cp: u32) -> Option<u16> {
+        let ch = char::from_u32(cp)?;
+        let face = TtfFace::parse(&self.bytes, self.face_index).ok()?;
+        let gid = face.glyph_index(ch)?.0;
+        (gid != 0).then_some(gid)
+    }
+}
+
+enum PendingFont {
+    Upright(FontSpec),
+    Face {
+        face_spec: FaceSpec,
+        include_line_gap: bool,
+        line_height_scale: f64,
+        upright_idx: usize,
+    },
+}
+
+struct FontEntry {
+    name: String,
     /// Face font indices `[regular, bold, italic, bold_italic]` (`None` when absent).
     faces: [Option<usize>; 4],
+    pending: Option<PendingFont>,
+    loaded: OnceLock<Option<LoadedFont>>,
+}
+
+impl FontEntry {
+    fn eager(loaded: LoadedFont, idx: usize) -> Self {
+        let name = loaded.name.clone();
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(loaded));
+        Self {
+            name,
+            faces: [Some(idx), None, None, None],
+            pending: None,
+            loaded: cell,
+        }
+    }
+
+    fn lazy(name: String, idx: usize, pending: PendingFont) -> Self {
+        Self {
+            name,
+            faces: [Some(idx), None, None, None],
+            pending: Some(pending),
+            loaded: OnceLock::new(),
+        }
+    }
 }
 
 struct Family {
     id: Option<String>,
+    primary: usize,
+    include_line_gap: bool,
+    line_height_scale: f64,
     /// Ordered indices into `FontAtlas::fonts`: primary first, then shared fallbacks.
     route: Vec<usize>,
-    metrics: FamilyMetrics,
+    metrics: OnceLock<FamilyMetrics>,
 }
 
 /// Runtime font chain and growable Slug atlas.
 pub struct FontAtlas {
-    fonts: Vec<LoadedFont>,
+    fonts: Vec<FontEntry>,
     families: Vec<Family>,
     buffer: SlugBuffer,
     next_slot: Slot,
@@ -237,27 +287,34 @@ impl FontAtlas {
             return Err(FontError::EmptyChain);
         }
 
-        let mut fonts: Vec<LoadedFont> = Vec::with_capacity(specs.len() * 2);
+        let mut fonts: Vec<FontEntry> = Vec::with_capacity(specs.len() * 2);
 
-        // Pass 1: load every listed font so its index equals its position in `specs`.
+        // Pass 1: register every listed font so its index equals its position in `specs`.
+        // Eager specs load and validate immediately; lazy specs defer I/O + parsing until first use.
         for spec in specs {
-            let bytes = load_source(&spec.name, &spec.source)?;
-            let mut loaded = build_loaded_font(
-                spec.name.clone(),
-                bytes,
-                spec.face_index,
-                spec.variations.clone(),
-                spec.include_line_gap,
-                spec.line_height_scale,
-                None,
-                None,
-            )?;
             let idx = fonts.len();
-            loaded.faces[0] = Some(idx);
-            fonts.push(loaded);
+            if spec.lazy {
+                fonts.push(FontEntry::lazy(
+                    spec.name.clone(),
+                    idx,
+                    PendingFont::Upright(spec.clone()),
+                ));
+            } else {
+                let bytes = load_source(&spec.name, &spec.source)?;
+                let loaded = build_loaded_font(
+                    spec.name.clone(),
+                    bytes,
+                    spec.face_index,
+                    spec.variations.clone(),
+                    spec.include_line_gap,
+                    spec.line_height_scale,
+                    None,
+                )?;
+                fonts.push(FontEntry::eager(loaded, idx));
+            }
         }
 
-        // Pass 2: load each listed font's bold / italic / bold-italic faces after all listed fonts.
+        // Pass 2: register each listed font's bold / italic / bold-italic faces after all listed fonts.
         const FACE_SUFFIXES: [(Face, &str); 3] = [
             (Face::Bold, " Bold"),
             (Face::Italic, " Italic"),
@@ -270,17 +327,34 @@ impl FontAtlas {
                     continue;
                 };
                 let face_name = format!("{}{}", spec.name, suffix);
-                let mut loaded = load_face_spec(
-                    &face_name,
-                    face_spec,
-                    spec.include_line_gap,
-                    spec.line_height_scale,
-                    upright_idx,
-                    &fonts[upright_idx],
-                )?;
                 let idx = fonts.len();
-                loaded.faces[0] = Some(idx);
-                fonts.push(loaded);
+                if spec.lazy {
+                    fonts.push(FontEntry::lazy(
+                        face_name,
+                        idx,
+                        PendingFont::Face {
+                            face_spec: face_spec.clone(),
+                            include_line_gap: spec.include_line_gap,
+                            line_height_scale: spec.line_height_scale,
+                            upright_idx,
+                        },
+                    ));
+                } else {
+                    let upright = fonts[upright_idx]
+                        .loaded
+                        .get()
+                        .and_then(|o| o.as_ref())
+                        .expect("eager upright font must be loaded");
+                    let loaded = load_face_spec(
+                        &face_name,
+                        face_spec,
+                        spec.include_line_gap,
+                        spec.line_height_scale,
+                        upright_idx,
+                        upright,
+                    )?;
+                    fonts.push(FontEntry::eager(loaded, idx));
+                }
                 fonts[upright_idx].faces[face_kind.as_index()] = Some(idx);
             }
         }
@@ -293,7 +367,7 @@ impl FontAtlas {
             .collect();
 
         let make_family =
-            |primary: usize, id: Option<String>, fonts: &[LoadedFont]| -> Result<Family, FontError> {
+            |primary: usize, id: Option<String>, fonts: &[FontEntry]| -> Result<Family, FontError> {
                 let mut route = Vec::with_capacity(1 + fallbacks.len());
                 route.push(primary);
                 for &fb in &fallbacks {
@@ -301,15 +375,22 @@ impl FontAtlas {
                         route.push(fb);
                     }
                 }
-                let font = &fonts[primary];
-                let face = parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)?;
                 let include_gap = specs[primary].include_line_gap;
                 let line_height_scale = specs[primary].line_height_scale;
-                let metrics = FamilyMetrics::from_face_scaled(&face, include_gap, line_height_scale);
+                let metrics_cell = OnceLock::new();
+                if let Some(Some(font)) = fonts[primary].loaded.get() {
+                    let face =
+                        parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)?;
+                    let m = FamilyMetrics::from_face_scaled(&face, include_gap, line_height_scale);
+                    let _ = metrics_cell.set(m);
+                }
                 Ok(Family {
                     id,
+                    primary,
+                    include_line_gap: include_gap,
+                    line_height_scale,
                     route,
-                    metrics,
+                    metrics: metrics_cell,
                 })
             };
 
@@ -385,20 +466,79 @@ impl FontAtlas {
         self.families.iter().map(|f| f.id.as_deref()).collect()
     }
 
-    /// Number of loaded fonts (listed fonts plus their faces).
+    /// Number of registered fonts (listed fonts plus their faces, loaded or deferred).
     #[inline]
     pub fn font_count(&self) -> usize {
         self.fonts.len()
     }
 
+    /// Number of font entries whose bytes have actually been read and parsed so far.
+    pub fn loaded_font_count(&self) -> usize {
+        self.fonts
+            .iter()
+            .filter(|f| f.loaded.get().is_some_and(Option::is_some))
+            .count()
+    }
+
+    /// Ensure font entry `idx` is loaded from disk/bytes (no-op once initialized).
+    fn ensure_font(&self, idx: usize) -> Option<&LoadedFont> {
+        let entry = self.fonts.get(idx)?;
+        if let Some(opt) = entry.loaded.get() {
+            return opt.as_ref();
+        }
+        entry
+            .loaded
+            .get_or_init(|| match entry.pending.as_ref()? {
+                PendingFont::Upright(spec) => {
+                    let bytes = load_source(&spec.name, &spec.source).ok()?;
+                    build_loaded_font(
+                        spec.name.clone(),
+                        bytes,
+                        spec.face_index,
+                        spec.variations.clone(),
+                        spec.include_line_gap,
+                        spec.line_height_scale,
+                        None,
+                    )
+                    .ok()
+                }
+                PendingFont::Face {
+                    face_spec,
+                    include_line_gap,
+                    line_height_scale,
+                    upright_idx,
+                } => {
+                    let upright = self.ensure_font(*upright_idx)?;
+                    load_face_spec(
+                        &entry.name,
+                        face_spec,
+                        *include_line_gap,
+                        *line_height_scale,
+                        *upright_idx,
+                        upright,
+                    )
+                    .ok()
+                }
+            })
+            .as_ref()
+    }
+
     /// Cell, line, and sprite metrics for `family`. Panics if `family` is out of range.
     pub fn family_metrics(&self, family: FamilyId) -> FamilyMetrics {
-        self.families[family.0].metrics
+        let fam = &self.families[family.0];
+        *fam.metrics.get_or_init(|| {
+            let font = self
+                .ensure_font(fam.primary)
+                .expect("family primary font must load when queried for metrics");
+            let face = parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)
+                .expect("already-validated font bytes must re-parse");
+            FamilyMetrics::from_face_scaled(&face, fam.include_line_gap, fam.line_height_scale)
+        })
     }
 
     /// Sprite geometry (cell aspect and light/heavy box-drawing weights) for `family`.
     pub fn sprite_metrics(&self, family: FamilyId) -> SpriteMetrics {
-        self.families[family.0].metrics.sprites
+        self.family_metrics(family).sprites
     }
 
     /// Single entry point for a terminal cell renderer (replaces `native/src/wall/cell.rs::resolve_cell_glyph`).
@@ -599,28 +739,36 @@ impl FontAtlas {
         // Choose the face font for the base if available and covering `base`.
         let base_font_idx = if face != Face::Regular {
             self.face_font(upright_idx, face)
-                .filter(|&fi| self.fonts[fi].cmap.contains_key(&base_cp))
+                .filter(|&fi| {
+                    self.ensure_font(fi)
+                        .and_then(|f| f.glyph_id(base_cp))
+                        .is_some()
+                })
                 .unwrap_or(upright_idx)
         } else {
             upright_idx
         };
-        let Some(&base_gid) = self.fonts[base_font_idx].cmap.get(&base_cp) else {
+        let Some(base_font) = self.ensure_font(base_font_idx) else {
+            return self.glyph(family, face, base);
+        };
+        let Some(base_gid) = base_font.glyph_id(base_cp) else {
             return self.glyph(family, face, base);
         };
 
         let base_face_parsed = parse_and_vary(
-            &self.fonts[base_font_idx].name,
-            &self.fonts[base_font_idx].bytes,
-            self.fonts[base_font_idx].face_index,
-            &self.fonts[base_font_idx].variations,
+            &base_font.name,
+            &base_font.bytes,
+            base_font.face_index,
+            &base_font.variations,
         )
         .expect("already-validated font bytes must re-parse");
         let base_adv = base_face_parsed
             .glyph_hor_advance(GlyphId(base_gid))
             .map(|a| a as i32)
             .filter(|&a| a > 0)
-            .unwrap_or(self.families[fam_idx].metrics.advance_fu);
-        let base_upem = self.fonts[base_font_idx].upem as f64;
+            .unwrap_or_else(|| self.family_metrics(family).advance_fu);
+        let base_upem = base_font.upem as f64;
+        let base_extents = base_font.extents;
 
         struct DraftPart {
             font_index: usize,
@@ -632,11 +780,8 @@ impl FontAtlas {
             ink_rect: Option<Rect>,
         }
 
-        let (base_curves, base_rect, _) = extract_raw_curves(
-            &base_face_parsed,
-            GlyphId(base_gid),
-            self.fonts[base_font_idx].extents,
-        );
+        let (base_curves, base_rect, _) =
+            extract_raw_curves(&base_face_parsed, GlyphId(base_gid), base_extents);
         let mut drafts = vec![DraftPart {
             font_index: base_font_idx,
             glyph_id: base_gid,
@@ -649,14 +794,16 @@ impl FontAtlas {
 
         for mark_ch in working.chars().skip(1) {
             let mark_cp = mark_ch as u32;
-            let resolved_mark = if let Some(&gid) = self.fonts[base_font_idx].cmap.get(&mark_cp) {
+            let resolved_mark = if let Some(gid) = base_font.glyph_id(mark_cp) {
                 Some((base_font_idx, gid, base_adv))
             } else if let Some(other_idx) = self.route_upright(fam_idx, mark_cp) {
                 if other_idx != upright_idx {
-                    self.fonts[other_idx].cmap.get(&mark_cp).map(|&gid| {
-                        let other_upem = self.fonts[other_idx].upem as f64;
-                        let units = ((base_adv as f64) * other_upem / base_upem).round() as i32;
-                        (other_idx, gid, units.max(1))
+                    self.ensure_font(other_idx).and_then(|other| {
+                        other.glyph_id(mark_cp).map(|gid| {
+                            let other_upem = other.upem as f64;
+                            let units = ((base_adv as f64) * other_upem / base_upem).round() as i32;
+                            (other_idx, gid, units.max(1))
+                        })
                     })
                 } else {
                     None
@@ -670,20 +817,19 @@ impl FontAtlas {
             };
 
             let (m_curves, m_rect, _) = if m_font_idx == base_font_idx {
-                extract_raw_curves(
-                    &base_face_parsed,
-                    GlyphId(m_gid),
-                    self.fonts[m_font_idx].extents,
-                )
+                extract_raw_curves(&base_face_parsed, GlyphId(m_gid), base_extents)
             } else {
+                let m_font = self
+                    .ensure_font(m_font_idx)
+                    .expect("mark font must be loaded");
                 let mf = parse_and_vary(
-                    &self.fonts[m_font_idx].name,
-                    &self.fonts[m_font_idx].bytes,
-                    self.fonts[m_font_idx].face_index,
-                    &self.fonts[m_font_idx].variations,
+                    &m_font.name,
+                    &m_font.bytes,
+                    m_font.face_index,
+                    &m_font.variations,
                 )
                 .expect("already-validated font bytes must re-parse");
-                extract_raw_curves(&mf, GlyphId(m_gid), self.fonts[m_font_idx].extents)
+                extract_raw_curves(&mf, GlyphId(m_gid), m_font.extents)
             };
 
             drafts.push(DraftPart {
@@ -714,12 +860,12 @@ impl FontAtlas {
             gap: f64,
         }
 
-        let to_cell_ink = |d: &DraftPart, fonts: &[LoadedFont]| -> Option<CellInk> {
+        let to_cell_ink = |d: &DraftPart| -> Option<CellInk> {
             let rect = d.ink_rect?;
             if rect.x_max <= rect.x_min || rect.y_max <= rect.y_min || d.units_per_cell <= 0 {
                 return None;
             }
-            let font = &fonts[d.font_index];
+            let font = self.ensure_font(d.font_index)?;
             let ext = font.extents;
             let em = ext.em_height();
             if em <= 0.0 {
@@ -737,11 +883,11 @@ impl FontAtlas {
             })
         };
 
-        let mut acc_box = to_cell_ink(&drafts[0], &self.fonts);
+        let mut acc_box = to_cell_ink(&drafts[0]);
         let mid = acc_box.map_or(0.0, |b| (b.y0 + b.y1) * 0.5);
 
         for d in drafts.iter_mut().skip(1) {
-            let Some(mut m) = to_cell_ink(d, &self.fonts) else {
+            let Some(mut m) = to_cell_ink(d) else {
                 continue;
             };
             let base_center = acc_box.map_or(0.5, |b| (b.x0 + b.x1) * 0.5);
@@ -787,12 +933,16 @@ impl FontAtlas {
 
         let mut packed = Vec::new();
         for d in &drafts {
+            let ext = self
+                .ensure_font(d.font_index)
+                .expect("composite part font must be loaded")
+                .extents;
             encode_composite_part_curves(
                 &d.raw_curves,
                 d.offset_x_fu,
                 d.offset_y_fu,
                 d.units_per_cell,
-                self.fonts[d.font_index].extents,
+                ext,
                 &mut packed,
             );
         }
@@ -842,21 +992,24 @@ impl FontAtlas {
 
     fn route_upright(&self, fam_idx: usize, codepoint: u32) -> Option<usize> {
         let family = self.families.get(fam_idx)?;
-        family
-            .route
-            .iter()
-            .copied()
-            .find(|&fi| self.fonts[fi].cmap.contains_key(&codepoint))
+        family.route.iter().copied().find(|&fi| {
+            self.ensure_font(fi)
+                .and_then(|f| f.glyph_id(codepoint))
+                .is_some()
+        })
     }
 
     /// Resolve `(family, face, codepoint)` to `(font_index, gid)` without encoding or allocating.
     fn resolve_font_glyph(&self, fam_idx: usize, face: Face, codepoint: u32) -> Option<(usize, u16)> {
         let upright_idx = self.route_upright(fam_idx, codepoint)?;
-        let upright_gid = *self.fonts[upright_idx].cmap.get(&codepoint)?;
+        let upright_gid = self.ensure_font(upright_idx)?.glyph_id(codepoint)?;
 
         if face != Face::Regular {
             if let Some(face_idx) = self.face_font(upright_idx, face) {
-                if let Some(&face_gid) = self.fonts[face_idx].cmap.get(&codepoint) {
+                if let Some(face_gid) = self
+                    .ensure_font(face_idx)
+                    .and_then(|f| f.glyph_id(codepoint))
+                {
                     return Some((face_idx, face_gid));
                 }
             }
@@ -879,7 +1032,7 @@ impl FontAtlas {
         if let Some(&slot) = self.sprite_by_key.get(&(fam_idx, codepoint)) {
             return slot;
         }
-        let metrics = self.families[fam_idx].metrics.sprites;
+        let metrics = self.sprite_metrics(FamilyId(fam_idx));
         let Some((curves, alpha)) = encode_sprite(codepoint, metrics) else {
             return BLANK_SLOT;
         };
@@ -896,7 +1049,9 @@ impl FontAtlas {
             return slot;
         }
         let slot = self.allocate_slot();
-        let font = &self.fonts[font_idx];
+        let font = self
+            .ensure_font(font_idx)
+            .expect("resolved font index must be loaded");
         let face = parse_and_vary(&font.name, &font.bytes, font.face_index, &font.variations)
             .expect("already-validated font bytes must re-parse");
         let encoded = encode_glyph(&face, GlyphId(gid), font.extents);
@@ -1034,7 +1189,7 @@ impl FontAtlas {
     /// sprite, composite, or external slots).
     pub fn describe_slot(&self, slot: Slot) -> Option<SlotInfo> {
         let &(font_idx, gid) = self.slot_sources.get(&slot)?;
-        let font = &self.fonts[font_idx];
+        let font = self.ensure_font(font_idx)?;
         let glyph_name = TtfFace::parse(&font.bytes, font.face_index)
             .ok()
             .and_then(|f| f.glyph_name(GlyphId(gid)).map(str::to_owned));
@@ -1046,24 +1201,24 @@ impl FontAtlas {
         })
     }
 
-    /// Human-readable name of a loaded font index (e.g. for describing composite parts).
+    /// Human-readable name of a registered font index (e.g. for describing composite parts).
     pub fn font_name(&self, font_index: usize) -> Option<&str> {
         self.fonts.get(font_index).map(|f| f.name.as_str())
     }
 
-    /// Check whether two loaded font indices share the same underlying font byte buffer
+    /// Check whether two font indices share the same underlying font byte buffer
     /// (true for variable-font instances of one file).
     pub fn shares_font_bytes(&self, a: usize, b: usize) -> bool {
-        match (self.fonts.get(a), self.fonts.get(b)) {
+        match (self.ensure_font(a), self.ensure_font(b)) {
             (Some(fa), Some(fb)) => Arc::ptr_eq(&fa.bytes, &fb.bytes),
             _ => false,
         }
     }
 
-    /// For a loaded font index, return the font index whose file it is a variable instance of,
+    /// For a font index, return the font index whose file it is a variable instance of,
     /// or `None` if it owns its own file.
     pub fn instance_of(&self, font_index: usize) -> Option<usize> {
-        self.fonts.get(font_index).and_then(|f| f.instance_of)
+        self.ensure_font(font_index).and_then(|f| f.instance_of)
     }
 }
 
@@ -1108,7 +1263,6 @@ fn load_face_spec(
             include_line_gap,
             line_height_scale,
             None,
-            None,
         )
     } else if !face_spec.variations.is_empty() {
         let base_idx = upright.instance_of.unwrap_or(upright_idx);
@@ -1119,7 +1273,6 @@ fn load_face_spec(
             face_spec.variations.clone(),
             include_line_gap,
             line_height_scale,
-            Some(Arc::clone(&upright.cmap)),
             Some(base_idx),
         )
     } else {
@@ -1140,17 +1293,12 @@ fn build_loaded_font(
     variations: Vec<Variation>,
     include_line_gap: bool,
     line_height_scale: f64,
-    shared_cmap: Option<Arc<HashMap<u32, u16>>>,
     instance_of: Option<usize>,
 ) -> Result<LoadedFont, FontError> {
     let face = parse_and_vary(&name, &bytes, face_index, &variations)?;
     let upem = face.units_per_em();
     let extents =
         FontExtents::from_face(&face, include_line_gap).with_line_height(line_height_scale);
-    let cmap = match shared_cmap {
-        Some(existing) => existing,
-        None => Arc::new(collect_cmap(&face)),
-    };
     Ok(LoadedFont {
         name,
         bytes,
@@ -1158,9 +1306,7 @@ fn build_loaded_font(
         variations,
         upem,
         extents,
-        cmap,
         instance_of,
-        faces: [None; 4],
     })
 }
 
@@ -1202,29 +1348,4 @@ fn parse_and_vary<'a>(
         }
     }
     Ok(face)
-}
-
-fn collect_cmap(face: &TtfFace<'_>) -> HashMap<u32, u16> {
-    let mut map = HashMap::new();
-    let Some(cmap) = face.tables().cmap else {
-        return map;
-    };
-    for subtable in cmap.subtables {
-        if !subtable.is_unicode() {
-            continue;
-        }
-        subtable.codepoints(|cp| {
-            if map.contains_key(&cp) {
-                return;
-            }
-            if let Some(ch) = char::from_u32(cp) {
-                if let Some(gid) = face.glyph_index(ch) {
-                    if gid.0 != 0 {
-                        map.insert(cp, gid.0);
-                    }
-                }
-            }
-        });
-    }
-    map
 }
