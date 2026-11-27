@@ -278,12 +278,12 @@ struct App {
     occluded: bool,
     wakes: Arc<WakeGate>,
     perf: super::perf::WallPerf,
-    /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
-    ime_composing: bool,
-    /// True while `wallctl app.ime preedit` is active; kept separate from [`Self::ime_composing`]
+    /// Active OS dead-key or IME preedit composition string (`WindowEvent::Ime(Ime::Preedit)`).
+    ime_preedit: Option<String>,
+    /// Active `wallctl app.ime preedit` composition string; kept separate from [`Self::ime_preedit`]
     /// because Wayland `zwp_text_input_v3.done` replies to earlier `set_ime_cursor_area` commits
     /// make winit emit `Ime::Preedit("", None)` asynchronously.
-    script_ime_composing: bool,
+    script_ime_preedit: Option<String>,
     /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
@@ -1052,8 +1052,14 @@ impl App {
         }
     }
 
+    fn active_ime_preedit(&self) -> Option<&str> {
+        self.script_ime_preedit
+            .as_deref()
+            .or(self.ime_preedit.as_deref())
+    }
+
     fn is_ime_composing(&self) -> bool {
-        self.ime_composing || self.script_ime_composing
+        self.active_ime_preedit().is_some()
     }
 
     fn sync_ime_cursor_area(&mut self, described: &Described) {
@@ -1775,6 +1781,11 @@ impl App {
         }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
+        let ime_preedit = self.active_ime_preedit().map(str::to_owned);
+        #[cfg(feature = "egui-ui")]
+        let ime_in_panel = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
+        #[cfg(not(feature = "egui-ui"))]
+        let ime_in_panel = false;
 
         let (Some(g), Some(terms)) = (&mut self.gfx, &self.terms) else { return };
         use wgpu::CurrentSurfaceTexture as Cst;
@@ -1877,7 +1888,7 @@ impl App {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome_with_options(
+            let paper = super::describe::describe_frame_chrome_with_options(
                 &described,
                 &camera,
                 viewport,
@@ -1889,7 +1900,39 @@ impl App {
                 self.hovered_scrollback_pill.as_deref(),
                 &mut pill_hits,
                 !cfg!(feature = "egui-ui"),
-            )
+            );
+            if !ime_in_panel {
+                if let Some(preedit_text) = ime_preedit.as_deref() {
+                    if let Some(focused) = described.terminals.iter().find(|t| t.focused) {
+                        if let Some(screen) = terms.screen(&focused.id) {
+                            let scale = g.cell_scale * focused.scale as f32;
+                            let cell_size = Vec2::new(metrics.cell_width * scale, metrics.cell_height * scale);
+                            let cursor_top_left = Vec2::new(
+                                focused.cell_origin.x as f32 + f32::from(screen.cursor.col) * cell_size.x,
+                                focused.cell_origin.y as f32 - f32::from(screen.cursor.row) * cell_size.y,
+                            );
+                            let body_rect = super::metrics::WorldRect::new(
+                                Vec2::new(focused.body_rect.min_x as f32, focused.body_rect.min_y as f32),
+                                Vec2::new(focused.body_rect.max_x as f32, focused.body_rect.max_y as f32),
+                            );
+                            super::chrome::push_ime_preedit(
+                                &mut shapes,
+                                &mut labels,
+                                &mut fonts,
+                                super::chrome::ChromeView::new(camera.zoom, sf),
+                                &super::chrome::ImePreeditDesc {
+                                    text: preedit_text,
+                                    cursor_top_left,
+                                    cell_size,
+                                    body_rect,
+                                    z: focused.z as f32 + 0.05,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            paper
         };
         if let Some(ref hid) = self.hovered_scrollback_pill {
             if !pill_hits.iter().any(|p| p.terminal_id == *hid) {
@@ -2336,14 +2379,20 @@ impl App {
         match ime {
             Ime::Enabled => {}
             Ime::Preedit(text, _) => {
-                self.ime_composing = !text.is_empty();
+                let next = (!text.is_empty()).then(|| text.clone());
+                if self.ime_preedit != next {
+                    self.ime_preedit = next;
+                    self.redraw();
+                }
             }
             Ime::Commit(text) => {
-                self.ime_composing = false;
+                self.ime_preedit = None;
                 self.ime_commit(text);
             }
             Ime::Disabled => {
-                self.ime_composing = false;
+                if self.ime_preedit.take().is_some() {
+                    self.redraw();
+                }
             }
         }
     }
@@ -2387,10 +2436,10 @@ impl App {
         self.win.set_window_focused(focused);
         if !focused {
             self.modifiers = ModifiersState::empty();
-            self.ime_composing = false;
+            self.ime_preedit = None;
             self.hovered_files.clear();
             self.pressed_scrollback_pill = None;
-            self.script_ime_composing = false;
+            self.script_ime_preedit = None;
             self.buttons = 0;
             if let Some(wall) = &mut self.wall {
                 wall.blur();
@@ -2848,16 +2897,18 @@ impl App {
                 use super::script::ScriptIme;
                 match ime_cmd {
                     ScriptIme::Preedit(text) => {
-                        self.script_ime_composing = !text.is_empty();
+                        self.script_ime_preedit = (!text.is_empty()).then_some(text);
+                        self.redraw();
                         "OK: ime preedit".to_string()
                     }
                     ScriptIme::Commit(text) => {
-                        self.script_ime_composing = false;
+                        self.script_ime_preedit = None;
                         self.ime_commit(&text);
                         "OK: ime commit".to_string()
                     }
                     ScriptIme::Disable => {
-                        self.script_ime_composing = false;
+                        self.script_ime_preedit = None;
+                        self.redraw();
                         "OK: ime disabled".to_string()
                     }
                 }
@@ -3379,8 +3430,8 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         occluded: false,
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
-        ime_composing: false,
-        script_ime_composing: false,
+        ime_preedit: None,
+        script_ime_preedit: None,
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
