@@ -4537,6 +4537,9 @@ dependencies = [
 [[package]]
 name = "wall-control"
 version = "0.1.0"
+dependencies = [
+ "wall-core",
+]
 
 [[package]]
 name = "wall-core"

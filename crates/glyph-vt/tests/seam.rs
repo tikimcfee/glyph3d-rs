@@ -728,3 +728,21 @@ fn keycap_variation_selector_matches_libghostty_in_mode_2027_off_and_on() {
     assert_eq!(screen.row(1)[0].width, 2);
 }
 
+#[test]
+fn text_trims_trailing_spaces_across_soft_wrapped_continuation_row() {
+    // Reproduces Claude Code's 78-col inline diff background bar reflowed to 60 cols:
+    // row 0 ends with spaces and soft-wraps onto row 1, which holds only trailing spaces.
+    let (mut vt, mut screen, _theme) = setup(80, 6);
+    vt.feed(
+        b"  2 -  console.log(\"Hello, World!\");                                         \r\nnext",
+    );
+    vt.resize(60, 6);
+    vt.fill(&mut screen);
+    assert!(screen.wrapped[0]);
+    assert_eq!(
+        vt.text(0, 0, 60, 5).trim_end_matches('\n'),
+        "  2 -  console.log(\"Hello, World!\");\nnext"
+    );
+}
+
+
