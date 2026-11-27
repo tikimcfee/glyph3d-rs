@@ -29,6 +29,21 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   atlas), and rebuilds one for a layout change with
   `relayout::rebuild_for_relayout`. A scene holds no device type; the wgpu
   drivers build its `SceneRenderer` from it (`SceneLike::make_renderer`).
+  A bare `glyph3d-native` invocation (or `--wall`, 2026-11-26; `--launcher`
+  opens the TUI launcher) opens **the terminal wall** (`native/src/wall/`): an
+  infinite orthographic canvas of live `g3d-termd` terminals with no HTTP/WebSocket
+  relay. Its CPU/host modules (`agents` background `agent-feed` coordinator,
+  `camera`, `cell`, `chrome`, `describe`, `glyphs` sparse emoji archive,
+  `labels`, `metrics`, `paper`, `replay`, `shapes`, `startup`, `test_pattern`)
+  compile under `--no-default-features`; `wgpu` adds `renderer` (`WallRenderer`,
+  `wall_{cells,paper,shapes}.wgsl`, runtime `GlyphSource` atlas textures,
+  offscreen PNG capture); `windowed` adds `app` (winit event loop joining `Wall`,
+  `Sessions`, `WallRenderer`, and `wall_control::Server`), `keys`, `perf`
+  (`WallPerf` frame/pump/idle probe), `script` (`app.*` synthetic
+  input/clipboard/screenshot/state verbs), and `session`; `egui-ui` adds `ui`
+  (on-demand egui host + `F1` debug HUD), `mount`, and `panels/` (`topbar`,
+  `bar_buttons`, `palette`, `sidebar`, `docked/{settings,status}`,
+  `menus/{context_menu,help}`, `agent_view`).
 - `glyph/` — the build/verify tool: the gate runner. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
@@ -98,10 +113,79 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `{word: text}`, e.g. Webster's 1913 from glyph3d-js, linked in, not
   vendored) answer a selected word at once, before any agent
   (`definition_engine::dictionary`).
+- **The terminal-wall crates** (2026-11-26, `out/WALL-PLAN-2026-11-26.md`):
+  - `crates/term-cells` — plain-data `Screen`, `Cell` (final sRGB RGBA8 with
+    inverse, conceal, and `boldIsBright` already resolved), `Cursor`, `Modes`,
+    and SGR `attrs` bits. Zero dependencies: must not depend on an emulator,
+    socket, window, or GPU.
+  - `crates/termd-client` — protocol 1.5 Unix-socket client (`Termd`,
+    `TermdHandle`, `Target`, `Event`), frame codec, same-UID peer check
+    (`getpeereid` / `SO_PEERCRED`), `connect_or_start`, and brain-restart
+    reconnect. Depends on `std` and `serde`/`serde_json` alone: must not depend
+    on an emulator, window, GPU, or async runtime.
+  - `crates/glyph-vt` — passive terminal viewer (`Vt`, `VtEvent`, scrollback,
+    `fill`, `text`), vendoring Makepad's pure-Rust port of Ghostty's VT core and
+    UAX #29 `cell_width` with attributions and local diff notes in
+    `crates/glyph-vt/NOTICE` (MIT + Unicode-3.0). Depends on `term-cells` alone:
+    must not depend on a socket, window, or GPU.
+  - `crates/glyph-font` — runtime TrueType / variable-TTF / OpenType-CFF font
+    loader, Slug quadratic-curve encoder (`assets/atlas/FORMAT.md`), procedural
+    cell sprites (box drawing, blocks, braille, legacy computing, powerline),
+    combining-mark clusters, `G3ES` sparse emoji index, system monospace lookup,
+    and growable `FontAtlas` with dirty-texel spans. Depends on `term-cells`,
+    `ttf-parser`, and `icu_normalizer`: must not depend on wgpu or a window.
+  - `crates/wall-core` — pure `f64` model and rules ported from JS `wall/`
+    (`Wall`, `WallModel`, `Groups`, `split`, `WallFullscreen`, `WallNames`,
+    `WallPointer`, `PressedKeys`, `TerminalSelection`, `AgentViews`,
+    `CommandRouter` with `wall.*` and `terminal.*` verbs, `WallConfig`,
+    `WallStore`, and `import` for browser `localStorage` exports). Depends on
+    `term-cells` and `serde`/`serde_json` alone: must not depend on a window,
+    GPU, or socket.
+  - `crates/wall-control` — local `AF_UNIX` control `Server`, `Client`, and
+    `wallctl` CLI (`wall-<ns>.sock` beside `termd-<ns>.sock`, directory `0700`,
+    socket `0600`, same-UID peer check, stale-socket replacement vs live
+    `AlreadyRunning` refusal, line-in / `<byte_len>\n<reply>\n` wire protocol,
+    plus `wallctl [--ns NAME] wall.import <file>` live or offline). Its library
+    modules use `std` alone and `wallctl` adds `wall-core` only for offline
+    store import: must not depend on a window, GPU, emulator, or `termd-client`.
+  - `crates/agent-feed` — background `gomuxai` subprocess followers
+    (`FleetFollower` over `agent export --json --follow --all`, `SessionPoller`
+    over `agent sessions --json`, `TranscriptFollower` and `LineFollower` over
+    `agent transcript <id> --follow` with tail-window `load_earlier`). Depends
+    on `std` and `serde`/`serde_json` alone: must not depend on a window, GPU,
+    or async runtime.
+  - `crates/term-session` — background per-terminal `Vt` worker threads, 16 ms /
+    16 KiB leading-edge coalescer (with DECSET 2026 sync hold and outbound
+    resize coalescing), lock-free window-owned `front_screen` swapped on
+    `Sessions::pump()`, and non-blocking IO writer. Depends on `termd-client`,
+    `glyph-vt`, `term-cells`, `wall-core`, `log`, and `serde_json`: must not
+    depend on winit or wgpu.
+  - **Control socket and scratch-daemon rule:** `wallctl [--ns NAME | --socket
+    PATH] <verb...>` reaches a running wall window on `wall-<ns>.sock` in the
+    same directory as `termd-<ns>.sock` (`$G3D_TERMD_DIR`, else
+    `/run/user/<uid>/g3d`, else `/tmp/g3d-<uid>`; default namespace `rs-wall`).
+    Every test, smoke script, or probe **must** set `G3D_TERMD_DIR` to a short
+    private directory under `/tmp` (Unix socket paths cap at ~100 bytes on
+    macOS, so `$TMPDIR` under `/var/folders/...` overflows; setting
+    `G3D_TERMD_DIR` also redirects `wall-<ns>.json` via
+    `wall_core::store::default_store_dir`), **never** touch live namespaces
+    `wall`, `agents`, `default`, or live `rs-wall`, and tear down **only** the
+    exact PIDs it started (never `pkill` by command line).
 - `engine/` — `fixtures/`, the conformance corpus recorded from the JS oracle
   (26 `.pipe.bin`, their generator and vendored inputs), and
   `glyph_schema.mjs`, generated from the schema.
-- `tools/` — check scripts, generators, `bench_hyper.py` performance harness, and repro helpers.
+- `tools/` — check scripts, generators, `bench_hyper.py` performance harness,
+  repro helpers, and the terminal-wall scripts (2026-11-26):
+  `tools/wall-smoke.sh` and `tools/wall-smoke-text.sh` (end-to-end
+  scratch-daemon + window + `wallctl` gesture and selection-lifetime smoke
+  checks), `tools/wall-relax.sh` (runs the wall under Makepad's `relax` JIT
+  against a scratch daemon with `GLYPH_WALL_SHADER_DIR=native/src/shaders` live
+  shader reload), `tools/vt-diff.sh` (differential VT corpus check comparing
+  `glyph-vt` against reference emulators), `tools/wall-perf.sh` (flood
+  throughput, wake-rate, and zero-frame idle CPU harness against scratch
+  daemons), and `tools/wall-bundle.sh` (packages `target/bundle/Glyph3D Wall.app`
+  on macOS with `glyph3d-native`, `wallctl`, `Info.plist`, generated `.icns`,
+  and bundled `assets/atlas/emoji-sheet.bin`).
 - `.agents/` — agent house rules (`rules/rust-engineering.md`), the operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`), and the definition engine's
   answering skill (`skills/definition-engine/SKILL.md`, 2026-10-31).
@@ -1093,6 +1177,17 @@ and the union is not:
   is shared by every engine and every witness but that twin. No golden view
   lays a stop wider than one cell, so their pixels are `tests/tab_stops.rs`'s
   three-field agreement and nothing more.
+- **The terminal wall (`native/src/wall/`) has no golden view in `pixel-ab` and
+  no windowed gate in `build.toml`** (2026-11-26). Its crate unit tests
+  (`term-cells`, `termd-client`, `glyph-vt`, `glyph-font`, `wall-core`,
+  `wall-control`, `agent-feed`, `term-session`) and `native::wall::*` unit/GPU
+  tests (including offscreen `WallRenderer` cell/shape/chrome renders and
+  headless egui panel passes) run inside `cargo-test`, and `cargo-build`,
+  `cargo-clippy`, `cargo-doc`, `cargo-check-no-ui` (every feature rung), and
+  `orphans` check its code; nothing in `pixel-ab` pixel-compares a wall frame
+  against a committed baseline, and `tools/wall-smoke.sh`,
+  `tools/wall-smoke-text.sh`, `tools/vt-diff.sh`, `tools/wall-perf.sh`, and
+  `tools/wall-bundle.sh` run outside `build.toml`.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is

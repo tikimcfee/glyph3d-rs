@@ -18,6 +18,7 @@ use wall_core::geom::{Point, Rect};
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::keymap::{KeyDecision, TerminalKey};
 use wall_core::layout::{union_rect, FULLSCREEN_Z};
+use wall_core::links::{HoveredLink, LinkKind, ScreenView};
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
 use wall_core::names::MAP_LABEL_PAD_X_PX;
@@ -32,7 +33,7 @@ use wall_core::snap::{snap_step, snap_to, GridSpec};
 use wall_core::status::{NoticeKind, StatusTone};
 use wall_core::store::{FullscreenMode, Storage, WallStore};
 use wall_core::wall::{
-    CharWidths, ScreenFillDelta, TerminalAppeared, Wall, WallFrame, WallOptions,
+    CharWidths, ScreenFillDelta, ScreenLookup, TerminalAppeared, Wall, WallFrame, WallOptions,
 };
 
 const MODS_NONE: Mods = Mods {
@@ -95,6 +96,7 @@ struct Harness {
     kills: Vec<String>,
     cursors: Vec<CursorIcon>,
     knobs_changed: Vec<String>,
+    opened_urls: Vec<String>,
 }
 
 impl Harness {
@@ -132,6 +134,7 @@ impl Harness {
             kills: Vec::new(),
             cursors: Vec::new(),
             knobs_changed: Vec::new(),
+            opened_urls: Vec::new(),
         }
     }
 
@@ -185,6 +188,9 @@ impl Harness {
                     WallEffect::ReadClipboard { target } => {
                         let text = self.clipboard.clone();
                         self.wall.deliver_clipboard(&target, &text);
+                    }
+                    WallEffect::OpenUrl { url } => {
+                        self.opened_urls.push(url);
                     }
                     WallEffect::SetCursor { cursor } => {
                         self.cursors.push(cursor);
@@ -2971,4 +2977,665 @@ fn wall_blur_clears_pressed_keys_cancels_close_hold_and_cancels_active_drag() {
         "releasing a key that was down before Wall::blur must not send a stray release"
     );
 }
+
+#[test]
+fn notify_refreshes_clock_after_idle_window_so_notice_survives_first_tick() {
+    let mut h = Harness::new();
+    let _t1 = h.spawn();
+    let notice_ms = h.wall.config().notice_ms;
+
+    // Window drew at t = 100 ms, then sat idle for 20 seconds (well past notice_ms).
+    let _ = h.wall.tick(0.016, 100.0);
+    let idle_now = 100.0 + notice_ms + 20_000.0;
+
+    // Refreshing clock before notify (`notify_at` / `set_now_ms`) stamps notice expiry at `idle_now + notice_ms`.
+    h.wall
+        .notify_at("font 'Bogus' is not installed — keeping monaspace-neon", idle_now);
+    let _ = h.wall.tick(0.016, idle_now + 16.0);
+    assert_eq!(
+        h.frame().notice.as_deref(),
+        Some("font 'Bogus' is not installed — keeping monaspace-neon"),
+        "notice posted after idle gap must survive the first draw tick"
+    );
+
+    // Still visible just before expiry, cleared at expiry.
+    let _ = h.wall.tick(0.016, idle_now + notice_ms - 50.0);
+    assert!(h.frame().notice.is_some());
+    let _ = h.wall.tick(0.016, idle_now + notice_ms + 1.0);
+    assert_eq!(h.frame().notice, None);
+
+    // Same for `set_now_ms` before a verb that emits a notice (`wall.attach` with bad target).
+    let later = idle_now + notice_ms + 30_000.0;
+    h.wall.set_now_ms(later);
+    let _ = h.wall.run("wall.attach @bad");
+    let _ = h.wall.tick(0.016, later + 16.0);
+    assert!(
+        h.frame().notice.as_deref().is_some_and(|s| s.starts_with("attach:")),
+        "verb notice after set_now_ms on idle window must not expire on first tick"
+    );
+}
+
+#[test]
+fn fullscreen_saved_canvas_grid_rescales_on_font_geometry_change() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.settle();
+
+    let old_geom = h.wall.model().geometry();
+    let orig_rect = h.wall.model().terminal_rect(&t1).expect("t1 rect");
+    assert_eq!(
+        (
+            h.wall.terminal(&t1).expect("t1").cols,
+            h.wall.terminal(&t1).expect("t1").rows,
+        ),
+        (100, 30)
+    );
+
+    // 1. Solo fullscreen: double cell stride while fullscreen, then exit.
+    h.run_ok(&format!("wall.fullscreen on {t1}"));
+    h.settle();
+    let doubled = CellGeometry {
+        stride: Point::new(old_geom.stride.x * 2.0, old_geom.stride.y * 2.0),
+        padding: old_geom.padding,
+        scale_z: old_geom.scale_z,
+    };
+    h.wall.set_geometry_preserving_panels(doubled);
+    h.pump();
+    h.settle();
+
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+    let after_solo = h.wall.terminal(&t1).expect("t1 after solo exit");
+    assert_eq!(
+        (after_solo.cols, after_solo.rows),
+        (50, 15),
+        "leaving solo fullscreen after font size doubling must restore rescaled canvas grid"
+    );
+    let restored_rect = h.wall.model().terminal_rect(&t1).expect("restored rect");
+    assert!((restored_rect.width() - orig_rect.width()).abs() < 1e-6);
+    assert!((restored_rect.height() - orig_rect.height()).abs() < 1e-6);
+
+    // 2. Tile-group fullscreen: restore original geometry while in group fullscreen, then exit.
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h.wall.store().group_of(&t1).expect("gid").to_owned();
+    h.settle();
+    let pre_group_cols = h.wall.terminal(&t1).expect("t1").cols;
+    let pre_group_rows = h.wall.terminal(&t1).expect("t1").rows;
+    assert_eq!((pre_group_cols, pre_group_rows), (50, 15));
+
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.settle();
+    h.wall.set_geometry_preserving_panels(old_geom);
+    h.pump();
+    h.settle();
+
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+    let t1_back = h.wall.terminal(&t1).expect("t1 after group exit");
+    let t2_back = h.wall.terminal(&t2).expect("t2 after group exit");
+    assert_eq!(
+        (t1_back.cols, t1_back.rows),
+        (100, 30),
+        "leaving group fullscreen after font change must restore rescaled grid for t1"
+    );
+    assert_eq!(
+        (t2_back.cols, t2_back.rows),
+        (100, 30),
+        "leaving group fullscreen after font change must restore rescaled grid for t2"
+    );
+}
+
+#[test]
+fn link_hover_underline_cursor_and_open_url_on_mac_and_linux() {
+    fn cell_center_screen(h: &mut Harness, id: &str, row: usize, col: usize) -> Point {
+        let f = h.frame();
+        let tf = f.terminals.iter().find(|t| t.id == id).expect("terminal frame");
+        let geom = h.wall.model().geometry();
+        let world = Point::new(
+            tf.cell_origin.x + (col as f64 + 0.5) * geom.stride.x * tf.scale,
+            tf.cell_origin.y - (row as f64 + 0.5) * geom.stride.y * tf.scale,
+        );
+        f.camera.to_screen(world, f.viewport.w, f.viewport.h)
+    }
+
+    // 1. macOS (`⌘`): wrapped plain URL + disallowed `file://`.
+    let mut h = Harness::with_platform(Platform::Mac);
+    let t1 = h.spawn();
+    h.run_ok(&format!("terminal.resize {t1} 20 6"));
+    h.settle();
+    let mut s = screen_from_lines(
+        &[
+            "go: https://glyph3d.",
+            "dev/docs/guide) tail",
+            "bad file:///etc/pass",
+            "mail mailto:a@b.dev.",
+            "",
+            "",
+        ],
+        20,
+        &[],
+        |_| false,
+    );
+    s.wrapped[0] = true;
+    h.screens.insert(t1.clone(), s);
+
+    let pt_wrap = cell_center_screen(&mut h, &t1, 1, 5);
+
+    // Plain hover without Cmd: no hovered_link, I-beam cursor.
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x,
+            y: pt_wrap.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_NONE,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    h.pump();
+    let tf0 = h
+        .frame()
+        .terminals
+        .into_iter()
+        .find(|t| t.id == t1)
+        .expect("t1");
+    assert_eq!(tf0.hovered_link, None);
+    assert_eq!(h.cursors.last().copied(), Some(CursorIcon::Text));
+
+    // Pressing Cmd without moving the pointer underlines the wrapped URL and sets Pointer cursor.
+    h.cursors.clear();
+    h.wall.modifiers_changed(MODS_META, &h.screens);
+    h.pump();
+    let expected = HoveredLink {
+        start_row: 0,
+        start_col: 4,
+        end_row: 1,
+        end_col: 14,
+        url: "https://glyph3d.dev/docs/guide".to_owned(),
+        kind: LinkKind::PlainUrl,
+    };
+    let tf1 = h
+        .frame()
+        .terminals
+        .into_iter()
+        .find(|t| t.id == t1)
+        .expect("t1");
+    assert_eq!(tf1.hovered_link, Some(expected));
+    assert_eq!(h.cursors.last().copied(), Some(CursorIcon::Pointer));
+
+    // Releasing Cmd clears underline and restores Text cursor.
+    h.cursors.clear();
+    h.wall.modifiers_changed(MODS_NONE, &h.screens);
+    h.pump();
+    assert_eq!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .hovered_link,
+        None
+    );
+    assert_eq!(h.cursors.last().copied(), Some(CursorIcon::Text));
+
+    // Cmd+click opens the wrapped URL without creating a text selection.
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x,
+            y: pt_wrap.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x,
+            y: pt_wrap.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 20.0,
+        },
+        &h.screens,
+    );
+    h.pump();
+    assert_eq!(h.opened_urls, vec!["https://glyph3d.dev/docs/guide"]);
+    assert_eq!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .text_selection,
+        None
+    );
+
+    // Cmd+drag beyond drag slop cancels opening the URL.
+    h.opened_urls.clear();
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x,
+            y: pt_wrap.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms + 40.0,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x + 20.0,
+            y: pt_wrap.y,
+            button: None,
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms + 50.0,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_wrap.x + 20.0,
+            y: pt_wrap.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 60.0,
+        },
+        &h.screens,
+    );
+    h.pump();
+    assert!(
+        h.opened_urls.is_empty(),
+        "dragging past slop must cancel pending link open"
+    );
+
+    // Disallowed `file://` scheme never underlines or opens.
+    let pt_file = cell_center_screen(&mut h, &t1, 2, 10);
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_file.x,
+            y: pt_file.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 70.0,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_file.x,
+            y: pt_file.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms + 80.0,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_file.x,
+            y: pt_file.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 90.0,
+        },
+        &h.screens,
+    );
+    h.pump();
+    assert!(h.opened_urls.is_empty(), "file:// URL must never open");
+
+    // `mailto:` opens cleanly with trailing period trimmed.
+    let pt_mail = cell_center_screen(&mut h, &t1, 3, 12);
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_mail.x,
+            y: pt_mail.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms + 100.0,
+        },
+        &h.screens,
+    );
+    h.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_mail.x,
+            y: pt_mail.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 110.0,
+        },
+        &h.screens,
+    );
+    h.pump();
+    assert_eq!(h.opened_urls, vec!["mailto:a@b.dev"]);
+
+    // 2. Linux (`Platform::Other`): `Ctrl` opens links, `Meta` does not.
+    let mut hl = Harness::with_platform(Platform::Other);
+    let lt1 = hl.spawn();
+    hl.run_ok(&format!("terminal.resize {lt1} 40 4"));
+    hl.settle();
+    hl.screens.insert(
+        lt1.clone(),
+        screen_from_lines(
+            &["visit http://localhost:3000/status ok", "", "", ""],
+            40,
+            &[],
+            |_| false,
+        ),
+    );
+    let lpt = cell_center_screen(&mut hl, &lt1, 0, 12);
+    hl.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: lpt.x,
+            y: lpt.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: hl.now_ms,
+        },
+        &hl.screens,
+    );
+    hl.pump();
+    assert_eq!(
+        hl.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == lt1)
+            .expect("lt1")
+            .hovered_link,
+        None,
+        "Meta must not activate links on Linux"
+    );
+    hl.wall.modifiers_changed(MODS_CTRL, &hl.screens);
+    hl.pump();
+    assert_eq!(
+        hl.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == lt1)
+            .expect("lt1")
+            .hovered_link
+            .as_ref()
+            .map(|l| l.url.as_str()),
+        Some("http://localhost:3000/status")
+    );
+    hl.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: lpt.x,
+            y: lpt.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_CTRL,
+            time_ms: hl.now_ms + 10.0,
+        },
+        &hl.screens,
+    );
+    hl.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: lpt.x,
+            y: lpt.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_CTRL,
+            time_ms: hl.now_ms + 20.0,
+        },
+        &hl.screens,
+    );
+    hl.pump();
+    assert_eq!(hl.opened_urls, vec!["http://localhost:3000/status"]);
+}
+
+#[test]
+fn osc8_screen_view_link_takes_precedence_and_clears_on_blur_and_scroll() {
+    struct Osc8Screen {
+        screen: Screen,
+        uris: HashMap<(usize, usize), String>,
+    }
+
+    impl ScreenView for Osc8Screen {
+        fn cells_screen(&self) -> &Screen {
+            &self.screen
+        }
+
+        fn hyperlink_at(&self, row: usize, col: usize) -> Option<&str> {
+            self.uris.get(&(row, col)).map(String::as_str)
+        }
+    }
+
+    struct Osc8Lookup {
+        id: String,
+        view: Osc8Screen,
+    }
+
+    impl ScreenLookup for Osc8Lookup {
+        fn screen(&self, id: &str) -> Option<&Screen> {
+            (id == self.id).then_some(&self.view.screen)
+        }
+
+        fn screen_view(&self, id: &str) -> Option<&dyn ScreenView> {
+            (id == self.id).then_some(&self.view as &dyn ScreenView)
+        }
+    }
+
+    let mut h = Harness::with_platform(Platform::Mac);
+    let t1 = h.spawn();
+    h.run_ok(&format!("terminal.resize {t1} 30 4"));
+    h.settle();
+
+    // Enable DECSET mouse tracking to verify Cmd+click on a link still opens without leaking to mouse_events.
+    h.wall.terminal_modes(
+        &t1,
+        Modes {
+            mouse: TermMouseTracking::Normal,
+            ..Modes::default()
+        },
+    );
+
+    let screen = screen_from_lines(
+        &[
+            "open [Release Notes] now",
+            "bad  https://hidden.example",
+            "",
+            "",
+        ],
+        30,
+        &[],
+        |_| false,
+    );
+    let mut uris = HashMap::new();
+    for c in 6..19 {
+        uris.insert((0, c), "https://glyph3d.dev/releases".to_owned());
+    }
+    for c in 5..27 {
+        uris.insert((1, c), "javascript:alert(1)".to_owned());
+    }
+    let lookup = Osc8Lookup {
+        id: t1.clone(),
+        view: Osc8Screen { screen, uris },
+    };
+
+    let cell_pt = |h: &mut Harness, row: usize, col: usize| -> Point {
+        let f = h.frame();
+        let tf = f.terminals.iter().find(|t| t.id == t1).expect("t1");
+        let geom = h.wall.model().geometry();
+        let world = Point::new(
+            tf.cell_origin.x + (col as f64 + 0.5) * geom.stride.x * tf.scale,
+            tf.cell_origin.y - (row as f64 + 0.5) * geom.stride.y * tf.scale,
+        );
+        f.camera.to_screen(world, f.viewport.w, f.viewport.h)
+    };
+
+    // OSC 8 hover with Cmd underlines cols 6..19 and opens on click without leaking mouse events.
+    let pt_osc8 = cell_pt(&mut h, 0, 10);
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_osc8.x,
+            y: pt_osc8.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms,
+        },
+        &lookup,
+    );
+    h.pump();
+    let hovered = h
+        .frame()
+        .terminals
+        .into_iter()
+        .find(|t| t.id == t1)
+        .expect("t1")
+        .hovered_link
+        .expect("OSC 8 hovered link");
+    assert_eq!(hovered.kind, LinkKind::Osc8);
+    assert_eq!(hovered.url, "https://glyph3d.dev/releases");
+    assert_eq!(
+        (hovered.start_row, hovered.start_col, hovered.end_row, hovered.end_col),
+        (0, 6, 0, 19)
+    );
+
+    h.mouse_events.clear();
+    h.wall.pointer_down(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_osc8.x,
+            y: pt_osc8.y,
+            button: Some(Button::Left),
+            buttons: Buttons::from_button(Button::Left),
+            mods: MODS_META,
+            time_ms: h.now_ms + 10.0,
+        },
+        &lookup,
+    );
+    h.wall.pointer_up(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_osc8.x,
+            y: pt_osc8.y,
+            button: Some(Button::Left),
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 20.0,
+        },
+        &lookup,
+    );
+    h.pump();
+    assert_eq!(h.opened_urls, vec!["https://glyph3d.dev/releases"]);
+    assert!(
+        h.mouse_events.is_empty(),
+        "Cmd+click on a link must not leak mouse events to the program"
+    );
+
+    // Blur clears hovered_link.
+    h.wall.blur();
+    h.pump();
+    assert_eq!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .hovered_link,
+        None
+    );
+
+    // Re-hover then scroll output -> stale hovered_link clears on fill delta.
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_osc8.x,
+            y: pt_osc8.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 30.0,
+        },
+        &lookup,
+    );
+    h.pump();
+    assert!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .hovered_link
+            .is_some()
+    );
+    h.wall.terminal_screen_filled(
+        &t1,
+        &lookup.view.screen,
+        ScreenFillDelta {
+            resized: false,
+            scrolled_top: 1,
+            within_margins: false,
+            rewritten_cols: &[],
+        },
+    );
+    h.pump();
+    assert_eq!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .hovered_link,
+        None,
+        "scrolling output must clear stale hovered_link"
+    );
+
+    // Disallowed `javascript:` OSC 8 on row 1 never underlines or opens.
+    let pt_js = cell_pt(&mut h, 1, 10);
+    h.wall.pointer_move(
+        &PointerEvent {
+            pointer_id: 1,
+            x: pt_js.x,
+            y: pt_js.y,
+            button: None,
+            buttons: Buttons(0),
+            mods: MODS_META,
+            time_ms: h.now_ms + 40.0,
+        },
+        &lookup,
+    );
+    h.pump();
+    assert_eq!(
+        h.frame()
+            .terminals
+            .into_iter()
+            .find(|t| t.id == t1)
+            .expect("t1")
+            .hovered_link,
+        None
+    );
+}
+
+
 
