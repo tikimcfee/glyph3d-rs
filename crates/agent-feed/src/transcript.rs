@@ -244,8 +244,7 @@ pub fn read_transcript_window(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::cli::spawn_command(&mut cmd)
         .map_err(|e| format!("could not run `{}`: {e}", cli.describe(&arg_refs)))?;
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -855,7 +854,7 @@ fn run_transcript_follow(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::cli::spawn_command(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             let mut guard = inner.lock().expect("transcript follower mutex poisoned");
