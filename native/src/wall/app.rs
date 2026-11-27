@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::Vec2;
 use term_cells::Screen;
-use wall_core::config::OptionAsAlt;
+use wall_core::config::{CopyOnSelect, OptionAsAlt};
 use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::keymap::FieldFocus;
@@ -34,13 +34,14 @@ use wall_core::keymap::KeyDecision;
 use wall_core::layout::Size;
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
-use wall_core::pointer::{Buttons, PointerEvent, WheelEvent};
+use wall_core::pointer::{Buttons, GestureKind, PointerEvent, WheelEvent, DRAG_SLOP_PX};
 use wall_core::scroll::DeltaMode;
 use wall_core::status::TermdState;
+use wall_core::store::FullscreenMode;
 use wall_core::wall::{screen_lookup, CharWidths, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -65,6 +66,13 @@ const PANEL_PAD: f32 = 0.3;
 /// Two presses this close in time and place are a double click.
 const DOUBLE_CLICK_MS: f64 = 500.0;
 const DOUBLE_CLICK_PX: f64 = 5.0;
+/// Lines scrolled per discrete physical mouse-wheel detent (`MouseScrollDelta::LineDelta`),
+/// matching Firefox's 3-line `deltaMode = 1` notch and Chrome's ~100 CSS px notch (`~3.3` rows).
+const LINES_PER_WHEEL_NOTCH: f64 = 3.0;
+/// Logical pixel delta per discrete physical mouse-wheel detent when a `zoomKeys` modifier is
+/// held (`WallCamera.js` `WHEEL_ZOOM.pixelsPerNotch = 100`), so a physical `Ctrl+wheel` notch
+/// exceeds `WallPointer`'s `PINCH_MAX_DELTA` (`50.0`) and glides by `stepFactor = 1.12`.
+const WHEEL_ZOOM_NOTCH_PX: f64 = 100.0;
 
 /// What a reader thread sends the event loop: something arrived, look.
 #[derive(Clone, Copy, Debug)]
@@ -113,15 +121,86 @@ impl Terminals {
     }
 }
 
+/// Linux `PRIMARY` selection bridge (middle-click paste & copy-on-select).
+///
+/// Speaks Wayland (`zwp_primary_selection_device_manager_v1` via `smithay-clipboard`) when the
+/// window owns a Wayland display handle, and X11 (`XA_PRIMARY` via a persistent `arboard::Clipboard`
+/// so selection ownership stays alive after `set_text`) otherwise.
+#[cfg(target_os = "linux")]
+struct LinuxPrimaryClipboard {
+    wayland: Option<smithay_clipboard::Clipboard>,
+    x11: Option<arboard::Clipboard>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPrimaryClipboard {
+    fn new(window: &Window) -> Self {
+        use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        if let Ok(handle) = window.display_handle() {
+            if let RawDisplayHandle::Wayland(wl) = handle.as_raw() {
+                // SAFETY: `Gfx` drops `linux_primary` before `window`, so `wl.display`
+                // stays valid for the full lifetime of `smithay_clipboard::Clipboard`.
+                let sc = unsafe { smithay_clipboard::Clipboard::new(wl.display.as_ptr()) };
+                return Self {
+                    wayland: Some(sc),
+                    x11: None,
+                };
+            }
+        }
+        Self {
+            wayland: None,
+            x11: arboard::Clipboard::new().ok(),
+        }
+    }
+
+    fn get(&mut self) -> Option<String> {
+        if let Some(wl) = &self.wayland {
+            return wl.load_primary().ok().filter(|s| !s.is_empty());
+        }
+        if let Some(x11) = &mut self.x11 {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            return x11
+                .get()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text()
+                .ok()
+                .filter(|s| !s.is_empty());
+        }
+        None
+    }
+
+    fn set(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(wl) = &self.wayland {
+            wl.store_primary(text);
+            return;
+        }
+        if let Some(x11) = &mut self.x11 {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            if let Err(e) = x11
+                .set()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text(text)
+            {
+                log::warn!("primary selection write failed: {e}");
+            }
+        }
+    }
+}
+
 /// What exists once there is a window.
 ///
 /// Field order is drop order, and it matters on Wayland: the egui layer
-/// (whose clipboard worker borrows the display) and the surface must go
-/// before the window (found on workstation, 2026-11-26: a segfault in
-/// `wl_proxy_destroy` at every exit).
+/// and `linux_primary` (whose clipboard workers borrow `wl_display`) and the
+/// surface must go before the window (found on workstation, 2026-11-26: a
+/// segfault in `wl_proxy_destroy` at every exit).
 struct Gfx {
     #[cfg(feature = "egui-ui")]
     ui: Option<WallUi>,
+    #[cfg(target_os = "linux")]
+    linux_primary: LinuxPrimaryClipboard,
     renderer: WallRenderer,
     depth: wgpu::TextureView,
     surface: wgpu::Surface<'static>,
@@ -129,6 +208,16 @@ struct Gfx {
     window: Arc<Window>,
     /// Renderer scale that makes a cell [`WORLD_CELL_HEIGHT`] tall.
     cell_scale: f32,
+}
+
+#[cfg(feature = "egui-ui")]
+impl Gfx {
+    fn ensure_ui(&mut self, device: &wgpu::Device) -> &mut WallUi {
+        self.ui.get_or_insert_with(|| {
+            let _s = super::startup::span("egui_init");
+            WallUi::new(device, &self.window, self.config.format)
+        })
+    }
 }
 
 struct App {
@@ -192,15 +281,33 @@ struct App {
     perf: super::perf::WallPerf,
     /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
     ime_composing: bool,
+    /// True while `wallctl app.ime preedit` is active; kept separate from [`Self::ime_composing`]
+    /// because Wayland `zwp_text_input_v3.done` replies to earlier `set_ime_cursor_area` commits
+    /// make winit emit `Ime::Preedit("", None)` asynchronously.
+    script_ime_composing: bool,
     /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
     macos_option_as_alt: Option<winit::platform::macos::OptionAsAlt>,
+    /// Monotonic synthetic clock advance (`ms`) applied by timed scripted sequences (`app.wheel_seq`).
+    clock_offset_ms: f64,
     /// Last text written by `WallEffect::WriteClipboard` (inspected via `app.clipboard`).
     last_copied: Option<String>,
     /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
     /// smoke tests never read or overwrite a user's live OS clipboard.
     memory_clipboard: Option<String>,
+    /// Process-local stand-in for Linux's `PRIMARY` selection when `GLYPH_WALL_CLIPBOARD=memory`.
+    memory_primary: Option<String>,
+    /// Last `wall.model().selection_clipboard()` value synced out to `PRIMARY`.
+    last_synced_selection_clip: String,
+    /// Where the middle mouse button went down, and whether it travelled past `DRAG_SLOP_PX`.
+    middle_press_pos: Option<Point>,
+    middle_dragged: bool,
+    /// External files currently hovering over the window (`WindowEvent::HoveredFile`).
+    hovered_files: Vec<PathBuf>,
+    /// External files dropped in the current event batch (`WindowEvent::DroppedFile`),
+    /// coalesced into one shell-quoted paste before `about_to_wait` sleeps.
+    pending_dropped_files: Vec<PathBuf>,
     use_memory_clipboard: bool,
 }
 
@@ -358,13 +465,219 @@ fn store_dir() -> PathBuf {
     wall_core::store::default_store_dir()
 }
 
+/// Convert a winit [`MouseScrollDelta`] + [`TouchPhase`] into the browser DOM wheel convention
+/// `(delta_x, delta_y, DeltaMode)` expected by `wall_core::pointer::WallPointer`.
+///
+/// - **Sign & Natural Scrolling**: On macOS (`macos/view.rs`), Wayland (`libinput`), and X11,
+///   winit already incorporates the OS natural-scrolling setting and reports positive deltas when
+///   content moves right/down (scrolling up/left). DOM `WheelEvent` uses the opposite sign
+///   (`+deltaY` scrolls down, moving content up), so both axes negate.
+/// - **1:1 Trackpad Pan**: `PixelDelta` is in physical pixels (`scrollingDelta * scale_factor`),
+///   so dividing by `scale_factor` produces exact 1:1 logical pixel travel at every camera zoom.
+/// - **Mouse Wheel Detents (`LineDelta`)**: winit reports `±1.0` per physical wheel detent on
+///   Wayland (`discrete`), X11 (`Button4/5` / `XInput2`), and macOS non-precise mice. Plain
+///   scroll scales by [`LINES_PER_WHEEL_NOTCH`] (`3.0` lines in `DeltaMode::Line`, keeping
+///   `TerminalScroller.trackpad = false`); wheel-zoom scales by [`WHEEL_ZOOM_NOTCH_PX`]
+///   (`100.0` px in `DeltaMode::Pixel`) so one detent glides by `WHEEL_ZOOM.step_factor` (`1.12x`)
+///   instead of falling under `WallPointer`'s `50 px` trackpad-pinch heuristic.
+/// - **TouchPhase & Momentum**: Zero-delta bookends (`MayBegin`, `Ended`, Wayland `axis_stop`)
+///   and `TouchPhase::Cancelled` return `None` so they do not extend `WheelStreamGate`'s `140 ms`
+///   quiet window after a gesture ends. `TouchPhase::Started` / `Ended` deliberately do **not**
+///   reset `WheelStreamGate`, because macOS emits `Ended` (finger lift) followed ~8 ms later by
+///   `Started` (`momentumPhase == Began`); keeping the latch intact across that transition stops
+///   a canvas pan flick from hijacking a focused terminal that slides under a stationary cursor.
+fn convert_scroll_delta(
+    delta: MouseScrollDelta,
+    phase: TouchPhase,
+    scale_factor: f64,
+    mods: Mods,
+    zoom_keys: &str,
+) -> Option<(f64, f64, DeltaMode)> {
+    if phase == TouchPhase::Cancelled {
+        return None;
+    }
+    let sf = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let (dx, dy, mode) = match delta {
+        MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+            (-x / sf, -y / sf, DeltaMode::Pixel)
+        }
+        MouseScrollDelta::LineDelta(x, y) => {
+            let (lx, ly) = (f64::from(x), f64::from(y));
+            let zooming = wall_core::chord::zooms_wheel(mods, zoom_keys).unwrap_or(false);
+            if zooming {
+                (
+                    -lx * WHEEL_ZOOM_NOTCH_PX,
+                    -ly * WHEEL_ZOOM_NOTCH_PX,
+                    DeltaMode::Pixel,
+                )
+            } else {
+                (
+                    -lx * LINES_PER_WHEEL_NOTCH,
+                    -ly * LINES_PER_WHEEL_NOTCH,
+                    DeltaMode::Line,
+                )
+            }
+        }
+    };
+    if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+        return None;
+    }
+    Some((dx, dy, mode))
+}
+
+/// Convert a winit [`WindowEvent::PinchGesture`] `delta` (`NSEvent.magnification`) into the
+/// multiplicative zoom factor passed to `Wall::pinch`.
+///
+/// Browsers map `magnification` to `WheelEvent { ctrlKey: true, deltaY: -100 * delta }`, which
+/// `WallPointer.js` turns into `Math.exp(-dy * 0.01) = Math.exp(delta)`. `delta.exp()` matches
+/// that exact rate, stays strictly positive for every finite `delta`, and composes exact across
+/// frame subdivisions (`exp(a) * exp(b) == exp(a + b)`).
+fn pinch_zoom_factor(delta: f64, phase: TouchPhase) -> Option<f64> {
+    if phase == TouchPhase::Cancelled || !delta.is_finite() || delta == 0.0 {
+        return None;
+    }
+    Some(delta.exp())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SmartZoomTarget {
+    Terminal(String),
+    Group(String),
+    Canvas,
+}
+
+fn smart_zoom_target_at(described: &Described, pt: Point) -> SmartZoomTarget {
+    let vw = described.viewport.w;
+    let vh = described.viewport.h;
+    let cam = described.camera;
+
+    let mut best_term: Option<(f64, &str)> = None;
+    for t in &described.terminals {
+        let sb = cam.to_screen_box(t.body_rect, vw, vh);
+        let in_body = pt.x >= sb.left && pt.x <= sb.right && pt.y >= sb.top && pt.y <= sb.bottom;
+        let in_bar = described.title_bars.iter().any(|b| {
+            if b.terminal_id != t.id {
+                return false;
+            }
+            let bb = cam.to_screen_box(b.rect, vw, vh);
+            pt.x >= bb.left && pt.x <= bb.right && pt.y >= bb.top && pt.y <= bb.bottom
+        });
+        if (in_body || in_bar) && best_term.is_none_or(|(z, _)| t.z >= z) {
+            best_term = Some((t.z, t.id.as_str()));
+        }
+    }
+    if let Some((_, id)) = best_term {
+        return SmartZoomTarget::Terminal(id.to_string());
+    }
+    for g in &described.groups {
+        let hb = cam.to_screen_box(g.header_rect, vw, vh);
+        if pt.x >= hb.left && pt.x <= hb.right && pt.y >= hb.top && pt.y <= hb.bottom {
+            return SmartZoomTarget::Group(g.id.clone());
+        }
+    }
+    SmartZoomTarget::Canvas
+}
+
+/// Quote `path` as a POSIX shell token suitable for pasting into an interactive shell.
+///
+/// Plain ASCII paths containing only `[A-Za-z0-9/._\-+@:,%=]` stay unquoted; every other path
+/// (spaces, quotes, `$`, globs, parens, backslashes, newlines, non-ASCII) is wrapped in single
+/// quotes with embedded `'` escaped as `'\''`.
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    let safe_unquoted = !raw.is_empty()
+        && raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b':' | b',' | b'%' | b'='
+                )
+        });
+    if safe_unquoted {
+        raw.into_owned()
+    } else {
+        format!("'{}'", raw.replace('\'', r"'\''"))
+    }
+}
+
+/// Format one or more dropped file paths as a space-separated shell-quoted string with a
+/// trailing space (matching Terminal.app, Ghostty, kitty, and WezTerm).
+fn format_dropped_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut out = paths
+        .iter()
+        .map(|p| shell_quote_path(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push(' ');
+    out
+}
+
+fn hovered_drop_notice(paths: &[PathBuf]) -> Option<String> {
+    match paths {
+        [] => None,
+        [only] => {
+            let label = only
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| only.display().to_string());
+            Some(format!("drop to paste path: {label}"))
+        }
+        many => Some(format!("drop to paste {} paths", many.len())),
+    }
+}
+
+/// Find the terminal body hit by a middle-click paste at `pt`, matching `WallPointer::on_down`
+/// (`HitPart::Body` inside the 6 px resize-edge band on the open canvas, or the active pane in
+/// fullscreen).
+fn middle_paste_target_at(described: &Described, pt: Point) -> Option<String> {
+    const EDGE_GRAB_PX: f64 = 6.0;
+    if let Some(fb) = &described.fullscreen_backdrop {
+        if fb.mode == FullscreenMode::Single {
+            return Some(fb.target.clone());
+        }
+    }
+    let vw = described.viewport.w;
+    let vh = described.viewport.h;
+    let cam = described.camera;
+    let mut best: Option<(f64, &str)> = None;
+    for t in &described.terminals {
+        let sb = cam.to_screen_box(t.body_rect, vw, vh);
+        let inset_x = if sb.right - sb.left > EDGE_GRAB_PX * 3.0 {
+            EDGE_GRAB_PX
+        } else {
+            0.0
+        };
+        let inset_y = if sb.bottom - sb.top > EDGE_GRAB_PX * 3.0 {
+            EDGE_GRAB_PX
+        } else {
+            0.0
+        };
+        if pt.x >= sb.left + inset_x
+            && pt.x <= sb.right - inset_x
+            && pt.y >= sb.top + inset_y
+            && pt.y <= sb.bottom - inset_y
+            && best.is_none_or(|(z, _)| t.z >= z)
+        {
+            best = Some((t.z, t.id.as_str()));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
 impl App {
     fn scale_factor(&self) -> f64 {
         self.win.scale_factor()
     }
 
     fn now_ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
+        self.start.elapsed().as_secs_f64() * 1000.0 + self.clock_offset_ms
     }
 
     fn mods(&self) -> Mods {
@@ -545,6 +858,8 @@ impl App {
         let metrics = renderer.metrics();
         let cell_scale = WORLD_CELL_HEIGHT / metrics.cell_height;
         renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
+        #[cfg(target_os = "linux")]
+        let linux_primary = LinuxPrimaryClipboard::new(&window);
         let sf = self.win.finish_open(&window, WallStyle::default(), renderer.style_mut());
 
         // The rules, at the renderer's cell size and the window's viewport.
@@ -575,6 +890,8 @@ impl App {
         self.gfx = Some(Gfx {
             #[cfg(feature = "egui-ui")]
             ui: None,
+            #[cfg(target_os = "linux")]
+            linux_primary,
             renderer,
             depth,
             surface,
@@ -710,7 +1027,17 @@ impl App {
         }
     }
 
+    fn is_ime_composing(&self) -> bool {
+        self.ime_composing || self.script_ime_composing
+    }
+
     fn sync_ime_cursor_area(&mut self, described: &Described) {
+        // On Wayland (`zwp_text_input_v3`), `set_ime_cursor_area` sends `text_input.commit()`,
+        // whose `done` reply without a new `preedit_string` makes winit emit `Ime::Preedit("", None)`
+        // and abort an active composition. Defer cursor-rect updates until composition finishes.
+        if self.is_ime_composing() {
+            return;
+        }
         let (Some(g), Some(terms)) = (&self.gfx, &self.terms) else { return };
         #[cfg(feature = "egui-ui")]
         if g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input()) {
@@ -843,6 +1170,83 @@ impl App {
         if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             log::warn!("copy: the clipboard refused the text: {e}");
         }
+    }
+
+    fn read_primary_selection(&mut self) -> Option<String> {
+        if self.use_memory_clipboard {
+            return self.memory_primary.clone().filter(|s| !s.is_empty());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(g) = &mut self.gfx {
+            return g.linux_primary.get();
+        }
+        None
+    }
+
+    fn write_primary_selection(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.use_memory_clipboard {
+            self.memory_primary = Some(text);
+        } else {
+            #[cfg(target_os = "linux")]
+            if let Some(g) = &mut self.gfx {
+                g.linux_primary.set(text);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = text;
+        }
+    }
+
+    fn drop_files(&mut self, paths: &[PathBuf]) {
+        let payload = format_dropped_paths(paths);
+        if payload.is_empty() {
+            return;
+        }
+        if let Some(wall) = &mut self.wall {
+            if wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            let described = wall.frame();
+            let target = if let Some(fb) = &described.fullscreen_backdrop {
+                match fb.mode {
+                    FullscreenMode::Single => Some(fb.target.clone()),
+                    FullscreenMode::Group => match smart_zoom_target_at(&described, self.cursor) {
+                        SmartZoomTarget::Terminal(id) => {
+                            if wall.focused_id() != Some(id.as_str()) {
+                                let _ = wall.run(format!("terminal.focus {id}"));
+                            }
+                            Some(id)
+                        }
+                        _ => wall.focused_id().map(str::to_owned),
+                    },
+                }
+            } else {
+                match smart_zoom_target_at(&described, self.cursor) {
+                    SmartZoomTarget::Terminal(id) => {
+                        if wall.focused_id() != Some(id.as_str()) {
+                            let _ = wall.run(format!("terminal.focus {id}"));
+                        }
+                        Some(id)
+                    }
+                    _ => wall.focused_id().map(str::to_owned),
+                }
+            };
+            if let Some(id) = target {
+                wall.deliver_clipboard(&id, &payload);
+            }
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
+    fn flush_dropped_files(&mut self) {
+        if self.pending_dropped_files.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_dropped_files);
+        self.drop_files(&batch);
     }
 
     fn apply(&mut self, effect: WallEffect) {
@@ -1095,6 +1499,7 @@ impl App {
         }
         if ran {
             self.apply_effects();
+            self.draw(false);
             self.redraw();
         }
     }
@@ -1359,6 +1764,9 @@ impl App {
             _ => None,
         };
         self.apply_effects();
+        if described.notice.is_none() {
+            described.notice = hovered_drop_notice(&self.hovered_files);
+        }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
 
@@ -1394,7 +1802,13 @@ impl App {
         let need_offscreen = self.pending_shot.is_some()
             || self.perf.is_enabled()
             || (self.exit_after == Some(self.frames + 1) && std::env::var_os("GLYPH_WALL_SHOT").is_some());
-        if frame.is_none() && !need_offscreen {
+        #[cfg(feature = "egui-ui")]
+        let need_ui = (!to_surface && self.exit_after.is_none())
+            || g.ui.as_ref().is_some_and(WallUi::has_pending_input)
+            || self.ui_repaint_at.is_some_and(|d| now >= d);
+        #[cfg(not(feature = "egui-ui"))]
+        let need_ui = false;
+        if frame.is_none() && !need_offscreen && !need_ui {
             if !to_surface && self.exit_after.is_some() {
                 self.frames += 1;
                 self.scripted();
@@ -1502,19 +1916,18 @@ impl App {
         #[cfg(feature = "egui-ui")]
         let agents_open = self.wall.as_ref().zip(self.agents.as_ref()).is_some_and(|(w, a)| a.has_open_views(w));
         #[cfg(feature = "egui-ui")]
+        let mut ui_painted_on_gpu = false;
+        #[cfg(feature = "egui-ui")]
         let mut ui_painted = {
             let skip_bootstrap_ui =
-                self.frames == 0 && self.exit_after.is_none() && self.pending_shot.is_none();
+                self.frames == 0 && to_surface && self.exit_after.is_none() && self.pending_shot.is_none();
             let ui_needed = !skip_bootstrap_ui
                 && (self.hud_open
                     || agents_open
                     || self.wall.as_ref().is_some_and(|w| self.panels.any_open(w, &described))
-                    || g.ui.as_ref().is_some_and(WallUi::is_active));
+                    || g.ui.as_ref().is_some_and(WallUi::is_active)
+                    || g.ui.as_ref().is_some_and(WallUi::has_pending_input));
             if ui_needed {
-                let ui = g.ui.get_or_insert_with(|| {
-                    let _s = super::startup::span("egui_init");
-                    WallUi::new(&self.ctx.device, &g.window, g.config.format)
-                });
                 let hud_terms: Vec<HudTerminalInfo<'_>> = described
                     .terminals
                     .iter()
@@ -1530,7 +1943,9 @@ impl App {
                 let wall_ref = self.wall.as_ref();
                 let mut agents_ref = self.agents.as_mut();
                 let window_sf = self.win.scale_factor();
-                let mut ui_frame = ui.run(&g.window, viewport, |ctx| {
+                let window_arc = g.window.clone();
+                let ui = g.ensure_ui(&self.ctx.device);
+                let mut ui_frame = ui.run(&window_arc, viewport, |ctx| {
                     agent_verbs.clear();
                     if let (Some(w), Some(ag)) = (wall_ref, agents_ref.as_deref_mut()) {
                         ag.show_panel(ctx, w, viewport, window_sf, &mut agent_verbs);
@@ -1545,10 +1960,11 @@ impl App {
                 panel_egui_keys = ui_frame.wants_keyboard;
                 if let (Some(painted), Some(v), Some(enc)) = (ui_frame.painted.as_mut(), &view, &mut encoder) {
                     ui.paint(&self.ctx.device, &self.ctx.queue, enc, v, painted);
+                    ui_painted_on_gpu = true;
                 }
                 match ui_frame.repaint_after {
                     Some(delay) if delay.is_zero() => {
-                        self.ui_repaint_at = None;
+                        self.ui_repaint_at = Some(Instant::now() + std::time::Duration::from_millis(16));
                         g.window.request_redraw();
                     }
                     Some(delay) => self.ui_repaint_at = Some(Instant::now() + delay),
@@ -1585,6 +2001,7 @@ impl App {
                     #[cfg(feature = "egui-ui")]
                     if let (Some(ui), Some(painted)) = (g.ui.as_mut(), ui_painted.as_mut()) {
                         ui.paint(&self.ctx.device, &self.ctx.queue, enc, color_view, painted);
+                        ui_painted_on_gpu = true;
                     }
                     #[cfg(not(feature = "egui-ui"))]
                     let _ = (enc, color_view);
@@ -1604,6 +2021,12 @@ impl App {
             }
             if let Some((path, responder)) = asked {
                 responder.send(format!("OK: wrote {}", path.display()));
+            }
+        }
+        #[cfg(feature = "egui-ui")]
+        if !ui_painted_on_gpu {
+            if let (Some(ui), Some(painted)) = (g.ui.as_mut(), ui_painted.as_mut()) {
+                ui.sync_textures_only(&self.ctx.device, &self.ctx.queue, painted);
             }
         }
         #[cfg(feature = "egui-ui")]
@@ -1635,6 +2058,7 @@ impl App {
             }
             if status_opened {
                 self.refresh_termd_status();
+                changed = true;
             }
             if changed {
                 self.apply_effects();
@@ -1695,6 +2119,13 @@ impl App {
 
     fn move_cursor(&mut self, x: f64, y: f64) {
         self.cursor = Point::new(x, y);
+        if (self.buttons & Buttons::MIDDLE.0) != 0
+            && self
+                .middle_press_pos
+                .is_some_and(|p| (x - p.x).hypot(y - p.y) > DRAG_SLOP_PX)
+        {
+            self.middle_dragged = true;
+        }
         if let Some(pressed_tid) = self.pressed_scrollback_pill.as_deref() {
             let over = (self.hit_scrollback_pill(x, y) == Some(pressed_tid))
                 .then(|| pressed_tid.to_owned());
@@ -1711,7 +2142,6 @@ impl App {
         };
         let pill_hover_changed = hovered_pill != self.hovered_scrollback_pill;
         self.hovered_scrollback_pill = hovered_pill;
-
         let ev = self.pointer(None);
         if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
             let lookup = screen_lookup(|id| terms.screen(id));
@@ -1728,24 +2158,88 @@ impl App {
         }
     }
 
-    fn pinch(&mut self, delta: f64) {
+    fn pinch(&mut self, delta: f64, phase: TouchPhase) {
+        let factor = pinch_zoom_factor(delta, phase);
         if let Some(wall) = &mut self.wall {
-            wall.pinch(self.cursor.x, self.cursor.y, 1.0 + delta);
+            if (phase == TouchPhase::Started || factor.is_some()) && wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            if wall.fullscreen().active() {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            if let Some(f) = factor {
+                wall.pinch(self.cursor.x, self.cursor.y, f);
+            }
         }
         self.apply_effects();
         self.redraw();
     }
 
-    fn wheel(&mut self, delta: MouseScrollDelta) {
+    fn smart_zoom(&mut self) {
+        if let Some(wall) = &mut self.wall {
+            if wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            if wall.fullscreen().active() {
+                self.apply_effects();
+                self.redraw();
+                return;
+            }
+            let described = wall.frame();
+            match smart_zoom_target_at(&described, self.cursor) {
+                SmartZoomTarget::Terminal(id) => {
+                    let pre = wall.camera().clone();
+                    let _ = wall.run(format!("wall.reveal {id}"));
+                    if wall.camera().target().is_some_and(|t| pre.is_at(t)) {
+                        let _ = wall.run("wall.fit");
+                    }
+                }
+                SmartZoomTarget::Group(gid) => {
+                    let pre = wall.camera().clone();
+                    let _ = wall.run(format!("wall.group.frame {gid}"));
+                    if wall.camera().target().is_some_and(|t| pre.is_at(t)) {
+                        let _ = wall.run("wall.fit");
+                    }
+                }
+                SmartZoomTarget::Canvas => {
+                    let _ = wall.run("wall.fit");
+                }
+            }
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
+    fn wheel_at(&mut self, delta: MouseScrollDelta, phase: TouchPhase, time_ms: f64) {
         let sf = self.scale_factor();
-        // winit: positive means the content moves right and down. The web's
-        // wheel, which the wall's rules speak: positive deltaY scrolls down,
-        // moving the content up. So the sign flips.
-        let (dx, dy, mode) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (-f64::from(x), -f64::from(y), DeltaMode::Line),
-            MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => (-x / sf, -y / sf, DeltaMode::Pixel),
+        let mods = self.mods();
+        let zoom_keys = self
+            .wall
+            .as_ref()
+            .map_or("ctrl alt meta", |w| w.config().zoom_keys.as_str());
+        let Some((dx, dy, mode)) = convert_scroll_delta(delta, phase, sf, mods, zoom_keys) else {
+            if phase == TouchPhase::Started {
+                if let Some(wall) = &mut self.wall {
+                    if wall.menu().is_some() {
+                        let _ = wall.run("wall.menu close");
+                        self.apply_effects();
+                        self.redraw();
+                    }
+                }
+            }
+            return;
         };
-        let ev = WheelEvent { x: self.cursor.x, y: self.cursor.y, delta_x: dx, delta_y: dy, delta_mode: mode, mods: self.mods(), time_ms: self.now_ms() };
+        let ev = WheelEvent {
+            x: self.cursor.x,
+            y: self.cursor.y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods,
+            time_ms,
+        };
         if let Some(wall) = &mut self.wall {
             wall.wheel(&ev);
         }
@@ -1753,8 +2247,13 @@ impl App {
         self.redraw();
     }
 
+    fn wheel(&mut self, delta: MouseScrollDelta, phase: TouchPhase) {
+        let time_ms = self.now_ms();
+        self.wheel_at(delta, phase, time_ms);
+    }
+
     fn key_input(&mut self, key: KeyEvent) {
-        if self.ime_composing && key.pressed {
+        if self.is_ime_composing() && key.pressed {
             return;
         }
         let host_chord = wall_core::chord::chord_mods(Platform::host());
@@ -1890,7 +2389,9 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
+            self.hovered_files.clear();
             self.pressed_scrollback_pill = None;
+            self.script_ime_composing = false;
             self.buttons = 0;
             if let Some(wall) = &mut self.wall {
                 wall.blur();
@@ -1906,160 +2407,453 @@ impl App {
         }
     }
 
+    #[cfg(feature = "egui-ui")]
+    fn script_pointer_goes_to_ui(&self) -> bool {
+        if self.buttons != 0 {
+            return false;
+        }
+        self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| {
+            pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
+                == PointerTarget::Ui
+        })
+    }
+
+    fn script_move(&mut self, x: f64, y: f64, run_ui_pass: bool) {
+        self.cursor = Point::new(x, y);
+        #[cfg(feature = "egui-ui")]
+        let ui_pointer = self.script_pointer_goes_to_ui();
+        #[cfg(not(feature = "egui-ui"))]
+        let ui_pointer = false;
+        #[cfg(feature = "egui-ui")]
+        if let Some(g) = &mut self.gfx {
+            g.ensure_ui(&self.ctx.device)
+                .push_script_pointer_moved(egui::pos2(x as f32, y as f32));
+        }
+        if !ui_pointer {
+            self.move_cursor(x, y);
+        }
+        if run_ui_pass {
+            self.draw(false);
+        }
+    }
+
+    fn script_down(&mut self, button: MouseButton, mods: Option<ModifiersState>) {
+        let prev = self.modifiers;
+        if let Some(m) = mods {
+            self.modifiers = m;
+        }
+        #[cfg(feature = "egui-ui")]
+        let ui_pointer = self.script_pointer_goes_to_ui();
+        #[cfg(not(feature = "egui-ui"))]
+        let ui_pointer = false;
+        #[cfg(feature = "egui-ui")]
+        if let (Some(g), Some(eb)) = (&mut self.gfx, super::ui::winit_button_to_egui(button)) {
+            let emods = super::ui::winit_mods_to_egui(self.modifiers);
+            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
+            let ui = g.ensure_ui(&self.ctx.device);
+            ui.push_script_pointer_moved(pos);
+            ui.push_script_pointer_button(pos, eb, true, emods);
+        }
+        if !ui_pointer {
+            self.mouse(ElementState::Pressed, button);
+        }
+        self.draw(false);
+        if mods.is_some() {
+            self.modifiers = prev;
+            #[cfg(feature = "egui-ui")]
+            if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+                ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+            }
+        }
+    }
+
+    fn script_up(&mut self, button: MouseButton, mods: Option<ModifiersState>) {
+        let prev = self.modifiers;
+        if let Some(m) = mods {
+            self.modifiers = m;
+        }
+        #[cfg(feature = "egui-ui")]
+        if let (Some(g), Some(eb)) = (&mut self.gfx, super::ui::winit_button_to_egui(button)) {
+            let emods = super::ui::winit_mods_to_egui(self.modifiers);
+            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
+            g.ensure_ui(&self.ctx.device)
+                .push_script_pointer_button(pos, eb, false, emods);
+        }
+        if button_of(button).is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0) {
+            self.mouse(ElementState::Released, button);
+        }
+        self.draw(false);
+        if mods.is_some() {
+            self.modifiers = prev;
+            #[cfg(feature = "egui-ui")]
+            if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+                ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+            }
+        }
+    }
+
+    fn script_key(&mut self, k: &super::script::ScriptKey) -> &'static str {
+        use super::script::{modifier_bit_of_physical, ScriptKeyPhase};
+        #[cfg(feature = "egui-ui")]
+        let panels_want_keys = {
+            let eff_mods = self.modifiers | k.mods;
+            let mapped = super::keys::key_from_parts(
+                k.physical,
+                &k.logical,
+                k.text.as_deref(),
+                ElementState::Pressed,
+                false,
+                eff_mods,
+            );
+            let menu_open = self.wall.as_ref().is_some_and(|w| w.menu().is_some());
+            let wall_chord_bypass =
+                !menu_open && chord_bypasses_panel_input(Platform::host(), &mapped);
+            !wall_chord_bypass
+                && (self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+                    || self.agents.as_ref().is_some_and(|a| a.panel_state().wants_keyboard)
+                    || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| {
+                        ui.is_active() && ui.context().egui_wants_keyboard_input()
+                    }))
+        };
+        #[cfg(not(feature = "egui-ui"))]
+        let panels_want_keys = false;
+
+        if panels_want_keys {
+            let prev = self.modifiers;
+            match k.phase {
+                ScriptKeyPhase::Tap => {
+                    self.modifiers |= k.mods;
+                    #[cfg(feature = "egui-ui")]
+                    if let Some(g) = &mut self.gfx {
+                        let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                        let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                        g.ensure_ui(&self.ctx.device)
+                            .push_script_key(ekey, true, emods, k.text.as_deref());
+                    }
+                    self.draw(false);
+                    #[cfg(feature = "egui-ui")]
+                    if let Some(g) = &mut self.gfx {
+                        let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                        let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                        g.ensure_ui(&self.ctx.device)
+                            .push_script_key(ekey, false, emods, None);
+                    }
+                    self.draw(false);
+                    self.modifiers = prev;
+                    "OK: key"
+                }
+                ScriptKeyPhase::Repeat => {
+                    self.modifiers |= k.mods;
+                    #[cfg(feature = "egui-ui")]
+                    if let Some(g) = &mut self.gfx {
+                        let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                        let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                        g.ensure_ui(&self.ctx.device)
+                            .push_script_key(ekey, true, emods, k.text.as_deref());
+                    }
+                    self.draw(false);
+                    self.modifiers = prev;
+                    "OK: key repeat"
+                }
+                ScriptKeyPhase::Down => {
+                    if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                        self.modifiers |= bit;
+                    }
+                    #[cfg(feature = "egui-ui")]
+                    if let Some(g) = &mut self.gfx {
+                        let eff = self.modifiers | k.mods;
+                        let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                        let emods = super::ui::winit_mods_to_egui(eff);
+                        g.ensure_ui(&self.ctx.device)
+                            .push_script_key(ekey, true, emods, k.text.as_deref());
+                    }
+                    self.draw(false);
+                    if modifier_bit_of_physical(k.physical).is_none() {
+                        self.modifiers = prev | k.mods;
+                    }
+                    "OK: key down"
+                }
+                ScriptKeyPhase::Up => {
+                    if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                        self.modifiers.remove(bit);
+                    }
+                    #[cfg(feature = "egui-ui")]
+                    if let Some(g) = &mut self.gfx {
+                        let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
+                        let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                        g.ensure_ui(&self.ctx.device)
+                            .push_script_key(ekey, false, emods, None);
+                    }
+                    self.draw(false);
+                    "OK: key up"
+                }
+            }
+        } else {
+            match k.phase {
+                ScriptKeyPhase::Tap => {
+                    let prev = self.modifiers;
+                    self.modifiers |= k.mods;
+                    let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                    let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                    self.key_input(down);
+                    self.key_input(up);
+                    self.modifiers = prev;
+                    "OK: key"
+                }
+                ScriptKeyPhase::Repeat => {
+                    let prev = self.modifiers;
+                    self.modifiers |= k.mods;
+                    let rep = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, true, self.modifiers);
+                    self.key_input(rep);
+                    self.modifiers = prev;
+                    "OK: key repeat"
+                }
+                ScriptKeyPhase::Down => {
+                    if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                        self.modifiers |= bit;
+                    }
+                    let eff = self.modifiers | k.mods;
+                    let prev = self.modifiers;
+                    self.modifiers = eff;
+                    let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                    self.key_input(down);
+                    if modifier_bit_of_physical(k.physical).is_none() {
+                        self.modifiers = prev | k.mods;
+                    }
+                    "OK: key down"
+                }
+                ScriptKeyPhase::Up => {
+                    if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                        self.modifiers.remove(bit);
+                    }
+                    let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                    self.key_input(up);
+                    "OK: key up"
+                }
+            }
+        }
+    }
+
     fn run_script(&mut self, cmd: super::script::ScriptCommand) -> String {
         use super::script::{button_label, keys_for_typed_text, ScriptCommand};
         match cmd {
-            ScriptCommand::Where => match &mut self.wall {
-                Some(wall) => super::script::format_where(&wall.frame(), self.cursor),
-                None => "ERR: the wall is not open yet".to_string(),
-            },
+            ScriptCommand::Where => {
+                self.draw(false);
+                match &mut self.wall {
+                    Some(wall) => {
+                        let described = wall.frame();
+                        let mut out = super::script::format_where(&described, self.cursor, wall.platform());
+                        out.push_str(&format!(
+                            "\npaper grid_show={} grid_minor={}",
+                            described.paper.grid_show, described.paper.grid.grid_minor
+                        ));
+                        #[cfg(feature = "egui-ui")]
+                        {
+                            let panel_lines = self.panels.format_where(wall, &described);
+                            if !panel_lines.is_empty() {
+                                out.push('\n');
+                                out.push_str(&panel_lines);
+                            }
+                        }
+                        out
+                    }
+                    None => "ERR: the wall is not open yet".to_string(),
+                }
+            }
             ScriptCommand::Move { x, y } => {
-                self.script_move(x, y);
+                self.script_move(x, y, true);
                 format!("OK: moved to ({x:.2}, {y:.2})")
             }
             ScriptCommand::Down { button, mods } => {
-                let prev = self.modifiers;
-                if let Some(m) = mods {
-                    self.modifiers = m;
-                }
-                self.script_mouse(ElementState::Pressed, button);
-                if mods.is_some() {
-                    self.modifiers = prev;
-                }
+                self.script_down(button, mods);
                 format!("OK: down {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
             }
             ScriptCommand::Up { button, mods } => {
-                let prev = self.modifiers;
-                if let Some(m) = mods {
-                    self.modifiers = m;
-                }
-                self.script_mouse(ElementState::Released, button);
-                if mods.is_some() {
-                    self.modifiers = prev;
-                }
+                self.script_up(button, mods);
                 format!("OK: up {} at ({:.2}, {:.2})", button_label(button), self.cursor.x, self.cursor.y)
             }
             ScriptCommand::Click { x, y, button, mods } => {
-                let prev = self.modifiers;
-                self.modifiers = mods;
                 self.last_release = None;
-                self.script_move(x, y);
-                self.script_mouse(ElementState::Pressed, button);
-                self.script_mouse(ElementState::Released, button);
-                self.modifiers = prev;
+                self.script_move(x, y, true);
+                self.script_down(button, Some(mods));
+                self.script_up(button, Some(mods));
                 format!("OK: clicked {} at ({x:.2}, {y:.2})", button_label(button))
             }
             ScriptCommand::DblClick { x, y } => {
                 self.last_release = None;
-                self.move_cursor(x, y);
-                self.mouse(ElementState::Pressed, MouseButton::Left);
-                self.mouse(ElementState::Released, MouseButton::Left);
-                self.mouse(ElementState::Pressed, MouseButton::Left);
-                self.mouse(ElementState::Released, MouseButton::Left);
+                self.script_move(x, y, true);
+                self.script_down(MouseButton::Left, None);
+                self.script_up(MouseButton::Left, None);
+                self.script_down(MouseButton::Left, None);
+                self.script_up(MouseButton::Left, None);
                 format!("OK: dblclick at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::TplClick { x, y } => {
+                self.last_release = None;
+                self.move_cursor(x, y);
+                for _ in 0..3 {
+                    self.mouse(ElementState::Pressed, MouseButton::Left);
+                    self.mouse(ElementState::Released, MouseButton::Left);
+                }
+                self.last_release = None;
+                format!("OK: tplclick at ({x:.2}, {y:.2})")
             }
             ScriptCommand::Drag { x0, y0, x1, y1, steps, button, mods } => {
                 let prev = self.modifiers;
                 self.modifiers = mods;
                 self.last_release = None;
-                self.move_cursor(x0, y0);
-                self.mouse(ElementState::Pressed, button);
+                self.script_move(x0, y0, true);
+                self.script_down(button, Some(mods));
+                self.modifiers = mods;
+                let wall_gesture = self.buttons != 0;
                 for i in 1..=steps {
                     let t = i as f64 / steps as f64;
-                    self.move_cursor(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+                    self.script_move(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, !wall_gesture);
                 }
-                self.mouse(ElementState::Released, button);
+                self.script_up(button, Some(mods));
                 self.modifiers = prev;
                 format!("OK: dragged {} ({x0:.2}, {y0:.2}) -> ({x1:.2}, {y1:.2}) in {steps} steps", button_label(button))
             }
-            ScriptCommand::Wheel { x, y, dx, dy, mods } => {
+            ScriptCommand::Wheel { x, y, dx, dy, unit, phase, dt_ms, mods } => {
+                use super::script::ScriptScrollUnit;
+                if let Some(dt) = dt_ms {
+                    self.clock_offset_ms += dt;
+                }
                 let prev = self.modifiers;
                 self.modifiers = mods;
-                self.move_cursor(x, y);
-                let sf = self.scale_factor();
-                self.wheel(MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf)));
+                self.script_move(x, y, true);
+                #[cfg(feature = "egui-ui")]
+                let ui_pointer = self.script_pointer_goes_to_ui();
+                #[cfg(not(feature = "egui-ui"))]
+                let ui_pointer = false;
+                #[cfg(feature = "egui-ui")]
+                if let Some(g) = &mut self.gfx {
+                    let emods = super::ui::winit_mods_to_egui(self.modifiers);
+                    g.ensure_ui(&self.ctx.device).push_script_wheel(
+                        egui::pos2(x as f32, y as f32),
+                        egui::vec2(dx as f32, dy as f32),
+                        emods,
+                    );
+                }
+                if !ui_pointer {
+                    let delta = match unit {
+                        ScriptScrollUnit::Pixel => {
+                            let sf = self.scale_factor();
+                            MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx * sf, dy * sf))
+                        }
+                        ScriptScrollUnit::Line => MouseScrollDelta::LineDelta(dx as f32, dy as f32),
+                    };
+                    self.wheel(delta, phase);
+                }
+                self.draw(false);
                 self.modifiers = prev;
+                #[cfg(feature = "egui-ui")]
+                if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
+                    ui.set_script_modifiers(super::ui::winit_mods_to_egui(prev));
+                }
                 format!("OK: wheel ({dx:.2}, {dy:.2}) at ({x:.2}, {y:.2})")
             }
-            ScriptCommand::Pinch { x, y, factor } => {
-                self.move_cursor(x, y);
-                self.pinch(factor - 1.0);
-                format!("OK: pinch {factor:.4} at ({x:.2}, {y:.2})")
-            }
-            ScriptCommand::Key(k) => {
-                use super::script::{modifier_bit_of_physical, ScriptKeyPhase};
-                match k.phase {
-                    ScriptKeyPhase::Tap => {
-                        let prev = self.modifiers;
-                        self.modifiers |= k.mods;
-                        let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                        let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                        self.key_input(down);
-                        self.key_input(up);
-                        self.modifiers = prev;
-                        "OK: key".to_string()
+            ScriptCommand::WheelSeq { x, y, mods, steps } => {
+                use super::script::ScriptScrollUnit;
+                let prev = self.modifiers;
+                self.modifiers = mods;
+                self.script_move(x, y, true);
+                #[cfg(feature = "egui-ui")]
+                let ui_pointer = self.script_pointer_goes_to_ui();
+                #[cfg(not(feature = "egui-ui"))]
+                let ui_pointer = false;
+                let sf = self.scale_factor();
+                let mut t_ms = self.now_ms();
+                let n = steps.len();
+                for step in steps {
+                    if ui_pointer {
+                        break;
                     }
-                    ScriptKeyPhase::Repeat => {
-                        let prev = self.modifiers;
-                        self.modifiers |= k.mods;
-                        let rep = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, true, self.modifiers);
-                        self.key_input(rep);
-                        self.modifiers = prev;
-                        "OK: key repeat".to_string()
-                    }
-                    ScriptKeyPhase::Down => {
-                        if let Some(bit) = modifier_bit_of_physical(k.physical) {
-                            self.modifiers |= bit;
+                    t_ms += step.dt_ms;
+                    let delta = match step.unit {
+                        ScriptScrollUnit::Pixel => MouseScrollDelta::PixelDelta(
+                            PhysicalPosition::new(step.dx * sf, step.dy * sf),
+                        ),
+                        ScriptScrollUnit::Line => {
+                            MouseScrollDelta::LineDelta(step.dx as f32, step.dy as f32)
                         }
-                        let eff = self.modifiers | k.mods;
-                        let prev = self.modifiers;
-                        self.modifiers = eff;
-                        let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                        self.key_input(down);
-                        if modifier_bit_of_physical(k.physical).is_none() {
-                            self.modifiers = prev | k.mods;
-                        }
-                        "OK: key down".to_string()
-                    }
-                    ScriptKeyPhase::Up => {
-                        if let Some(bit) = modifier_bit_of_physical(k.physical) {
-                            self.modifiers.remove(bit);
-                        }
-                        let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                        self.key_input(up);
-                        "OK: key up".to_string()
-                    }
+                    };
+                    self.wheel_at(delta, step.phase, t_ms);
                 }
+                let live_now = self.start.elapsed().as_secs_f64() * 1000.0;
+                if t_ms > live_now + self.clock_offset_ms {
+                    self.clock_offset_ms = t_ms - live_now;
+                }
+                self.modifiers = prev;
+                format!("OK: wheel_seq {n} step(s) at ({x:.2}, {y:.2})")
             }
+            ScriptCommand::Pinch { x, y, amount, phase } => {
+                use super::script::ScriptPinchAmount;
+                self.script_move(x, y, true);
+                #[cfg(feature = "egui-ui")]
+                let ui_pointer = self.script_pointer_goes_to_ui();
+                #[cfg(not(feature = "egui-ui"))]
+                let ui_pointer = false;
+                let delta = match amount {
+                    ScriptPinchAmount::Factor(factor) => factor.ln(),
+                    ScriptPinchAmount::Delta(d) => d,
+                };
+                if !ui_pointer {
+                    self.pinch(delta, phase);
+                }
+                format!("OK: pinch delta={delta:.4} at ({x:.2}, {y:.2})")
+            }
+            ScriptCommand::DoubleTap { at } => {
+                if let Some((x, y)) = at {
+                    self.move_cursor(x, y);
+                }
+                self.smart_zoom();
+                format!("OK: doubletap at ({:.2}, {:.2})", self.cursor.x, self.cursor.y)
+            }
+            ScriptCommand::Drop { at, paths } => {
+                if let Some((x, y)) = at {
+                    self.move_cursor(x, y);
+                }
+                self.hovered_files.clear();
+                self.pending_dropped_files.clear();
+                let count = paths.len();
+                self.drop_files(&paths);
+                format!("OK: dropped {count} file(s)")
+            }
+            ScriptCommand::HoverFile(paths) => {
+                let count = paths.len();
+                self.hovered_files = paths;
+                self.redraw();
+                format!("OK: hovering {count} file(s)")
+            }
+            ScriptCommand::CancelFile => {
+                self.hovered_files.clear();
+                self.redraw();
+                "OK: hover file cancelled".to_string()
+            }
+            ScriptCommand::Key(k) => self.script_key(&k).to_string(),
             ScriptCommand::Type(text) => {
                 let seq = keys_for_typed_text(&text);
                 let count = seq.len();
-                let prev = self.modifiers;
-                for k in seq {
-                    self.modifiers = k.mods;
-                    let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                    let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                    self.key_input(down);
-                    self.key_input(up);
+                for k in &seq {
+                    self.script_key(k);
                 }
-                self.modifiers = prev;
                 format!("OK: typed {count} key(s)")
             }
             ScriptCommand::Ime(ime_cmd) => {
                 use super::script::ScriptIme;
                 match ime_cmd {
                     ScriptIme::Preedit(text) => {
-                        let cursor = (!text.is_empty()).then_some((0, text.len()));
-                        self.ime(&Ime::Preedit(text, cursor));
+                        self.script_ime_composing = !text.is_empty();
                         "OK: ime preedit".to_string()
                     }
                     ScriptIme::Commit(text) => {
-                        self.ime(&Ime::Preedit(String::new(), None));
-                        self.ime(&Ime::Commit(text));
+                        self.script_ime_composing = false;
+                        self.ime_commit(&text);
                         "OK: ime commit".to_string()
                     }
                     ScriptIme::Disable => {
-                        self.ime(&Ime::Disabled);
+                        self.script_ime_composing = false;
                         "OK: ime disabled".to_string()
                     }
                 }
@@ -2090,85 +2884,28 @@ impl App {
                     }
                 }
             }
-        }
-    }
-
-    fn script_move(&mut self, x: f64, y: f64) {
-        self.cursor = Point::new(x, y);
-        #[cfg(feature = "egui-ui")]
-        if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
-            ui.push_egui_event(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
-            if pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
-                == PointerTarget::Ui
-            {
-                return;
-            }
-        }
-        self.move_cursor(x, y);
-    }
-
-    fn script_mouse(&mut self, state: ElementState, button: MouseButton) {
-        #[cfg(feature = "egui-ui")]
-        {
-            let egui_btn = match button {
-                MouseButton::Left => Some(egui::PointerButton::Primary),
-                MouseButton::Right => Some(egui::PointerButton::Secondary),
-                MouseButton::Middle => Some(egui::PointerButton::Middle),
-                MouseButton::Back => Some(egui::PointerButton::Extra1),
-                MouseButton::Forward => Some(egui::PointerButton::Extra2),
-                MouseButton::Other(_) => None,
-            };
-            let m = self.mods();
-            let modifiers = egui::Modifiers {
-                alt: m.alt,
-                ctrl: m.ctrl,
-                shift: m.shift,
-                mac_cmd: cfg!(target_os = "macos") && m.meta,
-                command: if cfg!(target_os = "macos") { m.meta } else { m.ctrl },
-            };
-            let pos = egui::pos2(self.cursor.x as f32, self.cursor.y as f32);
-            if state == ElementState::Pressed {
-                let to_ui = self.buttons == 0
-                    && self
-                        .gfx
-                        .as_ref()
-                        .and_then(|g| g.ui.as_ref())
-                        .is_some_and(|ui| {
-                            pointer_target(ui.is_active(), ui.context(), self.cursor, self.buttons)
-                                == PointerTarget::Ui
-                        });
-                if to_ui {
-                    if let (Some(ui), Some(btn)) =
-                        (self.gfx.as_mut().and_then(|g| g.ui.as_mut()), egui_btn)
-                    {
-                        ui.push_egui_event(egui::Event::PointerButton {
-                            pos,
-                            button: btn,
-                            pressed: true,
-                            modifiers,
-                        });
+            ScriptCommand::Primary(clip_cmd) => {
+                use super::script::ScriptClipboard;
+                match clip_cmd {
+                    ScriptClipboard::Get => self.read_primary_selection().unwrap_or_default(),
+                    ScriptClipboard::Clear => {
+                        if self.use_memory_clipboard {
+                            self.memory_primary = None;
+                        }
+                        self.last_synced_selection_clip.clear();
+                        "OK: primary cleared".to_string()
                     }
-                    return;
-                }
-            } else {
-                let wall_held = button_of(button)
-                    .is_some_and(|b| (self.buttons & Buttons::from_button(b).0) != 0);
-                if !wall_held {
-                    if let (Some(ui), Some(btn)) =
-                        (self.gfx.as_mut().and_then(|g| g.ui.as_mut()), egui_btn)
-                    {
-                        ui.push_egui_event(egui::Event::PointerButton {
-                            pos,
-                            button: btn,
-                            pressed: false,
-                            modifiers,
-                        });
+                    ScriptClipboard::Set(text) => {
+                        if !self.use_memory_clipboard {
+                            "ERR: app.primary set requires GLYPH_WALL_CLIPBOARD=memory".to_string()
+                        } else {
+                            self.memory_primary = Some(text);
+                            "OK: primary set".to_string()
+                        }
                     }
-                    return;
                 }
             }
         }
-        self.mouse(state, button);
     }
 
     fn mouse(&mut self, state: ElementState, button: MouseButton) {
@@ -2205,41 +2942,86 @@ impl App {
                 return;
             }
         }
-        let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
-        let lookup = screen_lookup(|id| terms.screen(id));
-        if pressed {
-            #[cfg(feature = "egui-ui")]
-            {
-                self.panels.blur_docked_inputs();
-                if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
-                    ui.surrender_focus();
+        if pressed && b == Button::Middle {
+            self.middle_press_pos = Some(Point::new(ev.x, ev.y));
+            self.middle_dragged = false;
+        }
+        // On Linux (or in `GLYPH_WALL_CLIPBOARD=memory` tests), an un-dragged middle-click on a
+        // terminal body pastes the OS `PRIMARY` selection when non-empty (unless a focused DECSET
+        // mouse-reporting program claimed the middle press), falling back to the wall's internal
+        // `selection_clipboard` when `PRIMARY` is empty.
+        if !pressed && b == Button::Middle && !self.middle_dragged {
+            self.middle_press_pos = None;
+            let primary_target = self.wall.as_mut().and_then(|wall| {
+                if !matches!(
+                    wall.pointer().active_gesture(),
+                    Some(GestureKind::Pan | GestureKind::FsPaste)
+                ) {
+                    return None;
                 }
-            }
-            // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
-            // mouse-reporting program claims it; no browser-menu passthrough.
-            if secondary {
-                if wall.menu().is_some() {
-                    let _ = wall.run("wall.menu close");
-                }
-                if wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+                let described = wall.frame();
+                middle_paste_target_at(&described, Point::new(ev.x, ev.y))
+            });
+            if let Some(tid) = primary_target {
+                if let Some(primary_text) = self.read_primary_selection() {
+                    if let Some(wall) = &mut self.wall {
+                        wall.pointer_cancel(&ev);
+                        wall.deliver_clipboard(&tid, &primary_text);
+                    }
                     self.apply_effects();
                     self.redraw();
                     return;
                 }
             }
-            wall.pointer_down(&ev, &lookup);
-        } else {
-            wall.pointer_up(&ev, &lookup);
-            if b == Button::Left && !secondary {
-                let here = Point::new(ev.x, ev.y);
-                let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
-                if double {
-                    wall.pointer_double_click(&ev);
-                    self.last_release = None;
-                } else {
-                    self.last_release = Some((ev.time_ms, here));
+        }
+        let mut new_primary: Option<String> = None;
+        {
+            let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+            let lookup = screen_lookup(|id| terms.screen(id));
+            if pressed {
+                #[cfg(feature = "egui-ui")]
+                {
+                    self.panels.blur_docked_inputs();
+                    if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
+                        ui.surrender_focus();
+                    }
+                }
+                // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
+                // mouse-reporting program claims it; no browser-menu passthrough.
+                if secondary {
+                    if wall.menu().is_some() {
+                        let _ = wall.run("wall.menu close");
+                    }
+                    if wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+                        self.apply_effects();
+                        self.redraw();
+                        return;
+                    }
+                }
+                wall.pointer_down(&ev, &lookup);
+            } else {
+                wall.pointer_up(&ev, &lookup);
+                if b == Button::Left && !secondary {
+                    if wall.config().copy_on_select != CopyOnSelect::False {
+                        let sel_clip = wall.model().selection_clipboard();
+                        if !sel_clip.is_empty() && sel_clip != self.last_synced_selection_clip {
+                            self.last_synced_selection_clip = sel_clip.to_owned();
+                            new_primary = Some(sel_clip.to_owned());
+                        }
+                    }
+                    let here = Point::new(ev.x, ev.y);
+                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
+                    if double {
+                        wall.pointer_double_click(&ev);
+                        self.last_release = None;
+                    } else {
+                        self.last_release = Some((ev.time_ms, here));
+                    }
                 }
             }
+        }
+        if let Some(primary_text) = new_primary {
+            self.write_primary_selection(primary_text);
         }
         self.apply_effects();
         self.redraw();
@@ -2376,8 +3158,26 @@ impl ApplicationHandler<Wake> for App {
                     self.mouse(state, button);
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !ui_pointer => self.wheel(delta),
-            WindowEvent::PinchGesture { delta, .. } if !ui_pointer => self.pinch(delta),
+            WindowEvent::MouseWheel { delta, phase, .. } if !ui_pointer => self.wheel(delta, phase),
+            WindowEvent::PinchGesture { delta, phase, .. } if !ui_pointer => self.pinch(delta, phase),
+            WindowEvent::DoubleTapGesture { .. } if !ui_pointer => self.smart_zoom(),
+            // Terminals on the wall sit strictly axis-aligned; two-finger rotation is a no-op.
+            WindowEvent::RotationGesture { .. } => {}
+            WindowEvent::HoveredFile(path) if !ui_pointer => {
+                self.hovered_files.push(path);
+                self.redraw();
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if !self.hovered_files.is_empty() {
+                    self.hovered_files.clear();
+                    self.redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) if !ui_pointer => {
+                self.hovered_files.clear();
+                self.pending_dropped_files.push(path);
+                self.redraw();
+            }
             WindowEvent::Ime(ime) if !ui_keys => self.ime(&ime),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 if self.win.handle_os_fullscreen_key(&event, self.modifiers, self.gfx.as_ref().map(|g| g.window.as_ref())) {
@@ -2411,6 +3211,7 @@ impl ApplicationHandler<Wake> for App {
             self.redraw();
         }
         self.serve_control();
+        self.flush_dropped_files();
         self.win.flush_save_if_due();
         if self.quit || self.perf.should_exit_on_wake(false) {
             event_loop.exit();
@@ -2494,6 +3295,10 @@ impl ApplicationHandler<Wake> for App {
             if now >= deadline {
                 self.ui_repaint_at = None;
                 self.redraw();
+                self.draw(false);
+                if let Some(next_ui) = self.ui_repaint_at {
+                    next_repaint = Some(next_ui);
+                }
             } else {
                 next_repaint = Some(next_repaint.map_or(deadline, |d| d.min(deadline)));
             }
@@ -2571,11 +3376,19 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         wakes: Arc::new(WakeGate::default()),
         perf: super::perf::WallPerf::from_env(),
         ime_composing: false,
+        script_ime_composing: false,
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
+        clock_offset_ms: 0.0,
         last_copied: None,
         memory_clipboard: None,
+        memory_primary: None,
+        last_synced_selection_clip: String::new(),
+        middle_press_pos: None,
+        middle_dragged: false,
+        hovered_files: Vec::new(),
+        pending_dropped_files: Vec::new(),
         use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
             .is_ok_and(|v| v.eq_ignore_ascii_case("memory")),
     };
@@ -2707,6 +3520,379 @@ mod tests {
         assert_eq!(
             pointer_target(true, &ctx, Point::new(1050.0, 200.0), Buttons::LEFT.0),
             PointerTarget::Wall
+        );
+    }
+}
+
+#[cfg(test)]
+mod pointer_fidelity_tests {
+    use super::*;
+
+    fn drain_scroll_lines(wall: &mut Wall) -> i32 {
+        wall.drain_effects()
+            .into_iter()
+            .filter_map(|e| match e {
+                WallEffect::ScrollTerminal { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn trackpad_pixel_delta_pans_one_to_one_at_every_zoom_and_respects_natural_sign() {
+        for &zoom in &[0.45_f64, 1.0, 3.75, 20.0] {
+            let mut wall = Wall::in_memory(RulesOptions {
+                viewport: Size::new(1600.0, 1000.0),
+                scale_factor: 2.0,
+                ..RulesOptions::default()
+            });
+            let cur_z = wall.camera().zoom();
+            wall.pinch(800.0, 500.0, zoom / cur_z);
+            assert!((wall.camera().zoom() - zoom).abs() < 1e-6);
+            let anchor_world = Point::new(12.0, -8.0);
+            let before_px = wall.camera().to_screen(anchor_world);
+
+            // Recorded macOS two-finger swipe right (+42 pt) & down (+18 pt) on a 2x Retina
+            // display: winit delivers `PhysicalPosition(84.0, 36.0)` across Started -> Moved -> Ended.
+            let recorded = [
+                (TouchPhase::Started, 0.0, 0.0, 0.0),
+                (TouchPhase::Moved, 50.0, 20.0, 8.0),
+                (TouchPhase::Moved, 34.0, 16.0, 16.0),
+                (TouchPhase::Ended, 0.0, 0.0, 24.0),
+            ];
+            for (phase, px_x, px_y, t_ms) in recorded {
+                if let Some((dx, dy, mode)) = convert_scroll_delta(
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(px_x, px_y)),
+                    phase,
+                    2.0,
+                    Mods::default(),
+                    "ctrl alt meta",
+                ) {
+                    wall.wheel(&WheelEvent {
+                        x: 800.0,
+                        y: 500.0,
+                        delta_x: dx,
+                        delta_y: dy,
+                        delta_mode: mode,
+                        mods: Mods::default(),
+                        time_ms: t_ms,
+                    });
+                }
+            }
+
+            let after_px = wall.camera().to_screen(anchor_world);
+            assert!(
+                (after_px.x - (before_px.x + 42.0)).abs() < 1e-6
+                    && (after_px.y - (before_px.y + 18.0)).abs() < 1e-6,
+                "zoom={zoom}: world content moved ({:.4}, {:.4}) logical px instead of (+42, +18)",
+                after_px.x - before_px.x,
+                after_px.y - before_px.y,
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_pan_flick_with_macos_momentum_never_hijacks_sliding_terminal_until_pointer_moves() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 2.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let _ = wall.drain_effects();
+
+        let described = wall.frame();
+        let t1_box = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        // Place stationary cursor 80 px to the left of focused `t1` (empty paper), then flick
+        // left (`scrollingDeltaX < 0`) so `t1` slides directly underneath `(cursor_x, cursor_y)`
+        // right as macOS switches from finger lift (`Ended`) to `momentumPhase::Began` (`Started`).
+        let cursor_x = t1_box.left - 80.0;
+        let cursor_y = 0.5 * (t1_box.top + t1_box.bottom);
+        assert!(cursor_x > 20.0);
+
+        let flick_and_momentum = [
+            (TouchPhase::Started, 0.0, 0.0, 1000.0),
+            (TouchPhase::Moved, -60.0, -10.0, 1008.0),
+            (TouchPhase::Moved, -60.0, -10.0, 1016.0),
+            (TouchPhase::Ended, 0.0, 0.0, 1024.0),       // fingers lift
+            (TouchPhase::Started, -50.0, -24.0, 1032.0), // macOS momentumPhase == Began!
+            (TouchPhase::Moved, -40.0, -30.0, 1040.0),   // t1 is now squarely under cursor!
+            (TouchPhase::Moved, -20.0, -30.0, 1048.0),
+            (TouchPhase::Ended, 0.0, 0.0, 1056.0),       // momentum ends
+        ];
+        for (phase, pt_x, pt_y, t_ms) in flick_and_momentum {
+            if let Some((dx, dy, mode)) = convert_scroll_delta(
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(pt_x * 2.0, pt_y * 2.0)),
+                phase,
+                2.0,
+                Mods::default(),
+                "ctrl alt meta",
+            ) {
+                wall.wheel(&WheelEvent {
+                    x: cursor_x,
+                    y: cursor_y,
+                    delta_x: dx,
+                    delta_y: dy,
+                    delta_mode: mode,
+                    mods: Mods::default(),
+                    time_ms: t_ms,
+                });
+            }
+        }
+        // Confirm `t1` really slid under `(cursor_x, cursor_y)` yet received 0 scroll lines.
+        let after = wall.frame();
+        let slid_box = after.camera.to_screen_box(
+            after.terminals[0].body_rect,
+            after.viewport.w,
+            after.viewport.h,
+        );
+        assert!(
+            cursor_x >= slid_box.left && cursor_x <= slid_box.right,
+            "expected t1 ({:.1}..{:.1}) to slide under cursor_x={cursor_x:.1}",
+            slid_box.left,
+            slid_box.right
+        );
+        assert_eq!(drain_scroll_lines(&mut wall), 0);
+
+        // Moving the pointer > LATCH_SLOP_PX (24 px) inside `t1` breaks the canvas latch so the
+        // user can immediately scroll `t1` without waiting 140 ms; then moving the pointer > 24 px
+        // off `t1` mid-momentum stops scrolling `t1`.
+        let inside_x = cursor_x + 40.0;
+        let (dx, dy, mode) = convert_scroll_delta(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 120.0)),
+            TouchPhase::Moved,
+            2.0,
+            Mods::default(),
+            "ctrl alt meta",
+        )
+        .unwrap();
+        wall.wheel(&WheelEvent {
+            x: inside_x,
+            y: cursor_y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 1064.0,
+        });
+        assert!(
+            drain_scroll_lines(&mut wall) > 0,
+            "moving >24px onto focused t1 should scroll t1"
+        );
+
+        let outside_x = slid_box.left - 40.0;
+        wall.wheel(&WheelEvent {
+            x: outside_x,
+            y: cursor_y,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 1072.0,
+        });
+        assert_eq!(
+            drain_scroll_lines(&mut wall),
+            0,
+            "momentum must stop scrolling t1 once pointer moves >24px off it"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_line_delta_scrolls_three_lines_per_notch_and_zooms_by_step_factor() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 1.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let _ = wall.drain_effects();
+        let described = wall.frame();
+        let sb = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        let (cx, cy) = (0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom));
+
+        // One upward wheel detent (`LineDelta(0, 1)`): 1 immediate lead line + 2 glided = 3 lines.
+        let (dx, dy, mode) = convert_scroll_delta(
+            MouseScrollDelta::LineDelta(0.0, 1.0),
+            TouchPhase::Moved,
+            1.0,
+            Mods::default(),
+            "ctrl alt meta",
+        )
+        .unwrap();
+        assert_eq!(mode, DeltaMode::Line);
+        assert_eq!(dy, -3.0);
+        wall.wheel(&WheelEvent {
+            x: cx,
+            y: cy,
+            delta_x: dx,
+            delta_y: dy,
+            delta_mode: mode,
+            mods: Mods::default(),
+            time_ms: 2000.0,
+        });
+        let mut total_lines = drain_scroll_lines(&mut wall);
+        for i in 1..=30 {
+            wall.tick(1.0 / 60.0, 2000.0 + f64::from(i) * 16.0);
+            total_lines += drain_scroll_lines(&mut wall);
+        }
+        assert_eq!(total_lines, 3);
+
+        // `Ctrl + LineDelta(0, 1)` glides camera zoom by exact `WHEEL_ZOOM.step_factor` (`1.12x`).
+        let z0 = wall.camera().zoom();
+        let anchor_before = wall.camera().to_world(Point::new(420.0, 310.0));
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let (zdx, zdy, zmode) = convert_scroll_delta(
+            MouseScrollDelta::LineDelta(0.0, 1.0),
+            TouchPhase::Moved,
+            1.0,
+            ctrl,
+            "ctrl alt meta",
+        )
+        .unwrap();
+        assert_eq!(zmode, DeltaMode::Pixel);
+        assert_eq!(zdy, -100.0);
+        wall.wheel(&WheelEvent {
+            x: 420.0,
+            y: 310.0,
+            delta_x: zdx,
+            delta_y: zdy,
+            delta_mode: zmode,
+            mods: ctrl,
+            time_ms: 3000.0,
+        });
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, 3000.0 + f64::from(i) * 16.0);
+        }
+        let z1 = wall.camera().zoom();
+        let anchor_after = wall.camera().to_world(Point::new(420.0, 310.0));
+        assert!(
+            ((z1 / z0) - 1.12).abs() < 1e-4,
+            "expected 1.12x zoom step per mouse notch, got {:.6}",
+            z1 / z0
+        );
+        assert!(
+            (anchor_after.x - anchor_before.x).hypot(anchor_after.y - anchor_before.y) < 1e-4
+        );
+    }
+
+    #[test]
+    fn pinch_uses_exponential_browser_rate_keeps_anchor_and_stays_positive_on_large_outward_deltas() {
+        assert_eq!(pinch_zoom_factor(0.0, TouchPhase::Started), None);
+        assert_eq!(pinch_zoom_factor(0.2, TouchPhase::Cancelled), None);
+
+        // Symmetric round-trip (`+0.35` then `-0.35`) returns to exact 1.0x, unlike `1 + delta`.
+        let f_in = pinch_zoom_factor(0.35, TouchPhase::Moved).unwrap();
+        let f_out = pinch_zoom_factor(-0.35, TouchPhase::Moved).unwrap();
+        assert!((f_in * f_out - 1.0).abs() < 1e-12);
+        assert!(pinch_zoom_factor(-1.5, TouchPhase::Moved).unwrap() > 0.0);
+
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 2.0,
+            ..RulesOptions::default()
+        });
+        let cur_z = wall.camera().zoom();
+        wall.pinch(800.0, 500.0, 4.0 / cur_z);
+        assert!((wall.camera().zoom() - 4.0).abs() < 1e-6);
+        let pt = Point::new(510.0, 290.0);
+        let world_before = wall.camera().to_world(pt);
+        for d in [0.08, 0.12, 0.05] {
+            wall.pinch(pt.x, pt.y, pinch_zoom_factor(d, TouchPhase::Moved).unwrap());
+        }
+        let world_after = wall.camera().to_world(pt);
+        assert!((wall.camera().zoom() - 4.0 * (0.25_f64).exp()).abs() < 1e-6);
+        assert!((world_after.x - world_before.x).hypot(world_after.y - world_before.y) < 1e-6);
+    }
+
+    #[test]
+    fn shell_quote_path_and_dropped_file_formatting_escape_unsafe_shell_metacharacters() {
+        use std::path::Path;
+
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/plain_file-1.2+ok@host:dir/a=b,c%d")),
+            "/tmp/plain_file-1.2+ok@host:dir/a=b,c%d"
+        );
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/my file's (1) $HOME & *.txt")),
+            r"'/tmp/my file'\''s (1) $HOME & *.txt'"
+        );
+        assert_eq!(shell_quote_path(Path::new("")), "''");
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/日本語.rs")),
+            "'/tmp/日本語.rs'"
+        );
+
+        let batch = vec![
+            PathBuf::from("/tmp/clean.rs"),
+            PathBuf::from("/tmp/two words'here.txt"),
+        ];
+        assert_eq!(
+            format_dropped_paths(&batch),
+            "/tmp/clean.rs '/tmp/two words'\\''here.txt' "
+        );
+        assert_eq!(
+            hovered_drop_notice(&batch[..1]).as_deref(),
+            Some("drop to paste path: clean.rs")
+        );
+        assert_eq!(
+            hovered_drop_notice(&batch).as_deref(),
+            Some("drop to paste 2 paths")
+        );
+    }
+
+    #[test]
+    fn middle_paste_target_hits_interior_body_and_excludes_resize_perimeter_and_empty_paper() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 1.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let described = wall.frame();
+        let sb = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        let center = Point::new(0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom));
+        assert_eq!(
+            middle_paste_target_at(&described, center).as_deref(),
+            Some("t1")
+        );
+        // Right on the outer resize edge (`sb.left + 2.0`) is `HitPart::Edge`, not `Body`.
+        assert_eq!(
+            middle_paste_target_at(&described, Point::new(sb.left + 2.0, center.y)),
+            None
+        );
+        assert_eq!(
+            middle_paste_target_at(&described, Point::new(20.0, 20.0)),
+            None
         );
     }
 }

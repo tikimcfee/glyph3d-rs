@@ -501,6 +501,8 @@ if [[ "$READY" -ne 1 ]]; then
 fi
 ctl wall.fit >/dev/null
 W="$(wait_settled)"
+CHORD="$(awk '$1 == "platform" { for (i = 3; i <= NF; i++) if ($i ~ /^chord=/) print substr($i, 7) }' <<<"$W")"
+CHORD="${CHORD:-cmd}"
 
 # ── 1. 10-second idle guarantee: zero `agent` commands while idle ────────────
 sleep 10.2
@@ -526,8 +528,8 @@ if ! wait_for_text t1 "AGENT_READY_PROMPT" 60; then
     exit 1
 fi
 
-# ── 2. Open Agent View via `cmd+a` chord & normal-zoom card ──────────────────
-ctl app.key cmd+a >/dev/null
+# ── 2. Open Agent View via `${CHORD}+a` chord & normal-zoom card ─────────────
+ctl app.key "${CHORD}+a" >/dev/null
 PAIRED_EXP=0
 for _ in $(seq 1 60); do
     PAIRED_EXP="$(ctl wall.agent.expand t1 2>/dev/null | expanded_count_of)"
@@ -542,13 +544,13 @@ W="$(wait_settled)"
 maybe_shot "$SHOT_DIR/01-card-normal-zoom.png"
 
 if [[ "$PAIRED_EXP" -ge 4 ]] && grep -q "^sessions" "$INVOCATIONS_LOG" && grep -q "^transcript .* --follow" "$INVOCATIONS_LOG"; then
-    record_pass "cmd+a chord opens & pairs card" "paired sess-coder-1, hydrated $PAIRED_EXP expandable events, started --follow"
+    record_pass "${CHORD}+a chord opens & pairs card" "paired sess-coder-1, hydrated $PAIRED_EXP expandable events, started --follow"
 else
-    record_fail "cmd+a chord opens & pairs card" "expanded=$PAIRED_EXP log=$(tr '\n' ';' <"$INVOCATIONS_LOG")"
+    record_fail "${CHORD}+a chord opens & pairs card" "expanded=$PAIRED_EXP log=$(tr '\n' ';' <"$INVOCATIONS_LOG")"
 fi
 
-# ── 3. Close with `cmd+a`, reopen via hovered title-bar `≡` button ───────────
-ctl app.key cmd+a >/dev/null
+# ── 3. Close with `${CHORD}+a`, reopen via hovered title-bar `≡` button ──────
+ctl app.key "${CHORD}+a" >/dev/null
 ctl wall.fit >/dev/null
 W_CLOSED="$(wait_settled)"
 # Compute `t1` title-bar hover coordinates and the leftmost (`≡` Agent View) button center
@@ -774,18 +776,18 @@ else
     record_fail "follow live restores tail" "follow='$R_FOLLOW' jump='$R_LIVE' back_at_live=$BACK_AT_LIVE"
 fi
 
-# ── 11. Bus snapshot in `wall.bus`, Sidebar (`cmd+b`), and Palette (`cmd+k`) ─
+# ── 11. Bus snapshot in `wall.bus`, Sidebar (`${CHORD}+b`), and Palette (`${CHORD}+k`) ─
 BUS_OUT="$(ctl wall.bus)"
-ctl app.key cmd+b >/dev/null
+ctl app.key "${CHORD}+b" >/dev/null
 wait_settled >/dev/null
 sleep 0.10
 maybe_shot "$SHOT_DIR/10-sidebar-live-agents.png"
 
-ctl app.key cmd+k >/dev/null
+ctl app.key "${CHORD}+k" >/dev/null
 sleep 0.12
 maybe_shot "$SHOT_DIR/11-palette-live-agents.png"
 ctl app.key Escape >/dev/null
-ctl app.key cmd+b >/dev/null
+ctl app.key "${CHORD}+b" >/dev/null
 wait_settled >/dev/null
 
 if [[ "$WALL_SMOKE_SHOTS" == "1" ]]; then

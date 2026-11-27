@@ -135,6 +135,16 @@ pub struct SidebarState {
     drag_offset: Option<egui::Vec2>,
     /// Active hold-to-close press `(terminal_id, start_time_secs)`.
     hold_close: Option<(String, f64)>,
+    /// Last rendered panel bounding box when open.
+    pub last_rect: Option<egui::Rect>,
+    /// Header drag hit rectangle when open.
+    pub header_drag_rect: Option<egui::Rect>,
+    /// Header dock button rectangles `[left, float, right, close]`.
+    pub dock_btn_rects: [Option<egui::Rect>; 4],
+    /// Group fold chevron rectangles keyed by group id.
+    pub group_fold_rects: HashMap<String, egui::Rect>,
+    /// Terminal row click rectangles keyed by terminal id.
+    pub term_row_rects: HashMap<String, egui::Rect>,
 }
 
 impl Default for SidebarState {
@@ -154,6 +164,11 @@ impl SidebarState {
             fold_state: HashMap::new(),
             drag_offset: None,
             hold_close: None,
+            last_rect: None,
+            header_drag_rect: None,
+            dock_btn_rects: [None; 4],
+            group_fold_rects: HashMap::new(),
+            term_row_rects: HashMap::new(),
         }
     }
 
@@ -380,6 +395,7 @@ fn draw_group_row(
         if collapsed { "unfold" } else { "fold" },
         false,
     );
+    state.group_fold_rects.insert(g.id.clone(), fold_resp.rect);
     if fold_resp.clicked() {
         tool_interacted = true;
         state.toggle_group_collapsed(&g.id, g.collapsed);
@@ -669,6 +685,7 @@ fn draw_terminal_row(
         ui.make_persistent_id(("wall_sb_term_row", &t.id)),
         egui::Sense::click(),
     );
+    state.term_row_rects.insert(t.id.clone(), row_hit.rect);
     if row_hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -772,9 +789,14 @@ pub fn show(
     out: &mut Vec<String>,
 ) {
     state.wants_keyboard = false;
+    state.group_fold_rects.clear();
+    state.term_row_rects.clear();
     if !state.open {
         state.drag_offset = None;
         state.hold_close = None;
+        state.last_rect = None;
+        state.header_drag_rect = None;
+        state.dock_btn_rects = [None; 4];
         return;
     }
 
@@ -807,6 +829,9 @@ pub fn show(
         .fixed_pos(pos)
         .fade_in(false)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("wall_sidebar initial sizing");
+            }
             let corner = if is_float {
                 egui::CornerRadius::same(7)
             } else {
@@ -856,6 +881,7 @@ pub fn show(
                             head_rect.bottom(),
                         ),
                     );
+                    state.header_drag_rect = Some(drag_rect);
                     let drag_resp = ui.interact(
                         drag_rect,
                         ui.make_persistent_id("wall_sidebar_head_drag"),
@@ -914,6 +940,13 @@ pub fn show(
                             egui::vec2(4.0 * 18.0 + 6.0, 18.0),
                             egui::Sense::hover(),
                         );
+                        for idx in 0..4 {
+                            let x0 = strip_rect.left() + idx as f32 * 20.0;
+                            state.dock_btn_rects[idx] = Some(egui::Rect::from_min_size(
+                                egui::pos2(x0, strip_rect.top()),
+                                egui::vec2(18.0, 18.0),
+                            ));
+                        }
                         let mut strip_ui = ui.new_child(
                             egui::UiBuilder::new()
                                 .max_rect(strip_rect)
@@ -1074,6 +1107,7 @@ pub fn show(
                 });
 
             // Inner vertical edge border when docked (`Sidebar.jsx:134`: `1px solid #222834`).
+            state.last_rect = Some(frame_resp.response.rect);
             if !is_float {
                 let r = frame_resp.response.rect;
                 let border_x = match state.side {

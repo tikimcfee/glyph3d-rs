@@ -19,12 +19,6 @@ WALLCTL="$REPO_ROOT/target/release/wallctl"
 G3D="${HOME}/.local/bin/g3d"
 NS="probe"
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    CHORD="cmd"
-else
-    CHORD="ctrl+alt"
-fi
-
 if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
     echo "ERR: missing $BIN or $WALLCTL (build --release -p glyph3d-native -p wall-control first)" >&2
     exit 1
@@ -208,7 +202,24 @@ if [[ "$READY" -ne 1 ]]; then
     echo "FAIL  startup: control socket or t1 never appeared (see $SHOT_DIR/wall.log)" >&2
     exit 1
 fi
-wait_settled >/dev/null
+W_BOOT="$(wait_settled)"
+read -r CHORD COPY_CHORD PASTE_CHORD CTRL_CLICK_MENU < <(awk '
+    $1 == "platform" {
+        c = ""; cp = ""; ps = ""; cm = "false";
+        for (i = 3; i <= NF; i++) {
+            if ($i ~ /^chord=/) c = substr($i, 7);
+            else if ($i ~ /^copy=/) cp = substr($i, 6);
+            else if ($i ~ /^paste=/) ps = substr($i, 7);
+            else if ($i ~ /^ctrl_click_menu=/) cm = substr($i, 17);
+        }
+        print c, cp, ps, cm;
+    }
+' <<<"$W_BOOT")
+if [[ -z "${CHORD:-}" || -z "${COPY_CHORD:-}" || -z "${PASTE_CHORD:-}" ]]; then
+    echo "FAIL  startup: app.where did not report platform chords" >&2
+    exit 1
+fi
+IFS='+' read -r -a CHORD_MODS <<<"$CHORD"
 
 # Confirm t1's shell is ready to execute commands.
 ctl app.type $'printf "BOOT_%s\\n" READY\n' >/dev/null
@@ -228,9 +239,9 @@ done
 W="$(wait_settled)"
 FOCUSED_NOW="$(awk '/^focused / {print $2}' <<<"$W")"
 if [[ "$SPAWN_OK" -eq 1 && "$FOCUSED_NOW" == "t2" ]]; then
-    record_pass "cmd+backslash spawn" "spawned t2 and focused it"
+    record_pass "${CHORD}+backslash spawn" "spawned t2 and focused it"
 else
-    record_fail "cmd+backslash spawn" "spawn_ok=$SPAWN_OK focused=$FOCUSED_NOW"
+    record_fail "${CHORD}+backslash spawn" "spawn_ok=$SPAWN_OK focused=$FOCUSED_NOW"
 fi
 
 # Confirm t2's shell is ready as well.
@@ -503,13 +514,6 @@ W_SEL="$(ctl app.where)"
 # writes the selected text to the wall's clipboard (rather than copyOnSelect).
 ctl app.clipboard clear >/dev/null
 BEFORE_CLIP="$(ctl app.clipboard)"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    COPY_CHORD="cmd+c"
-    PASTE_CHORD="cmd+v"
-else
-    COPY_CHORD="ctrl+shift+c"
-    PASTE_CHORD="ctrl+shift+v"
-fi
 ctl app.key "$COPY_CHORD" >/dev/null
 COPIED="$(ctl app.clipboard)"
 SEL_SPAN="$(python3 -c '
@@ -615,9 +619,9 @@ W_S2="$(wait_settled)"
 N_S2="$(grep -c '^terminal ' <<<"$W_S2")"
 SPLIT_GROUP="$(grep '^group ' <<<"$W_S2" | grep 'layout=split' || true)"
 if [[ "$N_S1" -eq $((N_S0 + 1)) && "$N_S2" -eq $((N_S0 + 2)) && -n "$SPLIT_GROUP" ]]; then
-    record_pass "cmd+d / cmd+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} in split group"
+    record_pass "${CHORD}+d / ${CHORD}+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} in split group"
 else
-    record_fail "cmd+d / cmd+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} split_group='${SPLIT_GROUP}'"
+    record_fail "${CHORD}+d / ${CHORD}+shift+d split" "terminals ${N_S0}->${N_S1}->${N_S2} split_group='${SPLIT_GROUP}'"
 fi
 
 # ── 13. Right-click + 14. Escape ─────────────────────────────────────────────
@@ -632,18 +636,18 @@ ctl app.key Escape >/dev/null
 W_ESC1="$(ctl app.where)"
 MENU_AFTER_ESC="$(awk '/^menu / {print $2}' <<<"$W_ESC1")"
 
-CTRL_CLICK_MENU="skipped"
-if [[ "$(uname -s)" == "Darwin" ]]; then
+CTRL_CLICK_MENU_GOT="skipped"
+if [[ "$CTRL_CLICK_MENU" == "true" ]]; then
     ctl app.click "$RC_X" "$RC_Y" left ctrl >/dev/null
     W_RC2="$(ctl app.where)"
-    CTRL_CLICK_MENU="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC2")"
+    CTRL_CLICK_MENU_GOT="$(awk '/^menu / {$1=""; sub(/^ /,""); print}' <<<"$W_RC2")"
     ctl app.key Escape >/dev/null
 fi
 
-if [[ "$MENU_OPEN" == terminal:t1* && ( "$CTRL_CLICK_MENU" == "skipped" || "$CTRL_CLICK_MENU" == terminal:t1* ) ]]; then
-    record_pass "right-click" "opened context menu ($MENU_OPEN, ctrl+click=${CTRL_CLICK_MENU%% *})"
+if [[ "$MENU_OPEN" == terminal:t1* && ( "$CTRL_CLICK_MENU_GOT" == "skipped" || "$CTRL_CLICK_MENU_GOT" == terminal:t1* ) ]]; then
+    record_pass "right-click" "opened context menu ($MENU_OPEN, ctrl+click=${CTRL_CLICK_MENU_GOT%% *})"
 else
-    record_fail "right-click" "menu='$MENU_OPEN' ctrl_click='$CTRL_CLICK_MENU'"
+    record_fail "right-click" "menu='$MENU_OPEN' ctrl_click='$CTRL_CLICK_MENU_GOT'"
 fi
 
 ctl app.click 18 18 >/dev/null
@@ -888,28 +892,22 @@ fi
 
 # ── 20. Window focus blur clears held modifiers & cancels close-hold ─────────
 N_BEFORE_BLUR="$(ctl app.where | grep -c '^terminal ')"
-# Hold chord modifier (`Cmd` on Mac), lose window focus (`Cmd+Tab` away), regain focus,
-# then press plain `d`: must type `d` (0x64) into t2 rather than splitting (`cmd+d`)!
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    ctl app.key --down cmd >/dev/null
-else
-    ctl app.key --down ctrl >/dev/null
-    ctl app.key --down alt >/dev/null
-fi
+# Hold the wall's chord modifier(s), lose window focus, regain focus, then press
+# plain `d`: must type `d` (0x64) into t2 rather than splitting (`${CHORD}+d`)!
+for mod in "${CHORD_MODS[@]}"; do
+    ctl app.key --down "$mod" >/dev/null
+done
 ctl app.focus off >/dev/null
 ctl app.focus on >/dev/null
 ctl app.key d >/dev/null
 wait_for_text t2 "K:64" 60 || true
 N_AFTER_D="$(ctl app.where | grep -c '^terminal ')"
 
-# Also verify holding `chord+x` starts `close_hold=active`, and losing focus (`app.focus off`)
+# Also verify holding `${CHORD}+x` starts `close_hold=active`, and losing focus (`app.focus off`)
 # cancels `close_hold` so the terminal is not closed while unfocused.
-if [[ "$(uname -s)" == "Darwin" ]]; then
-    ctl app.key --down cmd >/dev/null
-else
-    ctl app.key --down ctrl >/dev/null
-    ctl app.key --down alt >/dev/null
-fi
+for mod in "${CHORD_MODS[@]}"; do
+    ctl app.key --down "$mod" >/dev/null
+done
 ctl app.key --down x >/dev/null
 HOLD_ON="$(ctl app.where | awk '$1=="terminal" && $2=="t2" {for(i=3;i<=NF;i++) if($i~/^close_hold=/) print substr($i,12)}')"
 ctl app.focus off >/dev/null
@@ -921,9 +919,389 @@ ctl app.type "QUITRAW" >/dev/null
 wait_for_text t2 "RAW_EXIT" 60 || true
 
 if [[ "$N_AFTER_D" -eq "$N_BEFORE_BLUR" && "$HOLD_ON" == "active" && "$HOLD_AFTER_BLUR" == "none" ]]; then
-    record_pass "window blur resets mods & hold" "Cmd+Tab cleared held Cmd ('d' typed, no split) and cancelled close-hold"
+    record_pass "window blur resets mods & hold" "blur cleared held ${CHORD} ('d' typed, no split) and cancelled close-hold"
 else
     record_fail "window blur resets mods & hold" "terms=${N_BEFORE_BLUR}->${N_AFTER_D} hold=${HOLD_ON}->${HOLD_AFTER_BLUR}"
+fi
+
+# ── 21. Trackpad 1:1 pan, momentum target latch & leaving terminal stops scroll
+ctl terminal.focus t1 >/dev/null
+ctl wall.fit >/dev/null
+wait_settled >/dev/null
+ctl app.type $'clear; seq -f "LATLINE_%02g" 1 70\n' >/dev/null
+wait_for_text t1 "LATLINE_70" 60 || true
+ctl app.pinch 800 500 0.48 >/dev/null
+W_TP0="$(wait_settled)"
+read -r TP_CX TP_CY TP_X0 TP_Y0 TP_Z0 < <(python3 -c '
+import sys
+cx = cy = z = l = t = r = b = 0.0
+for line in sys.stdin:
+    if line.startswith("camera "):
+        p = dict(tok.split("=") for tok in line.split()[1:])
+        cx, cy, z = float(p["x"]), float(p["y"]), float(p["zoom"])
+    elif line.startswith("terminal t1 "):
+        for tok in line.split():
+            if tok.startswith("rect="):
+                l, t, r, b = map(float, tok[5:].split(","))
+# Stationary pointer on empty paper 70 px to the left of focused t1.
+print(f"{max(24.0, l - 70.0):.2f} {(t + b) / 2.0:.2f} {cx:.4f} {cy:.4f} {z:.4f}")
+' <<<"$W_TP0")
+
+# Replay a macOS two-finger swipe (-90,-6 px) -> finger lift (Ended) -> momentumPhase::Began
+# (Started, -110,-10 px) -> Ended: total (-200, -16) logical px so focused t1 slides squarely
+# under stationary (TP_CX, TP_CY) in BOTH x and y mid-momentum.
+ctl app.wheel_seq "$TP_CX" "$TP_CY" \
+    "started:0,0@0" "moved:-45,-3@8" "moved:-45,-3@8" "ended:0,0@8" \
+    "started:-40,-4@8" "moved:-40,-3@8" "moved:-30,-3@8" "ended:0,0@8" >/dev/null
+W_TP1="$(wait_settled)"
+TXT_TP1="$(ctl app.text t1)"
+
+# Now move > 24 px inside t1 (breaking the canvas latch) and scroll history, then mid-momentum
+# move > 24 px off t1 onto empty paper and verify t1 stops scrolling.
+read -r TP_IN_X TP_IN_Y TP_OUT_X < <(python3 -c '
+import sys
+for line in sys.stdin:
+    if line.startswith("terminal t1 "):
+        for tok in line.split():
+            if tok.startswith("rect="):
+                l, t, r, b = map(float, tok[5:].split(","))
+                print(f"{(l + r) / 2.0:.2f} {(t + b) / 2.0:.2f} {max(16.0, l - 50.0):.2f}")
+' <<<"$W_TP1")
+ctl app.wheel_seq "$TP_IN_X" "$TP_IN_Y" \
+    "started:0,0@160" "moved:0,28@8" "moved:0,28@8" "moved:0,28@8" "moved:0,28@8" >/dev/null
+for _ in $(seq 1 40); do
+    TXT_IN="$(ctl app.text t1)"
+    grep -Fq "LATLINE_70" <<<"$TXT_IN" || break
+    sleep 0.03
+done
+wait_settled >/dev/null
+sleep 0.05
+TXT_BEFORE_LEAVE="$(ctl app.text t1)"
+ctl app.wheel_seq "$TP_OUT_X" "$TP_IN_Y" \
+    "moved:0,28@8" "moved:0,28@8" "moved:0,28@8" "ended:0,0@8" >/dev/null
+sleep 0.08
+TXT_AFTER_LEAVE="$(ctl app.text t1)"
+
+TP_CHECK="$(python3 -c '
+import sys
+x0, y0, z0 = map(float, sys.argv[1:4])
+pcx, pcy = float(sys.argv[4]), float(sys.argv[5])
+w1, txt1, txt_in, txt_out = sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
+x1 = y1 = l1 = t1 = r1 = b1 = 0.0
+for line in w1.splitlines():
+    if line.startswith("camera "):
+        p = dict(tok.split("=") for tok in line.split()[1:])
+        x1, y1 = float(p["x"]), float(p["y"])
+    elif line.startswith("terminal t1 "):
+        for tok in line.split():
+            if tok.startswith("rect="):
+                l1, t1, r1, b1 = map(float, tok[5:].split(","))
+# Pan by (-200, -16) winit logical px -> content shifts (-200, -16) px -> camera shifts (+200/z, -16/z).
+pan_dx_px = (x1 - x0) * z0
+pan_dy_px = -(y1 - y0) * z0
+one_to_one = abs(pan_dx_px - 200.0) < 0.25 and abs(pan_dy_px - 16.0) < 0.25
+slid_under = (l1 <= pcx <= r1) and (t1 <= pcy <= b1)
+latched_canvas = ("LATLINE_70" in txt1)
+scrolled_inside = ("LATLINE_70" not in txt_in) and ("LATLINE_" in txt_in)
+stopped_on_leave = (txt_in == txt_out)
+ok = one_to_one and slid_under and latched_canvas and scrolled_inside and stopped_on_leave
+print(f"{int(ok)} pan_px=({pan_dx_px:.1f},{pan_dy_px:.1f}) slid={slid_under} latched={latched_canvas} in_scroll={scrolled_inside} leave_stop={stopped_on_leave}")
+' "$TP_X0" "$TP_Y0" "$TP_Z0" "$TP_CX" "$TP_CY" "$W_TP1" "$TXT_TP1" "$TXT_BEFORE_LEAVE" "$TXT_AFTER_LEAVE")"
+if [[ "${TP_CHECK%% *}" == "1" ]]; then
+    record_pass "trackpad 1:1 pan & latch" "${TP_CHECK#* }"
+else
+    record_fail "trackpad 1:1 pan & latch" "${TP_CHECK#* }"
+fi
+ctl terminal.scroll t1 -200 >/dev/null 2>&1 || true
+wait_for_text t1 "LATLINE_70" 60 || true
+
+# ── 22. LineDelta wheel notch (3 lines + 1.12x zoom), fs pinch guard & doubletap
+ctl wall.fit >/dev/null
+W_LN0="$(wait_settled)"
+read -r T1_CX T1_CY Z_LN0 < <(python3 -c '
+import sys
+cx = cy = z = 0.0
+for line in sys.stdin:
+    if line.startswith("camera "):
+        z = float(dict(tok.split("=") for tok in line.split()[1:])["zoom"])
+    elif line.startswith("terminal t1 "):
+        for tok in line.split():
+            if tok.startswith("rect="):
+                l, t, r, b = map(float, tok[5:].split(","))
+                cx, cy = (l + r) / 2.0, (t + b) / 2.0
+print(f"{cx:.2f} {cy:.2f} {z:.4f}")
+' <<<"$W_LN0")
+TXT_PRE_NOTCH="$(ctl app.text t1)"
+ctl app.wheel --line --dt 200 "$T1_CX" "$T1_CY" 0 1 >/dev/null
+wait_settled >/dev/null
+# Poll briefly until the 3-line scroll settles in term-session.
+for _ in $(seq 1 40); do
+    TXT_POST_NOTCH="$(ctl app.text t1)"
+    grep -Fq "LATLINE_70" <<<"$TXT_POST_NOTCH" || break
+    sleep 0.03
+done
+sleep 0.06
+TXT_POST_NOTCH="$(ctl app.text t1)"
+ctl terminal.scroll t1 -200 >/dev/null 2>&1 || true
+wait_for_text t1 "LATLINE_70" 60 || true
+
+# 1 notch of Ctrl+LineDelta zooms by exact WHEEL_ZOOM.stepFactor (1.12x).
+W_Z0="$(wait_settled)"
+ctl app.wheel --line --dt 200 500 350 0 1 ctrl >/dev/null
+W_Z1="$(wait_settled)"
+
+# Pinch in fullscreen must be ignored; double-tap smart-zoom frames t1 then toggles back to fit.
+ctl wall.fullscreen on >/dev/null
+W_FSP0="$(wait_settled)"
+ctl app.pinch --delta 800 500 -0.45 >/dev/null
+W_FSP1="$(ctl app.where)"
+ctl wall.fullscreen off >/dev/null
+wait_settled >/dev/null
+
+ctl app.pinch 800 500 0.45 >/dev/null
+W_DT0="$(wait_settled)"
+read -r DT_X DT_Y < <(term_center t1 "$W_DT0")
+ctl app.doubletap "$DT_X" "$DT_Y" >/dev/null
+W_DT1="$(wait_settled)"
+read -r DT_X2 DT_Y2 < <(term_center t1 "$W_DT1")
+ctl app.doubletap "$DT_X2" "$DT_Y2" >/dev/null
+W_DT2="$(wait_settled)"
+
+NOTCH_CHECK="$(python3 -c '
+import sys, re
+pre_txt, post_txt, wz0, wz1, wf0, wf1, wdt0, wdt1, wdt2 = sys.argv[1:10]
+def min_lat(s):
+    nums = [int(m) for m in re.findall(r"LATLINE_(\d+)", s)]
+    return min(nums) if nums else -1
+def zoom_of(s):
+    for line in s.splitlines():
+        if line.startswith("camera "):
+            return float(dict(tok.split("=") for tok in line.split()[1:])["zoom"])
+    return 0.0
+m0, m1 = min_lat(pre_txt), min_lat(post_txt)
+lines_scrolled = m0 - m1
+z0, z1 = zoom_of(wz0), zoom_of(wz1)
+ratio = z1 / z0 if z0 > 0 else 0.0
+zfs0, zfs1 = zoom_of(wf0), zoom_of(wf1)
+fs_guarded = abs(zfs1 - zfs0) < 1e-3
+zdt0, zdt1, zdt2 = zoom_of(wdt0), zoom_of(wdt1), zoom_of(wdt2)
+smart_ok = (zdt1 > zdt0 * 1.35) and (zdt2 < zdt1 * 0.92)
+ok = (lines_scrolled == 3) and (abs(ratio - 1.12) < 0.01) and fs_guarded and smart_ok
+print(f"{int(ok)} notch_lines={lines_scrolled} zoom_step={ratio:.4f} fs_guard={fs_guarded} doubletap={zdt0:.2f}->{zdt1:.2f}->{zdt2:.2f}")
+' "$TXT_PRE_NOTCH" "$TXT_POST_NOTCH" "$W_Z0" "$W_Z1" "$W_FSP0" "$W_FSP1" "$W_DT0" "$W_DT1" "$W_DT2")"
+if [[ "${NOTCH_CHECK%% *}" == "1" ]]; then
+    record_pass "LineDelta notch & smart-zoom" "${NOTCH_CHECK#* }"
+else
+    record_fail "LineDelta notch & smart-zoom" "${NOTCH_CHECK#* }"
+fi
+
+# ── 23. Word dblclick, line tplclick, copyOnSelect & PRIMARY middle-click ─────
+ctl terminal.focus t1 >/dev/null
+ctl wall.reveal t1 >/dev/null
+wait_settled >/dev/null
+ctl app.type $'clear; printf "  WORD_ALPHA(beta_tail)  \\n  SECOND_ROW_TOKEN  \\n"\n' >/dev/null
+wait_for_text t1 "SECOND_ROW_TOKEN" 60 || true
+W_SEL_TEST="$(wait_settled)"
+read -r WORD_X WORD_Y LINE_X LINE_Y BODY_MID_X BODY_MID_Y < <(python3 -c '
+import sys
+zoom = 20.0
+for line in sys.stdin:
+    if line.startswith("camera "):
+        zoom = float(dict(tok.split("=") for tok in line.split()[1:])["zoom"])
+    elif line.startswith("terminal t1 "):
+        parts = line.split()
+        cols = int([p[5:] for p in parts if p.startswith("cols=")][0])
+        rows = int([p[5:] for p in parts if p.startswith("rows=")][0])
+        l, t, r, b = map(float, [p[5:] for p in parts if p.startswith("rect=")][0].split(","))
+        pad = 0.3 * zoom
+        cw = (r - l - 2.0 * pad) / max(1, cols)
+        ch = (b - t - 2.0 * pad) / max(1, rows)
+        # Row 0 col 5 is inside "WORD_ALPHA"; row 1 col 6 is inside "SECOND_ROW_TOKEN".
+        wx, wy = l + pad + 5.5 * cw, t + pad + 0.5 * ch
+        lx, ly = l + pad + 6.5 * cw, t + pad + 1.5 * ch
+        mx, my = (l + r) / 2.0, t + pad + min(rows - 1.5, 6.5) * ch
+        print(f"{wx:.2f} {wy:.2f} {lx:.2f} {ly:.2f} {mx:.2f} {my:.2f}")
+' <<<"$W_SEL_TEST")
+
+# (a) copyOnSelect=true: dblclick selects word "WORD_ALPHA", populates PRIMARY/selection, leaves system clipboard untouched.
+ctl wall.config copyOnSelect true >/dev/null
+ctl app.clipboard clear >/dev/null
+ctl app.primary clear >/dev/null
+ctl app.dblclick "$WORD_X" "$WORD_Y" >/dev/null
+CLIP_AFTER_TRUE="$(ctl app.clipboard)"
+PRIM_AFTER_TRUE="$(ctl app.primary)"
+
+# Middle-click pastes "WORD_ALPHA" into t1.
+ctl app.type 'printf "MIDPASTE_%s\n" "' >/dev/null
+wait_for_text t1 'printf "MIDPASTE_' 40 || true
+sleep 0.04
+ctl app.click "$BODY_MID_X" "$BODY_MID_Y" middle >/dev/null
+sleep 0.04
+ctl app.type $'"\n' >/dev/null
+MID_OK=0
+wait_for_text t1 "MIDPASTE_WORD_ALPHA" 60 && MID_OK=1
+
+# (b) copyOnSelect=clipboard + tplclick on row 1 selects trimmed line "SECOND_ROW_TOKEN" & writes system clipboard.
+ctl wall.config copyOnSelect clipboard >/dev/null
+ctl app.clipboard clear >/dev/null
+ctl app.tplclick "$LINE_X" "$LINE_Y" >/dev/null
+CLIP_AFTER_CLIP="$(ctl app.clipboard)"
+
+# (c) copyOnSelect=false: selecting updates neither clipboard nor primary; external PRIMARY overrides on middle-click.
+ctl wall.config copyOnSelect false >/dev/null
+ctl app.clipboard clear >/dev/null
+ctl app.primary set "EXT_PRIMARY_88" >/dev/null
+ctl app.dblclick "$WORD_X" "$WORD_Y" >/dev/null
+CLIP_AFTER_FALSE="$(ctl app.clipboard)"
+PRIM_AFTER_FALSE="$(ctl app.primary)"
+
+ctl app.type 'printf "EXTPASTE_%s\n" "' >/dev/null
+wait_for_text t1 'printf "EXTPASTE_' 40 || true
+sleep 0.04
+ctl app.click "$BODY_MID_X" "$BODY_MID_Y" middle >/dev/null
+sleep 0.04
+ctl app.type $'"\n' >/dev/null
+EXT_OK=0
+wait_for_text t1 "EXTPASTE_EXT_PRIMARY_88" 60 && EXT_OK=1
+
+ctl wall.config copyOnSelect true >/dev/null
+ctl app.primary clear >/dev/null
+
+if [[ -z "$CLIP_AFTER_TRUE" && "$PRIM_AFTER_TRUE" == "WORD_ALPHA" && "$MID_OK" -eq 1 \
+   && "$CLIP_AFTER_CLIP" == "SECOND_ROW_TOKEN" \
+   && -z "$CLIP_AFTER_FALSE" && "$PRIM_AFTER_FALSE" == "EXT_PRIMARY_88" && "$EXT_OK" -eq 1 ]]; then
+    record_pass "word/line click, copyOnSelect & mid-paste" "dbl=WORD_ALPHA tpl=SECOND_ROW_TOKEN mid+PRIMARY ok"
+else
+    record_fail "word/line click, copyOnSelect & mid-paste" "true=('$CLIP_AFTER_TRUE','$PRIM_AFTER_TRUE',mid=$MID_OK) clip='$CLIP_AFTER_CLIP' false=('$CLIP_AFTER_FALSE','$PRIM_AFTER_FALSE',ext=$EXT_OK)"
+fi
+
+# ── 24. Block selection (⌘⌥ / Ctrl+Alt), ⌥-drag move & Shift-drag over DECSET ─
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    BLOCK_MOD="cmd+alt"
+else
+    BLOCK_MOD="ctrl+alt"
+fi
+ctl wall.reveal t1 >/dev/null
+wait_settled >/dev/null
+ctl app.type $'clear; printf "LEFT_1111_RIGHT\\nLEFT_2222_RIGHT\\n"\n' >/dev/null
+wait_for_text t1 "LEFT_2222_RIGHT" 60 || true
+W_BLK0="$(wait_settled)"
+read -r BX0 BY0 BX1 BY1 T1_WX0 T1_WY0 < <(python3 -c '
+import sys
+zoom = 20.0
+wx = wy = 0.0
+for line in sys.stdin:
+    if line.startswith("camera "):
+        zoom = float(dict(tok.split("=") for tok in line.split()[1:])["zoom"])
+    elif line.startswith("terminal t1 "):
+        parts = line.split()
+        cols = int([p[5:] for p in parts if p.startswith("cols=")][0])
+        rows = int([p[5:] for p in parts if p.startswith("rows=")][0])
+        l, t, r, b = map(float, [p[5:] for p in parts if p.startswith("rect=")][0].split(","))
+        wx, wy, _, _ = map(float, [p[6:] for p in parts if p.startswith("world=")][0].split(","))
+        pad = 0.3 * zoom
+        cw = (r - l - 2.0 * pad) / max(1, cols)
+        ch = (b - t - 2.0 * pad) / max(1, rows)
+        # Slice cols 5..8 ("1111" / "2222") across rows 0..1.
+        print(f"{l + pad + 5.25 * cw:.2f} {t + pad + 0.45 * ch:.2f} {l + pad + 8.75 * cw:.2f} {t + pad + 1.55 * ch:.2f} {wx:.4f} {wy:.4f}")
+' <<<"$W_BLK0")
+
+ctl app.primary clear >/dev/null
+ctl app.drag "$BX0" "$BY0" "$BX1" "$BY1" 14 left "$BLOCK_MOD" >/dev/null
+W_BLK1="$(ctl app.where)"
+BLK_SEL_TAG="$(awk '$1=="terminal" && $2=="t1" {for(i=3;i<=NF;i++) if($i~/^text_sel=/) print substr($i,10)}' <<<"$W_BLK1")"
+BLK_TEXT="$(ctl app.primary)"
+
+# Plain Alt/Option-drag on t1 body moves t1 rather than selecting text.
+read -r AM_X0 AM_Y0 < <(term_center t1 "$W_BLK0")
+AM_X1="$(python3 -c "print(f'{$AM_X0 + 88.0:.2f}')")"
+AM_Y1="$(python3 -c "print(f'{$AM_Y0 + 56.0:.2f}')")"
+ctl app.drag "$AM_X0" "$AM_Y0" "$AM_X1" "$AM_Y1" 12 left alt >/dev/null
+W_ALT1="$(wait_settled)"
+ALT_MOVED="$(python3 -c '
+import sys
+wx0, wy0 = float(sys.argv[1]), float(sys.argv[2])
+for line in sys.stdin:
+    if line.startswith("terminal t1 "):
+        for tok in line.split():
+            if tok.startswith("world="):
+                wx1, wy1, _, _ = map(float, tok[6:].split(","))
+                print(int(abs(wx1 - wx0) > 0.5 and abs(wy1 - wy0) > 0.5))
+' "$T1_WX0" "$T1_WY0" <<<"$W_ALT1")"
+
+# Enable DECSET ?1002h button-event mouse tracking in t1 and verify Shift+drag still selects text.
+ctl wall.reveal t1 >/dev/null
+wait_settled >/dev/null
+ctl app.type $'python3 -c \'import sys,time; sys.stdout.write("\\x1b[2J\\x1b[HMTRACK_SHIFT_OK\\n\\x1b[?1002h"); sys.stdout.flush(); time.sleep(20)\'\n' >/dev/null
+wait_for_text t1 "MTRACK_SHIFT_OK" 60 || true
+sleep 0.08
+W_MT="$(wait_settled)"
+read -r MX0 MY0 MX1 < <(python3 -c '
+import sys
+zoom = 20.0
+for line in sys.stdin:
+    if line.startswith("camera "):
+        zoom = float(dict(tok.split("=") for tok in line.split()[1:])["zoom"])
+    elif line.startswith("terminal t1 "):
+        parts = line.split()
+        cols = int([p[5:] for p in parts if p.startswith("cols=")][0])
+        rows = int([p[5:] for p in parts if p.startswith("rows=")][0])
+        l, t, r, b = map(float, [p[5:] for p in parts if p.startswith("rect=")][0].split(","))
+        pad = 0.3 * zoom
+        cw = (r - l - 2.0 * pad) / max(1, cols)
+        ch = (b - t - 2.0 * pad) / max(1, rows)
+        print(f"{l + pad + 0.25 * cw:.2f} {t + pad + 0.5 * ch:.2f} {l + pad + 15.2 * cw:.2f}")
+' <<<"$W_MT")
+ctl app.primary clear >/dev/null
+ctl app.drag "$MX0" "$MY0" "$MX1" "$MY0" 14 left shift >/dev/null
+SHIFT_TEXT="$(ctl app.primary)"
+ctl app.key ctrl+c >/dev/null
+ctl app.type $'printf "\\033[?1002l\\n"\n' >/dev/null
+
+WANT_BLK=$'1111\n2222'
+if [[ "$BLK_SEL_TAG" == block:* && "$BLK_TEXT" == "$WANT_BLK" && "$ALT_MOVED" == "1" && "$SHIFT_TEXT" == *"MTRACK_SHIFT_OK"* ]]; then
+    record_pass "block-drag, alt-move & shift-select" "sel=$BLK_SEL_TAG block='1111/2222' alt_moved=1 shift_override=ok"
+else
+    record_fail "block-drag, alt-move & shift-select" "sel=$BLK_SEL_TAG blk='${BLK_TEXT//$'\n'/|}' alt=$ALT_MOVED shift='$SHIFT_TEXT'"
+fi
+
+# ── 25. File drop (HoveredFile + multi-file shell-quoted DroppedFile) ─────────
+ctl wall.fit >/dev/null
+wait_settled >/dev/null
+ctl terminal.focus t2 >/dev/null
+ctl app.type "clear; python3 $D/raw_keys.py"$'\n' >/dev/null
+wait_for_text t2 "RAW_READY" 60 || true
+# Focus t1 so t2 is unfocused; dropping onto t2's rect must focus t2 and paste shell-quoted paths.
+ctl terminal.focus t1 >/dev/null
+W_DR0="$(wait_settled)"
+read -r DROP_X DROP_Y < <(term_center t2 "$W_DR0")
+ctl app.hover_file "/tmp/my file's (1).txt" >/dev/null
+ctl app.cancel_file >/dev/null
+ctl app.drop --at "$DROP_X" "$DROP_Y" "/tmp/plain_ok.rs" "/tmp/my file's (1).txt" >/dev/null
+
+# Expected pasted bytes: `/tmp/plain_ok.rs '/tmp/my file'\''s (1).txt' `
+WANT_DROP_HEX="$(python3 -c 'print(b"/tmp/plain_ok.rs \x27/tmp/my file\x27\\\x27\x27s (1).txt\x27 ".hex())')"
+DROP_SEEN=0
+for _ in $(seq 1 60); do
+    TXT_DR2="$(ctl app.text t2)"
+    HEX_DR2="$(python3 -c 'import sys,re; print("".join(re.findall(r"K:([0-9a-f]+)", sys.stdin.read())))' <<<"$TXT_DR2")"
+    if [[ "$HEX_DR2" == *"$WANT_DROP_HEX"* ]]; then
+        DROP_SEEN=1
+        break
+    fi
+    sleep 0.04
+done
+FOC_AFTER_DROP="$(ctl app.where | awk '/^focused / {print $2}')"
+T1_DROP_LEAK=0
+grep -Fq "plain_ok.rs" <<<"$(ctl app.text t1)" && T1_DROP_LEAK=1
+
+ctl app.type "QUITRAW" >/dev/null
+wait_for_text t2 "RAW_EXIT" 60 || true
+
+if [[ "$DROP_SEEN" -eq 1 && "$FOC_AFTER_DROP" == "t2" && "$T1_DROP_LEAK" -eq 0 ]]; then
+    record_pass "file drop shell-quoting" "focused t2 & pasted /tmp/plain_ok.rs '/tmp/my file'\\''s (1).txt' "
+else
+    record_fail "file drop shell-quoting" "seen=$DROP_SEEN focused=$FOC_AFTER_DROP leak=$T1_DROP_LEAK"
 fi
 
 ELAPSED="$(python3 -c "import time; print(f'{time.time() - $START_EPOCH:.1f}')")"

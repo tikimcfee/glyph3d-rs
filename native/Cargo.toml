@@ -116,6 +116,11 @@ ash = "0.38"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.2.2", optional = true, default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
 
+# Primary selection (`PRIMARY`) on Wayland (`zwp_primary_selection_device_manager_v1`),
+# matching the exact 0.7.3 crate `egui-winit` already links in `Cargo.lock`.
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-clipboard = { version = "0.7", optional = true }
+
 [features]
 default = ["wgpu", "windowed", "egui-ui", "launcher"]
 # The wgpu renderer (2026-10-31): the device, `GlyphRenderer`, the offscreen
@@ -127,7 +132,7 @@ default = ["wgpu", "windowed", "egui-ui", "launcher"]
 wgpu = ["dep:wgpu", "dep:wgpu-profiler", "dep:pollster", "glyph-field/wgpu", "glyph-field-derived/wgpu"]
 # The window: `windowed/` and winit (2026-10-26). Off, there is no window
 # (the binary refuses a windowed run).
-windowed = ["wgpu", "dep:winit", "dep:arboard", "dep:objc2-foundation"]
+windowed = ["wgpu", "dep:winit", "dep:arboard", "dep:objc2-foundation", "dep:smithay-clipboard"]
 # The terminal launcher (`--launcher`). Off, `--launcher` is refused; a bare
 # run opens the wall. It starts this binary's window as a child, so it needs one.
 launcher = ["windowed", "dep:ratatui", "dep:crossterm", "dep:toml_edit"]

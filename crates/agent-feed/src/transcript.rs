@@ -1100,7 +1100,7 @@ fn run_line_follow(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::cli::spawn_command(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             let mut guard = inner.lock().expect("line follower mutex poisoned");

@@ -1,20 +1,53 @@
 //! Scripted window-level input verbs (`app.move`, `app.down`, `app.up`, `app.click`,
-//! `app.dblclick`, `app.drag`, `app.wheel`, `app.pinch`, `app.key`, `app.type`, `app.ime`,
-//! `app.focus`, `app.clipboard`, and `app.where`) for driving a live `--wall` window over
-//! `wallctl`.
+//! `app.dblclick`, `app.tplclick`, `app.drag`, `app.wheel`, `app.wheel_seq`, `app.pinch`,
+//! `app.doubletap`, `app.drop`, `app.hover_file`, `app.cancel_file`, `app.key`, `app.type`,
+//! `app.ime`, `app.focus`, `app.clipboard`, `app.primary`, and `app.where`) for driving a
+//! live `--wall` window over `wallctl`.
 //!
 //! Coordinates are logical pixels from the window's top-left `(0, 0)`, matching
 //! `App::cursor` and `Wall`'s viewport coordinate space.
 
+use std::path::PathBuf;
+
 use wall_core::geom::Point;
+use wall_core::input::Platform;
 use wall_core::menu::MenuTarget;
 use wall_core::router::CommandRouter;
 use wall_core::wall::WallFrame;
-use winit::event::MouseButton;
+use winit::event::{MouseButton, TouchPhase};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, NativeKeyCode, PhysicalKey, SmolStr};
 
 /// Default interpolation step count for `app.drag` when omitted.
 pub const DEFAULT_DRAG_STEPS: usize = 12;
+
+/// Unit of a scripted scroll delta (`MouseScrollDelta::PixelDelta` vs `LineDelta`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScriptScrollUnit {
+    /// Logical pixel delta (`MouseScrollDelta::PixelDelta` after `scale_factor` scaling).
+    #[default]
+    Pixel,
+    /// Discrete mouse-wheel detents (`MouseScrollDelta::LineDelta`).
+    Line,
+}
+
+/// One timed event in an `app.wheel_seq` stream (`[<phase>:]<dx>,<dy>[@<dt_ms>]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScriptWheelStep {
+    pub phase: TouchPhase,
+    pub unit: ScriptScrollUnit,
+    pub dx: f64,
+    pub dy: f64,
+    pub dt_ms: f64,
+}
+
+/// Amount supplied to `app.pinch`: multiplicative zoom factor or raw `PinchGesture` delta.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScriptPinchAmount {
+    /// Multiplicative zoom factor (`> 0`), passed into `App::pinch` as `factor.ln()`.
+    Factor(f64),
+    /// Raw `WindowEvent::PinchGesture` `delta` (`NSEvent.magnification`), zoomed by `delta.exp()`.
+    Delta(f64),
+}
 
 /// One parsed `app.*` scripted-input or inspection command.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +73,8 @@ pub enum ScriptCommand {
     },
     /// `app.dblclick <x> <y>`
     DblClick { x: f64, y: f64 },
+    /// `app.tplclick <x> <y>`
+    TplClick { x: f64, y: f64 },
     /// `app.drag <x0> <y0> <x1> <y1> [steps] [left|right|middle] [mods]`
     Drag {
         x0: f64,
@@ -50,16 +85,43 @@ pub enum ScriptCommand {
         button: MouseButton,
         mods: ModifiersState,
     },
-    /// `app.wheel <x> <y> <dx> <dy> [mods]` (winit logical pixel delta: `+dy` scrolls up / zooms in).
+    /// `app.wheel [--line|--pixel] [--phase <phase>] [--dt <ms>] <x> <y> <dx> <dy> [mods]`
+    /// (winit delta convention: `+dy` scrolls up / zooms in).
     Wheel {
         x: f64,
         y: f64,
         dx: f64,
         dy: f64,
+        unit: ScriptScrollUnit,
+        phase: TouchPhase,
+        dt_ms: Option<f64>,
         mods: ModifiersState,
     },
-    /// `app.pinch <x> <y> <factor>`
-    Pinch { x: f64, y: f64, factor: f64 },
+    /// `app.wheel_seq <x> <y> [--mods <mods>] [--line] <step...>`
+    WheelSeq {
+        x: f64,
+        y: f64,
+        mods: ModifiersState,
+        steps: Vec<ScriptWheelStep>,
+    },
+    /// `app.pinch [--delta] [--phase <phase>] <x> <y> <factor_or_delta>`
+    Pinch {
+        x: f64,
+        y: f64,
+        amount: ScriptPinchAmount,
+        phase: TouchPhase,
+    },
+    /// `app.doubletap [x y]` (macOS two-finger smart-zoom `DoubleTapGesture`)
+    DoubleTap { at: Option<(f64, f64)> },
+    /// `app.drop [--at <x> <y>] <path...>`
+    Drop {
+        at: Option<(f64, f64)>,
+        paths: Vec<PathBuf>,
+    },
+    /// `app.hover_file <path...>`
+    HoverFile(Vec<PathBuf>),
+    /// `app.cancel_file`
+    CancelFile,
     /// `app.key [--down|--up|--repeat] [--key <logical>] [--text <typed>] <chord>`
     Key(ScriptKey),
     /// `app.type <text>`
@@ -70,6 +132,8 @@ pub enum ScriptCommand {
     Focus(bool),
     /// `app.clipboard [clear | set <text>]`
     Clipboard(ScriptClipboard),
+    /// `app.primary [clear | set <text>]` (Linux `PRIMARY` selection / memory-mode stand-in)
+    Primary(ScriptClipboard),
     /// `app.where`
     Where,
 }
@@ -141,14 +205,27 @@ pub fn parse_script_line(line: &str) -> Option<Result<ScriptCommand, String>> {
         "app.up" => Some(parse_down_or_up("app.up", args, false)),
         "app.click" => Some(parse_click(args)),
         "app.dblclick" => Some(parse_dblclick(args)),
+        "app.tplclick" => Some(parse_tplclick(args)),
         "app.drag" => Some(parse_drag(args)),
         "app.wheel" => Some(parse_wheel(args)),
+        "app.wheel_seq" => Some(parse_wheel_seq(args)),
         "app.pinch" => Some(parse_pinch(args)),
+        "app.doubletap" => Some(parse_doubletap(args)),
+        "app.drop" => Some(parse_drop_verb(args)),
+        "app.hover_file" => Some(parse_hover_file_verb(args)),
+        "app.cancel_file" => {
+            if !args.is_empty() {
+                Some(Err("usage: app.cancel_file".to_string()))
+            } else {
+                Some(Ok(ScriptCommand::CancelFile))
+            }
+        }
         "app.key" => Some(parse_key_verb(args)),
         "app.type" => Some(parse_type_verb(args)),
         "app.ime" => Some(parse_ime_verb(args)),
         "app.focus" => Some(parse_focus_verb(args)),
-        "app.clipboard" => Some(parse_clipboard_verb(args)),
+        "app.clipboard" => Some(parse_clipboard_verb("app.clipboard", args, ScriptCommand::Clipboard)),
+        "app.primary" => Some(parse_clipboard_verb("app.primary", args, ScriptCommand::Primary)),
         "app.where" => {
             if !args.is_empty() {
                 Some(Err("usage: app.where".to_string()))
@@ -284,6 +361,41 @@ fn parse_dblclick(args: &[String]) -> Result<ScriptCommand, String> {
     Ok(ScriptCommand::DblClick { x, y })
 }
 
+fn parse_tplclick(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.tplclick <x> <y>";
+    if args.len() != 2 {
+        return Err(format!("usage: {USAGE}"));
+    }
+    let x = parse_f64_arg(args, 0, "x", USAGE)?;
+    let y = parse_f64_arg(args, 1, "y", USAGE)?;
+    Ok(ScriptCommand::TplClick { x, y })
+}
+
+fn parse_doubletap(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.doubletap [x y]";
+    match args.len() {
+        0 => Ok(ScriptCommand::DoubleTap { at: None }),
+        2 => {
+            let x = parse_f64_arg(args, 0, "x", USAGE)?;
+            let y = parse_f64_arg(args, 1, "y", USAGE)?;
+            Ok(ScriptCommand::DoubleTap { at: Some((x, y)) })
+        }
+        _ => Err(format!("usage: {USAGE}")),
+    }
+}
+
+pub fn parse_touch_phase(raw: &str) -> Result<TouchPhase, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "started" | "start" | "began" => Ok(TouchPhase::Started),
+        "moved" | "move" | "changed" => Ok(TouchPhase::Moved),
+        "ended" | "end" => Ok(TouchPhase::Ended),
+        "cancelled" | "canceled" | "cancel" => Ok(TouchPhase::Cancelled),
+        _ => Err(format!(
+            "phase must be started|moved|ended|cancelled, not '{raw}'"
+        )),
+    }
+}
+
 fn parse_drag(args: &[String]) -> Result<ScriptCommand, String> {
     const USAGE: &str = "app.drag <x0> <y0> <x1> <y1> [steps] [left|right|middle] [mods]";
     if args.len() < 4 || args.len() > 7 {
@@ -337,33 +449,206 @@ fn parse_drag(args: &[String]) -> Result<ScriptCommand, String> {
 }
 
 fn parse_wheel(args: &[String]) -> Result<ScriptCommand, String> {
-    const USAGE: &str = "app.wheel <x> <y> <dx> <dy> [mods]";
-    if args.len() < 4 || args.len() > 5 {
+    const USAGE: &str =
+        "app.wheel [--line|--pixel] [--phase <started|moved|ended|cancelled>] [--dt <ms>] <x> <y> <dx> <dy> [mods]";
+    let mut unit = ScriptScrollUnit::Pixel;
+    let mut phase = TouchPhase::Moved;
+    let mut dt_ms: Option<f64> = None;
+    let mut pos: Vec<String> = Vec::with_capacity(args.len());
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--line" => unit = ScriptScrollUnit::Line,
+            "--pixel" => unit = ScriptScrollUnit::Pixel,
+            "--phase" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --phase (usage: {USAGE})"));
+                };
+                phase = parse_touch_phase(val)?;
+            }
+            "--dt" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --dt (usage: {USAGE})"));
+                };
+                let d: f64 = val
+                    .parse()
+                    .map_err(|_| format!("dt must be a number, not '{val}'"))?;
+                if !d.is_finite() || d < 0.0 {
+                    return Err(format!("dt must be finite and >= 0, not '{val}'"));
+                }
+                dt_ms = Some(d);
+            }
+            tok if tok.starts_with("--") => {
+                return Err(format!("unknown flag '{tok}' (usage: {USAGE})"));
+            }
+            tok => pos.push(tok.to_string()),
+        }
+        i += 1;
+    }
+
+    if pos.len() < 4 || pos.len() > 5 {
         return Err(format!("usage: {USAGE}"));
     }
-    let x = parse_f64_arg(args, 0, "x", USAGE)?;
-    let y = parse_f64_arg(args, 1, "y", USAGE)?;
-    let dx = parse_f64_arg(args, 2, "dx", USAGE)?;
-    let dy = parse_f64_arg(args, 3, "dy", USAGE)?;
-    let mods = match args.get(4) {
+    let x = parse_f64_arg(&pos, 0, "x", USAGE)?;
+    let y = parse_f64_arg(&pos, 1, "y", USAGE)?;
+    let dx = parse_f64_arg(&pos, 2, "dx", USAGE)?;
+    let dy = parse_f64_arg(&pos, 3, "dy", USAGE)?;
+    let mods = match pos.get(4) {
         Some(raw) => parse_mods(raw)?,
         None => ModifiersState::empty(),
     };
-    Ok(ScriptCommand::Wheel { x, y, dx, dy, mods })
+    Ok(ScriptCommand::Wheel {
+        x,
+        y,
+        dx,
+        dy,
+        unit,
+        phase,
+        dt_ms,
+        mods,
+    })
 }
 
-fn parse_pinch(args: &[String]) -> Result<ScriptCommand, String> {
-    const USAGE: &str = "app.pinch <x> <y> <factor>";
-    if args.len() != 3 {
+fn parse_wheel_step_token(
+    raw: &str,
+    default_unit: ScriptScrollUnit,
+    usage: &str,
+) -> Result<ScriptWheelStep, String> {
+    let (body, dt_ms) = match raw.rsplit_once('@') {
+        Some((b, dt_raw)) => {
+            let d: f64 = dt_raw
+                .parse()
+                .map_err(|_| format!("step dt must be a number in '{raw}'"))?;
+            if !d.is_finite() || d < 0.0 {
+                return Err(format!("step dt must be finite and >= 0 in '{raw}'"));
+            }
+            (b, d)
+        }
+        None => (raw, 8.0),
+    };
+
+    let mut unit = default_unit;
+    let mut phase = TouchPhase::Moved;
+    let mut rest = body;
+    while let Some((prefix, tail)) = rest.split_once(':') {
+        match prefix.trim().to_ascii_lowercase().as_str() {
+            "line" => unit = ScriptScrollUnit::Line,
+            "pixel" | "px" => unit = ScriptScrollUnit::Pixel,
+            other => phase = parse_touch_phase(other)?,
+        }
+        rest = tail;
+    }
+
+    let Some((dx_raw, dy_raw)) = rest.split_once(',') else {
+        return Err(format!(
+            "wheel_seq step '{raw}' must look like [phase:]dx,dy[@dt_ms] (usage: {usage})"
+        ));
+    };
+    let dx: f64 = dx_raw
+        .parse()
+        .map_err(|_| format!("dx must be a number in step '{raw}'"))?;
+    let dy: f64 = dy_raw
+        .parse()
+        .map_err(|_| format!("dy must be a number in step '{raw}'"))?;
+    if !dx.is_finite() || !dy.is_finite() {
+        return Err(format!("dx and dy must be finite in step '{raw}'"));
+    }
+    Ok(ScriptWheelStep {
+        phase,
+        unit,
+        dx,
+        dy,
+        dt_ms,
+    })
+}
+
+fn parse_wheel_seq(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str =
+        "app.wheel_seq <x> <y> [--mods <mods>] [--line|--pixel] <[phase:]dx,dy[@dt_ms] ...>";
+    if args.len() < 3 {
         return Err(format!("usage: {USAGE}"));
     }
     let x = parse_f64_arg(args, 0, "x", USAGE)?;
     let y = parse_f64_arg(args, 1, "y", USAGE)?;
-    let factor = parse_f64_arg(args, 2, "factor", USAGE)?;
-    if factor <= 0.0 {
-        return Err(format!("factor must be > 0, not '{factor}'"));
+
+    let mut mods = ModifiersState::empty();
+    let mut default_unit = ScriptScrollUnit::Pixel;
+    let mut steps = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mods" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --mods (usage: {USAGE})"));
+                };
+                mods = parse_mods(val)?;
+            }
+            "--line" => default_unit = ScriptScrollUnit::Line,
+            "--pixel" => default_unit = ScriptScrollUnit::Pixel,
+            tok if tok.starts_with("--") => {
+                return Err(format!("unknown flag '{tok}' (usage: {USAGE})"));
+            }
+            tok => steps.push(parse_wheel_step_token(tok, default_unit, USAGE)?),
+        }
+        i += 1;
     }
-    Ok(ScriptCommand::Pinch { x, y, factor })
+    if steps.is_empty() {
+        return Err(format!("usage: {USAGE}"));
+    }
+    Ok(ScriptCommand::WheelSeq { x, y, mods, steps })
+}
+
+fn parse_pinch(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str =
+        "app.pinch [--delta] [--phase <started|moved|ended|cancelled>] <x> <y> <factor_or_delta>";
+    let mut raw_delta = false;
+    let mut phase = TouchPhase::Moved;
+    let mut pos: Vec<String> = Vec::with_capacity(args.len());
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--delta" => raw_delta = true,
+            "--phase" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    return Err(format!("missing value after --phase (usage: {USAGE})"));
+                };
+                phase = parse_touch_phase(val)?;
+            }
+            tok if tok.starts_with("--") => {
+                return Err(format!("unknown flag '{tok}' (usage: {USAGE})"));
+            }
+            tok => pos.push(tok.to_string()),
+        }
+        i += 1;
+    }
+
+    if pos.len() != 3 {
+        return Err(format!("usage: {USAGE}"));
+    }
+    let x = parse_f64_arg(&pos, 0, "x", USAGE)?;
+    let y = parse_f64_arg(&pos, 1, "y", USAGE)?;
+    let amount = if raw_delta {
+        let d = parse_f64_arg(&pos, 2, "delta", USAGE)?;
+        ScriptPinchAmount::Delta(d)
+    } else {
+        let factor = parse_f64_arg(&pos, 2, "factor", USAGE)?;
+        if factor <= 0.0 {
+            return Err(format!("factor must be > 0, not '{factor}'"));
+        }
+        ScriptPinchAmount::Factor(factor)
+    };
+    Ok(ScriptCommand::Pinch {
+        x,
+        y,
+        amount,
+        phase,
+    })
 }
 
 fn parse_key_verb(args: &[String]) -> Result<ScriptCommand, String> {
@@ -519,15 +804,65 @@ fn parse_focus_verb(args: &[String]) -> Result<ScriptCommand, String> {
     }
 }
 
-fn parse_clipboard_verb(args: &[String]) -> Result<ScriptCommand, String> {
-    const USAGE: &str = "app.clipboard [clear | set <text>]";
-    match args.first().map(String::as_str) {
-        None => Ok(ScriptCommand::Clipboard(ScriptClipboard::Get)),
-        Some("clear") if args.len() == 1 => Ok(ScriptCommand::Clipboard(ScriptClipboard::Clear)),
-        Some("set") if args.len() >= 2 => {
-            Ok(ScriptCommand::Clipboard(ScriptClipboard::Set(args[1..].join(" "))))
+fn parse_drop_verb(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.drop [--at <x> <y>] <path...>";
+    let mut at: Option<(f64, f64)> = None;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--at" => {
+                let x = parse_f64_arg(args, i + 1, "x", USAGE)?;
+                let y = parse_f64_arg(args, i + 2, "y", USAGE)?;
+                at = Some((x, y));
+                i += 3;
+            }
+            "--" => {
+                for rest in &args[i + 1..] {
+                    if !rest.is_empty() {
+                        paths.push(PathBuf::from(rest));
+                    }
+                }
+                break;
+            }
+            tok => {
+                if !tok.is_empty() {
+                    paths.push(PathBuf::from(tok));
+                }
+                i += 1;
+            }
         }
-        _ => Err(format!("usage: {USAGE}")),
+    }
+    if paths.is_empty() {
+        return Err(format!("usage: {USAGE}"));
+    }
+    Ok(ScriptCommand::Drop { at, paths })
+}
+
+fn parse_hover_file_verb(args: &[String]) -> Result<ScriptCommand, String> {
+    const USAGE: &str = "app.hover_file <path...>";
+    let paths: Vec<PathBuf> = args
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if paths.is_empty() {
+        return Err(format!("usage: {USAGE}"));
+    }
+    Ok(ScriptCommand::HoverFile(paths))
+}
+
+fn parse_clipboard_verb(
+    verb: &str,
+    args: &[String],
+    wrap: fn(ScriptClipboard) -> ScriptCommand,
+) -> Result<ScriptCommand, String> {
+    let usage = format!("{verb} [clear | set <text>]");
+    match args.first().map(String::as_str) {
+        None => Ok(wrap(ScriptClipboard::Get)),
+        Some("clear") if args.len() == 1 => Ok(wrap(ScriptClipboard::Clear)),
+        Some("set") if args.len() >= 2 => Ok(wrap(ScriptClipboard::Set(args[1..].join(" ")))),
+        _ => Err(format!("usage: {usage}")),
     }
 }
 
@@ -1058,9 +1393,9 @@ fn ascii_punct_keycode(ch: char) -> Option<(KeyCode, bool)> {
 }
 
 /// Format `app.where`: each terminal's body and title-bar rects in logical screen pixels
-/// from the window's top-left, plus viewport, camera pose, focused id, wall selection,
-/// group frames/headers, and open menu state.
-pub fn format_where(described: &WallFrame, cursor: Point) -> String {
+/// from the window's top-left, plus viewport, platform chord set, camera pose, focused id,
+/// wall selection, group frames/headers, and open menu state.
+pub fn format_where(described: &WallFrame, cursor: Point, platform: Platform) -> String {
     let vw = described.viewport.w;
     let vh = described.viewport.h;
     let cam = described.camera;
@@ -1100,6 +1435,13 @@ pub fn format_where(described: &WallFrame, cursor: Point) -> String {
         "viewport w={vw:.2} h={vh:.2} scale={:.2}",
         described.scale_factor
     ));
+    let (platform_name, chord, copy_chord, paste_chord, ctrl_click_menu) = match platform {
+        Platform::Mac => ("mac", "cmd", "cmd+c", "cmd+v", true),
+        Platform::Other => ("other", "ctrl+alt", "ctrl+shift+c", "ctrl+shift+v", false),
+    };
+    lines.push(format!(
+        "platform {platform_name} chord={chord} copy={copy_chord} paste={paste_chord} ctrl_click_menu={ctrl_click_menu}"
+    ));
     lines.push(format!(
         "camera x={:.4} y={:.4} zoom={:.4} animating={}",
         cam.x, cam.y, cam.zoom, described.animating
@@ -1127,6 +1469,9 @@ pub fn format_where(described: &WallFrame, cursor: Point) -> String {
         let sb = cam.to_screen_box(t.body_rect, vw, vh);
         let text_sel = match &t.text_selection {
             None => "none".to_string(),
+            Some(sel) if sel.block => {
+                format!("block:{}:{}..{}:{}", sel.r0, sel.c0, sel.r1, sel.c1)
+            }
             Some(sel) => format!("{}:{}..{}:{}", sel.r0, sel.c0, sel.r1, sel.c1),
         };
         let hold_str = if t.close_hold_progress.is_some() {
@@ -1285,7 +1630,58 @@ mod tests {
                 y: 500.0,
                 dx: -40.0,
                 dy: 120.0,
+                unit: ScriptScrollUnit::Pixel,
+                phase: TouchPhase::Moved,
+                dt_ms: None,
                 mods: ModifiersState::CONTROL,
+            }
+        );
+        assert_eq!(
+            parse_script_line("app.wheel --line --phase started --dt 12 400 300 0 -1")
+                .unwrap()
+                .unwrap(),
+            ScriptCommand::Wheel {
+                x: 400.0,
+                y: 300.0,
+                dx: 0.0,
+                dy: -1.0,
+                unit: ScriptScrollUnit::Line,
+                phase: TouchPhase::Started,
+                dt_ms: Some(12.0),
+                mods: ModifiersState::empty(),
+            }
+        );
+        assert_eq!(
+            parse_script_line("app.wheel_seq 24 24 started:0,0@0 moved:-30,-20@8 ended:0,0@8")
+                .unwrap()
+                .unwrap(),
+            ScriptCommand::WheelSeq {
+                x: 24.0,
+                y: 24.0,
+                mods: ModifiersState::empty(),
+                steps: vec![
+                    ScriptWheelStep {
+                        phase: TouchPhase::Started,
+                        unit: ScriptScrollUnit::Pixel,
+                        dx: 0.0,
+                        dy: 0.0,
+                        dt_ms: 0.0,
+                    },
+                    ScriptWheelStep {
+                        phase: TouchPhase::Moved,
+                        unit: ScriptScrollUnit::Pixel,
+                        dx: -30.0,
+                        dy: -20.0,
+                        dt_ms: 8.0,
+                    },
+                    ScriptWheelStep {
+                        phase: TouchPhase::Ended,
+                        unit: ScriptScrollUnit::Pixel,
+                        dx: 0.0,
+                        dy: 0.0,
+                        dt_ms: 8.0,
+                    },
+                ],
             }
         );
         assert_eq!(
@@ -1293,8 +1689,34 @@ mod tests {
             ScriptCommand::Pinch {
                 x: 640.0,
                 y: 420.0,
-                factor: 1.25,
+                amount: ScriptPinchAmount::Factor(1.25),
+                phase: TouchPhase::Moved,
             }
+        );
+        assert_eq!(
+            parse_script_line("app.pinch --delta --phase moved 640 420 -0.25")
+                .unwrap()
+                .unwrap(),
+            ScriptCommand::Pinch {
+                x: 640.0,
+                y: 420.0,
+                amount: ScriptPinchAmount::Delta(-0.25),
+                phase: TouchPhase::Moved,
+            }
+        );
+        assert_eq!(
+            parse_script_line("app.tplclick 120 240").unwrap().unwrap(),
+            ScriptCommand::TplClick { x: 120.0, y: 240.0 }
+        );
+        assert_eq!(
+            parse_script_line("app.doubletap 500 350").unwrap().unwrap(),
+            ScriptCommand::DoubleTap {
+                at: Some((500.0, 350.0))
+            }
+        );
+        assert_eq!(
+            parse_script_line("app.doubletap").unwrap().unwrap(),
+            ScriptCommand::DoubleTap { at: None }
         );
         assert_eq!(
             parse_script_line("app.where").unwrap().unwrap(),
@@ -1359,14 +1781,20 @@ mod tests {
         for i in 1..=60 {
             wall.tick(1.0 / 60.0, f64::from(i) * 16.67);
         }
-        let report = format_where(&wall.frame(), Point::new(800.0, 500.0));
+        let report = format_where(&wall.frame(), Point::new(800.0, 500.0), Platform::Mac);
         assert!(report.contains("viewport w=1600.00 h=1000.00 scale=2.00"));
+        assert!(report.contains("platform mac chord=cmd copy=cmd+c paste=cmd+v ctrl_click_menu=true"));
         assert!(report.contains("focused t1"));
         assert!(report.contains("panels sidebar=false status=false settings=false help=false palette=false"));
         assert!(report.contains("fullscreen none"));
         assert!(report.contains("terminal t1 cols=100 rows=30 focused=true"));
         assert!(report.contains("close_hold=none"));
         assert!(report.contains("titlebar t1 rect="));
+
+        let other_report = format_where(&wall.frame(), Point::new(800.0, 500.0), Platform::Other);
+        assert!(other_report.contains(
+            "platform other chord=ctrl+alt copy=ctrl+shift+c paste=ctrl+shift+v ctrl_click_menu=false"
+        ));
     }
 
     #[test]
@@ -1434,6 +1862,32 @@ mod tests {
         assert_eq!(
             parse_script_line("app.clipboard set hello world").unwrap().unwrap(),
             ScriptCommand::Clipboard(ScriptClipboard::Set("hello world".to_string()))
+        );
+        assert_eq!(
+            parse_script_line("app.primary set linux primary").unwrap().unwrap(),
+            ScriptCommand::Primary(ScriptClipboard::Set("linux primary".to_string()))
+        );
+        assert_eq!(
+            parse_script_line(r#"app.drop --at 420 310 /tmp/a.txt "/tmp/my file's.txt""#)
+                .unwrap()
+                .unwrap(),
+            ScriptCommand::Drop {
+                at: Some((420.0, 310.0)),
+                paths: vec![
+                    PathBuf::from("/tmp/a.txt"),
+                    PathBuf::from("/tmp/my file's.txt"),
+                ],
+            }
+        );
+        assert_eq!(
+            parse_script_line("app.hover_file /tmp/dragged.rs")
+                .unwrap()
+                .unwrap(),
+            ScriptCommand::HoverFile(vec![PathBuf::from("/tmp/dragged.rs")])
+        );
+        assert_eq!(
+            parse_script_line("app.cancel_file").unwrap().unwrap(),
+            ScriptCommand::CancelFile
         );
     }
 }

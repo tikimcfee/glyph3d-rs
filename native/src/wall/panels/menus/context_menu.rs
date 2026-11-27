@@ -241,6 +241,8 @@ pub struct ContextMenuState {
     last_rect: Option<egui::Rect>,
     last_pointer_pos: Option<egui::Pos2>,
     closed_empty: bool,
+    /// Last rendered item row rectangles keyed by menu item id (`split-right`, `close`, `spawn`, etc.).
+    pub item_rects: std::collections::BTreeMap<String, egui::Rect>,
 }
 
 impl ContextMenuState {
@@ -327,13 +329,15 @@ pub fn show(
 
     let key = MenuInstanceKey::of(menu);
     let current_hover = ctx.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
-    if state.instance.as_ref() != Some(&key) {
+    let just_opened = state.instance.as_ref() != Some(&key);
+    if just_opened {
         *state = ContextMenuState {
             instance: Some(key),
             last_pointer_pos: current_hover,
             ..ContextMenuState::default()
         };
     }
+    state.item_rects.clear();
 
     let pointer_moved = match (current_hover, state.last_pointer_pos) {
         (Some(now), Some(prev)) => (now - prev).length_sq() > 0.01,
@@ -459,6 +463,9 @@ pub fn show(
     }
 
     let area_resp = menu_area(ctx, top_left).show(ctx, |ui| {
+        if ui.is_sizing_pass() {
+            ui.ctx().request_discard("wall_context_menu initial sizing");
+        }
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         menu_frame().show(ui, |ui| {
             ui.set_min_width(MENU_MIN_WIDTH);
@@ -470,15 +477,16 @@ pub fn show(
                 match item {
                     MenuItem::Sep { .. } => draw_separator(ui),
                     MenuItem::Action {
+                        id,
                         label,
                         verb,
                         detail,
-                        ..
                     } => {
                         let idx = row_cursor;
                         row_cursor += 1;
                         let is_active = state.active_row == Some(idx);
                         let resp = draw_plain_row(ui, label, detail.as_deref(), None, is_active);
+                        state.item_rects.insert(id.clone(), resp.rect);
                         if pointer_moved && resp.hovered() {
                             set_active_row(state, &non_sep, idx);
                         }
@@ -609,15 +617,16 @@ pub fn show(
     }
     state.last_rect = Some(rect);
 
-    // Dismiss on any press outside the menu box (there is no browser menu passthrough in native).
-    let clicked_outside = ctx.input(|i| {
-        i.events.iter().any(|ev| {
-            matches!(
-                ev,
-                egui::Event::PointerButton {
-                    pos,
-                    pressed: true,
-                    ..
+    // Dismiss on any press outside the menu box (ignoring the opening secondary press itself).
+    let clicked_outside = !just_opened
+        && ctx.input(|i| {
+            i.events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    egui::Event::PointerButton {
+                        pos,
+                        pressed: true,
+                        ..
                 } if !rect.contains(*pos)
             )
         })
@@ -1414,6 +1423,7 @@ fn draw_hold_row(
         });
 
     let row_rect = inner.response.rect;
+    state.item_rects.insert(item_id.to_owned(), row_rect);
     let resp = ui.interact(
         row_rect,
         egui::Id::new(("wall_menu_hold", item_id)),
@@ -1468,7 +1478,6 @@ fn draw_hold_row(
             progress = (elapsed / hold_secs).clamp(0.0, 1.0) as f32;
             ui.ctx()
                 .request_repaint_after(Duration::from_millis(16));
-            ui.ctx().request_repaint();
         }
     }
 
