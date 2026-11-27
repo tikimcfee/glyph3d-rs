@@ -2159,3 +2159,92 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
     );
     eprintln!("the daemon under test said exit_reason = {said:?}");
 }
+
+#[test]
+fn sessions_revive_starts_a_fresh_daemon_after_a_stop_and_a_terminal_lands_on_it() {
+    // The wall's outage notice has always said "a new terminal starts a fresh termd". Until
+    // 2026-11-27 it did not: after a stop `Sessions` only watched for a daemon someone else
+    // started, and a new terminal failed on the dead connection.
+    use term_session::News;
+
+    let scratch = ScratchDaemon::new("revive");
+    let sock = scratch.dir.join(format!("termd-{}.sock", scratch.ns));
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions =
+        term_session::Sessions::open_target(&scratch.target(), wake.waker()).expect("open");
+    assert!(!sessions.primary_gone());
+    assert_eq!(sessions.revive(), Ok(false), "nothing to revive while the daemon answers");
+    sessions
+        .spawn(Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()]), 80, 24)
+        .expect("spawn");
+
+    let stopper = Termd::connect(&scratch.target(), "stopper", Box::new(|| {})).expect("connect");
+    stopper.stop().expect("stop the scratch daemon");
+    drop(stopper);
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let (_, news) = sessions.pump();
+            news.iter().any(|n| matches!(n, News::Disconnected { .. }))
+        }),
+        "no News::Disconnected within 10 s of the stop"
+    );
+    assert!(sessions.primary_gone());
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || !sock.exists()),
+        "the stopped daemon's socket is still there"
+    );
+    assert!(sessions.take_reconnected().is_none(), "nobody started a daemon");
+
+    // What a new terminal did until now: fail, on the connection of the daemon that left.
+    let dead = sessions.spawn(None, 80, 24);
+    assert!(dead.is_err(), "a spawn on the dead connection cannot work: {dead:?}");
+
+    // The person asked for a terminal: start a daemon for it.
+    assert_eq!(sessions.revive(), Ok(true));
+    assert!(sock.exists(), "a fresh daemon listens on the namespace");
+    let ids = sessions.take_reconnected().expect("the fresh daemon is handed over");
+    assert!(ids.is_empty(), "a fresh daemon holds no terminal: {ids:?}");
+    assert!(!sessions.primary_gone());
+    assert_eq!(sessions.revive(), Ok(false));
+
+    let (id, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo REVIVED_$((40+2)); exec sleep 30".into(),
+            ]),
+            80,
+            24,
+        )
+        .expect("spawn on the fresh daemon");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            sessions.pump();
+            sessions
+                .session(&id)
+                .is_some_and(|s| screen_lines(s).iter().any(|l| l.contains("REVIVED_42")))
+        }),
+        "the new terminal's output never arrived"
+    );
+
+    // The passive watcher was withdrawn by `revive`: it must not find the fresh daemon a
+    // moment later and hand a second connection over, under the terminal just made. It
+    // polls every 300 ms; three polls' worth of waiting.
+    let until = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < until {
+        let (_, news) = sessions.pump();
+        assert!(
+            !news.iter().any(|n| matches!(n, News::Ended { .. } | News::Disconnected { .. })),
+            "the revived daemon's terminal was disturbed: {news:?}"
+        );
+        assert!(
+            sessions.take_reconnected().is_none(),
+            "a second daemon connection was handed over after the revive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sessions.session(&id).is_some());
+}
+

@@ -317,6 +317,42 @@ struct WakeGate {
     redraw_armed: std::sync::atomic::AtomicBool,
 }
 
+/// A daemon answers on the wall's namespace again (one the passive watcher found, or the
+/// fresh one a new terminal started): swap it in, tell the wall, and adopt what it holds.
+/// `false` when no daemon was waiting to be handed over.
+fn adopt_returned_termd(
+    wall: &mut Wall,
+    sessions: &mut Sessions,
+    render_ids: &mut RenderIds,
+    renderer: Option<&mut WallRenderer>,
+) -> bool {
+    let Some(live_ids) = sessions.take_reconnected() else {
+        return false;
+    };
+    log::info!("termd came back ({} terminal(s))", live_ids.len());
+    let welcome = sessions.hub().welcome();
+    wall.on_termd_welcome(welcome.instance.as_deref().unwrap_or(""), &welcome.features, epoch_now_ms());
+    wall.dismiss_termd_lost();
+    if !live_ids.is_empty() {
+        wall.set_live_terminals(&live_ids);
+    }
+    render_ids.retain_live(&live_ids, renderer);
+    for id in &live_ids {
+        match sessions.adopt(id) {
+            Ok((cols, rows)) => {
+                let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                if let Some(title) = sessions.default_title_for(id) {
+                    appeared = appeared.with_title(title);
+                }
+                wall.terminal_appeared(appeared);
+            }
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    wall.set_connected(true);
+    true
+}
+
 /// Maps terminal string ids to monotonic `u64` renderer keys so closed terminals can be
 /// freed from [`WallRenderer`] without ever colliding ids across spawn/close cycles.
 #[derive(Default)]
@@ -1348,13 +1384,35 @@ impl App {
             }
             other => {
                 let Terminals::Live(sessions) = terms else { return };
+                // A person asked for a terminal and the namespace is gone (it was stopped,
+                // or lost): start a fresh termd for it, as the outage notice says a new
+                // terminal does. Until 2026-11-27 the spawn below just failed on the dead
+                // connection, into the log.
+                if matches!(other, WallEffect::SpawnTerminal { .. } | WallEffect::ReattachTerminal { .. })
+                    && sessions.primary_gone()
+                {
+                    match sessions.revive() {
+                        Ok(_) => {
+                            adopt_returned_termd(
+                                wall,
+                                sessions,
+                                &mut self.render_ids,
+                                self.gfx.as_mut().map(|g| &mut g.renderer),
+                            );
+                        }
+                        Err(e) => log::error!("{e}"),
+                    }
+                }
                 match other {
                     WallEffect::SpawnTerminal { argv, cols, rows, .. } => {
                         match sessions.spawn(argv, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16) {
                             Ok((id, cols, rows)) => {
                                 wall.terminal_appeared(TerminalAppeared::new(id, u32::from(cols), u32::from(rows)));
                             }
-                            Err(e) => log::error!("the wall could not start a terminal: {e}"),
+                            Err(e) => {
+                                log::error!("the wall could not start a terminal: {e}");
+                                wall.notify(&format!("could not start a terminal: {e}"));
+                            }
                         }
                         self.refresh_termd_status();
                     }
@@ -1377,7 +1435,10 @@ impl App {
                                     Ok((spawn_id, c, r)) => {
                                         wall.terminal_appeared(TerminalAppeared::new(spawn_id, u32::from(c), u32::from(r)));
                                     }
-                                    Err(err) => log::error!("the wall could not attach terminal: {err}"),
+                                    Err(err) => {
+                                        log::error!("the wall could not attach terminal: {err}");
+                                        wall.notify(&format!("could not start a terminal: {err}"));
+                                    }
                                 }
                             }
                         }
@@ -1759,32 +1820,12 @@ impl App {
                     }
                 }
             }
-            if let Some(live_ids) = sessions.take_reconnected() {
-                log::info!("termd came back ({} terminal(s))", live_ids.len());
-                let welcome = sessions.hub().welcome();
-                wall.on_termd_welcome(
-                    welcome.instance.as_deref().unwrap_or(""),
-                    &welcome.features,
-                    epoch_now_ms(),
-                );
-                wall.dismiss_termd_lost();
-                if !live_ids.is_empty() {
-                    wall.set_live_terminals(&live_ids);
-                }
-                self.render_ids.retain_live(&live_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
-                for id in &live_ids {
-                    match sessions.adopt(id) {
-                        Ok((cols, rows)) => {
-                            let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
-                            if let Some(title) = sessions.default_title_for(id) {
-                                appeared = appeared.with_title(title);
-                            }
-                            wall.terminal_appeared(appeared);
-                        }
-                        Err(e) => log::error!("{e}"),
-                    }
-                }
-                wall.set_connected(true);
+            if adopt_returned_termd(
+                wall,
+                sessions,
+                &mut self.render_ids,
+                self.gfx.as_mut().map(|g| &mut g.renderer),
+            ) {
                 heard = true;
                 ended_any = true;
             }

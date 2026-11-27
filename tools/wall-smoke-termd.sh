@@ -12,9 +12,11 @@
 #      termd notice is up straight away, saying termd stopped, measured from the moment the
 #      daemon removes its socket (which it does as it tells its connections); the terminal is
 #      gone.
-#   3. a daemon started again on the namespace is picked up by the wall's passive watcher:
-#      the notice clears and a new terminal lands on it.
-#   4. `SIGTERM` to that daemon's holder: the notice says termd was ended by SIGTERM.
+#   3. a new terminal asked for then (`wall.spawn`, nothing else): the wall starts a fresh
+#      termd itself, as the notice says, the notice clears, and the terminal takes typing.
+#   4. after another stop, a daemon someone else starts on the namespace is picked up by the
+#      wall's passive watcher: the notice clears and a new terminal lands on it.
+#   5. `SIGTERM` to that daemon's holder: the notice says termd was ended by SIGTERM.
 #
 # The notice names the cause from `daemon.exit_reason` in the namespace's last status
 # document. A daemon from before that field says only that it is leaving, and the wall then
@@ -272,7 +274,42 @@ else
     record_fail "g3d stop shows the outage" "${STOP_CHECK#* }"
 fi
 
-# ── 3. A daemon back on the namespace is picked up, and the notice clears ────
+# ── 3. A new terminal starts a fresh termd ──────────────────────────────────
+# Nothing but the wall may start it: no socket before, and no daemon of this namespace.
+PRE_SOCK="$([[ -e "$SOCK" ]] && echo yes || echo no)"
+PRE_DAEMON="$(scratch_holder_pid || echo none)"
+R_FRESH="$(ctl wall.spawn 2>&1)"
+FRESH_ID=""
+for _ in $(seq 1 200); do
+    W_FRESH="$(ctl app.where 2>/dev/null)" || { sleep 0.05; continue; }
+    FRESH_ID="$(awk '/^terminal / {print $2; exit}' <<<"$W_FRESH")"
+    [[ -n "$FRESH_ID" ]] && break
+    sleep 0.05
+done
+TYPED=0
+if [[ -n "$FRESH_ID" ]]; then
+    ctl terminal.focus "$FRESH_ID" >/dev/null
+    ctl app.type "echo FRESH_\$((50+5))" >/dev/null
+    ctl app.key enter >/dev/null
+    wait_for_text "$FRESH_ID" "FRESH_55" 200 && TYPED=1
+fi
+FRESH_NOTICE="$(notice_line)"
+FRESH_TERMD="$(termd_line)"
+FRESH_HOLDER="$(scratch_holder_pid || echo none)"
+if [[ "$PRE_SOCK" == "no" && "$PRE_DAEMON" == "none" && -n "$FRESH_ID" && "$TYPED" -eq 1 \
+    && -S "$SOCK" && "$FRESH_HOLDER" != "none" \
+    && "$FRESH_NOTICE" == "termd_notice none" && "$FRESH_TERMD" == "termd state=ok "* ]]; then
+    record_pass "a new terminal starts a termd" "no daemon before; wall.spawn alone gave holder $FRESH_HOLDER and $FRESH_ID, which took typing; ${FRESH_NOTICE}; ${FRESH_TERMD%% says=*}"
+else
+    record_fail "a new terminal starts a termd" "socket before=$PRE_SOCK daemon before=$PRE_DAEMON reply='${R_FRESH}' id='${FRESH_ID}' typed=$TYPED holder=$FRESH_HOLDER ${FRESH_NOTICE} | ${FRESH_TERMD}"
+fi
+
+# ── 4. A daemon someone else starts is picked up, and the notice clears ──────
+"$G3D" --ns "$NS" stop >/dev/null 2>&1
+for _ in $(seq 1 200); do
+    [[ ! -e "$SOCK" && "$(notice_line)" == "termd_notice kind=lost"* ]] && break
+    sleep 0.05
+done
 "$G3D_TERMD" --ns "$NS" --daemon >/dev/null 2>&1
 BACK=0
 for _ in $(seq 1 200); do
@@ -298,7 +335,7 @@ else
     record_fail "a daemon back is picked up" "back=$BACK fresh=$FRESH socket=$([[ -S "$SOCK" ]] && echo yes || echo no) $(notice_line)"
 fi
 
-# ── 4. SIGTERM to the holder: the notice says so ────────────────────────────
+# ── 5. SIGTERM to the holder: the notice says so ────────────────────────────
 HOLDER_PID="$(scratch_holder_pid || true)"
 TERM_NOTICE="termd_notice ?"
 if [[ -n "$HOLDER_PID" ]]; then
