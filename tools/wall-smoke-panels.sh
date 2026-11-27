@@ -678,10 +678,9 @@ if [[ -n "$NEW_TID" ]]; then
     W_NT_MENU="$(ctl app.where)"
     read -r CM_CLOSE_X CM_CLOSE_Y < <(map_entry_center "context_menu " "items" "close" "$W_NT_MENU")
 
-    # Short press (< close_hold_ms)
+    # Short press (< close_hold_ms): immediate down/up without extra sleep jitter under load.
     ctl app.move "$CM_CLOSE_X" "$CM_CLOSE_Y" >/dev/null
     ctl app.down left >/dev/null
-    sleep 0.12
     ctl app.up left >/dev/null
     W_AFTER_SHORT="$(ctl app.where)"
     grep -q "^terminal ${NEW_TID} " <<<"$W_AFTER_SHORT" && SHORT_SURVIVED=1
@@ -734,7 +733,6 @@ read -r BB_CLOSE_X BB_CLOSE_Y < <(rect_center "bar_buttons " "close" "$W_BB_HOV2
 # Short press on title-bar `×` must NOT kill t2.
 ctl app.move "$BB_CLOSE_X" "$BB_CLOSE_Y" >/dev/null
 ctl app.down left >/dev/null
-sleep 0.12
 ctl app.up left >/dev/null
 W_BB_SHORT="$(ctl app.where)"
 BB_SHORT_KEPT=0
