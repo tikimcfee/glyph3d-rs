@@ -94,6 +94,12 @@ pub struct StatusState {
     pub trouble_since_ms: Option<u64>,
     /// Measured content width for floating placement so the window hugs its table instead of spanning `100vw`.
     float_width: Option<f32>,
+    /// Last rendered window bounding box when open.
+    pub last_rect: Option<egui::Rect>,
+    /// Floating header drag rectangle when open.
+    pub header_drag_rect: Option<egui::Rect>,
+    /// Terminal ids rendered in the status table on the last open pass.
+    pub shown_row_ids: Vec<String>,
 }
 
 /// Alias matching `StatusPanel` naming.
@@ -103,6 +109,13 @@ impl StatusState {
     /// Whether the status UI wants keyboard input routed to egui instead of a terminal (`false`).
     pub const fn wants_keyboard(&self) -> bool {
         self.wants_keyboard
+    }
+
+    /// Effective floating width in points (`StatusWindow` hugs its measured table width).
+    pub fn effective_float_width(&self, max_float_w: f32) -> f32 {
+        self.float_width
+            .unwrap_or(580.0)
+            .clamp(300.0_f32.min(max_float_w), max_float_w.min(760.0))
     }
 }
 
@@ -155,6 +168,9 @@ pub fn show(
         show_window(ctx, state, input, out);
     } else {
         state.head_drag.drag_at = None;
+        state.last_rect = None;
+        state.header_drag_rect = None;
+        state.shown_row_ids.clear();
     }
 
     false
@@ -366,11 +382,16 @@ pub fn show_window(
         }
     };
 
+    state.shown_row_ids = rows.iter().map(|r| r.id.clone()).collect();
+
     egui::Area::new(egui::Id::new("wall_status_window"))
         .fixed_pos(origin)
         .order(egui::Order::Foreground)
         .constrain(false)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("wall_status initial sizing");
+            }
             let panel_frame = egui::Frame::NONE
                 .fill(status_panel_bg())
                 .corner_radius(rounding)
@@ -457,6 +478,7 @@ pub fn show_window(
                                     galley,
                                     MUTED,
                                 );
+                                state.header_drag_rect = Some(title_rect);
                                 handle_head_drag(
                                     ui,
                                     &title_resp,
@@ -488,7 +510,7 @@ pub fn show_window(
                     .max_height(body_max_h)
                     .auto_shrink([false, side == PanelSide::Float])
                     .show(ui, |ui| {
-                        let body_resp = egui::Frame::NONE
+                        egui::Frame::NONE
                             .inner_margin(egui::Margin {
                                 left: 10,
                                 right: 10,
@@ -518,16 +540,22 @@ pub fn show_window(
                                             input.now_ms,
                                             inner_target_w,
                                         );
-                                        render_terminals_section(ui, rows, stale, out);
-                                        render_leftovers_section(ui, &doc.daemon.leftovers);
-                                        render_errors_section(ui, &doc.errors, input.errors_shown);
-                                        measured_content_w = daemon_w.max(ui.min_rect().width());
+                                        let terms_w =
+                                            render_terminals_section(ui, rows, stale, out);
+                                        let leftovers_w =
+                                            render_leftovers_section(ui, &doc.daemon.leftovers);
+                                        let errors_w = render_errors_section(
+                                            ui,
+                                            &doc.errors,
+                                            input.errors_shown,
+                                        );
+                                        measured_content_w = daemon_w
+                                            .max(terms_w)
+                                            .max(leftovers_w)
+                                            .max(errors_w);
                                     }
                                 }
                             });
-                        if measured_content_w == 0.0 {
-                            measured_content_w = body_resp.response.rect.width() - 20.0;
-                        }
                     });
                 if side == PanelSide::Float && measured_content_w > 0.0 {
                     state.float_width = Some(
@@ -538,6 +566,7 @@ pub fn show_window(
             });
 
             let r = frame_resp.response.rect;
+            state.last_rect = Some(r);
             match side {
                 PanelSide::Left => {
                     ui.painter().line_segment(
@@ -636,7 +665,8 @@ fn render_daemon_section(
     .map(|(w, n)| format!("{n} {w}"))
     .collect();
 
-    ui.horizontal_wrapped(|ui| {
+    let mut natural_w = natural_row1_w;
+    let row2_resp = ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(20.0, 2.0);
         ui.label(
             egui::RichText::new(format!("holder {}{holder_rss}", d.holder.pid))
@@ -661,17 +691,19 @@ fn render_daemon_section(
             );
         }
     });
+    natural_w = natural_w.max(row2_resp.response.rect.width());
 
     for warning in &d.env.warnings {
-        ui.label(
+        let r = ui.label(
             egui::RichText::new(format!("env: {warning}"))
                 .font(egui::FontId::monospace(12.0))
                 .color(AMBER),
         );
+        natural_w = natural_w.max(r.rect.width());
     }
 
     if let Some(newer) = upgrade_available {
-        ui.label(
+        let r = ui.label(
             egui::RichText::new(format!(
                 "the relay ships {} · g3d upgrade moves termd to it, every shell kept",
                 format_name_version(newer)
@@ -679,8 +711,9 @@ fn render_daemon_section(
             .font(egui::FontId::monospace(12.0))
             .color(AMBER),
         );
+        natural_w = natural_w.max(r.rect.width());
     }
-    natural_row1_w
+    natural_w
 }
 
 fn render_terminals_section(
@@ -688,15 +721,15 @@ fn render_terminals_section(
     rows: &[StatusTerminalRow],
     stale: bool,
     out: &mut Vec<String>,
-) {
+) -> f32 {
     ui.add_space(4.0);
     if rows.is_empty() {
-        ui.label(
+        let r = ui.label(
             egui::RichText::new("no terminals")
                 .font(egui::FontId::monospace(12.0))
                 .color(MUTED),
         );
-        return;
+        return r.rect.width();
     }
 
     let dim = if stale { 0.55_f32 } else { 1.0_f32 };
@@ -708,7 +741,7 @@ fn render_terminals_section(
         }
     };
 
-    egui::Grid::new("wall_status_terminals_grid")
+    let grid_resp = egui::Grid::new("wall_status_terminals_grid")
         .spacing(egui::vec2(14.0, 3.0))
         .striped(false)
         .show(ui, |ui| {
@@ -819,13 +852,15 @@ fn render_terminals_section(
                 }
             }
         });
+    grid_resp.response.rect.width()
 }
 
-fn render_leftovers_section(ui: &mut egui::Ui, leftovers: &[LeftoverStatus]) {
+fn render_leftovers_section(ui: &mut egui::Ui, leftovers: &[LeftoverStatus]) -> f32 {
     if leftovers.is_empty() {
-        return;
+        return 0.0;
     }
     ui.add_space(6.0);
+    let mut max_w = 0.0_f32;
     for l in leftovers {
         let mut job = egui::text::LayoutJob::default();
         job.append(
@@ -868,18 +903,21 @@ fn render_leftovers_section(ui: &mut egui::Ui, leftovers: &[LeftoverStatus]) {
             .collect::<Vec<_>>()
             .join("\n");
         let resp = ui.add(egui::Label::new(job).wrap().sense(egui::Sense::hover()));
+        max_w = max_w.max(resp.rect.width());
         if !tip.is_empty() {
             resp.on_hover_text(tip);
         }
     }
+    max_w
 }
 
-fn render_errors_section(ui: &mut egui::Ui, errors: &[StatusError], shown: usize) {
+fn render_errors_section(ui: &mut egui::Ui, errors: &[StatusError], shown: usize) -> f32 {
     let slice_len = errors.len().min(shown);
     if slice_len == 0 {
-        return;
+        return 0.0;
     }
     ui.add_space(6.0);
+    let mut max_w = 0.0_f32;
     for e in &errors[..slice_len] {
         let mut job = egui::text::LayoutJob::default();
         job.append(
@@ -939,9 +977,11 @@ fn render_errors_section(ui: &mut egui::Ui, errors: &[StatusError], shown: usize
         );
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.set_max_width(640.0);
-        ui.add(egui::Label::new(job).wrap().sense(egui::Sense::hover()))
-            .on_hover_text(tip);
+        let resp = ui.add(egui::Label::new(job).wrap().sense(egui::Sense::hover()));
+        max_w = max_w.max(resp.rect.width());
+        resp.on_hover_text(tip);
     }
+    max_w
 }
 
 #[cfg(test)]
@@ -1254,5 +1294,35 @@ mod tests {
         let dismiss_pt = egui::pos2(nt_pos.x + nt_size.x + 18.0, nt_pos.y + nt_size.y * 0.5);
         let dismiss_out = click_at(&ctx, dismiss_pt, (1280.0, 900.0), &mut state, &input);
         assert_eq!(dismiss_out, vec!["wall.status.dismiss"]);
+    }
+
+    #[test]
+    fn floating_width_stabilizes_without_creeping() {
+        let ctx = egui::Context::default();
+        let mut state = StatusState::default();
+        let mut input = StatusInput::new(
+            StatusPlacement {
+                open: true,
+                side: PanelSide::Float,
+                float: None,
+            },
+            sample_live_status(),
+            1_794_519_127_407,
+        );
+        input
+            .wall_names
+            .insert("t1".to_string(), "main shell".to_string());
+
+        run_frame(&ctx, Vec::new(), (1600.0, 1000.0), &mut state, &input);
+        run_frame(&ctx, Vec::new(), (1600.0, 1000.0), &mut state, &input);
+        let settled = state.float_width.expect("floating status sets float_width");
+        for _ in 0..20 {
+            run_frame(&ctx, Vec::new(), (1600.0, 1000.0), &mut state, &input);
+        }
+        let after = state.float_width.expect("floating status keeps float_width");
+        assert!(
+            (after - settled).abs() < 0.01,
+            "float_width crept from {settled} to {after}"
+        );
     }
 }

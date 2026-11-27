@@ -85,6 +85,14 @@ pub struct SettingsState {
     focus_field: Option<String>,
     /// Last active key scrolled into view via keyboard navigation.
     last_scrolled_key: Option<String>,
+    /// Last rendered panel bounding box when open.
+    pub last_rect: Option<egui::Rect>,
+    /// Floating header drag rectangle when open.
+    pub header_drag_rect: Option<egui::Rect>,
+    /// Number of visible unfolded matching knobs on the last open pass.
+    pub visible_count: usize,
+    /// Rendered control rectangles keyed by knob identifier (`gridShow`, `gridMinor`, etc.).
+    pub control_rects: BTreeMap<String, egui::Rect>,
 }
 
 /// Alias matching `SettingsPanel` naming.
@@ -197,12 +205,16 @@ pub fn show(
     input: &SettingsInput,
     out: &mut Vec<String>,
 ) -> bool {
+    state.control_rects.clear();
     if !input.placement.open {
         state.was_open = false;
         state.wants_keyboard = false;
         state.head_drag.drag_at = None;
         state.focus_field = None;
         state.focus_search = false;
+        state.last_rect = None;
+        state.header_drag_rect = None;
+        state.visible_count = 0;
         return false;
     }
 
@@ -257,6 +269,9 @@ pub fn show(
         .order(egui::Order::Foreground)
         .constrain(false)
         .show(ctx, |ui| {
+            if ui.is_sizing_pass() {
+                ui.ctx().request_discard("wall_settings initial sizing");
+            }
             let panel_frame = egui::Frame::NONE
                 .fill(settings_panel_bg())
                 .corner_radius(rounding)
@@ -311,6 +326,7 @@ pub fn show(
                                     galley,
                                     MUTED,
                                 );
+                                state.header_drag_rect = Some(title_rect);
                                 handle_head_drag(
                                     ui,
                                     &title_resp,
@@ -421,6 +437,7 @@ pub fn show(
                     .filter(|g| !is_folded(g.section.id))
                     .flat_map(|g| g.items.iter().map(|it| (it.key, it.def)))
                     .collect();
+                state.visible_count = visible_keys.len();
 
                 let mut at = state.active.min(visible_keys.len().saturating_sub(1));
                 let mut moved_by_keys = false;
@@ -676,6 +693,7 @@ pub fn show(
 
             // Docked inner border (`borderRight` on left dock, `borderLeft` on right dock).
             let r = frame_resp.response.rect;
+            state.last_rect = Some(r);
             match side {
                 PanelSide::Left => {
                     ui.painter().line_segment(
@@ -745,6 +763,7 @@ fn render_knob_control(
         KnobKind::Bool => {
             let on = value.as_bool().unwrap_or(false);
             let (_id, rect) = ui.allocate_space(egui::vec2(30.0, 16.0));
+            state.control_rects.insert(key.to_string(), rect);
             let resp = ui
                 .interact(
                     rect,
@@ -935,6 +954,7 @@ fn render_commit_field(
         }
         edit.show(ui)
     });
+    state.control_rects.insert(key.to_string(), inner.response.rect);
     let mut output = inner.inner;
 
     if select_all_now {

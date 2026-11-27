@@ -47,7 +47,11 @@ const NAME_EMPTY_FG: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x73, 0x84);
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TopbarState {
     /// Last rendered bounding rectangle (`None` before first non-fullscreen frame).
-    last_bar_rect: Option<egui::Rect>,
+    pub last_bar_rect: Option<egui::Rect>,
+    /// Last rendered `termd` chip slot rectangle (`None` in fullscreen or when width is 0).
+    pub last_chip_rect: Option<egui::Rect>,
+    /// Last rendered button rectangles keyed by short action name (`spawn`, `fit`, `find`, `sidebar`, `status`, `settings`, `help`).
+    pub button_rects: std::collections::BTreeMap<&'static str, egui::Rect>,
 }
 
 /// Plain-data inputs for [`show`].
@@ -128,6 +132,8 @@ pub fn show(
 ) -> TopbarOutput {
     if input.fullscreen {
         state.last_bar_rect = None;
+        state.last_chip_rect = None;
+        state.button_rects.clear();
         return TopbarOutput::default();
     }
 
@@ -218,66 +224,80 @@ pub fn show(
             ui.horizontal_wrapped(|ui| {
                 draw_wall_name_badge(ui, input.wall_name);
 
-                if draw_topbar_button(
+                let (spawn_clicked, spawn_r) = draw_topbar_button_with_rect(
                     ui,
                     "+ terminal",
                     false,
                     &format!("New terminal ({spawn_chord})"),
-                ) {
+                );
+                state.button_rects.insert("spawn", spawn_r);
+                if spawn_clicked {
                     out.push("wall.spawn".to_owned());
                 }
 
-                if draw_topbar_button(
+                let (fit_clicked, fit_r) = draw_topbar_button_with_rect(
                     ui,
                     "fit all",
                     false,
                     &format!("Fit all ({fit_chord})"),
-                ) {
+                );
+                state.button_rects.insert("fit", fit_r);
+                if fit_clicked {
                     out.push("wall.fit".to_owned());
                 }
 
-                if draw_topbar_button(
+                let (find_clicked, find_r) = draw_topbar_button_with_rect(
                     ui,
                     &find_label,
                     input.palette_open,
                     &format!("Find by name ({find_chord})"),
-                ) {
+                );
+                state.button_rects.insert("find", find_r);
+                if find_clicked {
                     out.push(palette_verb.to_owned());
                 }
 
-                if draw_topbar_button(
+                let (sb_clicked, sb_r) = draw_topbar_button_with_rect(
                     ui,
                     &list_label,
                     input.sidebar_open,
                     &format!("Every terminal and group ({list_chord})"),
-                ) {
+                );
+                state.button_rects.insert("sidebar", sb_r);
+                if sb_clicked {
                     out.push("wall.sidebar toggle".to_owned());
                 }
 
-                if draw_topbar_button(
+                let (st_clicked, st_r) = draw_topbar_button_with_rect(
                     ui,
                     &status_label,
                     input.status_open,
                     &format!("termd's status window ({status_chord})"),
-                ) {
+                );
+                state.button_rects.insert("status", st_r);
+                if st_clicked {
                     out.push("wall.status toggle".to_owned());
                 }
 
-                if draw_topbar_button(
+                let (set_clicked, set_r) = draw_topbar_button_with_rect(
                     ui,
                     "settings",
                     input.settings_open,
                     &format!("Every knob, searchable ({settings_chord})"),
-                ) {
+                );
+                state.button_rects.insert("settings", set_r);
+                if set_clicked {
                     out.push("wall.settings toggle".to_owned());
                 }
 
-                if draw_topbar_button(
+                let (help_clicked, help_r) = draw_topbar_button_with_rect(
                     ui,
                     "?",
                     input.help_open,
                     &format!("Keys, gestures and verbs ({help_chord})"),
-                ) {
+                );
+                state.button_rects.insert("help", help_r);
+                if help_clicked {
                     out.push("wall.help toggle".to_owned());
                 }
             });
@@ -293,6 +313,7 @@ pub fn show(
             egui::vec2(chip_w, bar_h),
         )
     });
+    state.last_chip_rect = termd_chip_rect;
     let notice_slot_rect = (notice_w > 0.0).then(|| {
         egui::Rect::from_min_size(
             egui::pos2(strip_left, TOPBAR_TOP_PX),
@@ -400,7 +421,12 @@ fn draw_wall_name_badge(ui: &mut egui::Ui, wall_name: &str) {
     });
 }
 
-fn draw_topbar_button(ui: &mut egui::Ui, label: &str, is_open: bool, tooltip: &str) -> bool {
+fn draw_topbar_button_with_rect(
+    ui: &mut egui::Ui,
+    label: &str,
+    is_open: bool,
+    tooltip: &str,
+) -> (bool, egui::Rect) {
     let font_id = egui::TextStyle::Button.resolve(ui.style());
     let measure_galley = ui
         .painter()
@@ -440,7 +466,7 @@ fn draw_topbar_button(ui: &mut egui::Ui, label: &str, is_open: bool, tooltip: &s
     }
 
     resp.on_hover_text(tooltip);
-    clicked
+    (clicked, rect)
 }
 
 #[cfg(test)]
