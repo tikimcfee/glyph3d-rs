@@ -9,6 +9,7 @@ name = "wallctl"
 path = "src/bin/wallctl.rs"
 
 [dependencies]
+wall-core = { path = "../wall-core" }
 
 [lints]
 workspace = true
