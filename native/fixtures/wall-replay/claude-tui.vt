@@ -1,0 +1,23 @@
+7[r8[?25h[?25l[?2004h[?2031h[?1004h[38;2;215;119;87mWelcome[9Gto[12GClaude[19GCode[24G[38;2;153;153;153mv2.1.332[39m
+
+[2GLet's[8Gget[12Gstarted.
+
+[2G[1mChoose[9Gthe[13Gtext[18Gstyle[24Gthat[29Glooks[35Gbest[40Gwith[45Gyour[50Gterminal[22m
+[2G[38;2;153;153;153mTo[5Gchange[12Gthis[17Glater,[24Grun[28G/theme[39m
+
+[2G[38;2;177;185;249m❯[4G[38;2;78;186;101m✔[6G[38;2;177;185;249mAuto[11G(match[18Gterminal)[39m
+[6GDark[11Gmode
+[6GLight[12Gmode
+[6GDark[11Gmode[16G(colorblind-friendly)
+[6GLight[12Gmode[17G(colorblind-friendly)
+[6GDark[11Gmode[16G(ANSI[22Gcolors[29Gonly)
+[6GLight[12Gmode[17G(ANSI[23Gcolors[30Gonly)
+
+[2G[38;2;80;80;80m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌[39m
+[2G[2m 1[6G[22m[38;2;102;217;239mfunction[15G[38;2;166;226;46mgreet[39m()[23G{
+[2G[38;2;220;90;90m[48;2;61;1;0m 2 -[38;2;248;248;242m  console.log("Hello, [48;2;92;2;0mWorld[48;2;61;1;0m!");                                         [49m[39m
+[2G[38;2;80;200;80m[48;2;2;40;0m 2 +[38;2;248;248;242m  console.[38;2;166;226;46mlog[38;2;248;248;242m([38;2;230;219;116m"Hello, [48;2;4;71;0mClaude[48;2;2;40;0m!"[38;2;248;248;242m);                                        [39m[49m
+[2G[2m 3[6G[22m}
+[2G[38;2;80;80;80m╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌[39m
+[2G[38;2;153;153;153m Syntax[10Gtheme:[17GMonokai[25GExtended[34G(ctrl+t[42Gto[45Gdisable)[39m
+[1C[15A]11;?[c[>0q[?u]7501;?[c[<u[>5u[>4;2m[?2026$p_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\[16t[?1016$p[c

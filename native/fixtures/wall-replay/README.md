@@ -37,6 +37,13 @@ cargo run --release -p termd-client --example termd_record -- \
 cargo run --release -p termd-client --example termd_record -- \
   --out native/fixtures/wall-replay/vim-screen.vt --size 80x24 --settle-ms 600 \
   -- /usr/bin/vim --clean -c "syntax on" -c "set number ruler" native/src/wall/replay.rs
+
+# 5. Offline Claude Code Ink TUI (`claude --bare` in an isolated scratch HOME with
+#    `ANTHROPIC_BASE_URL=http://127.0.0.1:1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`,
+#    `DISABLE_TELEMETRY=1`, `DISABLE_AUTOUPDATER=1` — exercises CHA `CSI G`, 24-bit RGB
+#    inline diff preview, Kitty keyboard `CSI < u` / `CSI > 5 u`, APC graphics query,
+#    DECRQM, and box-drawing rules without touching any live backend):
+./tools/vt-diff.sh --record-claude-tui native/fixtures/wall-replay/claude-tui.vt
 ```
 
 ## How to render offscreen
