@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use wall_core::chord::chord_label;
-use wall_core::dock::DOCK_WIDTHS;
+use wall_core::dock::{PanelKind, DOCK_WIDTHS};
 use wall_core::input::Platform;
 use wall_core::status::{
     chip_look, empty_daemon_message, format_bytes, format_name_version, format_span, notice_for,
@@ -14,6 +14,7 @@ use wall_core::status::{
 };
 use wall_core::store::{PanelSide, StatusWindowState as StatusPlacement};
 
+use super::super::resize::{self, ResizeSpec, ResizeState};
 use super::{
     dock_buttons_rtl, handle_head_drag, panel_viewport_rect, resolve_panel_box, status_panel_bg,
     tone_color, HeadDragState, AMBER, BORDER, BRIGHT, HEAD_BORDER, HOVER_ROW_BG, MUTED, NOTICE_BG,
@@ -99,6 +100,8 @@ pub struct StatusState {
     pub trouble_since_ms: Option<u64>,
     /// Measured content width for floating placement so the window hugs its table instead of spanning `100vw`.
     float_width: Option<f32>,
+    /// The edge grips, and a resize drag in progress.
+    pub resize: ResizeState,
     /// Last rendered window bounding box when open.
     pub last_rect: Option<egui::Rect>,
     /// Floating header drag rectangle when open.
@@ -118,7 +121,8 @@ impl StatusState {
         self.wants_keyboard
     }
 
-    /// Effective floating width in points (`StatusWindow` hugs its measured table width).
+    /// Effective floating width in points when none is set on the window
+    /// (`StatusWindow` hugs its measured table width).
     pub fn effective_float_width(&self, max_float_w: f32) -> f32 {
         self.float_width
             .unwrap_or(580.0)
@@ -182,6 +186,7 @@ pub fn show(
         state.last_rect = None;
         state.header_drag_rect = None;
         state.shown_row_ids.clear();
+        state.resize.reset();
     }
 
     false
@@ -365,15 +370,20 @@ pub fn show_window(
 ) {
     let viewport = panel_viewport_rect(ctx);
     let side = input.placement.side;
+    let limits = PanelKind::Status.limits();
     let max_float_w = (viewport.width() - 32.0).max(160.0);
     let target_default_w = match side {
-        PanelSide::Float => state
-            .float_width
-            .unwrap_or(580.0)
-            .clamp(300.0_f32.min(max_float_w), max_float_w.min(760.0)),
+        // Floating, the window hugs its table until a width is set on it
+        // or an edge is being dragged.
+        PanelSide::Float => resize::float_width(
+            &state.resize,
+            &input.placement.size,
+            state.effective_float_width(max_float_w),
+            viewport,
+        ),
         PanelSide::Left | PanelSide::Right => DOCK_WIDTHS.status as f32,
     };
-    let (origin, width, max_height) = resolve_panel_box(
+    let (mut origin, width, mut max_height) = resolve_panel_box(
         viewport,
         side,
         input.dock_rect,
@@ -381,6 +391,28 @@ pub fn show_window(
         &state.head_drag,
         target_default_w,
     );
+    // The height the window is held to: the viewport's when docked; when
+    // floating, the one set on it, else none (as tall as its table).
+    let held_height = match side {
+        PanelSide::Float => resize::float_height(&state.resize, &input.placement.size, viewport),
+        PanelSide::Left | PanelSide::Right => Some(max_height),
+    };
+    if side == PanelSide::Float {
+        if let Some(at) = resize::float_origin(&state.resize) {
+            origin = at;
+        }
+        if let Some(h) = held_height {
+            max_height = h;
+        }
+        // Its bottom edge stays in the window, wherever it was put.
+        max_height = max_height.min(resize::room_below(origin.y, viewport));
+    }
+    // A floating panel has a 1 px border, drawn outside what it holds: the
+    // size set on it is the box with its border, so what it holds is that
+    // much smaller (a drag would otherwise grow it 2 px on every release).
+    let rim = if side == PanelSide::Float { resize::FLOAT_RIM_PX } else { 0.0 };
+    let width = width - 2.0 * rim;
+    let max_height = max_height - 2.0 * rim;
 
     let rounding = match side {
         PanelSide::Float => egui::CornerRadius::same(7),
@@ -422,12 +454,10 @@ pub fn show_window(
 
             let frame_resp = panel_frame.show(ui, |ui| {
                 ui.set_width(width);
-                if side == PanelSide::Float {
-                    ui.set_max_height(max_height);
-                } else {
+                if held_height.is_some() {
                     ui.set_min_height(max_height);
-                    ui.set_max_height(max_height);
                 }
+                ui.set_max_height(max_height);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
                 // ── Header (`● termd [· state]` + `⇤ ◫ ⇥ ×`) ─────────────────
@@ -531,7 +561,7 @@ pub fn show_window(
                 egui::ScrollArea::both()
                     .id_salt("wall_status_body")
                     .max_height(body_max_h)
-                    .auto_shrink([false, side == PanelSide::Float])
+                    .auto_shrink([false, held_height.is_none()])
                     .show(ui, |ui| {
                         egui::Frame::NONE
                             .inner_margin(egui::Margin {
@@ -605,6 +635,21 @@ pub fn show_window(
                 }
                 PanelSide::Float => {}
             }
+
+            // The edges that resize it.
+            resize::grips(
+                ui,
+                &mut state.resize,
+                &ResizeSpec {
+                    verb: "wall.status",
+                    side,
+                    rect: r,
+                    limits,
+                    viewport,
+                    centered: false,
+                },
+                out,
+            );
         });
 }
 
@@ -1176,6 +1221,7 @@ mod tests {
                 open: true,
                 side: PanelSide::Float,
                 float: None,
+                ..StatusPlacement::default()
             },
             absent_status,
             2_000,
@@ -1220,6 +1266,7 @@ mod tests {
                 open: true,
                 side: PanelSide::Left,
                 float: None,
+                ..StatusPlacement::default()
             },
             sample_live_status(),
             1_794_519_127_407,
@@ -1328,6 +1375,7 @@ mod tests {
                 open: true,
                 side: PanelSide::Float,
                 float: None,
+                ..StatusPlacement::default()
             },
             sample_live_status(),
             1_794_519_127_407,

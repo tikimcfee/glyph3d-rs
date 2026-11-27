@@ -815,6 +815,8 @@ fn import_sidebar(val: &Value, store: &mut WallStore, unmapped: &mut Vec<Unmappe
         float,
         collapsed,
         mode: None,
+        // The JS panels were one size: an export names none.
+        size: None,
     });
     true
 }
@@ -830,7 +832,12 @@ fn import_status(val: &Value, store: &mut WallStore, unmapped: &mut Vec<Unmapped
     let open = obj.get("open").and_then(Value::as_bool);
     let side = parse_panel_side(obj.get("side"), "status.side", unmapped);
     let float = parse_opt_float_point(obj.get("float"), "status.float", unmapped);
-    store.set_status_window(StatusWindowPatch { open, side, float });
+    store.set_status_window(StatusWindowPatch {
+        open,
+        side,
+        float,
+        size: None,
+    });
     true
 }
 
@@ -872,6 +879,7 @@ fn import_settings_panel(
         side,
         float,
         collapsed,
+        size: None,
     });
     true
 }
@@ -887,7 +895,12 @@ fn import_help_panel(val: &Value, store: &mut WallStore, unmapped: &mut Vec<Unma
     let open = obj.get("open").and_then(Value::as_bool);
     let side = parse_panel_side(obj.get("side"), "help.side", unmapped);
     let float = parse_opt_float_point(obj.get("float"), "help.float", unmapped);
-    store.set_help_panel(HelpPanelPatch { open, side, float });
+    store.set_help_panel(HelpPanelPatch {
+        open,
+        side,
+        float,
+        size: None,
+    });
     true
 }
 

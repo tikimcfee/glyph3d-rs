@@ -3273,6 +3273,7 @@ mod tests {
                 float: None,
                 collapsed: Vec::new(),
                 mode: None,
+                size: Default::default(),
             }
         }
         fn set_panel(&mut self, _: PanelKind, _: PanelPatch) {}

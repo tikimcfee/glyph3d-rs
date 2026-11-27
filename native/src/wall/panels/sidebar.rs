@@ -19,6 +19,9 @@
 //! - Docks on the left or right viewport edge (using `input.dock_rect` from
 //!   [`wall_core::dock::dock_layout`]) or floats freely with draggable header
 //!   persistence (`wall.sidebar float x y`).
+//! - Is as wide as its edge was dragged ([`super::resize`]): `wall.sidebar
+//!   width` docked, `wall.sidebar size` floating; a name is cut only when the
+//!   panel is too narrow for it.
 //! - Never steals keyboard focus from the focused terminal (`wants_keyboard` is
 //!   always `false`).
 
@@ -26,13 +29,14 @@ use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 use wall_core::chord::chord_label;
-use wall_core::dock::{DockLayout, DockSide, DOCK_WIDTHS};
+use wall_core::dock::{DockLayout, DockSide, PanelKind, PanelSize, DOCK_WIDTHS};
 use wall_core::input::Platform;
 use wall_core::sidebar::{
     build_sidebar, EntryRow, GroupRow, SectionKind, SectionRow, SidebarInput as CoreSidebarInput,
     SidebarMode, SidebarModel, SidebarRow,
 };
 
+use super::resize::{self, ResizeSpec, ResizeState};
 use super::{
     chrome_icon_btn, dock_buttons, format_verb_line, layout_elided, paint_chrome_icon,
     parse_hex_color, safe_viewport_rect, sanitize_egui_text, ChromeIcon,
@@ -48,7 +52,7 @@ pub fn sidebar_dock_rect(
     side: DockSide,
     layout: &DockLayout,
 ) -> Option<egui::Rect> {
-    let w = DOCK_WIDTHS.sidebar as f32;
+    let w = layout.widths.sidebar as f32;
     let offset = layout.sidebar as f32;
     match side {
         DockSide::Left => {
@@ -130,6 +134,11 @@ pub struct SidebarState {
     pub side: DockSide,
     /// Top-left position in viewport points when `side == DockSide::Float`.
     pub float_pos: egui::Pos2,
+    /// The sizes set on the panel (the store's): its floating width and
+    /// height are read here; its docked width arrives in `dock_rect`.
+    pub size: PanelSize,
+    /// The edge grips, and a resize drag in progress.
+    pub resize: ResizeState,
     /// Always `false`: sidebar controls never steal keyboard focus from terminals.
     pub wants_keyboard: bool,
     /// Tracks `(last_input_collapsed, effective_collapsed)` per group id so
@@ -175,6 +184,8 @@ impl SidebarState {
             open,
             side,
             float_pos: egui::pos2(16.0, 48.0),
+            size: PanelSize::default(),
+            resize: ResizeState::default(),
             wants_keyboard: false,
             fold_state: HashMap::new(),
             drag_offset: None,
@@ -1089,14 +1100,26 @@ pub fn show(
         state.last_rect = None;
         state.header_drag_rect = None;
         state.dock_btn_rects = [None; 4];
+        state.resize.reset();
         return;
     }
 
     let viewport = safe_viewport_rect(ctx);
-    let panel_w = (DOCK_WIDTHS.sidebar as f32).min(viewport.width().max(120.0));
+    let limits = PanelKind::Sidebar.limits();
     let is_float = state.side == DockSide::Float;
 
-    let (pos, fixed_h, max_h) = if is_float {
+    let (pos, panel_w, fixed_h, max_h) = if is_float {
+        let panel_w = resize::float_width(
+            &state.resize,
+            &state.size,
+            limits.float_default_width as f32,
+            viewport,
+        );
+        // A drag on an edge pins the panel where the drag has it.
+        if let Some(origin) = resize::float_origin(&state.resize) {
+            state.float_pos = origin;
+        }
+        let held_h = resize::float_height(&state.resize, &state.size, viewport);
         let clamped = egui::pos2(
             state
                 .float_pos
@@ -1108,12 +1131,28 @@ pub fn show(
                 .clamp(viewport.top(), (viewport.bottom() - 48.0).max(viewport.top())),
         );
         state.float_pos = clamped;
-        (clamped, None, (viewport.height() - 120.0).max(96.0))
+        // The floating panel's 1 px border is outside what it holds: the
+        // size is the box with it.
+        let rim = 2.0 * resize::FLOAT_RIM_PX;
+        // Its bottom edge stays in the window, wherever it was put.
+        let room = resize::room_below(clamped.y, viewport);
+        let held_h = held_h.map(|h| h.min(room));
+        (
+            clamped,
+            panel_w - rim,
+            held_h.map(|h| h - rim),
+            held_h.map_or(((viewport.height() - 120.0).max(96.0)).min(room), |h| h - rim),
+        )
     } else {
         let r = input
             .dock_rect
             .unwrap_or_else(|| fallback_dock_rect(viewport, state.side));
-        (r.min, Some(r.height().max(48.0)), r.height().max(48.0))
+        (
+            r.min,
+            r.width().max(120.0_f32.min(viewport.width())),
+            Some(r.height().max(48.0)),
+            r.height().max(48.0),
+        )
     };
 
     egui::Area::new(egui::Id::new(SIDEBAR_AREA_ID))
@@ -1285,7 +1324,7 @@ pub fn show(
                     egui::ScrollArea::vertical()
                         .id_salt("wall_sidebar_body")
                         .max_height(body_max_h)
-                        .auto_shrink([false, is_float])
+                        .auto_shrink([false, fixed_h.is_none()])
                         .show(ui, |ui| {
                             ui.set_width(panel_w);
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
@@ -1390,6 +1429,21 @@ pub fn show(
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(0x22, 0x28, 0x34)),
                 );
             }
+
+            // The edges that resize it, over the rows and the scroll bar.
+            resize::grips(
+                ui,
+                &mut state.resize,
+                &ResizeSpec {
+                    verb: "wall.sidebar",
+                    side: state.side,
+                    rect: frame_resp.response.rect,
+                    limits,
+                    viewport,
+                    centered: false,
+                },
+                out,
+            );
         });
 }
 

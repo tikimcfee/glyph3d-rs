@@ -4149,3 +4149,63 @@ fn new_terminal_size_is_what_spawn_and_split_ask_for_and_survives_a_restart() {
     again.run_ok("wall.config newTerminalSize default");
     assert_eq!(sizes_asked_by(&mut again, "wall.spawn"), vec![(100, 30)]);
 }
+
+
+// ── Panel sizes (`wall.<panel> width|size`) ──────────────────────────────────
+
+#[test]
+fn a_resized_panel_moves_the_dock_layout_and_keeps_its_size_through_a_restart() {
+    use wall_core::dock::{PanelKind, DOCK_WIDTHS};
+
+    let storage = SharedStorage::default();
+    let opts = WallOptions {
+        platform: Platform::Mac,
+        geometry: CellGeometry {
+            stride: Point::new(0.6, 1.2),
+            padding: Point::new(0.4, 0.4),
+            scale_z: 1.0,
+        },
+        ..Default::default()
+    };
+
+    {
+        let mut h = Harness::with_storage(storage.clone(), "resize-scope", opts.clone());
+        h.run_ok("wall.sidebar right");
+        h.run_ok("wall.settings right");
+        let before = h.frame().panels.dock;
+        assert_eq!(before.widths, DOCK_WIDTHS);
+        assert_eq!(before.offset(PanelKind::Settings), DOCK_WIDTHS.sidebar);
+
+        // The sidebar wider: settings, stacked inside it, moves over, and
+        // the topbar's inset and the edge taken from the canvas follow.
+        h.run_ok("wall.sidebar width 400");
+        let after = h.frame().panels.dock;
+        assert_eq!(after.widths.sidebar, 400.0);
+        assert_eq!(after.offset(PanelKind::Settings), 400.0);
+        assert_eq!(after.edges.right, 400.0 + DOCK_WIDTHS.settings);
+        assert_eq!(after.inset.right - before.inset.right, 400.0 - DOCK_WIDTHS.sidebar);
+        assert_eq!(h.frame().panels.sidebar.size.dock_width, Some(400.0));
+
+        // A floating size and the palette's are in the frame for the panels to read.
+        h.run_ok("wall.help float");
+        h.run_ok("wall.help size 520 360");
+        h.run_ok("wall.palette size 700");
+        let frame = h.frame();
+        assert_eq!(frame.panels.help_panel.size.float_width, Some(520.0));
+        assert_eq!(frame.panels.help_panel.size.float_height, Some(360.0));
+        assert_eq!(frame.panels.palette.float_width, Some(700.0));
+        // A floating panel takes no edge, whatever its size.
+        assert_eq!(frame.panels.dock.edges.right, 400.0 + DOCK_WIDTHS.settings);
+    }
+
+    let mut again = Harness::with_storage(storage, "resize-scope", opts);
+    let frame = again.frame();
+    assert_eq!(frame.panels.dock.widths.sidebar, 400.0);
+    assert_eq!(frame.panels.dock.offset(PanelKind::Settings), 400.0);
+    assert_eq!(frame.panels.help_panel.size.float_height, Some(360.0));
+    assert_eq!(frame.panels.palette.float_width, Some(700.0));
+
+    // The default again, and the layout is the standard one.
+    again.run_ok("wall.sidebar width default");
+    assert_eq!(again.frame().panels.dock.widths, DOCK_WIDTHS);
+}

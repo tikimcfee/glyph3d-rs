@@ -2934,6 +2934,12 @@ impl WallModel {
         self.emit_change();
     }
 
+    /// Set the command palette's size (`wall.palette size`).
+    pub fn set_palette_size(&mut self, size: crate::dock::PanelSize) {
+        self.store.set_palette_size(size);
+        self.notify_changed();
+    }
+
     pub fn set_help_panel(&mut self, patch: impl Into<HelpPanelPatch>) {
         self.store.set_help_panel(patch);
         self.emit_change();

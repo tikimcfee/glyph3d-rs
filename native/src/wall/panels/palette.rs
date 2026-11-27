@@ -18,6 +18,9 @@ use wall_core::palette::{
     Palette, PaletteEffect, PaletteItem, PaletteItemKind, PaletteMode, PaletteSnapshot,
 };
 
+use wall_core::dock::{DockSide, PanelSize, PALETTE_LIMITS};
+
+use super::resize::{self, ResizeSpec, ResizeState};
 use super::{format_verb_line, layout_elided, parse_hex_color, safe_viewport_rect};
 
 const INPUT_ID_SALT: &str = "wall_palette_query_input";
@@ -28,11 +31,18 @@ const MODAL_ID_SALT: &str = "wall_palette_modal";
 #[derive(Clone, Debug, Default)]
 pub struct PaletteInput {
     pub snapshot: PaletteSnapshot,
+    /// The size set on the palette (`wall.palette size`): its width, and
+    /// the height its box is held to. Unset, it is 560 px wide and as tall
+    /// as its list, up to most of the window.
+    pub size: PanelSize,
 }
 
 impl From<PaletteSnapshot> for PaletteInput {
     fn from(snapshot: PaletteSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            size: PanelSize::default(),
+        }
     }
 }
 
@@ -53,6 +63,8 @@ pub struct PaletteState {
     pub last_rect: Option<egui::Rect>,
     /// Number of filtered items shown in `Find` mode on the last open pass.
     pub item_count: usize,
+    /// The edge grips, and a resize drag in progress.
+    pub resize: ResizeState,
 }
 
 impl PaletteState {
@@ -162,6 +174,7 @@ pub fn show(
         state.wants_keyboard = false;
         state.last_rect = None;
         state.item_count = 0;
+        state.resize.reset();
         return;
     }
     state.wants_keyboard = true;
@@ -185,10 +198,23 @@ pub fn show(
     });
 
     let viewport = safe_viewport_rect(ctx);
-    let box_width = (viewport.width() - 32.0).clamp(140.0, 560.0);
+    let box_width = resize::float_width(
+        &state.resize,
+        &input.size,
+        PALETTE_LIMITS.float_default_width as f32,
+        viewport,
+    )
+    .max(140.0);
     let box_left = viewport.left() + ((viewport.width() - box_width) * 0.5).max(0.0);
+    // The box's 1 px border is outside what it holds: the size is the box
+    // with it.
+    let box_width = box_width - 2.0 * resize::FLOAT_RIM_PX;
     let box_top = viewport.top() + (viewport.height() * 0.14).clamp(6.0, viewport.height() * 0.5);
     let list_max_h = (viewport.height() * 0.60).max(56.0);
+    // The height the box is held to once one is set (or its bottom is being
+    // dragged): the list then fills what the input leaves of it.
+    let held_height = resize::float_height(&state.resize, &input.size, viewport)
+        .map(|h| h.min((viewport.bottom() - box_top - 8.0).max(96.0)));
 
     // Full-viewport scrim (`Palette.jsx:239`).
     let mut scrim_clicked = false;
@@ -242,7 +268,7 @@ pub fn show(
                     color: egui::Color32::from_black_alpha(150),
                 });
 
-            frame.show(ui, |ui| {
+            let framed = frame.show(ui, |ui| {
                 ui.set_width(box_width);
                 ui.set_max_width(box_width);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
@@ -326,10 +352,13 @@ pub fn show(
                         .selected
                         .min(items.len().saturating_sub(1));
 
+                    let list_h = held_height.map(|h| {
+                        (box_top + h - resize::FLOAT_RIM_PX - ui.cursor().top()).max(40.0)
+                    });
                     egui::ScrollArea::vertical()
                         .id_salt("wall_palette_list")
-                        .max_height(list_max_h)
-                        .auto_shrink([false, true])
+                        .max_height(list_h.unwrap_or(list_max_h))
+                        .auto_shrink([false, list_h.is_none()])
                         .show(ui, |ui| {
                             ui.set_width(box_width);
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
@@ -436,6 +465,22 @@ pub fn show(
                         });
                 }
             });
+
+            // The edges that resize it: the sides its width (it stays
+            // centred), the bottom its height.
+            resize::grips(
+                ui,
+                &mut state.resize,
+                &ResizeSpec {
+                    verb: "wall.palette",
+                    side: DockSide::Float,
+                    rect: framed.response.rect,
+                    limits: PALETTE_LIMITS,
+                    viewport,
+                    centered: true,
+                },
+                out,
+            );
         });
     modal_rect = modal_rect.union(area_resp.response.rect);
     state.last_rect = Some(modal_rect);

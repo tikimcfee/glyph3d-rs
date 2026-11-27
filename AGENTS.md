@@ -43,7 +43,8 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   input/clipboard/screenshot/state verbs), and `session`; `egui-ui` adds `ui`
   (on-demand egui host + `F1` debug HUD), `mount`, and `panels/` (`topbar`,
   `bar_buttons`, `palette`, `sidebar`, `docked/{settings,status}`,
-  `menus/{context_menu,help}`, `agent_view`).
+  `menus/{context_menu,help}`, `agent_view`, and `resize`: the grips on a
+  panel's edges, 2026-11-27).
 - `glyph/` — the build/verify tool: the gate runner. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the

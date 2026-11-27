@@ -2,8 +2,8 @@
 //! in place of browser `localStorage`.
 //!
 //! Stores terminal positions, custom names, attached gomuxai targets, hidden flags, groups
-//! (including split trees), panel placements (`sidebar`, `status`, `settings`, `help`),
-//! dialled configuration overrides, fullscreen state and per-terminal fullscreen text sizes,
+//! (including split trees), panel placements and sizes (`sidebar`, `status`, `settings`,
+//! `help`, and the palette's size), dialled configuration overrides, fullscreen state and per-terminal fullscreen text sizes,
 //! and Agent View entries. Each store instance is scoped by a name passed at construction
 //! (where the JS app scopes by relay port), pruned against live terminal ids on connect, and
 //! written atomically via a sibling temporary file renamed into place.
@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentSide, GroupLayout};
+use crate::dock::{DockWidths, PanelKind, PanelSize, PALETTE_LIMITS};
 use crate::geom::Point;
 use crate::sidebar::SidebarMode;
 use crate::split::{self, SplitNode};
@@ -146,6 +147,7 @@ pub struct StoreKeys {
     pub fullscreen_text: String,
     pub agent_views: String,
     pub attached: String,
+    pub palette: String,
 }
 
 impl StoreKeys {
@@ -165,6 +167,7 @@ impl StoreKeys {
             fullscreen_text: k("fullscreenText"),
             agent_views: k("agentViews"),
             attached: k("attached"),
+            palette: k("palette"),
         }
     }
 }
@@ -261,6 +264,10 @@ pub struct SidebarState {
     /// A store written before it reads as `group`.
     #[serde(default)]
     pub mode: SidebarMode,
+    /// The sizes its edges were dragged to (`wall.sidebar width|size`,
+    /// 2026-11-27). A store written before it reads as the defaults.
+    #[serde(default, skip_serializing_if = "PanelSize::is_default")]
+    pub size: PanelSize,
 }
 
 impl Default for SidebarState {
@@ -271,6 +278,7 @@ impl Default for SidebarState {
             float: Point::new(80.0, 80.0),
             collapsed: Vec::new(),
             mode: SidebarMode::default(),
+            size: PanelSize::default(),
         }
     }
 }
@@ -283,6 +291,7 @@ pub struct SidebarPatch {
     pub float: Option<Point>,
     pub collapsed: Option<Vec<String>>,
     pub mode: Option<SidebarMode>,
+    pub size: Option<PanelSize>,
 }
 
 impl From<SidebarState> for SidebarPatch {
@@ -293,6 +302,7 @@ impl From<SidebarState> for SidebarPatch {
             float: Some(s.float),
             collapsed: Some(s.collapsed),
             mode: Some(s.mode),
+            size: Some(s.size),
         }
     }
 }
@@ -304,6 +314,10 @@ pub struct StatusWindowState {
     pub side: PanelSide,
     #[serde(default, with = "serde_opt_point")]
     pub float: Option<Point>,
+    /// The sizes its edges were dragged to (`wall.status width|size`,
+    /// 2026-11-27). A store written before it reads as the defaults.
+    #[serde(default, skip_serializing_if = "PanelSize::is_default")]
+    pub size: PanelSize,
 }
 
 impl Default for StatusWindowState {
@@ -312,6 +326,7 @@ impl Default for StatusWindowState {
             open: false,
             side: PanelSide::Float,
             float: None,
+            size: PanelSize::default(),
         }
     }
 }
@@ -324,6 +339,7 @@ pub struct StatusWindowPatch {
     pub open: Option<bool>,
     pub side: Option<PanelSide>,
     pub float: Option<Option<Point>>,
+    pub size: Option<PanelSize>,
 }
 
 impl From<StatusWindowState> for StatusWindowPatch {
@@ -332,6 +348,7 @@ impl From<StatusWindowState> for StatusWindowPatch {
             open: Some(s.open),
             side: Some(s.side),
             float: Some(s.float),
+            size: Some(s.size),
         }
     }
 }
@@ -344,6 +361,10 @@ pub struct SettingsPanelState {
     #[serde(default, with = "serde_opt_point")]
     pub float: Option<Point>,
     pub collapsed: Vec<String>,
+    /// The sizes its edges were dragged to (`wall.settings width|size`,
+    /// 2026-11-27). A store written before it reads as the defaults.
+    #[serde(default, skip_serializing_if = "PanelSize::is_default")]
+    pub size: PanelSize,
 }
 
 impl Default for SettingsPanelState {
@@ -353,6 +374,7 @@ impl Default for SettingsPanelState {
             side: PanelSide::Float,
             float: None,
             collapsed: Vec::new(),
+            size: PanelSize::default(),
         }
     }
 }
@@ -364,6 +386,7 @@ pub struct SettingsPanelPatch {
     pub side: Option<PanelSide>,
     pub float: Option<Option<Point>>,
     pub collapsed: Option<Vec<String>>,
+    pub size: Option<PanelSize>,
 }
 
 impl From<SettingsPanelState> for SettingsPanelPatch {
@@ -373,6 +396,7 @@ impl From<SettingsPanelState> for SettingsPanelPatch {
             side: Some(s.side),
             float: Some(s.float),
             collapsed: Some(s.collapsed),
+            size: Some(s.size),
         }
     }
 }
@@ -384,6 +408,10 @@ pub struct HelpPanelState {
     pub side: PanelSide,
     #[serde(default, with = "serde_opt_point")]
     pub float: Option<Point>,
+    /// The sizes its edges were dragged to (`wall.help width|size`,
+    /// 2026-11-27). A store written before it reads as the defaults.
+    #[serde(default, skip_serializing_if = "PanelSize::is_default")]
+    pub size: PanelSize,
 }
 
 impl Default for HelpPanelState {
@@ -392,6 +420,7 @@ impl Default for HelpPanelState {
             open: false,
             side: PanelSide::Float,
             float: None,
+            size: PanelSize::default(),
         }
     }
 }
@@ -402,6 +431,7 @@ pub struct HelpPanelPatch {
     pub open: Option<bool>,
     pub side: Option<PanelSide>,
     pub float: Option<Option<Point>>,
+    pub size: Option<PanelSize>,
 }
 
 impl From<HelpPanelState> for HelpPanelPatch {
@@ -410,6 +440,7 @@ impl From<HelpPanelState> for HelpPanelPatch {
             open: Some(s.open),
             side: Some(s.side),
             float: Some(s.float),
+            size: Some(s.size),
         }
     }
 }
@@ -473,7 +504,8 @@ pub struct AgentViewState {
     pub filters: Option<BTreeMap<String, bool>>,
 }
 
-/// On-disk JSON document with the exact 13 section keys and shapes of `WallStore.js`.
+/// On-disk JSON document: the 13 section keys and shapes of `WallStore.js`, and
+/// `palette`, the command palette's size (native only, 2026-11-27).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreDocumentRef<'a> {
@@ -490,6 +522,8 @@ struct StoreDocumentRef<'a> {
     fullscreen: &'a Option<FullscreenState>,
     fullscreen_text: &'a BTreeMap<String, f64>,
     agent_views: &'a BTreeMap<String, AgentViewState>,
+    #[serde(skip_serializing_if = "PanelSize::is_default")]
+    palette: &'a PanelSize,
 }
 
 /// Durable wall state scoped by name and persisted atomically through [`Storage`].
@@ -511,6 +545,7 @@ pub struct WallStore {
     fullscreen: Option<FullscreenState>,
     fullscreen_text: BTreeMap<String, f64>,
     agent_views: BTreeMap<String, AgentViewState>,
+    palette: PanelSize,
 }
 
 impl WallStore {
@@ -591,6 +626,11 @@ impl WallStore {
             })
             .unwrap_or_default();
 
+        let palette = field("palette")
+            .and_then(|v| serde_json::from_value::<PanelSize>(v.clone()).ok())
+            .map(|size| size.within(&PALETTE_LIMITS))
+            .unwrap_or_default();
+
         WallStore {
             scope,
             keys,
@@ -609,6 +649,7 @@ impl WallStore {
             fullscreen,
             fullscreen_text,
             agent_views,
+            palette,
         }
     }
 
@@ -654,6 +695,7 @@ impl WallStore {
             fullscreen: &self.fullscreen,
             fullscreen_text: &self.fullscreen_text,
             agent_views: &self.agent_views,
+            palette: &self.palette,
         };
         let mut bytes =
             serde_json::to_vec_pretty(&doc).expect("WallStore document always serializes");
@@ -677,6 +719,7 @@ impl WallStore {
         self.fullscreen = None;
         self.fullscreen_text.clear();
         self.agent_views.clear();
+        self.palette = PanelSize::default();
     }
 
     // ── terminals ────────────────────────────────────────────────────────────
@@ -985,6 +1028,48 @@ impl WallStore {
         if let Some(mode) = p.mode {
             self.sidebar.mode = mode;
         }
+        if let Some(size) = p.size {
+            self.sidebar.size = size;
+        }
+        self.persist();
+    }
+
+    // ── panel sizes ──────────────────────────────────────────────────────────
+
+    /// The size set on one dockable panel (`None` fields: its defaults).
+    pub fn panel_size(&self, kind: PanelKind) -> PanelSize {
+        match kind {
+            PanelKind::Sidebar => self.sidebar.size,
+            PanelKind::Status => self.status.size,
+            PanelKind::Settings => self.settings.size,
+            PanelKind::Help => self.help.size,
+        }
+    }
+
+    /// How wide each panel is when docked: the width set on it, else its
+    /// default ([`crate::dock::DOCK_WIDTHS`]).
+    pub fn dock_widths(&self) -> DockWidths {
+        let mut widths = DockWidths::default();
+        for kind in PanelKind::ALL {
+            if let Some(width) = self.panel_size(kind).dock_width {
+                widths.set(kind, width);
+            }
+        }
+        widths
+    }
+
+    /// The command palette's size: its floating width and height (it has no
+    /// docked form).
+    pub fn palette_size(&self) -> PanelSize {
+        self.palette
+    }
+
+    /// Set the command palette's size (`wall.palette size`).
+    pub fn set_palette_size(&mut self, size: PanelSize) {
+        if self.palette == size {
+            return;
+        }
+        self.palette = size;
         self.persist();
     }
 
@@ -1004,6 +1089,9 @@ impl WallStore {
         }
         if let Some(float) = p.float {
             self.status.float = float;
+        }
+        if let Some(size) = p.size {
+            self.status.size = size;
         }
         self.persist();
     }
@@ -1047,6 +1135,9 @@ impl WallStore {
         if let Some(collapsed) = p.collapsed {
             self.settings.collapsed = collapsed;
         }
+        if let Some(size) = p.size {
+            self.settings.size = size;
+        }
         self.persist();
     }
 
@@ -1066,6 +1157,9 @@ impl WallStore {
         }
         if let Some(float) = p.float {
             self.help.float = float;
+        }
+        if let Some(size) = p.size {
+            self.help.size = size;
         }
         self.persist();
     }
@@ -1162,7 +1256,19 @@ fn parse_sidebar(raw: Option<&serde_json::Value>) -> SidebarState {
     {
         out.mode = mode;
     }
+    out.size = parse_panel_size(obj, PanelKind::Sidebar);
     out
+}
+
+/// A panel's `size` as stored, with anything outside its limits dropped.
+fn parse_panel_size(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    kind: PanelKind,
+) -> PanelSize {
+    obj.get("size")
+        .and_then(|v| serde_json::from_value::<PanelSize>(v.clone()).ok())
+        .map(|size| size.within(&kind.limits()))
+        .unwrap_or_default()
 }
 
 fn parse_status_window(raw: Option<&serde_json::Value>) -> StatusWindowState {
@@ -1184,6 +1290,7 @@ fn parse_status_window(raw: Option<&serde_json::Value>) -> StatusWindowState {
             out.float = opt.map(Point::from);
         }
     }
+    out.size = parse_panel_size(obj, PanelKind::Status);
     out
 }
 
@@ -1212,6 +1319,7 @@ fn parse_settings_panel(raw: Option<&serde_json::Value>) -> SettingsPanelState {
     {
         out.collapsed = collapsed;
     }
+    out.size = parse_panel_size(obj, PanelKind::Settings);
     out
 }
 
@@ -1234,6 +1342,7 @@ fn parse_help_panel(raw: Option<&serde_json::Value>) -> HelpPanelState {
             out.float = opt.map(Point::from);
         }
     }
+    out.size = parse_panel_size(obj, PanelKind::Help);
     out
 }
 
@@ -1396,6 +1505,7 @@ mod tests {
                 float: Point::new(80.0, 80.0),
                 collapsed: vec!["g-1".to_string()],
                 mode: SidebarMode::Host,
+                size: PanelSize::default(),
             }
         );
         assert!(WallStore::open(&dir.0, "8093").groups().is_empty());
@@ -1434,6 +1544,7 @@ mod tests {
                 open: false,
                 side: PanelSide::Float,
                 float: None,
+                size: PanelSize::default(),
             }
         );
         s.set_sidebar(SidebarPatch {
@@ -1445,6 +1556,7 @@ mod tests {
             open: Some(true),
             side: Some(PanelSide::Float),
             float: Some(Some(Point::new(40.0, 60.0))),
+            ..Default::default()
         });
         s.set_status_window(StatusWindowPatch {
             side: Some(PanelSide::Right),
@@ -1458,6 +1570,7 @@ mod tests {
                 open: true,
                 side: PanelSide::Right,
                 float: Some(Point::new(40.0, 60.0)),
+                size: PanelSize::default(),
             }
         );
         assert_eq!(
@@ -1468,6 +1581,7 @@ mod tests {
                 float: Point::new(80.0, 80.0),
                 collapsed: Vec::new(),
                 mode: SidebarMode::Group,
+                size: PanelSize::default(),
             }
         );
         assert_ne!(back.keys().status, back.keys().sidebar);
@@ -1650,6 +1764,92 @@ mod tests {
 
         reloaded.clear_config("background");
         assert!(WallStore::open(&dir.0, "rs-wall").config().is_empty());
+    }
+
+    #[test]
+    fn panel_sizes_round_trip_per_panel_and_a_bad_one_reads_as_the_default() {
+        use crate::dock::DOCK_WIDTHS;
+
+        let dir = ScratchDir::new("sizes");
+        let mut s = WallStore::open(&dir.0, "8101");
+        // Nothing set: every panel docks at its standard width.
+        assert_eq!(s.dock_widths(), DOCK_WIDTHS);
+        assert!(s.palette_size().is_default());
+
+        let sidebar = PanelSize {
+            dock_width: Some(320.0),
+            ..PanelSize::default()
+        };
+        let settings = PanelSize {
+            dock_width: None,
+            float_width: Some(760.0),
+            float_height: Some(540.0),
+        };
+        s.set_sidebar(SidebarPatch {
+            size: Some(sidebar),
+            ..Default::default()
+        });
+        s.set_settings_panel(SettingsPanelPatch {
+            size: Some(settings),
+            ..Default::default()
+        });
+        s.set_palette_size(PanelSize {
+            float_width: Some(700.0),
+            ..PanelSize::default()
+        });
+        // A patch that names no size leaves it alone.
+        s.set_sidebar(SidebarPatch {
+            open: Some(true),
+            ..Default::default()
+        });
+
+        let back = WallStore::open(&dir.0, "8101");
+        assert_eq!(back.sidebar().size, sidebar);
+        assert_eq!(back.panel_size(PanelKind::Sidebar), sidebar);
+        assert_eq!(back.settings_panel().size, settings);
+        assert_eq!(back.status_window().size, PanelSize::default());
+        assert_eq!(back.help_panel().size, PanelSize::default());
+        assert_eq!(back.palette_size().float_width, Some(700.0));
+        let widths = back.dock_widths();
+        assert_eq!(widths.sidebar, 320.0);
+        // A floating size does not change the docked width.
+        assert_eq!(widths.settings, DOCK_WIDTHS.settings);
+        assert_eq!(widths.status, DOCK_WIDTHS.status);
+
+        // On disk: only what was set, under each panel's own key.
+        let text = fs::read_to_string(back.path().unwrap()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["sidebar"]["size"], serde_json::json!({ "dockWidth": 320.0 }));
+        assert_eq!(
+            doc["settings"]["size"],
+            serde_json::json!({ "floatWidth": 760.0, "floatHeight": 540.0 })
+        );
+        assert!(doc["status"].get("size").is_none());
+        assert_eq!(doc["palette"], serde_json::json!({ "floatWidth": 700.0 }));
+
+        // A file edited by hand: sizes no panel may have, and one that is
+        // not a size at all, read as the defaults; the rest of the panel's
+        // state is kept.
+        let mut edited = doc.clone();
+        edited["sidebar"]["size"] = serde_json::json!({ "dockWidth": 3.0, "floatWidth": 400.0 });
+        edited["settings"]["size"] = serde_json::json!("wide");
+        edited["palette"] = serde_json::json!({ "floatWidth": 1.0, "floatHeight": 300.0 });
+        fs::write(back.path().unwrap(), serde_json::to_vec(&edited).unwrap()).unwrap();
+        let hand = WallStore::open(&dir.0, "8101");
+        assert!(hand.sidebar().open);
+        assert_eq!(
+            hand.sidebar().size,
+            PanelSize { dock_width: None, float_width: Some(400.0), float_height: None }
+        );
+        assert_eq!(hand.settings_panel().size, PanelSize::default());
+        assert_eq!(
+            hand.palette_size(),
+            PanelSize { dock_width: None, float_width: None, float_height: Some(300.0) }
+        );
+
+        // A store written before sizes existed reads as the defaults.
+        let old = WallStore::open(&dir.0, "8102");
+        assert_eq!(old.dock_widths(), DOCK_WIDTHS);
     }
 
     #[test]

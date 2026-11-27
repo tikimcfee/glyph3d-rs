@@ -622,6 +622,7 @@ mod tests {
                 side: PanelSide::Right,
                 float: None,
                 collapsed: Vec::new(),
+                ..SettingsPlacement::default()
             },
             platform: Platform::Mac,
             dock_rect: Some(egui::Rect::from_min_size(
@@ -696,6 +697,7 @@ mod tests {
                 open: true,
                 side: PanelSide::Float,
                 float: Some(Point::new(24.0, 96.0)),
+                ..StatusPlacement::default()
             },
             termd,
             1_794_519_129_000,

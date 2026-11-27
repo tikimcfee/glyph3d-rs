@@ -51,7 +51,7 @@ use crate::commands::{
     WallSnapshot as CmdWallSnapshot,
 };
 use crate::config::{AgentSide, GroupLayout, WallConfig, WALL_CONFIG_KEYS};
-use crate::dock::{dock_layout, DockLayout, DockSide, DockState};
+use crate::dock::{dock_layout, DockLayout, DockSide, DockState, PanelSize};
 use crate::fullscreen::{
     dock_state_from_store, EnterOptions, FullscreenArea, FullscreenConfig, FullscreenHost,
     FullscreenTerminal, TextStep, WallFullscreen, BACKDROP_OPACITY,
@@ -556,6 +556,8 @@ pub struct PanelsFrame {
     pub settings_panel: SettingsPanelState,
     pub help_panel: HelpPanelState,
     pub dock: DockLayout,
+    /// The command palette's size (the floating half; it has no docked form).
+    pub palette: PanelSize,
 }
 
 /// Complete plain-data description of one rendered frame of the wall.
@@ -3160,6 +3162,7 @@ impl WallCore {
             settings_panel: self.model.store().settings_panel().clone(),
             help_panel: self.model.store().help_panel().clone(),
             dock: dock_layout(&dock_state),
+            palette: self.model.store().palette_size(),
         };
 
         let animating = self.model.camera().moving()
@@ -3682,6 +3685,7 @@ impl WallApi for WallCore {
                     float: Some(PointPayload::from(s.float)),
                     collapsed: s.collapsed.clone(),
                     mode: Some(s.mode.as_str().to_owned()),
+                    size: s.size,
                 }
             }
             PanelKind::Status => {
@@ -3692,6 +3696,7 @@ impl WallApi for WallCore {
                     float: s.float.map(PointPayload::from),
                     collapsed: Vec::new(),
                     mode: None,
+                    size: s.size,
                 }
             }
             PanelKind::Settings => {
@@ -3702,6 +3707,7 @@ impl WallApi for WallCore {
                     float: s.float.map(PointPayload::from),
                     collapsed: s.collapsed.clone(),
                     mode: None,
+                    size: s.size,
                 }
             }
             PanelKind::Help => {
@@ -3712,6 +3718,7 @@ impl WallApi for WallCore {
                     float: s.float.map(PointPayload::from),
                     collapsed: Vec::new(),
                     mode: None,
+                    size: s.size,
                 }
             }
         }
@@ -3726,22 +3733,26 @@ impl WallApi for WallCore {
                 float: patch.float,
                 collapsed: patch.collapsed,
                 mode: patch.mode.as_deref().and_then(SidebarMode::parse),
+                size: patch.size,
             }),
             PanelKind::Status => self.model.set_status_window(StatusWindowPatch {
                 open: patch.open,
                 side,
                 float: patch.float.map(Some),
+                size: patch.size,
             }),
             PanelKind::Settings => self.model.set_settings_panel(SettingsPanelPatch {
                 open: patch.open,
                 side,
                 float: patch.float.map(Some),
                 collapsed: patch.collapsed,
+                size: patch.size,
             }),
             PanelKind::Help => self.model.set_help_panel(HelpPanelPatch {
                 open: patch.open,
                 side,
                 float: patch.float.map(Some),
+                size: patch.size,
             }),
         }
         if self.fullscreen.active() {
@@ -4117,6 +4128,14 @@ impl WallApi for WallCore {
             self.palette_open = open;
             self.model.notify_changed();
         }
+    }
+
+    fn palette_size(&self) -> PanelSize {
+        self.model.store().palette_size()
+    }
+
+    fn set_palette_size(&mut self, size: PanelSize) {
+        self.model.set_palette_size(size);
     }
 
     fn agent_set_stick_bottom(&mut self, id: &str, mode: &str) -> Result<bool, String> {

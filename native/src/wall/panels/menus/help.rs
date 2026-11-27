@@ -7,10 +7,12 @@
 //! the rectangle given by [`wall_core::dock::dock_layout`].
 
 use wall_core::chord::chord_label;
-use wall_core::dock::{DOCK_WIDTHS, DockLayout, DockSide};
+use wall_core::dock::{DockLayout, DockSide, PanelKind, PanelSize};
 use wall_core::geom::Point;
 use wall_core::input::Platform;
 use wall_core::keymap::{HelpGroup, search_help};
+
+use crate::wall::panels::resize::{self, ResizeSpec, ResizeState};
 
 // Opaque #0e1118 on linear-blended sRGB targets so bright terminal borders behind
 // the panel do not ghost through (`config/defaults.toml` [wall] panel_opacity note).
@@ -45,6 +47,9 @@ pub struct HelpPanelInput {
     pub platform: Platform,
     /// Populated help sections from [`wall_core::keymap::help_sections`].
     pub sections: Vec<HelpGroup>,
+    /// The sizes set on the panel (the store's): its floating width and
+    /// height are read here; its docked width arrives in `dock_rect`.
+    pub size: PanelSize,
 }
 
 impl Default for HelpPanelInput {
@@ -56,6 +61,7 @@ impl Default for HelpPanelInput {
             dock_rect: None,
             platform: current_platform(),
             sections: Vec::new(),
+            size: PanelSize::default(),
         }
     }
 }
@@ -68,7 +74,7 @@ impl HelpPanelInput {
         layout: &DockLayout,
         viewport: egui::Rect,
     ) -> Option<egui::Rect> {
-        let width = (DOCK_WIDTHS.help as f32).min(viewport.width().max(1.0));
+        let width = (layout.widths.help as f32).min(viewport.width().max(1.0));
         let offset = layout.help as f32;
         match side {
             DockSide::Left => {
@@ -115,6 +121,8 @@ pub struct HelpPanelState {
     /// Current search box text (`query` in `wall/HelpPanel.jsx`).
     pub query: String,
     drag: Option<HeadDrag>,
+    /// The edge grips, and a resize drag in progress.
+    pub resize: ResizeState,
     last_rect: Option<egui::Rect>,
     /// Floating header drag rectangle when open.
     pub header_drag_rect: Option<egui::Rect>,
@@ -167,6 +175,7 @@ pub fn show(
         state.last_rect = None;
         state.header_drag_rect = None;
         state.shown_row_count = 0;
+        state.resize.reset();
         return false;
     }
 
@@ -259,6 +268,7 @@ pub fn show(
     let (panel_pos, panel_width, fixed_height, max_height) = compute_box_geometry(
         input,
         state.drag.map(|d| d.current_pos),
+        &state.resize,
         viewport,
     );
 
@@ -350,6 +360,21 @@ pub fn show(
                 }
                 DockSide::Float => {}
             }
+
+            // The edges that resize it.
+            resize::grips(
+                ui,
+                &mut state.resize,
+                &ResizeSpec {
+                    verb: "wall.help",
+                    side: input.side,
+                    rect,
+                    limits: PanelKind::Help.limits(),
+                    viewport,
+                    centered: false,
+                },
+                out,
+            );
         });
 
     state.last_rect = Some(area_resp.response.rect);
@@ -359,6 +384,7 @@ pub fn show(
 fn compute_box_geometry(
     input: &HelpPanelInput,
     drag_pos: Option<egui::Pos2>,
+    resizing: &ResizeState,
     viewport: egui::Rect,
 ) -> (egui::Pos2, f32, Option<f32>, f32) {
     match input.side {
@@ -373,10 +399,19 @@ fn compute_box_geometry(
             (rect.min, width, Some(height), height)
         }
         DockSide::Float => {
-            let max_w = (viewport.width() - 32.0).max(140.0);
-            let width = (DOCK_WIDTHS.help as f32).min(max_w);
-            let max_h = (viewport.height() - 120.0).max(120.0);
-            let pos = drag_pos
+            let width = resize::float_width(
+                resizing,
+                &input.size,
+                PanelKind::Help.limits().float_default_width as f32,
+                viewport,
+            );
+            // Held to a height once one is set (or the bottom is being
+            // dragged); else as tall as its rows, up to the viewport's room.
+            let held = resize::float_height(resizing, &input.size, viewport);
+            let max_h = held.unwrap_or((viewport.height() - 120.0).max(120.0));
+            // A drag on an edge pins the panel where the drag has it.
+            let pos = resize::float_origin(resizing)
+                .or(drag_pos)
                 .or_else(|| input.float_pos.map(|p| egui::pos2(p.x as f32, p.y as f32)))
                 .unwrap_or_else(|| {
                     egui::pos2(
@@ -384,7 +419,12 @@ fn compute_box_geometry(
                         viewport.top() + FLOAT_DEFAULT_TOP,
                     )
                 });
-            (pos, width, None, max_h)
+            // Its bottom edge stays in the window, wherever it was put.
+            let max_h = max_h.min(resize::room_below(pos.y, viewport));
+            // The floating panel's 1 px border is outside what it holds:
+            // the size is the box with it.
+            let rim = 2.0 * resize::FLOAT_RIM_PX;
+            (pos, width - rim, held.map(|_| max_h - rim), max_h - rim)
         }
     }
 }
@@ -729,7 +769,7 @@ impl SaturatingSubF32 for f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wall_core::dock::{DockPanel, DockState, dock_layout};
+    use wall_core::dock::{DOCK_WIDTHS, DockPanel, DockState, dock_layout};
     use wall_core::keymap::{HelpVerb, help_sections};
 
     fn sample_sections() -> Vec<HelpGroup> {
@@ -800,6 +840,7 @@ mod tests {
                     dock_rect: HelpPanelInput::dock_rect_for(side, &dock, viewport),
                     platform: Platform::Mac,
                     sections: sections.clone(),
+    size: Default::default(),
                 };
                 let ctx = egui::Context::default();
                 let mut state = HelpPanelState::default();
@@ -830,6 +871,7 @@ mod tests {
             dock_rect: None,
             platform: Platform::Mac,
             sections: sample_sections(),
+    size: Default::default(),
         };
         let ctx = egui::Context::default();
         let mut state = HelpPanelState::default();
@@ -916,6 +958,7 @@ mod tests {
             dock_rect: None,
             platform: Platform::Mac,
             sections: sample_sections(),
+    size: Default::default(),
         };
         let ctx = egui::Context::default();
         let mut state = HelpPanelState::default();
@@ -1050,6 +1093,7 @@ mod tests {
             dock_rect: None,
             platform: Platform::Other,
             sections: vec![],
+    size: Default::default(),
         };
         let ctx = egui::Context::default();
         let mut state = HelpPanelState::default();

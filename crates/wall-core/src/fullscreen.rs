@@ -156,6 +156,7 @@ pub fn dock_state_from_store(store: &WallStore) -> DockState {
         status_window: DockPanel::new(st.open, st.side),
         settings_panel: Some(DockPanel::new(se.open, se.side)),
         help_panel: Some(DockPanel::new(he.open, he.side)),
+        widths: store.dock_widths(),
     }
 }
 

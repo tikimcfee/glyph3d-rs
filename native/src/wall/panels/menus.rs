@@ -145,6 +145,7 @@ mod tests {
             dock_rect: HelpPanelInput::dock_rect_for(DockSide::Right, &dock, viewport_rect),
             platform: Platform::Mac,
             sections: help_sections(Platform::Mac, "ctrl alt meta", &verbs).expect("valid"),
+    size: Default::default(),
         };
 
         let egui_ctx = egui::Context::default();

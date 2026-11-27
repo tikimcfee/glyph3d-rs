@@ -9,14 +9,21 @@
 //! - Right-click / menu-key context menu ([`panels::context_menu`], open state in `WallFrame::menu`)
 //! - Help reference sheet ([`panels::help`], open & dock state in `WallFrame::panels.help_panel`)
 //!
-//! [`Wall`] owns the open and placement state of all panels; [`Panels`] owns
-//! only each widget's transient UI view state (queries, active row, drafts,
-//! drag offsets, hold-to-close progress, and cached help sections).
+//! [`Wall`] owns the open, placement and size state of all panels; [`Panels`]
+//! owns only each widget's transient UI view state (queries, active row,
+//! drafts, drag offsets, hold-to-close progress, and cached help sections).
+//!
+//! A panel's edge can be dragged ([`panels::resize`]). The size reaches the
+//! wall on release, as a verb; until then the docked panels and the topbar
+//! are laid out with the dragged width ([`Panels::live_dock`]), so what is
+//! stacked inside a panel follows its edge as it moves.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use wall_core::dock::{DOCK_WIDTHS, DockSide};
+use wall_core::dock::{
+    DockLayout, DockPanel, DockSide, DockState, PanelKind, PanelSize, dock_layout,
+};
 use wall_core::geom::Point;
 use wall_core::input::Platform;
 use wall_core::keymap::{FieldFocus, HelpGroup};
@@ -121,6 +128,41 @@ impl Panels {
         self.help_wants_keys = false;
     }
 
+    /// The dock layout the panels are drawn with: the wall's, with the
+    /// width of any docked panel whose edge is being dragged taken from the
+    /// drag. The wall's own layout (what a fullscreen terminal fits beside)
+    /// moves when the drag ends and the width is stored.
+    fn live_dock(&self, described: &WallFrame) -> DockLayout {
+        let p = &described.panels;
+        let mut widths = p.dock.widths;
+        let dragged = [
+            (PanelKind::Sidebar, p.sidebar.side, &self.sidebar.resize),
+            (PanelKind::Status, p.status_window.side, &self.status.resize),
+            (PanelKind::Settings, p.settings_panel.side, &self.settings.resize),
+            (PanelKind::Help, p.help_panel.side, &self.help.resize),
+        ];
+        let mut any = false;
+        for (kind, side, resize) in dragged {
+            if side == DockSide::Float {
+                continue;
+            }
+            if let Some(width) = resize.live_width() {
+                widths.set(kind, f64::from(width));
+                any = true;
+            }
+        }
+        if !any {
+            return p.dock;
+        }
+        dock_layout(&DockState {
+            sidebar: DockPanel::new(p.sidebar.open, p.sidebar.side),
+            status_window: DockPanel::new(p.status_window.open, p.status_window.side),
+            settings_panel: Some(DockPanel::new(p.settings_panel.open, p.settings_panel.side)),
+            help_panel: Some(DockPanel::new(p.help_panel.open, p.help_panel.side)),
+            widths,
+        })
+    }
+
     /// Draw the topbar, hovered title-bar buttons, and every open panel into
     /// `ctx`, returning every emitted `wall.*` / `terminal.*` verb line (including
     /// `wall.palette`) to run through `wall.run` after the pass.
@@ -134,6 +176,7 @@ impl Panels {
         let platform = wall.platform();
         let viewport = panels::safe_viewport_rect(ctx);
         let fullscreen = described.fullscreen_backdrop.is_some();
+        let dock = self.live_dock(described);
 
         // Synchronize `PaletteState::open` with `Wall`'s `palette_open`.
         let just_opened_palette = described.palette_open && !self.was_palette_open;
@@ -379,7 +422,7 @@ impl Panels {
                 wall_name,
                 platform,
                 fullscreen,
-                inset: described.panels.dock.inset,
+                inset: dock.inset,
                 termd_chip_width,
                 notice_width: 0.0,
                 palette_open: described.palette_open || self.palette.open,
@@ -414,6 +457,7 @@ impl Panels {
         if described.panels.sidebar.open {
             let sb = &described.panels.sidebar;
             self.sidebar.side = sb.side;
+            self.sidebar.size = sb.size;
             if self.last_sidebar_float != Some(sb.float) {
                 self.sidebar.float_pos = egui::pos2(sb.float.x as f32, sb.float.y as f32);
                 self.last_sidebar_float = Some(sb.float);
@@ -422,11 +466,7 @@ impl Panels {
                 let core_input = build_core_sidebar_input(wall, snap, &sb.collapsed, sb.mode);
                 let input = panels::sidebar::SidebarInput {
                     model: build_sidebar(&core_input),
-                    dock_rect: panels::sidebar::sidebar_dock_rect(
-                        viewport,
-                        sb.side,
-                        &described.panels.dock,
-                    ),
+                    dock_rect: panels::sidebar::sidebar_dock_rect(viewport, sb.side, &dock),
                     platform,
                     close_hold_ms: wall.config().close_hold_ms.max(0.0).round() as u64,
                 };
@@ -441,7 +481,7 @@ impl Panels {
         // so opening two at once never stacks one panel directly under another, while
         // keeping the exact JS `{ right: 12, top: 46 }` spot when opened alone.
         let (default_status_float, default_settings_float, default_help_float) =
-            compute_default_float_spots(viewport, described, &self.status);
+            compute_default_float_spots(viewport, described, &dock, &self.status);
 
         // 2. `termd` status chip, window & trouble notice (`wall.status`).
         if chip_pos.is_some() || status_window_or_notice || self.status_was_active {
@@ -466,17 +506,9 @@ impl Panels {
                 now_ms,
                 restart_notice_ms: restart_ms,
                 errors_shown: wall.config().errors_shown as usize,
-                dock_rect: dock_rect(
-                    viewport,
-                    st.side,
-                    described.panels.dock.status,
-                    DOCK_WIDTHS.status,
-                ),
+                dock_rect: dock_rect(viewport, st.side, dock.status, dock.widths.status),
                 chip_pos,
-                chrome_inset: (
-                    described.panels.dock.inset.left as f32,
-                    described.panels.dock.inset.right as f32,
-                ),
+                chrome_inset: (dock.inset.left as f32, dock.inset.right as f32),
                 // `egui-ui` owns the interactive dismissible outage banner (`×` -> `wall.status.dismiss`);
                 // `app.rs` passes `draw_status_notice = false` to `describe.rs` so only one banner paints.
                 show_notice: true,
@@ -497,12 +529,7 @@ impl Panels {
                 placement: sp.clone(),
                 config: wall.config().clone(),
                 dialled: wall.store().config().keys().cloned().collect(),
-                dock_rect: dock_rect(
-                    viewport,
-                    sp.side,
-                    described.panels.dock.settings,
-                    DOCK_WIDTHS.settings,
-                ),
+                dock_rect: dock_rect(viewport, sp.side, dock.settings, dock.widths.settings),
                 platform,
                 refused: BTreeMap::new(),
             };
@@ -523,13 +550,10 @@ impl Panels {
                 open: help_open,
                 side: hp.side,
                 float_pos: hp.float.or(default_help_float),
-                dock_rect: help::HelpPanelInput::dock_rect_for(
-                    hp.side,
-                    &described.panels.dock,
-                    viewport,
-                ),
+                dock_rect: help::HelpPanelInput::dock_rect_for(hp.side, &dock, viewport),
                 platform,
                 sections,
+                size: hp.size,
             };
             self.help_wants_keys = help::show(ctx, &mut self.help, &input, &mut out);
         } else {
@@ -567,6 +591,7 @@ impl Panels {
             if let Some(snap) = &snapshot {
                 let input = palette::PaletteInput {
                     snapshot: build_palette_snapshot(wall, snap, described, platform),
+                    size: described.panels.palette,
                 };
                 palette::show(ctx, &mut self.palette, &input, &mut out);
             }
@@ -761,13 +786,19 @@ impl Panels {
         }
 
         let pal_open = described.palette_open || self.palette.open;
+        // `size` is what is stored for the panel (`dock=<w>`, `float=<w>x<h>`,
+        // a `-` for a side at its default) and `grips` its resize strips as
+        // drawn, by edge. They end every panel's line but the sidebar's,
+        // whose list (`rows`) stays last.
         lines.push(format!(
-            "palette open={} query={:?} active={} items={} rect={}",
+            "palette open={} query={:?} active={} items={} rect={} size={} grips={}",
             pal_open,
             self.palette.palette.query,
             self.palette.palette.selected,
             self.palette.item_count,
             fmt_opt_rect(self.palette.last_rect),
+            fmt_size(&described.panels.palette),
+            self.palette.resize.report(),
         ));
 
         if self.selection_bar.count > 0 {
@@ -811,7 +842,7 @@ impl Panels {
         // with no terminal on the wall; `rows` is the whole list as drawn,
         // top to bottom (`panels::sidebar::SidebarState::rows_drawn`).
         lines.push(format!(
-            "panel sidebar open={} side={} mode={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} mode_group={} mode_host={} folds={} terms={} agents={} rows={}",
+            "panel sidebar open={} side={} mode={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} mode_group={} mode_host={} size={} grips={} folds={} terms={} agents={} rows={}",
             sb.open,
             dock_side_name(sb.side),
             sb.mode.as_str(),
@@ -824,6 +855,8 @@ impl Panels {
             fmt_opt_rect(self.sidebar.dock_btn_rects[3]),
             fmt_opt_rect(self.sidebar.mode_btn_rects[0]),
             fmt_opt_rect(self.sidebar.mode_btn_rects[1]),
+            fmt_size(&sb.size),
+            self.sidebar.resize.report(),
             if sb_folds.is_empty() { "none".to_string() } else { sb_folds.join(";") },
             if sb_terms.is_empty() { "none".to_string() } else { sb_terms.join(";") },
             if sb_agents.is_empty() { "none".to_string() } else { sb_agents.join(";") },
@@ -841,13 +874,15 @@ impl Panels {
             self.status.shown_row_ids.join(",")
         };
         lines.push(format!(
-            "panel status open={} side={} rows={} rect={} header={} notice_dismiss={}",
+            "panel status open={} side={} rows={} rect={} header={} notice_dismiss={} size={} grips={}",
             st.open,
             dock_side_name(st.side),
             st_rows,
             fmt_opt_rect(self.status.last_rect),
             fmt_opt_rect(self.status.header_drag_rect),
             fmt_opt_rect(self.status.notice_dismiss_rect),
+            fmt_size(&st.size),
+            self.status.resize.report(),
         ));
 
         let sp = &described.panels.settings_panel;
@@ -859,7 +894,7 @@ impl Panels {
             .collect();
         sp_ctrls.sort();
         lines.push(format!(
-            "panel settings open={} side={} query={:?} items={} rect={} header={} controls={}",
+            "panel settings open={} side={} query={:?} items={} rect={} header={} controls={} size={} grips={}",
             sp.open,
             dock_side_name(sp.side),
             self.settings.query,
@@ -867,17 +902,21 @@ impl Panels {
             fmt_opt_rect(self.settings.last_rect),
             fmt_opt_rect(self.settings.header_drag_rect),
             if sp_ctrls.is_empty() { "none".to_string() } else { sp_ctrls.join(";") },
+            fmt_size(&sp.size),
+            self.settings.resize.report(),
         ));
 
         let hp = &described.panels.help_panel;
         lines.push(format!(
-            "panel help open={} side={} query={:?} rows={} rect={} header={}",
+            "panel help open={} side={} query={:?} rows={} rect={} header={} size={} grips={}",
             hp.open,
             dock_side_name(hp.side),
             self.help.query,
             self.help.shown_row_count,
             fmt_opt_rect(self.help.last_rect()),
             fmt_opt_rect(self.help.header_drag_rect),
+            fmt_size(&hp.size),
+            self.help.resize.report(),
         ));
 
         let mut menu_items: Vec<String> = self
@@ -935,6 +974,18 @@ fn fmt_opt_rect(r: Option<egui::Rect>) -> String {
     r.map_or_else(|| "none".to_string(), fmt_rect)
 }
 
+/// A panel's stored size as `app.where` prints it: `dock=<w>,float=<w>x<h>`,
+/// with `-` for whatever is at its default.
+fn fmt_size(size: &PanelSize) -> String {
+    let px = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |v| format!("{v}"));
+    format!(
+        "dock={},float={}x{}",
+        px(size.dock_width),
+        px(size.float_width),
+        px(size.float_height)
+    )
+}
+
 /// Default floating origins for simultaneously open unplaced (`float: None`) right-anchored
 /// panels (`status`, `settings`, `help`). When only one is open and no panel is docked on the
 /// right edge, returns `None` so it uses its exact JS `{ right: 12, top: 46 }` spot; when two
@@ -943,6 +994,7 @@ fn fmt_opt_rect(r: Option<egui::Rect>) -> String {
 fn compute_default_float_spots(
     viewport: egui::Rect,
     described: &WallFrame,
+    dock: &DockLayout,
     status_state: &status::StatusState,
 ) -> (Option<Point>, Option<Point>, Option<Point>) {
     let st_unplaced = described.panels.status_window.open
@@ -956,15 +1008,34 @@ fn compute_default_float_spots(
         && described.panels.help_panel.float.is_none();
 
     let count = usize::from(st_unplaced) + usize::from(sp_unplaced) + usize::from(hp_unplaced);
-    let inset_right = (described.panels.dock.inset.right as f32).max(12.0);
+    let inset_right = (dock.inset.right as f32).max(12.0);
     if count == 0 || (count == 1 && inset_right <= 12.5) {
         return (None, None, None);
     }
 
+    // Each at the width it will be drawn: the one set on it, else its own.
     let max_w = (viewport.width() - 32.0).max(140.0);
-    let st_w = status_state.effective_float_width((viewport.width() - 32.0).max(160.0));
-    let sp_w = (DOCK_WIDTHS.settings as f32).min(max_w);
-    let hp_w = (DOCK_WIDTHS.help as f32).min(max_w);
+    let float_w = |kind: PanelKind, size: &PanelSize, own: f32| -> f32 {
+        size.float_width
+            .map_or(own, |w| w as f32)
+            .max(kind.limits().float_min_width as f32)
+            .min(max_w)
+    };
+    let st_w = float_w(
+        PanelKind::Status,
+        &described.panels.status_window.size,
+        status_state.effective_float_width((viewport.width() - 32.0).max(160.0)),
+    );
+    let sp_w = float_w(
+        PanelKind::Settings,
+        &described.panels.settings_panel.size,
+        PanelKind::Settings.limits().float_default_width as f32,
+    );
+    let hp_w = float_w(
+        PanelKind::Help,
+        &described.panels.help_panel.size,
+        PanelKind::Help.limits().float_default_width as f32,
+    );
 
     let mut cursor_right = viewport.right() - inset_right;
     let base_y = viewport.top() + 46.0;
@@ -1695,5 +1766,146 @@ mod tests {
             wall.frame().status_notice.is_none(),
             "clicking × must clear the red outage notice"
         );
+    }
+
+    #[test]
+    fn panels_are_drawn_at_their_stored_size_and_an_edge_drag_resizes_them() {
+        use crate::wall::panels::resize::Grip;
+        use wall_core::dock::DOCK_WIDTHS;
+
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+        let mut now = 1.0;
+        let mut pass = |events: Vec<egui::Event>, panels: &mut Panels, wall: &mut Wall| {
+            now += 0.05;
+            run_pass_at(&ctx, now, events, panels, wall).0
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (view_w, sidebar_w, settings_w) = (
+            1400.0_f32,
+            DOCK_WIDTHS.sidebar as f32,
+            DOCK_WIDTHS.settings as f32,
+        );
+
+        // The sidebar and settings docked right: settings sits inside the sidebar.
+        assert!(wall.run("wall.sidebar right").text.starts_with("OK"));
+        assert!(wall.run("wall.settings right").text.starts_with("OK"));
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        let sb = panels.sidebar.last_rect.unwrap();
+        assert_eq!((sb.right(), sb.width()), (view_w, sidebar_w));
+        let sp = panels.settings.last_rect.unwrap();
+        assert_eq!((sp.right(), sp.width()), (view_w - sidebar_w, settings_w));
+
+        // Drag the sidebar's canvas-facing edge 100 px left.
+        let grip = panels.sidebar.resize.grip_rect(Grip::Left).unwrap().center();
+        let to = grip - egui::vec2(100.0, 0.0);
+        pass(vec![egui::Event::PointerMoved(grip)], &mut panels, &mut wall);
+        pass(vec![button(grip, true)], &mut panels, &mut wall);
+        pass(vec![egui::Event::PointerMoved(grip - egui::vec2(40.0, 0.0))], &mut panels, &mut wall);
+        let during = pass(vec![egui::Event::PointerMoved(to)], &mut panels, &mut wall);
+        assert!(during.is_empty(), "nothing is sent while the drag lasts: {during:?}");
+        // The next pass draws with the dragged width: the sidebar is wider,
+        // settings has moved over with its edge, and the topbar clears both;
+        // the wall's own layout waits for the release.
+        pass(Vec::new(), &mut panels, &mut wall);
+        let sb = panels.sidebar.last_rect.unwrap();
+        assert_eq!((sb.right(), sb.width()), (view_w, sidebar_w + 100.0));
+        let sp = panels.settings.last_rect.unwrap();
+        assert_eq!((sp.right(), sp.width()), (view_w - sidebar_w - 100.0, settings_w));
+        let bar = panels.topbar.last_bar_rect.unwrap();
+        assert!(bar.right() <= sp.left(), "topbar {bar:?} under settings {sp:?}");
+        assert_eq!(wall.frame().panels.dock.widths.sidebar, DOCK_WIDTHS.sidebar);
+
+        // Release: the width goes to the wall as a verb, and is stored.
+        let sent = pass(vec![button(to, false)], &mut panels, &mut wall);
+        assert_eq!(sent, vec!["wall.sidebar width 348".to_string()]);
+        assert_eq!(wall.store().sidebar().size.dock_width, Some(348.0));
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.sidebar.last_rect.unwrap().width(), 348.0);
+        assert_eq!(wall.frame().panels.dock.offset(wall_core::dock::PanelKind::Settings), 348.0);
+        let described = wall.frame();
+        let line = panels.format_where(&wall, &described);
+        let sidebar_line = line.lines().find(|l| l.starts_with("panel sidebar ")).unwrap();
+        assert!(sidebar_line.contains(" size=dock=348,float=-x- grips=left:"), "{sidebar_line}");
+
+        // A double click on the edge puts the default back.
+        let grip = panels.sidebar.resize.grip_rect(Grip::Left).unwrap().center();
+        let mut sent = Vec::new();
+        for pressed in [true, false, true, false] {
+            sent.extend(pass(vec![button(grip, pressed)], &mut panels, &mut wall));
+        }
+        assert_eq!(sent, vec!["wall.sidebar width default".to_string()]);
+        assert_eq!(wall.store().sidebar().size.dock_width, None);
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.sidebar.last_rect.unwrap().width(), sidebar_w);
+        assert!(wall.run("wall.sidebar close").text.starts_with("OK"));
+
+        // Floating, each panel is the size set on it, where it was put.
+        for (verb, at, size) in [
+            ("wall.settings", (100.0, 110.0), (600.0, 420.0)),
+            ("wall.help", (60.0, 70.0), (520.0, 300.0)),
+            ("wall.status", (20.0, 400.0), (560.0, 260.0)),
+            ("wall.sidebar", (700.0, 80.0), (330.0, 350.0)),
+        ] {
+            for other in ["wall.settings", "wall.help", "wall.status", "wall.sidebar"] {
+                let _ = wall.run(format!("{other} close"));
+            }
+            assert!(wall.run(format!("{verb} float {} {}", at.0, at.1)).text.starts_with("OK"));
+            assert!(wall.run(format!("{verb} size {} {}", size.0, size.1)).text.starts_with("OK"));
+            for _ in 0..3 {
+                pass(Vec::new(), &mut panels, &mut wall);
+            }
+            let rect = match verb {
+                "wall.settings" => panels.settings.last_rect,
+                "wall.help" => panels.help.last_rect(),
+                "wall.status" => panels.status.last_rect,
+                _ => panels.sidebar.last_rect,
+            }
+            .unwrap();
+            assert_eq!(
+                (rect.left(), rect.top(), rect.width(), rect.height()),
+                (at.0, at.1, size.0, size.1),
+                "{verb}"
+            );
+        }
+
+        // A floating panel's right edge, dragged: its place is pinned and
+        // its width set; the height it had is kept.
+        let grip = panels.sidebar.resize.grip_rect(Grip::Right).unwrap().center();
+        let to = grip + egui::vec2(70.0, 0.0);
+        pass(vec![egui::Event::PointerMoved(grip)], &mut panels, &mut wall);
+        pass(vec![button(grip, true)], &mut panels, &mut wall);
+        pass(vec![egui::Event::PointerMoved(grip + egui::vec2(30.0, 0.0))], &mut panels, &mut wall);
+        pass(vec![egui::Event::PointerMoved(to)], &mut panels, &mut wall);
+        let sent = pass(vec![button(to, false)], &mut panels, &mut wall);
+        assert_eq!(
+            sent,
+            vec!["wall.sidebar float 700 80".to_string(), "wall.sidebar size 400".to_string()]
+        );
+        let stored = wall.store().sidebar().size;
+        assert_eq!((stored.float_width, stored.float_height), (Some(400.0), Some(350.0)));
+
+        // The palette is as wide as it was sized, and stays centred.
+        let _ = wall.run("wall.sidebar close");
+        assert!(wall.run("wall.palette size 700 380").text.starts_with("OK"));
+        wall.set_palette_open(true);
+        for _ in 0..3 {
+            pass(Vec::new(), &mut panels, &mut wall);
+        }
+        let pal = panels.palette.last_rect.unwrap();
+        assert_eq!((pal.width(), pal.height()), (700.0, 380.0));
+        assert_eq!(pal.center().x, view_w * 0.5);
+        let described = wall.frame();
+        let line = panels.format_where(&wall, &described);
+        let palette_line = line.lines().find(|l| l.starts_with("palette ")).unwrap();
+        assert!(palette_line.contains(" size=dock=-,float=700x380 grips=left:"), "{palette_line}");
     }
 }

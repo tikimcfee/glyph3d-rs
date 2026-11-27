@@ -5,11 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wall_core::chord::chord_label;
 use wall_core::config::{check_config, default_knob_value, WallConfig};
-use wall_core::dock::DOCK_WIDTHS;
+use wall_core::dock::PanelKind;
 use wall_core::input::Platform;
 use wall_core::settings::{search_settings, KnobDef, KnobKind, KnobValue, SettingsGroup};
 use wall_core::store::{PanelSide, SettingsPanelState as SettingsPlacement};
 
+use super::super::resize::{self, ResizeSpec, ResizeState};
 use super::{
     dock_buttons_rtl, handle_head_drag, icon_btn, marked_layout_job, panel_viewport_rect,
     resolve_panel_box, settings_panel_bg, ChromeIcon, HeadDragState, ACTIVE_ROW_BG, BORDER, BRIGHT,
@@ -91,6 +92,8 @@ pub struct SettingsState {
     pub wants_keyboard: bool,
     /// Floating header drag state (`useHeadDrag` in `Panel.jsx`).
     pub head_drag: HeadDragState,
+    /// The edge grips, and a resize drag in progress.
+    pub resize: ResizeState,
     /// Per-knob refusal reason from the most recent rejected edit (`SettingsPanel.jsx`'s `refused`).
     pub refused: BTreeMap<String, String>,
     /// Live text drafts for `Text`, `Number`, and `Color` hex fields while focused.
@@ -245,6 +248,7 @@ pub fn show(
         state.last_rect = None;
         state.header_drag_rect = None;
         state.visible_count = 0;
+        state.resize.reset();
         return false;
     }
 
@@ -278,14 +282,45 @@ pub fn show(
 
     let viewport = panel_viewport_rect(ctx);
     let side = input.placement.side;
-    let (origin, width, max_height) = resolve_panel_box(
+    let limits = PanelKind::Settings.limits();
+    let (mut origin, width, mut max_height) = resolve_panel_box(
         viewport,
         side,
         input.dock_rect,
         input.placement.float,
         &state.head_drag,
-        DOCK_WIDTHS.settings as f32,
+        match side {
+            PanelSide::Float => resize::float_width(
+                &state.resize,
+                &input.placement.size,
+                limits.float_default_width as f32,
+                viewport,
+            ),
+            PanelSide::Left | PanelSide::Right => limits.dock_default as f32,
+        },
     );
+    // The height the panel is held to: the viewport's when docked; when
+    // floating, the one set on it, else none (as tall as its list).
+    let held_height = match side {
+        PanelSide::Float => resize::float_height(&state.resize, &input.placement.size, viewport),
+        PanelSide::Left | PanelSide::Right => Some(max_height),
+    };
+    if side == PanelSide::Float {
+        if let Some(at) = resize::float_origin(&state.resize) {
+            origin = at;
+        }
+        if let Some(h) = held_height {
+            max_height = h;
+        }
+        // Its bottom edge stays in the window, wherever it was put.
+        max_height = max_height.min(resize::room_below(origin.y, viewport));
+    }
+    // A floating panel has a 1 px border, drawn outside what it holds: the
+    // size set on it is the box with its border, so what it holds is that
+    // much smaller (a drag would otherwise grow it 2 px on every release).
+    let rim = if side == PanelSide::Float { resize::FLOAT_RIM_PX } else { 0.0 };
+    let width = width - 2.0 * rim;
+    let max_height = max_height - 2.0 * rim;
 
     let rounding = match side {
         PanelSide::Float => egui::CornerRadius::same(7),
@@ -313,12 +348,10 @@ pub fn show(
 
             let frame_resp = panel_frame.show(ui, |ui| {
                 ui.set_width(width);
-                if side == PanelSide::Float {
-                    ui.set_max_height(max_height);
-                } else {
+                if held_height.is_some() {
                     ui.set_min_height(max_height);
-                    ui.set_max_height(max_height);
                 }
+                ui.set_max_height(max_height);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
                 // ── Header (`settings` + `⇤ ◫ ⇥ ×`) ──────────────────────────
@@ -504,7 +537,7 @@ pub fn show(
                 egui::ScrollArea::vertical()
                     .id_salt("wall_settings_body")
                     .max_height(body_max_h)
-                    .auto_shrink([false, side == PanelSide::Float])
+                    .auto_shrink([false, held_height.is_none()])
                     .show(ui, |ui| {
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
@@ -565,10 +598,28 @@ pub fn show(
                                             egui::FontId::monospace(12.0),
                                             LABEL,
                                         ));
-                                        ui.label(
-                                            egui::RichText::new(group.section.subtitle)
-                                                .font(egui::FontId::monospace(11.0))
-                                                .color(MUTED),
+                                        // Cut to the row: a subtitle longer than the
+                                        // panel is wide made the panel's box wider
+                                        // than its slot, over whatever is docked
+                                        // beside it (and that panel's edge grip).
+                                        let room = (ui.available_width()
+                                            - if searching { 30.0 } else { 0.0 })
+                                        .max(0.0);
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(room, 16.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(
+                                                            group.section.subtitle,
+                                                        )
+                                                        .font(egui::FontId::monospace(11.0))
+                                                        .color(MUTED),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
                                         );
                                         if searching {
                                             ui.with_layout(
@@ -759,6 +810,21 @@ pub fn show(
                 }
                 PanelSide::Float => {}
             }
+
+            // The edges that resize it.
+            resize::grips(
+                ui,
+                &mut state.resize,
+                &ResizeSpec {
+                    verb: "wall.settings",
+                    side,
+                    rect: r,
+                    limits,
+                    viewport,
+                    centered: false,
+                },
+                out,
+            );
         });
 
     true

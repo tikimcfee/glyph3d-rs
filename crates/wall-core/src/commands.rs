@@ -499,6 +499,10 @@ pub struct PanelPlacement {
     /// `None` for the panels that have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The sizes set on it (`wall.<panel> width|size`); absent while it is
+    /// at its defaults.
+    #[serde(default, skip_serializing_if = "PanelSize::is_default")]
+    pub size: PanelSize,
 }
 
 impl Default for PanelPlacement {
@@ -509,6 +513,7 @@ impl Default for PanelPlacement {
             float: None,
             collapsed: Vec::new(),
             mode: None,
+            size: PanelSize::default(),
         }
     }
 }
@@ -535,16 +540,13 @@ pub struct PanelPatch {
     pub collapsed: Option<Vec<String>>,
     /// The sidebar's list mode, `"group"` or `"host"`.
     pub mode: Option<String>,
+    /// The panel's sizes, whole (`wall.<panel> width|size`).
+    pub size: Option<PanelSize>,
 }
 
 /// Which panel a panel-placement verb operates on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PanelKind {
-    Sidebar,
-    Status,
-    Settings,
-    Help,
-}
+pub use crate::dock::PanelKind;
+use crate::dock::{PanelLimits, PanelSize, PALETTE_LIMITS};
 
 /// Screen-space bounding box (CSS px) returned for positioning `wall.menu`
 /// (unified with [`crate::camera::ScreenBox`]).
@@ -757,6 +759,15 @@ pub trait WallApi {
     }
     /// Open or close the command palette overlay (`wall.palette`).
     fn set_palette_open(&mut self, _open: bool) {}
+
+    /// The command palette's size (`wall.palette size`): its width and
+    /// height, in the floating half of a [`PanelSize`].
+    fn palette_size(&self) -> PanelSize {
+        PanelSize::default()
+    }
+
+    /// Set the command palette's size.
+    fn set_palette_size(&mut self, _size: PanelSize) {}
     fn termd_state(&self) -> String;
     fn termd_dismiss_lost(&mut self) -> bool;
 
@@ -899,10 +910,80 @@ fn place_panel<W: WallApi>(
             );
             Ok(())
         }
+        "width" | "size" => {
+            let mut size = wall.panel(kind).size;
+            size_words(&mut size, &kind.limits(), kind.name(), args)?;
+            wall.set_panel(
+                kind,
+                PanelPatch { size: Some(size), ..PanelPatch::default() },
+            );
+            Ok(())
+        }
         _ => Err(format!(
-            "the {name} takes toggle|open|close|left|right|float, not '{what}'"
+            "the {name} takes toggle|open|close|left|right|float|width|size, not '{what}'"
         )),
     }
+}
+
+/// Apply `width <px>|default` (the docked width) or `size <w> [h]|default`
+/// (the floating size; a width alone leaves the height as it was) to `size`.
+/// A number outside `limits` is refused naming the panel.
+fn size_words(
+    size: &mut PanelSize,
+    limits: &PanelLimits,
+    name: &str,
+    args: &[String],
+) -> Result<(), String> {
+    let what = args.first().map_or("", String::as_str);
+    let first = args.get(1).map(String::as_str);
+    match (what, first) {
+        ("width", Some("default")) => size.dock_width = None,
+        ("width", Some(_)) => {
+            size.dock_width = Some(limits.check_dock_width(name, num_arg(args.get(1), "width")?)?);
+        }
+        ("width", None) => return Err("width takes a number of px, or default".to_string()),
+        ("size", Some("default")) => {
+            size.float_width = None;
+            size.float_height = None;
+        }
+        ("size", Some(_)) => {
+            let width = limits.check_float_width(name, num_arg(args.get(1), "width")?)?;
+            let height = match args.get(2) {
+                Some(_) => Some(limits.check_float_height(name, num_arg(args.get(2), "height")?)?),
+                None => size.float_height,
+            };
+            size.float_width = Some(width);
+            size.float_height = height;
+        }
+        ("size", None) => {
+            return Err("size takes a width and a height in px, or default".to_string());
+        }
+        _ => unreachable!("size_words is called for width and size alone"),
+    }
+    Ok(())
+}
+
+/// What a panel verb's reply says about the panel: `closed`, or `open,
+/// <side>`, then the size set for the side it is on (`320 px wide`, `520 x
+/// 400`), which a panel at its defaults has none of.
+fn placement_words(now: &PanelPlacement) -> String {
+    if !now.open {
+        return "closed".to_string();
+    }
+    let size = match now.side.as_str() {
+        "float" => match (now.size.float_width, now.size.float_height) {
+            (Some(w), Some(h)) => format!(", {w} x {h}"),
+            (Some(w), None) => format!(", {w} px wide"),
+            (None, Some(h)) => format!(", {h} px tall"),
+            (None, None) => String::new(),
+        },
+        _ => now
+            .size
+            .dock_width
+            .map(|w| format!(", {w} px wide"))
+            .unwrap_or_default(),
+    };
+    format!("open, {}{size}", now.side)
 }
 
 fn on_off_knob<W: WallApi>(wall: &mut W, key: &str, how: Option<&String>) -> Result<bool, String> {
@@ -1755,8 +1836,8 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.sidebar",
-        "[toggle|open|close|left|right|float [x y]|mode [group|host|toggle]]",
-        "Open, close or place the sidebar, or list it by group or by host",
+        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]|mode [group|host|toggle]]",
+        "Open, close, place or size the sidebar (width: docked; size: floating; default resets), or list it by group or by host",
         |args, wall| {
             if args.first().map(String::as_str) == Some("mode") {
                 let current = wall
@@ -1788,11 +1869,7 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
             }
             place_panel(wall, PanelKind::Sidebar, "sidebar", args)?;
             let now = wall.panel(PanelKind::Sidebar);
-            let state = if now.open {
-                format!("open, {}", now.side)
-            } else {
-                "closed".to_string()
-            };
+            let state = placement_words(&now);
             Ok(CommandReply::ok(
                 format!("sidebar {state}"),
                 Some(json!({ "sidebar": now })),
@@ -1836,17 +1913,13 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.status",
-        "[toggle|open|close|left|right|float [x y]]",
-        "Open, close or place the termd status window",
+        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]]",
+        "Open, close, place or size the termd status window (width: docked; size: floating; default resets)",
         |args, wall| {
             place_panel(wall, PanelKind::Status, "status window", args)?;
             let now = wall.panel(PanelKind::Status);
             let termd = wall.termd_state();
-            let state = if now.open {
-                format!("open, {}", now.side)
-            } else {
-                "closed".to_string()
-            };
+            let state = placement_words(&now);
             Ok(CommandReply::ok(
                 format!("status window {state} · termd {termd}"),
                 Some(json!({ "window": now, "termd": termd })),
@@ -2051,16 +2124,12 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.settings",
-        "[toggle|open|close|left|right|float [x y]]",
-        "Open, close or place the settings panel",
+        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]]",
+        "Open, close, place or size the settings panel (width: docked; size: floating; default resets)",
         |args, wall| {
             place_panel(wall, PanelKind::Settings, "settings panel", args)?;
             let now = wall.panel(PanelKind::Settings);
-            let state = if now.open {
-                format!("open, {}", now.side)
-            } else {
-                "closed".to_string()
-            };
+            let state = placement_words(&now);
             Ok(CommandReply::ok(
                 format!("settings {state}"),
                 Some(json!({ "panel": now })),
@@ -2071,16 +2140,12 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.help",
-        "[toggle|open|close|left|right|float [x y]]",
-        "Open, close or place the help: the wall's keys, gestures and verbs",
+        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]]",
+        "Open, close, place or size the help: the wall's keys, gestures and verbs",
         |args, wall| {
             place_panel(wall, PanelKind::Help, "help", args)?;
             let now = wall.panel(PanelKind::Help);
-            let state = if now.open {
-                format!("open, {}", now.side)
-            } else {
-                "closed".to_string()
-            };
+            let state = placement_words(&now);
             Ok(CommandReply::ok(
                 format!("help {state}"),
                 Some(json!({ "panel": now })),
@@ -2436,17 +2501,32 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.palette",
-        "[toggle|open|close]",
-        "Open, close or toggle the command palette",
+        "[toggle|open|close|size <w> [h]]",
+        "Open, close or toggle the command palette, or size it (size default resets)",
         |args, wall| {
             let how = args.first().map_or("toggle", String::as_str);
+            if how == "size" {
+                let mut size = wall.palette_size();
+                size_words(&mut size, &PALETTE_LIMITS, "palette", args)?;
+                wall.set_palette_size(size);
+                let words = match (size.float_width, size.float_height) {
+                    (Some(w), Some(h)) => format!("{w} x {h}"),
+                    (Some(w), None) => format!("{w} px wide"),
+                    (None, Some(h)) => format!("{h} px tall"),
+                    (None, None) => "its own size".to_string(),
+                };
+                return Ok(CommandReply::ok(
+                    format!("palette {words}"),
+                    Some(json!({ "size": size })),
+                ));
+            }
             let next = match how {
                 "toggle" => !wall.palette_open(),
                 "open" | "on" => true,
                 "close" | "off" => false,
                 other => {
                     return Err(format!(
-                        "palette takes toggle|open|close, not '{other}'"
+                        "palette takes toggle|open|close|size, not '{other}'"
                     ));
                 }
             };
@@ -2587,6 +2667,7 @@ mod tests {
         fullscreen: FullscreenStatus,
         panels: BTreeMap<String, PanelPlacement>,
         palette_open: bool,
+        palette_size: PanelSize,
         agent_stick_bottom: BTreeMap<String, bool>,
         termd_state: String,
         termd_lost: bool,
@@ -2626,6 +2707,7 @@ mod tests {
                 fullscreen: FullscreenStatus::default(),
                 panels: BTreeMap::new(),
                 palette_open: false,
+                palette_size: PanelSize::default(),
                 agent_stick_bottom: BTreeMap::new(),
                 termd_state: "ok".to_string(),
                 termd_lost: false,
@@ -3136,6 +3218,9 @@ mod tests {
             if let Some(mode) = patch.mode {
                 cur.mode = Some(mode);
             }
+            if let Some(size) = patch.size {
+                cur.size = size;
+            }
             self.panels.insert(Self::panel_key(kind).to_string(), cur);
         }
 
@@ -3332,6 +3417,14 @@ mod tests {
 
         fn set_palette_open(&mut self, open: bool) {
             self.palette_open = open;
+        }
+
+        fn palette_size(&self) -> PanelSize {
+            self.palette_size
+        }
+
+        fn set_palette_size(&mut self, size: PanelSize) {
+            self.palette_size = size;
         }
 
         fn agent_set_stick_bottom(&mut self, id: &str, mode: &str) -> Result<bool, String> {
@@ -3833,5 +3926,103 @@ mod tests {
         r.execute(["wall.sidebar", "close"]);
         r.execute(["wall.sidebar", "open"]);
         assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn panels_take_a_docked_width_and_a_floating_size_and_refuse_what_is_out_of_range() {
+        let mut r = wall_router();
+        let size = |r: &CommandRouter<FakeWall>, kind| r.context.panel(kind).size;
+
+        // A docked width: said in the reply while the panel is docked, and
+        // kept when it floats or closes.
+        assert_eq!(r.execute(["wall.sidebar", "right"]).text, "OK: sidebar open, right");
+        let wide = r.execute(["wall.sidebar", "width", "320"]);
+        assert_eq!(wide.text, "OK: sidebar open, right, 320 px wide");
+        assert_eq!(
+            wide.data.unwrap()["sidebar"]["size"],
+            json!({ "dockWidth": 320.0 })
+        );
+        assert_eq!(size(&r, PanelKind::Sidebar).dock_width, Some(320.0));
+        assert_eq!(r.execute(["wall.sidebar", "float"]).text, "OK: sidebar open, float");
+        assert_eq!(r.execute(["wall.sidebar", "close"]).text, "OK: sidebar closed");
+        assert_eq!(
+            r.execute(["wall.sidebar", "left"]).text,
+            "OK: sidebar open, left, 320 px wide"
+        );
+        // Sizing a panel does not open it.
+        r.execute(["wall.help", "close"]);
+        assert_eq!(r.execute(["wall.help", "width", "500"]).text, "OK: help closed");
+        assert_eq!(size(&r, PanelKind::Help).dock_width, Some(500.0));
+
+        // A floating size: a width alone, then both; a later width alone
+        // keeps the height.
+        r.execute(["wall.settings", "float"]);
+        assert_eq!(
+            r.execute(["wall.settings", "size", "700"]).text,
+            "OK: settings open, float, 700 px wide"
+        );
+        assert_eq!(
+            r.execute(["wall.settings", "size", "760", "540"]).text,
+            "OK: settings open, float, 760 x 540"
+        );
+        assert_eq!(
+            r.execute(["wall.settings", "size", "800"]).text,
+            "OK: settings open, float, 800 x 540"
+        );
+        // The docked width is its own: untouched by the floating size.
+        assert_eq!(size(&r, PanelKind::Settings).dock_width, None);
+        assert_eq!(r.execute(["wall.settings", "right"]).text, "OK: settings open, right");
+
+        // `default` puts each back.
+        assert_eq!(
+            r.execute(["wall.sidebar", "width", "default"]).text,
+            "OK: sidebar open, left"
+        );
+        assert_eq!(size(&r, PanelKind::Sidebar), PanelSize::default());
+        r.execute(["wall.settings", "float"]);
+        assert_eq!(
+            r.execute(["wall.settings", "size", "default"]).text,
+            "OK: settings open, float"
+        );
+        assert_eq!(size(&r, PanelKind::Settings), PanelSize::default());
+
+        // Refused naming the panel and what it takes; nothing changes.
+        for (line, why) in [
+            ("wall.sidebar width 50", "the sidebar docks 180 to 1600 px wide, not 50"),
+            ("wall.sidebar width", "width takes a number of px, or default"),
+            ("wall.sidebar width wide", "width takes a number, not 'wide'"),
+            ("wall.status size 10", "the status window floats 300 to 4000 px wide, not 10"),
+            ("wall.status size 500 5", "the status window floats 120 to 4000 px tall, not 5"),
+            ("wall.status size", "size takes a width and a height in px, or default"),
+            (
+                "wall.help tall",
+                "the help takes toggle|open|close|left|right|float|width|size, not 'tall'",
+            ),
+        ] {
+            let reply = r.execute(line);
+            assert!(reply.is_err(), "{line:?} was taken: {}", reply.text);
+            assert!(reply.text.contains(why), "{line:?}: {}", reply.text);
+        }
+        assert_eq!(size(&r, PanelKind::Sidebar), PanelSize::default());
+        assert_eq!(size(&r, PanelKind::Status), PanelSize::default());
+
+        // The palette has a size and no dock.
+        assert_eq!(
+            r.execute(["wall.palette", "size", "720", "480"]).text,
+            "OK: palette 720 x 480"
+        );
+        assert_eq!(r.context.palette_size.float_width, Some(720.0));
+        assert!(!r.context.palette_open, "sizing the palette does not open it");
+        assert_eq!(
+            r.execute(["wall.palette", "size", "default"]).text,
+            "OK: palette its own size"
+        );
+        assert!(r.context.palette_size.is_default());
+        let refused = r.execute(["wall.palette", "size", "100"]);
+        assert!(
+            refused.text.contains("the palette floats 320 to 4000 px wide, not 100"),
+            "{}",
+            refused.text
+        );
     }
 }

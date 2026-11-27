@@ -808,6 +808,78 @@ else
     record_fail "bar buttons (hover, hide, hold)" "hover=$HOVER_SHOWN hidden=$WAS_HIDDEN short_kept=$BB_SHORT_KEPT hold_killed=$BB_HOLD_KILLED"
 fi
 
+# ── 13. Panel edges: a drag resizes, the size is stored, a double click resets ─
+# `grips=` on a panel's app.where line is its resize strips as drawn, by edge;
+# `size=` is what the store holds for it (`dock=<w>,float=<w>x<h>`, `-` = default).
+ctl wall.sidebar right >/dev/null
+ctl app.where >/dev/null
+W_RS0="$(ctl app.where)"
+read -r RS_X RS_Y < <(map_entry_center "panel sidebar " "grips" "left" "$W_RS0")
+RS_X1="$(python3 -c "print(f'{$RS_X - 120.0:.2f}')")"
+ctl app.drag "$RS_X" "$RS_Y" "$RS_X1" "$RS_Y" 8 >/dev/null
+ctl app.where >/dev/null
+W_RS1="$(ctl app.where)"
+RS_REPLY="$(ctl wall.sidebar open 2>&1 || true)"
+read -r RS_X2 RS_Y2 < <(map_entry_center "panel sidebar " "grips" "left" "$W_RS1")
+ctl app.dblclick "$RS_X2" "$RS_Y2" >/dev/null
+ctl app.where >/dev/null
+W_RS2="$(ctl app.where)"
+ctl wall.sidebar close >/dev/null
+
+# Floating: the bottom-right corner sets width and height; `size default` puts both back.
+ctl wall.help float 200 150 >/dev/null
+ctl app.where >/dev/null
+W_RS3="$(ctl app.where)"
+read -r RC_X RC_Y < <(map_entry_center "panel help " "grips" "bottom_right" "$W_RS3")
+RC_X1="$(python3 -c "print(f'{$RC_X + 90.0:.2f}')")"
+RC_Y1="$(python3 -c "print(f'{$RC_Y - 70.0:.2f}')")"
+ctl app.drag "$RC_X" "$RC_Y" "$RC_X1" "$RC_Y1" 8 >/dev/null
+ctl app.where >/dev/null
+W_RS4="$(ctl app.where)"
+ctl wall.help size default >/dev/null
+ctl wall.help close >/dev/null
+
+RS_CHECK="$(python3 -c '
+import sys
+w0, w1, w2, w3, w4, reply = sys.argv[1:7]
+def tok(s, prefix, key):
+    for l in s.splitlines():
+        if l.startswith(prefix):
+            for t in l.split():
+                if t.startswith(key + "="):
+                    return t[len(key) + 1:]
+    return ""
+def rect(s, prefix):
+    v = tok(s, prefix, "rect")
+    return tuple(map(float, v.split(","))) if v and v != "none" else (0.0, 0.0, 0.0, 0.0)
+sb = [rect(w, "panel sidebar ") for w in (w0, w1, w2)]
+widths = [r[2] - r[0] for r in sb]
+docked = (
+    abs(widths[0] - 248.0) < 1.5 and abs(widths[1] - 368.0) < 3.0 and abs(widths[2] - 248.0) < 1.5
+    and all(abs(r[2] - sb[0][2]) < 1.0 for r in sb)          # it stays against its edge
+    and tok(w0, "panel sidebar ", "size").startswith("dock=-,")
+    and tok(w1, "panel sidebar ", "size").startswith("dock=3")  # stored
+    and tok(w2, "panel sidebar ", "size").startswith("dock=-,")
+    and "px wide" in reply
+)
+h0, h1 = rect(w3, "panel help "), rect(w4, "panel help ")
+dw, dh = (h1[2] - h1[0]) - (h0[2] - h0[0]), (h1[3] - h1[1]) - (h0[3] - h0[1])
+floated = (
+    abs(dw - 90.0) < 4.0 and abs(dh + 70.0) < 4.0
+    and abs(h1[0] - h0[0]) < 1.0 and abs(h1[1] - h0[1]) < 1.0   # its corner moved, not its place
+    and "float=" in tok(w4, "panel help ", "size") and "float=-x-" not in tok(w4, "panel help ", "size")
+)
+ok = docked and floated
+sb_size = tok(w1, "panel sidebar ", "size")
+hp_size = tok(w4, "panel help ", "size")
+print(f"{int(ok)} sidebar_w={widths[0]:.0f}->{widths[1]:.0f}->{widths[2]:.0f} stored={sb_size} help_dwh=({dw:.0f},{dh:.0f}) help_size={hp_size}")
+' "$W_RS0" "$W_RS1" "$W_RS2" "$W_RS3" "$W_RS4" "$RS_REPLY")"
+if [[ "${RS_CHECK%% *}" == "1" ]]; then
+    record_pass "panel edges (drag, reset)" "${RS_CHECK#* }"
+else
+    record_fail "panel edges (drag, reset)" "${RS_CHECK#* }"
+fi
+
 echo ""
 echo "=== PANEL SMOKE SUMMARY: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
 [[ "$FAIL_COUNT" -eq 0 ]]

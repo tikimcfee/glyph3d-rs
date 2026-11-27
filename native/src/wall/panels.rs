@@ -16,6 +16,8 @@ pub mod agent_view;
 // The buttons on a terminal's title bar, and the bar across the top of the window.
 pub mod bar_buttons;
 pub mod palette;
+// The grips on a panel's edges: drag to resize, double-click for the default.
+pub mod resize;
 pub mod selection_bar;
 pub mod sidebar;
 pub mod topbar;
