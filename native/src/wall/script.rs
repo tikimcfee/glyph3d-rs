@@ -1459,6 +1459,17 @@ pub fn format_where(described: &WallFrame, cursor: Point, platform: Platform) ->
         described.palette_open,
         described.paper.grid_show,
     ));
+    // The termd banner (`wall_core::status::notice_for`): its kind, and its text to the
+    // end of the line.
+    lines.push(match &described.status_notice {
+        Some(notice) => format!(
+            "termd_notice kind={} dismiss={} text={}",
+            notice.kind.as_str(),
+            notice.dismiss,
+            notice.text.replace('\n', " ")
+        ),
+        None => "termd_notice none".to_string(),
+    });
     let fs_str = match &described.fullscreen_backdrop {
         None => "none".to_string(),
         Some(fb) => format!("{:?}:{}", fb.mode, fb.target).to_ascii_lowercase(),
@@ -1786,6 +1797,7 @@ mod tests {
         assert!(report.contains("platform mac chord=cmd copy=cmd+c paste=cmd+v ctrl_click_menu=true"));
         assert!(report.contains("focused t1"));
         assert!(report.contains("panels sidebar=false status=false settings=false help=false palette=false"));
+        assert!(report.contains("\ntermd_notice none\n"));
         assert!(report.contains("fullscreen none"));
         assert!(report.contains("terminal t1 cols=100 rows=30 focused=true"));
         assert!(report.contains("close_hold=none"));

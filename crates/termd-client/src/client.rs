@@ -16,6 +16,11 @@
 //!   reconnect window verifying `WELCOME.instance`, re-subscribes active terminals and asks
 //!   each `raw` subscription for a repaint, then notifies the host with [`Event::Reconnected`]
 //!   (or [`Event::Disconnected`] when the namespace is gone).
+//! - A namespace that leaves on purpose (protocol 1.6: `stop`, the holder's `SIGTERM`, the
+//!   idle exit) says so, and the reader ends at once with [`Event::Disconnected`]
+//!   (`restart: false`) and no reconnect: on `ERROR exiting`, carrying the daemon's message;
+//!   and, for a connection that follows the status document, on the close after a document
+//!   with `daemon.exiting: true` (a follower gets that document and no `ERROR`).
 
 use crate::frame::{self, ty, Frame, FrameDecoder};
 use crate::msg::*;
@@ -155,8 +160,15 @@ pub enum Event {
     /// drop), re-subscribed active terminals, and requested repaints.
     Reconnected { restart: bool, generation: Option<u64> },
     /// Connection ended permanently (namespace stopped, instance changed, or reconnect timed out).
+    /// When the namespace left on purpose (`ERROR exiting`, protocol 1.6), `message` is the
+    /// daemon's own.
     Disconnected { restart: bool, message: String },
 }
+
+/// What [`Event::Disconnected`] says for a status follower whose namespace left on purpose:
+/// its notice is a last document with `daemon.exiting: true`, which names no cause.
+pub const NAMESPACE_LEFT: &str =
+    "the namespace left on purpose: its terminals are ended and nothing listens there now";
 
 /// Optional tuning for connection startup, timeouts and reconnect window.
 #[derive(Clone, Debug)]
@@ -210,6 +222,9 @@ struct Shared {
     conn_cv: Condvar,
     subs: Mutex<SubTable>,
     closed_by_client: AtomicBool,
+    /// A status document said `daemon.exiting: true`: the close that follows is the
+    /// namespace leaving, not a restart to ride.
+    namespace_exiting: AtomicBool,
     request_timeout_ms: AtomicU64,
     reconnect_window_ms: AtomicU64,
 }
@@ -964,6 +979,7 @@ impl Termd {
             conn_cv: Condvar::new(),
             subs: Mutex::new(SubTable { by_handle: BTreeMap::new(), status_follow: None }),
             closed_by_client: AtomicBool::new(false),
+            namespace_exiting: AtomicBool::new(false),
             request_timeout_ms: AtomicU64::new(req_ms),
             reconnect_window_ms: AtomicU64::new(reconn_ms),
         });
@@ -1148,7 +1164,13 @@ fn reader_loop(
                     return;
                 }
 
-                let (planned, recoverable, reason) = classify_drop(&drop_err);
+                let (planned, recoverable, reason) = match classify_drop(&drop_err) {
+                    // A status follower was told by its last document, and gets no `ERROR`.
+                    (_, true, _) if shared.namespace_exiting.load(Ordering::Acquire) => {
+                        (false, false, NAMESPACE_LEFT.to_owned())
+                    }
+                    verdict => verdict,
+                };
                 // Take down the dead writer and wake any callers whose requests were sent on the
                 // old connection (PROTOCOL.md: input and mutations are at-most-once).
                 if let Ok(mut writer_guard) = shared.writer.lock() {
@@ -1226,6 +1248,9 @@ fn classify_drop(err: &Error) -> (bool, bool, String) {
         Error::Wire(wire) => match wire.code.as_str() {
             code::RESTART => (true, true, wire.message.clone()),
             code::BRAIN_FAILED => (false, true, wire.message.clone()),
+            // (1.6) The namespace left on purpose: nothing to reconnect to, and the
+            // daemon's message says why (`stop`, `SIGTERM`, the idle rule).
+            code::EXITING => (false, false, wire.message.clone()),
             _ => (false, false, wire.to_string()),
         },
         Error::Io(io_err) => (false, true, io_err.to_string()),
@@ -1316,6 +1341,8 @@ fn reconnect_and_restore(
             Err(err) if err.is_not_running() => {
                 return Err("nothing listens any more: the namespace and its terminals are gone".into());
             }
+            // The namespace left while a restart was being ridden.
+            Err(Error::Wire(wire)) if wire.code == code::EXITING => return Err(wire.message),
             Err(Error::Io(ref io_err)) if io_err.kind() == io::ErrorKind::PermissionDenied => {
                 return Err(format!("unsafe socket on reconnect: {io_err}"));
             }
@@ -1685,6 +1712,11 @@ fn route_json_event(
         }
         "status" => {
             if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(payload) {
+                // (1.6) A follower's notice that the namespace is leaving; the close is next.
+                if doc.pointer("/daemon/exiting").and_then(serde_json::Value::as_bool) == Some(true)
+                {
+                    shared.namespace_exiting.store(true, Ordering::Release);
+                }
                 return push_event(events_tx, wake, Event::Status(doc));
             }
         }
@@ -2052,5 +2084,167 @@ mod tests {
 
         drop(client);
         server.join().unwrap();
+    }
+
+    /// A mock daemon for one client: it answers `HELLO` and the client's first `requests`
+    /// requests, runs `script` (what the daemon sends as it leaves), closes, and then counts
+    /// the connections made in the next 450 ms: a reconnect attempt (the first comes 100 ms
+    /// after a close) would be one. Returns the `HELLO` it was sent and that count.
+    fn leaving_daemon(
+        listener: UnixListener,
+        requests: usize,
+        script: impl FnOnce(&mut UnixStream) + Send + 'static,
+    ) -> thread::JoinHandle<(serde_json::Value, usize)> {
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut dec = FrameDecoder::default();
+            let hello_frame = read_raw_frame(&mut stream, &mut dec).unwrap();
+            assert_eq!(hello_frame.ty, ty::HELLO);
+            let hello: serde_json::Value = serde_json::from_slice(&hello_frame.payload).unwrap();
+            stream
+                .write_all(&frame::encode_json(ty::WELCOME, 0, &mock_welcome("inst-1", 1, 16 << 20)))
+                .unwrap();
+            for _ in 0..requests {
+                let request = read_raw_frame(&mut stream, &mut dec).unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&request.payload).unwrap();
+                let reply = match body["op"].as_str() {
+                    Some("subscribe") => serde_json::json!({
+                        "req": body["req"], "ok": true, "handle": 4, "role": "own",
+                        "seq": 0, "cols": 80, "rows": 24
+                    }),
+                    Some("status_follow") => serde_json::json!({
+                        "req": body["req"], "ok": true, "interval_ms": 500
+                    }),
+                    _ => serde_json::json!({"req": body["req"], "ok": true}),
+                };
+                stream.write_all(&frame::encode_json(ty::REPLY, 0, &reply)).unwrap();
+            }
+            script(&mut stream);
+            drop(stream);
+
+            listener.set_nonblocking(true).unwrap();
+            let until = Instant::now() + Duration::from_millis(450);
+            let mut reconnects = 0;
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok(_) => reconnects += 1,
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            (hello, reconnects)
+        })
+    }
+
+    #[test]
+    fn error_exiting_ends_at_once_with_the_daemons_message_and_no_reconnect() {
+        const LEAVING: &str = "the namespace is leaving (stop): its terminals are ended and nothing will listen here";
+        let scratch = ScratchDir::new("exiting");
+        let listener = UnixListener::bind(scratch.socket()).unwrap();
+        let server = leaving_daemon(listener, 1, |stream| {
+            // Behind what was already queued for the connection: its terminal's last frame.
+            stream.write_all(&frame::encode_output(4, 7, b"bye")).unwrap();
+            let leaving = WireError::new(code::EXITING, LEAVING);
+            stream.write_all(&frame::encode_json(ty::ERROR, 0, &leaving)).unwrap();
+        });
+
+        let client = Termd::connect(&Target::socket(scratch.socket()), "ut", Box::new(|| {})).unwrap();
+        client.subscribe("t1", Role::Own, Some((80, 24)), 0).unwrap();
+        let told = Instant::now();
+        let last = client.events().recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(last, Event::Output { handle: 4, seq: 7, bytes: b"bye".to_vec() });
+        // No backoff before it: the first reconnect attempt would wait 100 ms.
+        let ended = client.events().recv_timeout(Duration::from_millis(90)).unwrap();
+        assert_eq!(
+            ended,
+            Event::Disconnected { restart: false, message: LEAVING.to_owned() },
+            "after {:?}",
+            told.elapsed()
+        );
+        // It is permanent: a request fails with the same words, at once.
+        let err = client.list().expect_err("no daemon to ask");
+        assert!(
+            matches!(&err, Error::Disconnected { restart: false, message } if message == LEAVING),
+            "got {err:?}"
+        );
+
+        let (hello, reconnects) = server.join().unwrap();
+        assert_eq!(reconnects, 0, "`exiting` means there is nothing to reconnect to");
+        assert_eq!(hello["proto"], serde_json::json!([1, 6]), "the HELLO this client sends");
+    }
+
+    /// A connection that follows the status document, closed after a document whose
+    /// `daemon.exiting` is `exiting`: the events after the documents, and the reconnects tried.
+    fn follower_closed_after_a_document(tag: &str, exiting: bool) -> (Vec<Event>, usize) {
+        let scratch = ScratchDir::new(tag);
+        let listener = UnixListener::bind(scratch.socket()).unwrap();
+        let server = leaving_daemon(listener, 2, move |stream| {
+            for last in [false, exiting] {
+                let doc = serde_json::json!({
+                    "ev": "status", "at": 1, "terminals": [], "errors": [],
+                    "daemon": {"ns": "mock", "instance": "inst-1", "exiting": last},
+                });
+                stream.write_all(&frame::encode_json(ty::EVENT, 0, &doc)).unwrap();
+            }
+        });
+
+        let client = Termd::connect(&Target::socket(scratch.socket()), "ut", Box::new(|| {})).unwrap();
+        client.subscribe("t1", Role::Own, Some((80, 24)), 0).unwrap();
+        client.status_follow(Some(500)).unwrap();
+        for _ in 0..2 {
+            let doc = client.events().recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(matches!(doc, Event::Status(_)), "got {doc:?}");
+        }
+        let mut after = Vec::new();
+        while let Ok(ev) = client.events().recv_timeout(Duration::from_millis(90)) {
+            after.push(ev);
+        }
+        let (_, reconnects) = server.join().unwrap();
+        drop(client);
+        (after, reconnects)
+    }
+
+    #[test]
+    fn a_status_follower_ends_on_the_close_after_its_exiting_document() {
+        // The follower's notice is its last document: no `ERROR` follows it, only the close.
+        let (after, reconnects) = follower_closed_after_a_document("exitdoc", true);
+        assert_eq!(
+            after,
+            vec![Event::Disconnected { restart: false, message: NAMESPACE_LEFT.to_owned() }]
+        );
+        assert_eq!(reconnects, 0, "a namespace that said it was leaving is not redialled");
+
+        // The same close after a document that did not say so is a crash: ride it.
+        let (after, reconnects) = follower_closed_after_a_document("crashdoc", false);
+        assert_eq!(after, Vec::new(), "no verdict while the reconnect window is open");
+        assert!(reconnects >= 1, "a bare close is redialled: {reconnects} attempt(s)");
+    }
+
+    #[test]
+    fn any_1_x_welcome_is_accepted_and_another_major_is_not() {
+        for (tag, proto, accepted) in [("w15", [1, 5], true), ("w19", [1, 9], true), ("w20", [2, 0], false)] {
+            let scratch = ScratchDir::new(tag);
+            let listener = UnixListener::bind(scratch.socket()).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut dec = FrameDecoder::default();
+                let _ = read_raw_frame(&mut stream, &mut dec).unwrap();
+                let welcome = Welcome { proto, ..mock_welcome("inst-1", 1, 16 << 20) };
+                stream.write_all(&frame::encode_json(ty::WELCOME, 0, &welcome)).unwrap();
+                let _ = read_raw_frame(&mut stream, &mut dec);
+            });
+            let outcome = Termd::connect(&Target::socket(scratch.socket()), "ut", Box::new(|| {}));
+            match outcome {
+                Ok(client) => {
+                    assert!(accepted, "a {proto:?} WELCOME was accepted");
+                    assert_eq!(client.welcome().proto, proto);
+                    drop(client);
+                }
+                Err(err) => {
+                    assert!(!accepted, "a {proto:?} WELCOME was refused: {err}");
+                    assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+                }
+            }
+            server.join().unwrap();
+        }
     }
 }

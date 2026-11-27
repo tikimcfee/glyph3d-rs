@@ -104,12 +104,24 @@ impl FromStr for TermdState {
     }
 }
 
-/// Latched record of a holder crash that lost live shells (`TermdStatus.lost`).
+/// Latched record of a namespace that went away with live shells in it
+/// (`TermdStatus.lost`): a holder crash or kill, or (2026-11-27) a namespace that
+/// left on purpose.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LostLatch {
     pub ns: String,
     pub at: u64,
+    /// Why, in the client's words, when the namespace left on purpose
+    /// ([`TermdStatus::on_gone`]); `None` for one that simply stopped listening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+/// A stopped namespace ends its terminals, then says it is exiting, within about
+/// 0.2 s (measured on protocol 1.6). A document may list no terminal in between, so
+/// shells listed this recently still count as lost with the namespace. The daemon's
+/// idle exit comes 5 minutes after its last terminal, far outside this.
+const SHELLS_LISTED_RECENTLY_MS: u64 = 3_000;
 
 // ── Status document schema (docs/termd/PROTOCOL.md § status) ─────────────────
 
@@ -339,7 +351,10 @@ pub struct TermdStatus {
     lacks: Vec<String>,
     doc: Option<StatusDoc>,
     by_id: HashMap<String, usize>,
+    /// Whether the last document that was not `exiting` listed any terminal.
     had_terminals: bool,
+    /// When a document last listed a terminal.
+    shells_listed_at: Option<u64>,
     last_exiting: bool,
     lost: Option<LostLatch>,
 }
@@ -363,6 +378,7 @@ impl TermdStatus {
             doc: None,
             by_id: HashMap::new(),
             had_terminals: false,
+            shells_listed_at: None,
             last_exiting: false,
             lost: None,
         }
@@ -469,13 +485,49 @@ impl TermdStatus {
                 self.ns = ns.clone();
             }
         }
-        self.had_terminals = !doc.terminals.is_empty();
+        // A namespace's last document says `exiting` and lists nothing: what it
+        // held is what the document before it listed.
+        if !doc.daemon.exiting {
+            self.had_terminals = !doc.terminals.is_empty();
+        }
+        if !doc.terminals.is_empty() {
+            self.shells_listed_at = Some(now_ms);
+        }
         self.last_exiting = doc.daemon.exiting;
         if self.state != TermdState::Ok {
             self.state = TermdState::Ok;
             self.since_ms = now_ms;
         }
         self.set_doc(Some(doc));
+    }
+
+    /// The connection ended for good, with the client's reason
+    /// (`termd_client::Event::Disconnected`'s message).
+    ///
+    /// A namespace that left on purpose (`stop`, the holder's `SIGTERM`: protocol 1.6,
+    /// "A namespace that leaves") with shells in it is an outage, shown at once:
+    /// [`TermdState::Lost`], latched with `reason`, with no wait for a reconnect
+    /// to fail. The wall follows the status document, so its notice of the
+    /// leaving is the last document's `daemon.exiting`, not an `ERROR` naming the
+    /// cause. An empty namespace leaving (the idle exit) stays
+    /// [`TermdState::Absent`], and any other end is [`Self::on_disconnected`]'s.
+    pub fn on_gone(&mut self, reason: &str, now_ms: u64) {
+        let shells_lost = self.had_terminals
+            || self
+                .shells_listed_at
+                .is_some_and(|at| now_ms.saturating_sub(at) <= SHELLS_LISTED_RECENTLY_MS);
+        if self.last_exiting && shells_lost {
+            self.transition(TermdState::Lost, false, now_ms);
+            self.had_terminals = false;
+            self.shells_listed_at = None;
+            if let Some(latch) = &mut self.lost {
+                if latch.reason.is_none() && !reason.is_empty() {
+                    latch.reason = Some(reason.to_string());
+                }
+            }
+        } else {
+            self.on_disconnected(false, now_ms);
+        }
     }
 
     /// Handle the status socket closing: if the daemon's last document reported
@@ -541,7 +593,9 @@ impl TermdStatus {
         self.since_ms = meta.since;
         self.lacks = meta.lacks;
         if let Some(d) = &doc {
-            self.had_terminals = !d.terminals.is_empty();
+            if !d.daemon.exiting {
+                self.had_terminals = !d.terminals.is_empty();
+            }
             self.last_exiting = d.daemon.exiting;
         }
         self.set_doc(doc);
@@ -549,6 +603,7 @@ impl TermdStatus {
             self.lost = Some(LostLatch {
                 ns: self.ns.clone(),
                 at: self.since_ms,
+                reason: None,
             });
         }
     }
@@ -590,6 +645,7 @@ impl TermdStatus {
             self.lost = Some(LostLatch {
                 ns: self.ns.clone(),
                 at: self.since_ms,
+                reason: None,
             });
         }
     }
@@ -716,10 +772,14 @@ pub fn notice_for(
             kind: NoticeKind::Lost,
             tone: StatusTone::Red,
             dismiss: true,
-            text: format!(
-                "termd lost: the shells in namespace \"{}\" are gone · a new terminal starts a fresh termd",
-                lost.ns
-            ),
+            text: match &lost.reason {
+                // The namespace said it was leaving: the reason says what is gone.
+                Some(reason) => format!("termd lost: {reason}"),
+                None => format!(
+                    "termd lost: the shells in namespace \"{}\" are gone · a new terminal starts a fresh termd",
+                    lost.ns
+                ),
+            },
         });
     }
     let lacks = status.lacks();
@@ -1252,6 +1312,73 @@ mod tests {
         );
         assert!(status.dismiss_lost());
         assert_eq!(notice_for(&status, status.since_ms(), 85_000, 400), None);
+    }
+
+    #[test]
+    fn a_namespace_that_leaves_on_purpose_with_shells_is_lost_at_once_with_its_reason() {
+        const LEFT: &str =
+            "the namespace left on purpose: its terminals are ended and nothing listens there now";
+        let live = |ids: &[&str]| {
+            let terminals: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+            json!({"daemon": {"ns": "rs-wall", "exiting": false}, "terminals": terminals})
+        };
+        let exiting = json!({"daemon": {"ns": "rs-wall", "exiting": true}, "terminals": []});
+
+        // `g3d stop` with two quiet shells: the last document that listed them is 20 s
+        // old, the namespace's last one lists nothing and says `exiting`, and the
+        // connection ends for good. Lost on that instant, with the reason: no
+        // restart grace, no wait for a reconnect to find the socket gone.
+        let mut status = TermdStatus::default();
+        status.on_status_json(live(&["t1", "t2"]), 10_000).unwrap();
+        status.on_status_json(exiting.clone(), 30_000).unwrap();
+        assert!(notice_for(&status, status.since_ms(), 30_000, 400).is_none());
+        status.on_gone(LEFT, 30_001);
+        assert_eq!(status.state(), TermdState::Lost);
+        let lost = notice_for(&status, status.since_ms(), 30_001, 400).expect("the outage notice");
+        assert_eq!(lost.kind, NoticeKind::Lost);
+        assert_eq!(lost.tone, StatusTone::Red);
+        assert!(lost.dismiss);
+        assert_eq!(lost.text, format!("termd lost: {LEFT}"));
+        assert_eq!(status.lost().unwrap().reason.as_deref(), Some(LEFT));
+        assert!(status.dismiss_lost());
+        assert!(notice_for(&status, status.since_ms(), 31_000, 400).is_none());
+
+        // A document that lists nothing may come between the terminals ending and the
+        // `exiting` one (a stop takes about 0.2 s): the shells listed a moment ago
+        // still went with the namespace.
+        let mut status = TermdStatus::default();
+        status.on_status_json(live(&["t1"]), 10_000).unwrap();
+        status.on_status_json(live(&[]), 10_150).unwrap();
+        status.on_status_json(exiting.clone(), 10_200).unwrap();
+        status.on_gone(LEFT, 10_201);
+        assert_eq!(status.state(), TermdState::Lost);
+        assert_eq!(status.lost().unwrap().reason.as_deref(), Some(LEFT));
+
+        // The idle exit: the namespace has been empty for five minutes. Nothing was
+        // lost, so nothing is said.
+        let mut status = TermdStatus::default();
+        status.on_status_json(live(&["t1"]), 10_000).unwrap();
+        status.on_status_json(live(&[]), 12_000).unwrap();
+        status.on_status_json(exiting, 312_000).unwrap();
+        status.on_gone(LEFT, 312_001);
+        assert_eq!(status.state(), TermdState::Absent);
+        assert!(status.lost().is_none());
+        assert!(notice_for(&status, status.since_ms(), 312_001, 400).is_none());
+
+        // Any other end (no document said `exiting`) is a disconnect as before: a
+        // restart to ride, until the socket proves absent.
+        let mut status = TermdStatus::default();
+        status.on_status_json(live(&["t1"]), 10_000).unwrap();
+        status.on_gone("no termd brain answered within 10s: timed out", 20_000);
+        assert_eq!(status.state(), TermdState::Restarting);
+        assert!(status.lost().is_none());
+        status.on_socket_absent(20_500);
+        assert_eq!(status.state(), TermdState::Lost);
+        let plain = notice_for(&status, status.since_ms(), 20_500, 400).unwrap();
+        assert_eq!(
+            plain.text,
+            "termd lost: the shells in namespace \"rs-wall\" are gone · a new terminal starts a fresh termd"
+        );
     }
 
     #[test]

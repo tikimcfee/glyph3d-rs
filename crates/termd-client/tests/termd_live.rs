@@ -672,6 +672,247 @@ fn rides_unplanned_brain_crash_and_restores_subscription() {
     collect_output_until(&client, sub.handle, b"AFTER-CRASH:still-here:", Duration::from_secs(5));
 }
 
+/// The `g3d` CLI beside the daemon under test, run against the scratch namespace alone
+/// (`G3D_TERMD_DIR` is the scratch directory, `--ns` the scratch namespace).
+fn g3d_in(scratch: &ScratchDaemon, verb: &[&str]) -> std::process::Output {
+    let g3d = scratch.bin.with_file_name("g3d");
+    assert!(g3d.is_file(), "no g3d CLI beside {}", scratch.bin.display());
+    Command::new(g3d)
+        .env("G3D_TERMD_DIR", &scratch.dir)
+        .env_remove("G3D_TERMD_SOCKET")
+        .arg("--ns")
+        .arg(&scratch.ns)
+        .args(verb)
+        .output()
+        .expect("run g3d")
+}
+
+/// What a client subscribed to a terminal sees when `g3d stop` ends its namespace
+/// (PROTOCOL.md 1.6, "A namespace that leaves").
+struct StopOutcome {
+    /// The `Event::Disconnected` the client got.
+    event: Event,
+    /// From `g3d stop` returning to the daemon removing its socket, which it does as it
+    /// tells its connections: the daemon's own time to end its terminals.
+    daemon_took: Duration,
+    /// From the socket leaving to that event (zero when the event was first): the client's.
+    after_notice: Duration,
+    /// From starting `g3d stop` to that event.
+    after_asking: Duration,
+    /// The last status document's `daemon.exiting`, for a client that follows status.
+    saw_exiting_document: bool,
+    /// Connections made to the namespace's socket path in the 700 ms after it left: a
+    /// reconnect attempt (the first comes 100 ms after a close) would be one.
+    reconnect_attempts: usize,
+}
+
+fn stop_while_subscribed(tag: &str, follow_status: bool) -> Option<StopOutcome> {
+    use std::os::unix::net::UnixListener;
+
+    let bin = require_termd_bin()?;
+    let scratch = ScratchDaemon::new(tag, bin);
+    let client = scratch.start_client(Box::new(|| {}));
+    client
+        .create(&fast_create(
+            "t-stop",
+            80,
+            24,
+            vec!["/bin/sh", "-c", "printf 'UP\\n'; exec sleep 60"],
+        ))
+        .unwrap();
+    let sub = client.subscribe("t-stop", Role::Own, Some((80, 24)), 0).unwrap();
+    collect_output_until(&client, sub.handle, b"UP", Duration::from_secs(5));
+    if follow_status {
+        client.status_follow(Some(500)).unwrap();
+        wait_for_event(&client, Duration::from_secs(5), |ev| matches!(ev, Event::Status(_)));
+    }
+
+    let sock = scratch.dir.join(format!("termd-{}.sock", scratch.ns));
+    let asked = Instant::now();
+    let stop = g3d_in(&scratch, &["stop"]);
+    let stopped = Instant::now();
+    assert!(
+        stop.status.success(),
+        "g3d stop: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // The daemon removes its socket as it tells its connections. Listen in its place as soon
+    // as it has: any reconnect the client tries lands here and is counted. Meanwhile watch
+    // the client's events, to time its verdict against the socket leaving.
+    let mut saw_exiting_document = false;
+    let mut gone: Option<(Instant, UnixListener)> = None;
+    let mut heard: Option<(Instant, Event)> = None;
+    let give_up = Instant::now() + Duration::from_secs(8);
+    while gone.is_none() || heard.is_none() {
+        assert!(
+            Instant::now() < give_up,
+            "8 s after g3d stop: socket gone: {}, Disconnected: {:?}",
+            gone.is_some(),
+            heard.as_ref().map(|(_, ev)| ev)
+        );
+        if gone.is_none() && !sock.exists() {
+            let listener = UnixListener::bind(&sock).expect("listen where the namespace was");
+            listener.set_nonblocking(true).unwrap();
+            gone = Some((Instant::now(), listener));
+        }
+        match client.events().try_recv() {
+            Ok(Event::Status(doc)) => saw_exiting_document |= doc["daemon"]["exiting"] == true,
+            Ok(ev @ Event::Disconnected { .. }) => heard = Some((Instant::now(), ev)),
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("the client's event channel closed with no Disconnected event")
+            }
+        }
+    }
+    let (gone_at, listener) = gone.expect("the loop ends with both");
+    let (heard_at, event) = heard.expect("the loop ends with both");
+
+    std::thread::sleep(Duration::from_millis(700));
+    let mut reconnect_attempts = 0;
+    while listener.accept().is_ok() {
+        reconnect_attempts += 1;
+    }
+    // Before `scratch` drops: its cleanup dials this path, and nothing must answer.
+    drop(listener);
+    let _ = std::fs::remove_file(&sock);
+
+    Some(StopOutcome {
+        event,
+        daemon_took: gone_at.saturating_duration_since(stopped),
+        after_notice: heard_at.saturating_duration_since(gone_at),
+        after_asking: heard_at.saturating_duration_since(asked),
+        saw_exiting_document,
+        reconnect_attempts,
+    })
+}
+
+#[test]
+fn stop_ends_a_subscribed_client_at_once_with_the_daemons_message() {
+    let Some(out) = stop_while_subscribed("exit", false) else { return };
+    println!(
+        "[1.6 exiting] g3d stop while subscribed: {:?} · {:.1} ms after the daemon's notice (the daemon took {} ms after stop returned; {} ms after stop was asked) · {} reconnect attempt(s)",
+        out.event,
+        out.after_notice.as_secs_f64() * 1e3,
+        out.daemon_took.as_millis(),
+        out.after_asking.as_millis(),
+        out.reconnect_attempts
+    );
+    let Event::Disconnected { restart, message } = &out.event else {
+        panic!("expected Disconnected, got {:?}", out.event);
+    };
+    assert!(!restart, "a namespace that left is not a restart");
+    // `ERROR exiting` carries the cause; the client passes it on as it came.
+    assert!(
+        message.contains("stop") && !message.starts_with("exiting:"),
+        "expected the daemon's own message, got {message:?}"
+    );
+    assert_eq!(out.reconnect_attempts, 0, "no reconnect after `exiting`");
+    assert!(
+        out.after_notice <= Duration::from_millis(100),
+        "Disconnected {:?} after the daemon's notice",
+        out.after_notice
+    );
+}
+
+#[test]
+fn stop_ends_a_status_follower_at_once_too() {
+    // The wall's shape: `term_session::Sessions` follows the status document on the
+    // connection it subscribes on. A follower gets no `ERROR exiting`: its notice is a last
+    // document with `daemon.exiting: true`, and then the close.
+    let Some(out) = stop_while_subscribed("exitf", true) else { return };
+    println!(
+        "[1.6 exiting, status follower] g3d stop while subscribed: {:?} · {:.1} ms after the daemon's notice (the daemon took {} ms after stop returned; {} ms after stop was asked) · exiting document seen: {} · {} reconnect attempt(s)",
+        out.event,
+        out.after_notice.as_secs_f64() * 1e3,
+        out.daemon_took.as_millis(),
+        out.after_asking.as_millis(),
+        out.saw_exiting_document,
+        out.reconnect_attempts
+    );
+    assert!(out.saw_exiting_document, "a follower's last document says exiting");
+    let Event::Disconnected { restart, message } = &out.event else {
+        panic!("expected Disconnected, got {:?}", out.event);
+    };
+    assert!(!restart, "a namespace that left is not a restart");
+    assert!(
+        message.contains("left on purpose"),
+        "expected the client to say the namespace left, got {message:?}"
+    );
+    assert_eq!(out.reconnect_attempts, 0, "no reconnect after `daemon.exiting`");
+    assert!(
+        out.after_notice <= Duration::from_millis(100),
+        "Disconnected {:?} after the daemon's notice",
+        out.after_notice
+    );
+}
+
+#[test]
+fn g3d_upgrade_of_the_brain_alone_still_reconnects() {
+    let Some(bin) = require_termd_bin() else { return };
+    let scratch = ScratchDaemon::new("upcli", bin);
+    let client = scratch.start_client(Box::new(|| {}));
+    let gen_before = client.welcome().generation.unwrap_or(1);
+    client
+        .create(&fast_create(
+            "t-up",
+            80,
+            24,
+            vec![
+                "/bin/sh",
+                "-c",
+                "printf 'BOOTED\\n'; while IFS= read -r line; do printf 'SURVIVED:%s:\\n' \"$line\"; done",
+            ],
+        ))
+        .unwrap();
+    let sub = client.subscribe("t-up", Role::Own, Some((80, 24)), 0).unwrap();
+    collect_output_until(&client, sub.handle, b"BOOTED", Duration::from_secs(5));
+    client.status_follow(Some(500)).unwrap();
+
+    let asked = Instant::now();
+    let upgrade = g3d_in(&scratch, &["upgrade"]);
+    assert!(
+        upgrade.status.success(),
+        "g3d upgrade: {}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+
+    let mut exiting_document = false;
+    let reconn_ev = wait_for_event(&client, Duration::from_secs(10), |ev| {
+        if let Event::Status(doc) = ev {
+            exiting_document |= doc["daemon"]["exiting"] == true;
+        }
+        assert!(
+            !matches!(ev, Event::Disconnected { .. }),
+            "a brain upgrade must not end the client: {ev:?}"
+        );
+        matches!(ev, Event::Reconnected { .. })
+    });
+    println!(
+        "[1.6 upgrade] g3d upgrade (brain only) while subscribed: {reconn_ev:?} · {} ms after it was asked",
+        asked.elapsed().as_millis()
+    );
+    assert!(!exiting_document, "an upgrade is not a namespace leaving");
+    match reconn_ev {
+        Event::Reconnected { restart, generation } => {
+            assert!(restart, "expected planned restart=true on upgrade");
+            assert!(
+                generation.unwrap_or(0) > gen_before,
+                "expected generation > {gen_before}, got {generation:?}"
+            );
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    wait_for_event(&client, Duration::from_secs(5), |ev| {
+        matches!(ev, Event::Repaint { handle, .. } if *handle == sub.handle)
+    });
+    client.paste(sub.handle, "after-upgrade\n").unwrap();
+    collect_output_until(&client, sub.handle, b"SURVIVED:after-upgrade:", Duration::from_secs(5));
+}
+
 #[test]
 fn target_namespace_honours_g3d_termd_dir_env_in_subprocess() {
     // Child entrypoint when invoked with `TERMD_ENV_CHILD_DIR`.

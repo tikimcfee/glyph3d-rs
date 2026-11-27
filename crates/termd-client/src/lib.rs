@@ -13,7 +13,7 @@ pub mod paths;
 
 pub use client::{
     ConnectOptions, Error, Event, Termd, TermdHandle, DEFAULT_RECONNECT_WINDOW,
-    DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_REQUEST_TIMEOUT, NAMESPACE_LEFT,
 };
 pub use msg::{
     code, Capture, CaptureFormat, CaptureReply, Colors, Create, CreateReply, Flow, HolderInfo,

@@ -1,4 +1,4 @@
-//! JSON control payload types for `g3d-termd` wire protocol 1.5.
+//! JSON control payload types for `g3d-termd` wire protocol 1.6.
 //!
 //! Both peers ignore unknown fields (`serde`'s default) so future 1.x minor versions remain
 //! wire-compatible without breaking older clients. Adapted from `g3d-wire` (MIT, same owner).
@@ -6,8 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Protocol `[major, minor]` spoken by this client.
-pub const PROTO: [u32; 2] = [1, 5];
+/// Protocol `[major, minor]` spoken by this client: what its `HELLO` says. Any `WELCOME` of
+/// the same major is accepted, older minors included.
+pub const PROTO: [u32; 2] = [1, 6];
 
 /// Wire error codes returned in `REPLY.error`, `ERROR` frames, and `error` events.
 pub mod code {
@@ -33,6 +34,10 @@ pub mod code {
     pub const AUTH: &str = "auth";
     pub const RESTART: &str = "restart";
     pub const BRAIN_FAILED: &str = "brain_failed";
+    /// (1.6) The namespace is leaving on purpose (`stop`, the holder's `SIGTERM`, the idle
+    /// exit): its terminals are ended and nothing will listen there. The opposite of
+    /// [`RESTART`]: don't reconnect.
+    pub const EXITING: &str = "exiting";
 
     // Terminal `error` event codes.
     pub const INPUT_FULL: &str = "input_full";

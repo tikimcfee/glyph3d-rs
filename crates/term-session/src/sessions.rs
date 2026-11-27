@@ -669,7 +669,7 @@ impl Sessions {
         for id in self.detached_ended.drain(..) {
             news.push(News::Ended { id });
         }
-        let mut daemon_gone = false;
+        let mut daemon_gone: Option<String> = None;
         let mut latest_status: Option<serde_json::Value> = None;
 
         for ev in self.hub.poll_daemon_events() {
@@ -678,8 +678,7 @@ impl Sessions {
                     log::info!("termd came back (restart: {restart}); its terminals repaint");
                 }
                 DaemonEvent::Gone { message, .. } => {
-                    daemon_gone = true;
-                    news.push(News::Disconnected { message });
+                    daemon_gone = Some(message);
                 }
                 DaemonEvent::UpgradeFailed { message } => {
                     log::warn!("termd upgrade failed: {message}");
@@ -711,6 +710,16 @@ impl Sessions {
         if let Some(doc) = latest_status {
             news.push(News::Status(doc));
         }
+        // After the status document, as on the wire: a namespace that leaves says so in its
+        // last document (`daemon.exiting`) and then closes, and the host reads the close by
+        // what that document said. Until 2026-11-27 the close was handed over first.
+        let daemon_gone = match daemon_gone {
+            Some(message) => {
+                news.push(News::Disconnected { message });
+                true
+            }
+            None => false,
+        };
 
         let mut extra_gone_indices = Vec::new();
         for idx in 0..self.extras.len() {

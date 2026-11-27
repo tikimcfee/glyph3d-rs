@@ -2074,3 +2074,53 @@ fn sessions_pump_surfaces_live_news_status_updates() {
         "Sessions::pump must emit News::Status containing the spawned terminal"
     );
 }
+
+#[test]
+fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
+    // A namespace that leaves on purpose (protocol 1.6) tells a status follower with a last
+    // document, `daemon.exiting: true`, and then closes. `Sessions` follows status, and the
+    // wall reads the close by what that document said: the news must come in wire order.
+    use term_session::News;
+
+    let scratch = ScratchDaemon::new("stexit");
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions =
+        term_session::Sessions::open_target(&scratch.target(), wake.waker()).expect("open");
+    let (id, _, _) = sessions
+        .spawn(Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()]), 80, 24)
+        .expect("spawn");
+
+    // Stopped from another connection, as `g3d stop` does it.
+    let stopper = Termd::connect(&scratch.target(), "stopper", Box::new(|| {})).expect("connect");
+    stopper.stop().expect("stop the scratch daemon");
+
+    let mut seen = wake.current();
+    let mut order: Vec<String> = Vec::new();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let (_, news) = sessions.pump();
+            for n in news {
+                match n {
+                    News::Ended { id } => order.push(format!("ended {id}")),
+                    News::Status(doc) => {
+                        if doc["daemon"]["exiting"] == true {
+                            order.push("exiting document".into());
+                        }
+                    }
+                    News::Disconnected { message } => order.push(format!("disconnected: {message}")),
+                    _ => {}
+                }
+            }
+            order.iter().any(|what| what.starts_with("disconnected"))
+        }),
+        "no News::Disconnected within 10 s of the stop: {order:?}"
+    );
+    assert_eq!(
+        order,
+        vec![
+            format!("ended {id}"),
+            "exiting document".to_string(),
+            format!("disconnected: {}", termd_client::NAMESPACE_LEFT),
+        ]
+    );
+}

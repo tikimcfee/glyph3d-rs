@@ -2551,6 +2551,35 @@ fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice(
     assert_eq!(h.frame().status_notice, None);
     assert!(h.frame().notice.is_some());
 
+    // A namespace that leaves on purpose with a shell in it (`g3d stop`): its last document
+    // says `exiting`, the connection ends for good, and the Lost notice is in the very next
+    // frame with the reason, no clock tick between.
+    let live_doc = serde_json::json!({
+        "daemon": { "ns": "test", "exiting": false },
+        "terminals": [{ "id": t1, "cols": 100, "rows": 30, "flow": "ok", "subscribers": [] }]
+    });
+    h.wall.on_termd_status(live_doc, 9_000).expect("status ok");
+    assert_eq!(h.frame().status_notice, None);
+    h.wall
+        .on_termd_status(
+            serde_json::json!({ "daemon": { "ns": "test", "exiting": true }, "terminals": [] }),
+            9_400,
+        )
+        .expect("status ok");
+    h.wall.on_termd_gone(
+        "the namespace left on purpose: its terminals are ended and nothing listens there now",
+        9_401,
+    );
+    let left = h.frame().status_notice.expect("Lost notice at once");
+    assert_eq!(left.kind, NoticeKind::Lost);
+    assert!(left.dismiss);
+    assert_eq!(
+        left.text,
+        "termd lost: the namespace left on purpose: its terminals are ended and nothing listens there now"
+    );
+    assert!(h.wall.dismiss_termd_lost());
+    assert_eq!(h.frame().status_notice, None);
+
     // Epoch-ms timestamps combined with clamped dt (1/30 s) must advance by real wall-clock delta.
     let epoch_base: u64 = 1_795_000_000_000;
     let ok_doc2 = serde_json::json!({

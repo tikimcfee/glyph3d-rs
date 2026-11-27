@@ -103,7 +103,10 @@
 # 1154 -> 1174 (2026-11-26): wall-root parity, perf, and idle/status-wake tests (+20).
 # 1174 -> 1184 (2026-11-27): the sidebar's one list (+10): wall-core's model
 # (7) and `wall.sidebar mode` (1), the panel's switch (1), the mount (1).
-test_floor = 1184
+# 1184 -> 1192 (2026-11-27): a namespace that leaves, protocol 1.6 (+8):
+# termd-client (3 unit, 3 live), term-session's news order (1 live), the
+# wall's outage notice (1).
+test_floor = 1192
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target `test --relax` runs, each golden render, each kind = "cmd"

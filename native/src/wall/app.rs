@@ -1751,7 +1751,9 @@ impl App {
                     News::Disconnected { message } => {
                         log::error!("termd is gone: {message}");
                         wall.set_connected(false);
-                        wall.on_termd_disconnected(false, epoch_now_ms());
+                        // A namespace that left on purpose is an outage now, with its
+                        // reason, not a restart to wait out.
+                        wall.on_termd_gone(&message, epoch_now_ms());
                         heard = true;
                     }
                 }
