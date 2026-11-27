@@ -457,7 +457,13 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
 
     let x0 = term.origin.x + f32(col) * cell_size.x;
     let exact_span_right = term.origin.x + f32(col + span_cols) * cell_size.x;
-    let x1 = select(x0 + quad_w, exact_span_right, quad_w == span_w);
+    let raw_x1 = select(x0 + quad_w, exact_span_right, quad_w == span_w);
+    let grid_right = term.origin.x + f32(term.cols) * cell_size.x;
+    let clipped = raw_x1 > grid_right;
+    let x1 = select(raw_x1, grid_right, clipped);
+    let uv_x_hi = select(1.0, clamp((grid_right - x0) / max(raw_x1 - x0, 1e-6), 0.0, 1.0), clipped);
+    let uv = vec2<f32>(select(0.0, uv_x_hi, c.x > 0.5), c.y);
+
     let y0 = term.origin.y - f32(row + 1u) * cell_size.y;
     let y1 = term.origin.y - f32(row) * cell_size.y;
     let x = select(x0, x1, c.x > 0.5);
@@ -465,9 +471,9 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     let z = term.z + Z_OFFSET_INK;
 
     let clip = frame.view_proj * vec4<f32>(x, y, z, 1.0);
-    let foot_cu = frame.view_proj * vec4<f32>(x1 - x0, 0.0, 0.0, 0.0);
+    let foot_cu = frame.view_proj * vec4<f32>(raw_x1 - x0, 0.0, 0.0, 0.0);
     let foot_cv = frame.view_proj * vec4<f32>(0.0, y1 - y0, 0.0, 0.0);
-    let foot_c0 = clip - c.x * foot_cu - c.y * foot_cv;
+    let foot_c0 = clip - uv.x * foot_cu - uv.y * foot_cv;
     let foot_scale = vec3<f32>(frame.viewport.x * 0.5, -frame.viewport.y * 0.5, 1.0);
 
     var emoji_cell_xy = vec2<f32>(0.0);
@@ -490,9 +496,9 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     let raw_fg = unpack_rgba8(cell.fg).rgb;
     var fg_rgb = raw_fg;
     var cell_style = style;
+    let cell_bg_rgba = unpack_rgba8(cell.bg);
+    let cell_bg = select(unpack_rgba8(term.default_bg).rgb, cell_bg_rgba.rgb, cell_bg_rgba.a > 0.0);
     if under_cursor {
-        let cell_bg_rgba = unpack_rgba8(cell.bg);
-        let cell_bg = select(unpack_rgba8(term.default_bg).rgb, cell_bg_rgba.rgb, cell_bg_rgba.a > 0.0);
         let cursor_rgb = resolved_cursor_color().rgb;
         let diff = abs(cell_bg - cursor_rgb);
         // Ghostty cursor-text default: draw the glyph over a solid block cursor in the
@@ -501,11 +507,29 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
         fg_rgb = select(cell_bg, raw_fg, max(diff.x, max(diff.y, diff.z)) < 0.05);
         cell_style = cell_style & (~STYLE_DIM);
     }
-    let fg_srgb = vec4<f32>(fg_rgb, 1.0);
-    let decor_srgb = select(fg_srgb.rgb, unpack_rgba8(cell.ul).rgb, (cell_style & STYLE_UNDERLINE_COLOR) != 0u);
+    var decor_srgb = select(fg_rgb, unpack_rgba8(cell.ul).rgb, (cell_style & STYLE_UNDERLINE_COLOR) != 0u);
+    var fg_alpha = 1.0;
+    if (cell_style & STYLE_DIM) != 0u && frame.target_is_srgb != 0u && mode != 1u {
+        // The JS wall (WebGL2 sRGB canvas, docs/architecture/rendering.md "Colour")
+        // blends SGR 2 dim ink and lines in gamma/sRGB space (uDimAlpha = 0.5).
+        // Linear blending alpha = 0.5 into an *_Srgb target lands ~0.75 in sRGB on
+        // dark panels and washes out dim-inverse text. Mix toward cell_bg in sRGB
+        // here so both light-on-dark and dark-on-light dim match the browser wall.
+        let dim = clamp(frame.dim_alpha, 0.0, 1.0);
+        if dim <= 0.0 {
+            fg_alpha = 0.0;
+        } else {
+            fg_rgb = mix(cell_bg, fg_rgb, dim);
+            decor_srgb = mix(cell_bg, decor_srgb, dim);
+            cell_style = cell_style & (~STYLE_DIM);
+        }
+    }
+    let fg_srgb = vec4<f32>(fg_rgb, fg_alpha);
+
+    let visible_span_cols = min(span_cols, term.cols - col);
 
     out.clip = clip;
-    out.glyph_uv = c;
+    out.glyph_uv = uv;
     out.fg_srgb = fg_srgb;
     out.decor_srgb = decor_srgb;
     out.curve_start = curve_start;
@@ -516,7 +540,7 @@ fn vs_ink(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> I
     out.cell_info = vec4<f32>(
         quad_w / max(cell_size.x, 1e-6),
         cell_size.x / max(cell_size.y, 1e-6),
-        f32(span_cols),
+        f32(visible_span_cols),
         quad_w / max(cell_size.y, 1e-6),
     );
     out.emoji_cell_xy = emoji_cell_xy;
@@ -776,7 +800,7 @@ fn vs_cursor(@builtin(vertex_index) vi: u32) -> CursorVsOut {
         return out;
     }
     let solid_block = (term.cursor_flags & CURSOR_SOLID_BLOCK) != 0u;
-    let span_cols = max((term.cursor_flags >> 4u) & 3u, 1u);
+    let span_cols = min(max((term.cursor_flags >> 4u) & 3u, 1u), term.cols - term.cursor_col);
     let c = quad_corner(vi);
     let cell_size = frame.cell_size * term.scale;
     let x0 = term.origin.x + f32(term.cursor_col) * cell_size.x;

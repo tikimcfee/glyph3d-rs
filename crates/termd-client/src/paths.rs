@@ -314,35 +314,112 @@ pub fn verify_peer_uid(sock: &std::os::unix::net::UnixStream, expected_uid: u32)
     Ok(())
 }
 
-/// Locates `g3d-termd`: beside the current executable, in `~/.local/bin`, or on `$PATH`.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Locates `g3d-termd` even when launched from Finder or a desktop launcher with a minimal `PATH`:
+/// 1. `$G3D_TERMD_BIN` when set (refused immediately if missing or non-executable)
+/// 2. Beside the current executable (`Contents/MacOS/g3d-termd` or `target/release/g3d-termd`)
+/// 3. `$PATH`
+/// 4. `~/.local/bin/g3d-termd` and `~/.cargo/bin/g3d-termd`
+/// 5. Standard Unix/macOS binary prefixes omitted from Finder's `PATH` (`/opt/homebrew/bin`,
+///    `/usr/local/bin`, `/usr/bin`)
 pub fn find_termd() -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    const SYSTEM_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
+    #[cfg(not(target_os = "macos"))]
+    const SYSTEM_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin"];
+
+    let env_bin = non_empty_env_path("G3D_TERMD_BIN");
+    let exe = std::env::current_exe().ok();
+    let path_var = std::env::var_os("PATH");
+    let home = non_empty_env_path("HOME");
+    let sys: Vec<&Path> = SYSTEM_DIRS.iter().map(Path::new).collect();
+    find_termd_with(
+        env_bin.as_deref(),
+        exe.as_deref(),
+        path_var.as_deref(),
+        home.as_deref(),
+        &sys,
+    )
+}
+
+fn find_termd_with(
+    env_bin: Option<&Path>,
+    current_exe: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+    system_dirs: &[&Path],
+) -> Result<PathBuf, String> {
+    if let Some(explicit) = env_bin {
+        if is_executable_file(explicit) {
+            return Ok(explicit.to_path_buf());
+        }
+        return Err(format!(
+            "G3D_TERMD_BIN={} is not an executable file",
+            explicit.display()
+        ));
+    }
+
     let mut looked = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Some(dir) = current_exe.and_then(Path::parent) {
+        let candidate = dir.join("g3d-termd");
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+        looked.push(candidate.display().to_string());
+    }
+
+    if let Some(path_var) = path_var.filter(|p| !p.is_empty()) {
+        for dir in std::env::split_paths(path_var) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
             let candidate = dir.join("g3d-termd");
-            if candidate.is_file() {
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+        looked.push("$PATH".into());
+    }
+
+    if let Some(home) = home {
+        for rel in [".local/bin/g3d-termd", ".cargo/bin/g3d-termd"] {
+            let candidate = home.join(rel);
+            if is_executable_file(&candidate) {
                 return Ok(candidate);
             }
             looked.push(candidate.display().to_string());
         }
     }
-    if let Some(home) = non_empty_env_path("HOME") {
-        let local_bin = home.join(".local/bin/g3d-termd");
-        if local_bin.is_file() {
-            return Ok(local_bin);
+
+    for sys_dir in system_dirs {
+        let candidate = sys_dir.join("g3d-termd");
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
         }
-        looked.push(local_bin.display().to_string());
+        looked.push(candidate.display().to_string());
     }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("g3d-termd");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    looked.push("$PATH".into());
-    Err(format!("no g3d-termd binary found (looked at {})", looked.join(", ")))
+
+    Err(format!(
+        "no g3d-termd binary found (looked at {})",
+        looked.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -396,6 +473,91 @@ mod tests {
         assert_eq!(
             check_socket_parent(&open_dir.join("termd-x.sock"), uid).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_termd_discovers_local_and_system_bins_under_minimal_finder_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from(format!("/tmp/g3d-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let app_exe = root.join("Glyph3D Wall.app/Contents/MacOS/glyph3d-native");
+        let fake_usr_bin = root.join("usr/bin");
+        let fake_home = root.join("home");
+        let fake_brew = root.join("opt/homebrew/bin");
+        std::fs::create_dir_all(app_exe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&fake_usr_bin).unwrap();
+        std::fs::create_dir_all(fake_home.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(&fake_brew).unwrap();
+
+        let write_bin = |path: &Path, mode: u32| {
+            std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+
+        // Non-executable file in ~/.local/bin must be skipped; fallback system dir wins.
+        let local_termd = fake_home.join(".local/bin/g3d-termd");
+        let brew_termd = fake_brew.join("g3d-termd");
+        write_bin(&local_termd, 0o644);
+        write_bin(&brew_termd, 0o755);
+
+        let finder_path = std::ffi::OsString::from(fake_usr_bin.as_os_str());
+        assert_eq!(
+            find_termd_with(
+                None,
+                Some(&app_exe),
+                Some(&finder_path),
+                Some(&fake_home),
+                &[fake_brew.as_path()],
+            )
+            .unwrap(),
+            brew_termd
+        );
+
+        // Once ~/.local/bin/g3d-termd is executable, it wins with both Finder PATH and empty PATH.
+        std::fs::set_permissions(&local_termd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_termd_with(
+                None,
+                Some(&app_exe),
+                Some(&finder_path),
+                Some(&fake_home),
+                &[fake_brew.as_path()],
+            )
+            .unwrap(),
+            local_termd
+        );
+        assert_eq!(
+            find_termd_with(None, Some(&app_exe), None, Some(&fake_home), &[]).unwrap(),
+            local_termd
+        );
+
+        // A bundled Contents/MacOS/g3d-termd beside the executable outranks ~/.local/bin.
+        let bundled_termd = app_exe.parent().unwrap().join("g3d-termd");
+        write_bin(&bundled_termd, 0o755);
+        assert_eq!(
+            find_termd_with(
+                None,
+                Some(&app_exe),
+                Some(&finder_path),
+                Some(&fake_home),
+                &[fake_brew.as_path()],
+            )
+            .unwrap(),
+            bundled_termd
+        );
+
+        // Explicit G3D_TERMD_BIN wins when executable and refuses a missing path.
+        let explicit = root.join("custom-termd");
+        assert!(find_termd_with(Some(&explicit), Some(&app_exe), None, Some(&fake_home), &[]).is_err());
+        write_bin(&explicit, 0o755);
+        assert_eq!(
+            find_termd_with(Some(&explicit), Some(&app_exe), None, Some(&fake_home), &[]).unwrap(),
+            explicit
         );
 
         let _ = std::fs::remove_dir_all(&root);

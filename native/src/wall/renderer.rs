@@ -5,10 +5,11 @@
 //! textures (`curves`, `glyphmap`, `emoji`) and caches per-terminal GPU cell
 //! buffers so unchanged terminals upload zero bytes.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
@@ -21,8 +22,8 @@ use crate::gpu::GpuContext;
 
 use super::camera::WallCamera;
 use super::cell::{
-    CellGpu, CellSelection, apply_selection_to_cell, dirty_row_ranges_with_selection,
-    pack_cell_resolved,
+    CellGpu, CellLinkHover, CellSelection, apply_hover_link_to_cell, apply_selection_to_cell,
+    dirty_row_ranges_with_overlays, pack_cell_resolved, snap_row_span_to_wide,
 };
 use super::glyphs::GlyphSource;
 use super::labels::{Label, LabelGlyphGpu, LabelHeight, pack_label_glyphs};
@@ -118,6 +119,8 @@ pub struct TerminalDraw<'a> {
     pub border_color: Option<u32>,
     /// Optional cell-coordinate text selection highlight (linear stream or column block).
     pub selection: Option<CellSelection>,
+    /// Optional cell-coordinate hovered hyperlink range drawn as a single underline.
+    pub hover_link: Option<CellLinkHover>,
 }
 
 /// Complete description of one wall frame submitted to [`WallRenderer::render`].
@@ -190,6 +193,7 @@ struct TerminalGpu {
     rows: u16,
     uploaded_gen: u64,
     uploaded_selection: Option<CellSelection>,
+    uploaded_hover_link: Option<CellLinkHover>,
     force_repack: bool,
     row_has_bg: Vec<bool>,
     has_any_bg: bool,
@@ -226,6 +230,7 @@ pub struct WallRenderer {
     color_format: wgpu::TextureFormat,
     paper_buf: wgpu::Buffer,
     paper_bg: wgpu::BindGroup,
+    paper_pl: wgpu::PipelineLayout,
     paper_pipeline: wgpu::RenderPipeline,
     draw_paper: bool,
     shape_frame_buf: wgpu::Buffer,
@@ -233,6 +238,7 @@ pub struct WallRenderer {
     shapes_buf: wgpu::Buffer,
     shapes_cap: usize,
     shapes_bg: wgpu::BindGroup,
+    shape_pl: wgpu::PipelineLayout,
     shape_opaque_pipeline: wgpu::RenderPipeline,
     shape_blend_pipeline: wgpu::RenderPipeline,
     frame_buf: wgpu::Buffer,
@@ -245,17 +251,345 @@ pub struct WallRenderer {
     labels_buf: wgpu::Buffer,
     labels_cap: usize,
     labels_bg: wgpu::BindGroup,
+    cell_pl: wgpu::PipelineLayout,
+    label_pl: wgpu::PipelineLayout,
     panel_pipeline: wgpu::RenderPipeline,
     fill_pipeline: wgpu::RenderPipeline,
     ink_pipeline: wgpu::RenderPipeline,
     cursor_pipeline: wgpu::RenderPipeline,
     label_pipeline: wgpu::RenderPipeline,
+    shader_watcher: Option<ShaderWatcher>,
     terminals: HashMap<u64, TerminalGpu>,
     pack_scratch: Vec<CellGpu>,
     shape_scratch: Vec<ShapeGpu>,
     label_scratch: Vec<LabelGlyphGpu>,
     draw_runs: Vec<DrawRun>,
     cursor_blink: CursorBlinkState,
+}
+
+const SHADER_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+const PAPER_ENTRY_POINTS: &[&str] = &["vs_paper", "fs_paper"];
+const SHAPE_ENTRY_POINTS: &[&str] = &["vs_shape", "fs_shape"];
+const CELL_ENTRY_POINTS: &[&str] = &[
+    "vs_panel",
+    "fs_panel",
+    "vs_fill",
+    "fs_fill",
+    "vs_ink",
+    "fs_ink",
+    "vs_cursor",
+    "fs_cursor",
+    "vs_label",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchedShaderKind {
+    Paper,
+    Shapes,
+    Cells,
+}
+
+impl WatchedShaderKind {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Paper => "wall_paper.wgsl",
+            Self::Shapes => "wall_shapes.wgsl",
+            Self::Cells => "wall_cells.wgsl",
+        }
+    }
+
+    const fn entry_points(self) -> &'static [&'static str] {
+        match self {
+            Self::Paper => PAPER_ENTRY_POINTS,
+            Self::Shapes => SHAPE_ENTRY_POINTS,
+            Self::Cells => CELL_ENTRY_POINTS,
+        }
+    }
+}
+
+struct WatchedShader {
+    kind: WatchedShaderKind,
+    last_stamp: Option<(SystemTime, u64)>,
+    last_error: Option<String>,
+    notice: Option<String>,
+}
+
+struct ShaderWatcher {
+    dir: PathBuf,
+    poll_interval: Duration,
+    next_poll: Instant,
+    files: [WatchedShader; 3],
+    active_notice: Option<String>,
+}
+
+impl ShaderWatcher {
+    fn from_dir(dir: PathBuf, now: Instant) -> Self {
+        let make = |kind: WatchedShaderKind| {
+            let stamp = file_stamp(&dir.join(kind.file_name()));
+            WatchedShader {
+                kind,
+                last_stamp: stamp,
+                last_error: None,
+                notice: None,
+            }
+        };
+        Self {
+            files: [
+                make(WatchedShaderKind::Paper),
+                make(WatchedShaderKind::Shapes),
+                make(WatchedShaderKind::Cells),
+            ],
+            dir,
+            poll_interval: SHADER_POLL_INTERVAL,
+            next_poll: now + SHADER_POLL_INTERVAL,
+            active_notice: None,
+        }
+    }
+
+    fn from_env(now: Instant) -> Option<Self> {
+        let dir = std::env::var_os("GLYPH_WALL_SHADER_DIR")?;
+        if dir.is_empty() {
+            return None;
+        }
+        Some(Self::from_dir(PathBuf::from(dir), now))
+    }
+
+    fn refresh_notice(&mut self) -> bool {
+        let next = self.files.iter().find_map(|f| f.notice.clone());
+        let changed = next != self.active_notice;
+        self.active_notice = next;
+        changed
+    }
+}
+
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
+/// Parse and validate WGSL source with `naga` and verify every required entry point exists.
+fn validate_wall_wgsl(name: &str, src: &str, required_entries: &[&str]) -> Result<(), String> {
+    let module = wgpu::naga::front::wgsl::parse_str(src)
+        .map_err(|e| format!("{name}: {}", e.emit_to_string(src)))?;
+    let mut validator = wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    );
+    validator
+        .validate(&module)
+        .map_err(|e| format!("{name}: {}", e.emit_to_string(src)))?;
+    for &entry in required_entries {
+        if !module.entry_points.iter().any(|ep| ep.name == entry) {
+            return Err(format!("{name}: missing entry point `{entry}`"));
+        }
+    }
+    Ok(())
+}
+
+/// First non-empty line of a multi-line error, truncated for the wall's one-line notice bar.
+fn compact_shader_error(name: &str, full: &str) -> String {
+    let line = full
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("invalid WGSL");
+    let stripped = line.strip_prefix(name).and_then(|s| s.strip_prefix(':')).map(str::trim).unwrap_or(line);
+    let mut out = format!("shader {name}: {stripped}");
+    if out.len() > 140 {
+        let mut end = 137;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("...");
+    }
+    out
+}
+
+fn build_paper_pipeline(
+    device: &wgpu::Device,
+    paper_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall paper pipeline"),
+        layout: Some(paper_pl),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_paper"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_paper"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(PREMUL_BLEND),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: WALL_DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn build_shape_pipelines(
+    device: &wgpu::Device,
+    shape_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let make = |label: &str, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(shape_pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_shape"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_shape"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    (
+        make("wall shape opaque pipeline", true),
+        make("wall shape blend pipeline", false),
+    )
+}
+
+fn build_cell_pipelines(
+    device: &wgpu::Device,
+    cell_pl: &wgpu::PipelineLayout,
+    label_pl: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
+    let make = |label: &str, vs: &str, fs: &str, depth_write: bool| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(cell_pl),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(vs),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(PREMUL_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: WALL_DEPTH_FORMAT,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let panel = make("wall panel pipeline", "vs_panel", "fs_panel", true);
+    let fill = make("wall fill pipeline", "vs_fill", "fs_fill", true);
+    let ink = make("wall ink pipeline", "vs_ink", "fs_ink", false);
+    let cursor = make("wall cursor pipeline", "vs_cursor", "fs_cursor", false);
+    let label = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wall label pipeline"),
+        layout: Some(label_pl),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_label"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_ink"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(PREMUL_BLEND),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: WALL_DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (panel, fill, ink, cursor, label)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,9 +749,33 @@ fn cursor_is_solid_block(draw: &TerminalDraw<'_>, blink_on: bool) -> bool {
         && draw.screen.cursor.shape == CursorShape::Block
 }
 
-fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
-    let screen = draw.screen;
+/// Resolve the cursor's anchor column and column span `(col, span_cols)`.
+///
+/// When the cursor lands on the trailing half (`width == 0`) of a 2-column wide
+/// character, snap back to its leading cell so the cursor covers the full glyph
+/// rather than splitting it. At the right margin, clamp `span_cols` to the
+/// remaining columns so a last-column wide cell never overflows the panel.
+fn resolved_cursor_cell(screen: &Screen) -> (u16, u32) {
     let cur = screen.cursor;
+    if cur.col >= screen.cols || cur.row >= screen.rows {
+        return (cur.col, 1);
+    }
+    let row = screen.row(cur.row);
+    let cell = row[cur.col as usize];
+    if cell.width == 0 && cur.col > 0 && row[cur.col as usize - 1].width == 2 {
+        let head = cur.col - 1;
+        let avail = u32::from(screen.cols - head);
+        (head, 2u32.min(avail).max(1))
+    } else if cell.width == 2 {
+        let avail = u32::from(screen.cols - cur.col);
+        (cur.col, 2u32.min(avail).max(1))
+    } else {
+        (cur.col, 1)
+    }
+}
+
+fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool, span_cols: u32) -> u32 {
+    let cur = draw.screen.cursor;
     let drawn = cursor_drawn_now(draw, blink_on);
     let solid_block = cursor_is_solid_block(draw, blink_on);
     let shape = match cur.shape {
@@ -425,13 +783,8 @@ fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
         CursorShape::Bar => 1u32,
         CursorShape::Underline => 2u32,
     };
-    let span_cols = if drawn {
-        let w = screen.row(cur.row)[cur.col as usize].width;
-        if w == 2 { 2u32 } else { 1u32 }
-    } else {
-        1u32
-    };
-    let mut flags = (shape << 1) | (span_cols << 4);
+    let span = if drawn { span_cols.clamp(1, 2) } else { 1u32 };
+    let mut flags = (shape << 1) | (span << 4);
     if drawn {
         flags |= CURSOR_VISIBLE_FLAG;
     }
@@ -439,6 +792,29 @@ fn pack_cursor_flags(draw: &TerminalDraw<'_>, blink_on: bool) -> u32 {
         flags |= CURSOR_SOLID_BLOCK_FLAG;
     }
     flags
+}
+
+/// Load a wall WGSL shader from `GLYPH_WALL_SHADER_DIR/<file>` when set (dev loop),
+/// falling back to the compile-time `include_str!` source.
+fn load_wall_wgsl(file: &str, embedded: &'static str) -> Cow<'static, str> {
+    if let Ok(dir) = std::env::var("GLYPH_WALL_SHADER_DIR") {
+        if !dir.is_empty() {
+            let path = Path::new(&dir).join(file);
+            match std::fs::read_to_string(&path) {
+                Ok(src) => {
+                    log::info!("wall shader: loaded {} from disk", path.display());
+                    return Cow::Owned(src);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "GLYPH_WALL_SHADER_DIR: could not read {}: {e}; using embedded shader",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    Cow::Borrowed(embedded)
 }
 
 fn make_shared_bg(
@@ -519,48 +895,17 @@ impl WallRenderer {
         });
         let paper_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_paper.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_paper.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_paper.wgsl",
+                include_str!("../shaders/wall_paper.wgsl"),
+            )),
         });
         let paper_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall paper pl"),
             bind_group_layouts: &[Some(&paper_bgl)],
             immediate_size: 0,
         });
-        let paper_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wall paper pipeline"),
-            layout: Some(&paper_pl),
-            vertex: wgpu::VertexState {
-                module: &paper_shader,
-                entry_point: Some("vs_paper"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &paper_shader,
-                entry_point: Some("fs_paper"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(PREMUL_BLEND),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: WALL_DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let paper_pipeline = build_paper_pipeline(device, &paper_pl, &paper_shader, color_format);
 
         let shape_frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall shape frame uniform"),
@@ -616,52 +961,18 @@ impl WallRenderer {
         });
         let shape_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_shapes.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_shapes.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_shapes.wgsl",
+                include_str!("../shaders/wall_shapes.wgsl"),
+            )),
         });
         let shape_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall shapes pl"),
             bind_group_layouts: &[Some(&shapes_bgl)],
             immediate_size: 0,
         });
-        let make_shape_pipeline = |label: &str, depth_write: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&shape_pl),
-                vertex: wgpu::VertexState {
-                    module: &shape_shader,
-                    entry_point: Some("vs_shape"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shape_shader,
-                    entry_point: Some("fs_shape"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: Some(PREMUL_BLEND),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: WALL_DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let shape_opaque_pipeline = make_shape_pipeline("wall shape opaque pipeline", true);
-        let shape_blend_pipeline = make_shape_pipeline("wall shape blend pipeline", false);
+        let (shape_opaque_pipeline, shape_blend_pipeline) =
+            build_shape_pipelines(device, &shape_pl, &shape_shader, color_format);
 
         let frame_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wall frame uniform"),
@@ -773,57 +1084,17 @@ impl WallRenderer {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wall_cells.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wall_cells.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(load_wall_wgsl(
+                "wall_cells.wgsl",
+                include_str!("../shaders/wall_cells.wgsl"),
+            )),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let cell_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wall cells pl"),
             bind_group_layouts: &[Some(&shared_bgl), Some(&term_bgl)],
             immediate_size: 0,
         });
-
-        let make_pipeline = |label: &str, vs: &str, fs: &str, depth_write: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fs),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: Some(PREMUL_BLEND),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: WALL_DEPTH_FORMAT,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let panel_pipeline = make_pipeline("wall panel pipeline", "vs_panel", "fs_panel", true);
-        let fill_pipeline = make_pipeline("wall fill pipeline", "vs_fill", "fs_fill", true);
-        let ink_pipeline = make_pipeline("wall ink pipeline", "vs_ink", "fs_ink", false);
-        let cursor_pipeline = make_pipeline("wall cursor pipeline", "vs_cursor", "fs_cursor", false);
 
         let labels_cap = 256usize;
         let labels_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -858,41 +1129,10 @@ impl WallRenderer {
             bind_group_layouts: &[Some(&shared_bgl), Some(&labels_bgl)],
             immediate_size: 0,
         });
-        let label_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wall label pipeline"),
-            layout: Some(&label_pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_label"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_ink"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: Some(PREMUL_BLEND),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: WALL_DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let (panel_pipeline, fill_pipeline, ink_pipeline, cursor_pipeline, label_pipeline) =
+            build_cell_pipelines(device, &cell_pl, &label_pl, &shader, color_format);
+
+        let shader_watcher = ShaderWatcher::from_env(Instant::now());
 
         Self {
             glyphs,
@@ -901,6 +1141,7 @@ impl WallRenderer {
             color_format,
             paper_buf,
             paper_bg,
+            paper_pl,
             paper_pipeline,
             draw_paper: false,
             shape_frame_buf,
@@ -908,6 +1149,7 @@ impl WallRenderer {
             shapes_buf,
             shapes_cap,
             shapes_bg,
+            shape_pl,
             shape_opaque_pipeline,
             shape_blend_pipeline,
             frame_buf,
@@ -920,11 +1162,14 @@ impl WallRenderer {
             labels_buf,
             labels_cap,
             labels_bg,
+            cell_pl,
+            label_pl,
             panel_pipeline,
             fill_pipeline,
             ink_pipeline,
             cursor_pipeline,
             label_pipeline,
+            shader_watcher,
             terminals: HashMap::new(),
             pack_scratch: Vec::new(),
             shape_scratch: Vec::new(),
@@ -979,6 +1224,40 @@ impl WallRenderer {
         }
     }
 
+    /// Load a bundled or installed system font family by name with `line_height_scale` at run
+    /// time, dropping the previous atlas and GPU textures, rebuilding the shared bind group,
+    /// re-measuring cell & line metrics, and forcing every cached terminal to re-pack.
+    ///
+    /// On error (e.g. a family name that is not installed), leaves the current family, atlas,
+    /// metrics, and bind group completely untouched.
+    pub fn reload_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        family_name: &str,
+        line_height_scale: f64,
+    ) -> Result<bool, glyph_font::FontError> {
+        let changed = self
+            .glyphs
+            .reload_family(device, queue, family_name, line_height_scale)?;
+        if !changed {
+            return Ok(false);
+        }
+        self.metrics = self.glyphs.cell_metrics();
+        self.glyphs.apply_line_metrics(&mut self.style);
+        self.shared_bg = make_shared_bg(
+            device,
+            &self.shared_bgl,
+            &self.frame_buf,
+            &self.glyphs,
+            &self.emoji_sampler,
+        );
+        for gpu in self.terminals.values_mut() {
+            gpu.force_repack = true;
+        }
+        Ok(true)
+    }
+
     /// Measure the unclipped world width of `text` drawn at `height` under `zoom`.
     pub fn measure_label_width(&mut self, text: &str, height: LabelHeight, zoom: f32) -> f32 {
         self.glyphs.measure_label_width(text, height.resolve_world(zoom))
@@ -990,6 +1269,154 @@ impl WallRenderer {
 
     pub fn style_mut(&mut self) -> &mut WallStyle {
         &mut self.style
+    }
+
+    /// Active one-line shader reload error notice, if the latest disk reload failed validation.
+    pub fn shader_error_notice(&self) -> Option<&str> {
+        self.shader_watcher
+            .as_ref()
+            .and_then(|w| w.active_notice.as_deref())
+    }
+
+    /// Override the watched shader directory (for tests; production reads `GLYPH_WALL_SHADER_DIR`).
+    #[cfg(test)]
+    pub(crate) fn set_shader_watch_dir(&mut self, dir: Option<PathBuf>) {
+        self.shader_watcher = dir.map(|d| {
+            let mut w = ShaderWatcher::from_dir(d, Instant::now());
+            w.next_poll = Instant::now();
+            w
+        });
+    }
+
+    /// Poll `GLYPH_WALL_SHADER_DIR` for modified wall WGSL files, validate changed source with
+    /// `naga`, rebuild only the affected pipeline(s), and swap them in atomically.
+    ///
+    /// Returns `(needs_redraw, next_poll_deadline)`. When `GLYPH_WALL_SHADER_DIR` is unset,
+    /// returns `(false, None)` immediately without touching the filesystem or scheduling timers.
+    pub fn poll_shaders(
+        &mut self,
+        device: &wgpu::Device,
+        now: Instant,
+    ) -> (bool, Option<Instant>) {
+        let Some(watcher) = self.shader_watcher.as_mut() else {
+            return (false, None);
+        };
+        if now < watcher.next_poll {
+            return (false, Some(watcher.next_poll));
+        }
+        watcher.next_poll = now + watcher.poll_interval;
+        let next_deadline = Some(watcher.next_poll);
+
+        let mut dirty = false;
+        let dir = watcher.dir.clone();
+        let mut to_reload: Vec<(usize, WatchedShaderKind, String)> = Vec::new();
+
+        for (idx, entry) in watcher.files.iter_mut().enumerate() {
+            let path = dir.join(entry.kind.file_name());
+            let stamp = file_stamp(&path);
+            if stamp.is_none() || stamp == entry.last_stamp {
+                continue;
+            }
+            entry.last_stamp = stamp;
+            match std::fs::read_to_string(&path) {
+                Ok(src) => to_reload.push((idx, entry.kind, src)),
+                Err(e) => {
+                    let msg = format!("{}: {e}", entry.kind.file_name());
+                    if entry.last_error.as_deref() != Some(msg.as_str()) {
+                        log::error!("wall shader reload failed: {msg}");
+                        entry.last_error = Some(msg.clone());
+                    }
+                    entry.notice = Some(compact_shader_error(entry.kind.file_name(), &msg));
+                }
+            }
+        }
+
+        for (idx, kind, src) in to_reload {
+            let name = kind.file_name();
+            let t0 = Instant::now();
+            match self.try_reload_shader(device, kind, &src) {
+                Ok(()) => {
+                    log::info!(
+                        "wall shader reloaded: {name} ({:.1} ms)",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    if let Some(w) = self.shader_watcher.as_mut() {
+                        w.files[idx].last_error = None;
+                        w.files[idx].notice = None;
+                    }
+                    dirty = true;
+                }
+                Err(err) => {
+                    if let Some(w) = self.shader_watcher.as_mut() {
+                        if w.files[idx].last_error.as_deref() != Some(err.as_str()) {
+                            log::error!("wall shader reload failed ({name}):\n{err}");
+                            w.files[idx].last_error = Some(err.clone());
+                        }
+                        w.files[idx].notice = Some(compact_shader_error(name, &err));
+                    }
+                }
+            }
+        }
+
+        if let Some(w) = self.shader_watcher.as_mut() {
+            if w.refresh_notice() {
+                dirty = true;
+            }
+        }
+        (dirty, next_deadline)
+    }
+
+    fn try_reload_shader(
+        &mut self,
+        device: &wgpu::Device,
+        kind: WatchedShaderKind,
+        src: &str,
+    ) -> Result<(), String> {
+        let name = kind.file_name();
+        validate_wall_wgsl(name, src, kind.entry_points())?;
+
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(name),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(src)),
+        });
+
+        match kind {
+            WatchedShaderKind::Paper => {
+                let paper = build_paper_pipeline(device, &self.paper_pl, &module, self.color_format);
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.paper_pipeline = paper;
+            }
+            WatchedShaderKind::Shapes => {
+                let (opaque, blend) =
+                    build_shape_pipelines(device, &self.shape_pl, &module, self.color_format);
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.shape_opaque_pipeline = opaque;
+                self.shape_blend_pipeline = blend;
+            }
+            WatchedShaderKind::Cells => {
+                let (panel, fill, ink, cursor, label) = build_cell_pipelines(
+                    device,
+                    &self.cell_pl,
+                    &self.label_pl,
+                    &module,
+                    self.color_format,
+                );
+                if let Some(err) = pollster::block_on(scope.pop()) {
+                    return Err(format!("{name}: wgpu validation error: {err}"));
+                }
+                self.panel_pipeline = panel;
+                self.fill_pipeline = fill;
+                self.ink_pipeline = ink;
+                self.cursor_pipeline = cursor;
+                self.label_pipeline = label;
+            }
+        }
+        Ok(())
     }
 
     /// Advance the renderer's cursor-blink phase to `now` for `terminals` and return
@@ -1095,6 +1522,7 @@ impl WallRenderer {
                     rows,
                     uploaded_gen: 0,
                     uploaded_selection: None,
+                    uploaded_hover_link: None,
                     force_repack: false,
                     row_has_bg: vec![false; usize::from(rows)],
                     has_any_bg: false,
@@ -1110,6 +1538,7 @@ impl WallRenderer {
             .get_mut(&draw.id)
             .expect("terminal GPU state just inserted");
 
+        let (cursor_col, cursor_span) = resolved_cursor_cell(screen);
         let term_uniform = TerminalUniform {
             origin: draw.position.to_array(),
             z: draw.z,
@@ -1118,9 +1547,9 @@ impl WallRenderer {
             rows: u32::from(rows),
             default_bg: screen.default_bg,
             panel_opacity: draw.panel_opacity.unwrap_or(self.style.panel_opacity),
-            cursor_col: u32::from(screen.cursor.col),
+            cursor_col: u32::from(cursor_col),
             cursor_row: u32::from(screen.cursor.row),
-            cursor_flags: pack_cursor_flags(draw, self.cursor_blink.visible),
+            cursor_flags: pack_cursor_flags(draw, self.cursor_blink.visible, cursor_span),
             border_override: draw.border_color.unwrap_or(0),
             scale: sanitize_scale(draw.scale),
             cursor_color: screen.cursor_color,
@@ -1130,10 +1559,12 @@ impl WallRenderer {
         queue.write_buffer(&gpu.uniform_buf, 0, bytemuck::bytes_of(&term_uniform));
 
         let active_selection = draw.selection.filter(|s| !s.is_empty());
+        let active_hover_link = draw.hover_link.filter(|l| !l.is_empty());
 
         if cell_count == 0 {
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             return;
         }
 
@@ -1143,14 +1574,25 @@ impl WallRenderer {
             self.pack_scratch.reserve(cell_count);
             for r in 0..usize::from(rows) {
                 let mut any_bg = false;
-                let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
-                for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                let row_cells = screen.row(r as u16);
+                let sel_span = active_selection.map_or(0..0, |s| {
+                    snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
+                });
+                let link_span = active_hover_link.map_or(0..0, |l| {
+                    snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                });
+                for (c, cell) in row_cells.iter().enumerate() {
                     let mut packed =
                         pack_cell_resolved(self.glyphs.resolve_cell(screen, cell), screen, cell);
+                    let col_u16 = c as u16;
                     if let Some(sel) = active_selection {
-                        let col_u16 = c as u16;
                         if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                             apply_selection_to_cell(&mut packed, &sel);
+                        }
+                    }
+                    if let Some(link) = active_hover_link {
+                        if col_u16 >= link_span.start && col_u16 < link_span.end {
+                            apply_hover_link_to_cell(&mut packed, &link);
                         }
                     }
                     if (packed.bg >> 24) != 0 {
@@ -1164,19 +1606,24 @@ impl WallRenderer {
             queue.write_buffer(&gpu.cells_buf, 0, bytemuck::cast_slice(&self.pack_scratch));
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
             gpu.force_repack = false;
             stats.terminals_uploaded += 1;
             stats.rows_uploaded += usize::from(rows);
             stats.write_calls += 1;
-        } else if screen.generation != gpu.uploaded_gen || active_selection != gpu.uploaded_selection
+        } else if screen.generation != gpu.uploaded_gen
+            || active_selection != gpu.uploaded_selection
+            || active_hover_link != gpu.uploaded_hover_link
         {
-            let dirty = dirty_row_ranges_with_selection(
+            let dirty = dirty_row_ranges_with_overlays(
                 &screen.row_gen,
                 cols,
                 screen.generation,
                 gpu.uploaded_gen,
                 gpu.uploaded_selection,
                 active_selection,
+                gpu.uploaded_hover_link,
+                active_hover_link,
             );
             let cols_usize = usize::from(cols);
             if !dirty.is_empty() {
@@ -1187,17 +1634,28 @@ impl WallRenderer {
                 self.pack_scratch.reserve(range.len() * cols_usize);
                 for r in range.clone() {
                     let mut any_bg = false;
-                    let sel_span = active_selection.map_or(0..0, |s| s.row_span(r as u16, cols));
-                    for (c, cell) in screen.row(r as u16).iter().enumerate() {
+                    let row_cells = screen.row(r as u16);
+                    let sel_span = active_selection.map_or(0..0, |s| {
+                        snap_row_span_to_wide(row_cells, s.row_span(r as u16, cols))
+                    });
+                    let link_span = active_hover_link.map_or(0..0, |l| {
+                        snap_row_span_to_wide(row_cells, l.row_span(r as u16, cols))
+                    });
+                    for (c, cell) in row_cells.iter().enumerate() {
                         let mut packed = pack_cell_resolved(
                             self.glyphs.resolve_cell(screen, cell),
                             screen,
                             cell,
                         );
+                        let col_u16 = c as u16;
                         if let Some(sel) = active_selection {
-                            let col_u16 = c as u16;
                             if col_u16 >= sel_span.start && col_u16 < sel_span.end {
                                 apply_selection_to_cell(&mut packed, &sel);
+                            }
+                        }
+                        if let Some(link) = active_hover_link {
+                            if col_u16 >= link_span.start && col_u16 < link_span.end {
+                                apply_hover_link_to_cell(&mut packed, &link);
                             }
                         }
                         if (packed.bg >> 24) != 0 {
@@ -1219,6 +1677,7 @@ impl WallRenderer {
             gpu.has_any_bg = gpu.row_has_bg.iter().any(|&b| b);
             gpu.uploaded_gen = screen.generation;
             gpu.uploaded_selection = active_selection;
+            gpu.uploaded_hover_link = active_hover_link;
         }
     }
 
@@ -1757,6 +2216,7 @@ pub fn render_test_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -1847,6 +2307,7 @@ pub fn render_chrome_pattern_offscreen(
             panel_opacity: None,
             border_color: t.border_color,
             selection: t.selection,
+            hover_link: None,
         })
         .collect();
 
@@ -2016,6 +2477,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let near = TerminalDraw {
                 id: 2,
@@ -2027,6 +2489,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             let list = if reverse_input { [near, far] } else { [far, near] };
             let frame = WallFrame { terminals: &list, ..Default::default() };
@@ -2069,6 +2532,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
         let cam = WallCamera::new(Vec2::new(3.0, -4.0), 32.0);
@@ -2300,6 +2764,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let shapes = vec![
@@ -2541,6 +3006,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
 
         let w = 256u32;
@@ -2628,6 +3094,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             };
             render_rgba_bytes(
                 &ctx,
@@ -2670,6 +3137,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let cam = WallCamera::new(Vec2::new(1.0, -0.5), 48.0);
         let s_before = renderer.prepare(
@@ -2699,6 +3167,7 @@ mod tests {
             panel_opacity: Some(1.0),
             border_color: None,
             selection: None,
+            hover_link: None,
         };
         let s_after = renderer.prepare(
             &ctx.device,
@@ -2777,6 +3246,7 @@ mod tests {
                 panel_opacity: None,
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -2883,6 +3353,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection: None,
+                hover_link: None,
             }
         }
 
@@ -3058,6 +3529,7 @@ mod tests {
                 panel_opacity: Some(1.0),
                 border_color: None,
                 selection,
+                hover_link: None,
             }
         }
 
@@ -3213,5 +3685,771 @@ mod tests {
         );
         assert_eq!(count_cell(&px_clear, 3, 1, is_sel_bg), 0, "cleared selection must restore original background");
         assert!(count_cell(&px_clear, 3, 1, is_orig_fg) > 40, "cleared selection must restore original fg");
+    }
+
+    #[test]
+    fn gpu_shader_hot_reload_validates_swaps_and_keeps_old_on_error() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+        // With watcher disabled, poll_shaders is a zero-work no-op.
+        renderer.set_shader_watch_dir(None);
+        assert_eq!(renderer.poll_shaders(&ctx.device, Instant::now()), (false, None));
+        assert!(renderer.shader_error_notice().is_none());
+
+        // Stage all three shaders in a temporary watch directory.
+        let tmp = std::env::temp_dir().join(format!(
+            "glyph3d-shader-reload-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create temp shader dir");
+        let cells_src = include_str!("../shaders/wall_cells.wgsl");
+        std::fs::write(tmp.join("wall_paper.wgsl"), include_str!("../shaders/wall_paper.wgsl")).unwrap();
+        std::fs::write(tmp.join("wall_shapes.wgsl"), include_str!("../shaders/wall_shapes.wgsl")).unwrap();
+        std::fs::write(tmp.join("wall_cells.wgsl"), cells_src).unwrap();
+
+        renderer.set_shader_watch_dir(Some(tmp.clone()));
+        let mut screen = Screen::new(4, 2);
+        screen.default_bg = rgb(0x10, 0x10, 0x20);
+        let draws = [TerminalDraw {
+            id: 1,
+            screen: &screen,
+            position: Vec2::new(-2.0, 2.0),
+            z: 0.0,
+            scale: 1.0,
+            focused: false,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        }];
+        let cam = WallCamera::new(Vec2::ZERO, 32.0);
+        let (w, h) = (128, 128);
+
+        let center_rgb = |px: &[u8]| -> [u8; 3] {
+            let i = ((h / 2) * w + (w / 2)) as usize * 4;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        // Baseline: dark blue panel (#101020).
+        let px0 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c0 = center_rgb(&px0);
+        assert!(c0[2] > c0[1], "baseline should be dark blue, got {c0:?}");
+
+        // 1. Valid edit: force panel fragment output to bright green (0.0, 0.8, 0.2).
+        let green_src = cells_src.replacen(
+            "let fill_rgb = srgb_to_output(in.fill_color.rgb);",
+            "let fill_rgb = srgb_to_output(vec3<f32>(0.0, 0.8, 0.2));",
+            1,
+        );
+        assert_ne!(green_src, cells_src, "expected fill_rgb line in wall_cells.wgsl");
+        std::fs::write(tmp.join("wall_cells.wgsl"), &green_src).unwrap();
+        let (dirty, next) = renderer.poll_shaders(&ctx.device, Instant::now() + SHADER_POLL_INTERVAL);
+        assert!(dirty, "valid edit must trigger reload");
+        assert!(next.is_some());
+        assert!(renderer.shader_error_notice().is_none());
+
+        let px1 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c1 = center_rgb(&px1);
+        assert!(c1[1] > 180 && c1[0] < 30, "reloaded shader should draw green panel, got {c1:?}");
+
+        // 2. Broken WGSL: keep green pipeline intact, expose error notice, and do not re-dirty on repeat poll.
+        std::fs::write(tmp.join("wall_cells.wgsl"), "fn broken( { !!!").unwrap();
+        let (dirty_err, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 3,
+        );
+        assert!(dirty_err, "new shader error should dirty notice");
+        let notice = renderer.shader_error_notice().expect("error notice should be set");
+        assert!(notice.contains("wall_cells.wgsl"), "notice should name shader: {notice}");
+
+        let (dirty_repeat, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 5,
+        );
+        assert!(!dirty_repeat, "unchanged broken file must not spam redraws/errors");
+
+        let px2 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c2 = center_rgb(&px2);
+        assert!(c2[1] > 180 && c2[0] < 30, "old green pipeline must stay active on error, got {c2:?}");
+
+        // 3. Fix back to original: clears notice and restores dark blue panel.
+        std::fs::write(tmp.join("wall_cells.wgsl"), cells_src).unwrap();
+        let (dirty_fix, _) = renderer.poll_shaders(
+            &ctx.device,
+            Instant::now() + SHADER_POLL_INTERVAL * 7,
+        );
+        assert!(dirty_fix, "fixed shader must reload and clear notice");
+        assert!(renderer.shader_error_notice().is_none());
+        let px3 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &draws, ..Default::default() },
+            w,
+            h,
+        );
+        let c3 = center_rgb(&px3);
+        assert!(c3[2] > c3[1] && c3[1] < 40, "restored shader should draw dark blue again, got {c3:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Colour parity with the JS browser wall: `Theme::default()` carries `#cccccc` fg,
+    /// `#0a0a1e` panel bg, `#6ee7a0` cursor, and `terminalPalette.js`'s 16 ANSI colours
+    /// (`bold_is_bright = false`), and SGR 2 (`DIM`) blends in sRGB space toward `cell_bg`
+    /// on an `Rgba8UnormSrgb` target so both dark-panel dim and dim-inverse match WebGL.
+    #[test]
+    fn js_wall_theme_and_srgb_dim_match_browser_wall() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Col 0: plain '█' (#cccccc on #0a0a1e)
+        // Col 1: dim '█' (sRGB 50% mix of #cccccc and #0a0a1e -> #6b6b75)
+        // Col 2: dim inverse 'M' (#0a0a1e on #cccccc fill -> sRGB 50% mix #6b6b75 on #cccccc)
+        // Col 3: ANSI blue '█' (#1a1ae6)
+        // Col 4: bold ANSI red '█' (bold_is_bright=false -> still #b31a1a, not #ff4d4d)
+        // Col 5: empty panel cell (#0a0a1e)
+        // Col 6: cursor cell 'M' (focused solid block #6ee7a0 with #0a0a1e glyph ink)
+        let stream = "\x1b[H\x1b[2J█\x1b[2m█\x1b[0;2;7mM\x1b[0;34m█\x1b[0;1;31m█\x1b[0m M\x1b[1;7H";
+        let screen = super::super::replay::replay_screen(stream.as_bytes(), 8, 1);
+        assert_eq!(screen.default_fg, term_cells::rgb(0xcc, 0xcc, 0xcc));
+        assert_eq!(screen.default_bg, term_cells::rgb(0x0a, 0x0a, 0x1e));
+        assert_eq!(screen.cursor_color, term_cells::rgb(0x6e, 0xe7, 0xa0));
+        assert_eq!(screen.cursor.col, 6);
+
+        let w = 640u32;
+        let h = 160u32;
+        let m = renderer.metrics();
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.05);
+        let draw = TerminalDraw {
+            id: 1,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: None,
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+        let px = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[draw], ..Default::default() },
+            w,
+            h,
+        );
+
+        let cell_center_rgb = |col: u16| -> [u8; 3] {
+            let world = Vec2::new((f32::from(col) + 0.5) * m.cell_width, -0.5 * m.cell_height);
+            let sp = cam.world_to_screen(world, (w, h));
+            let x = (sp.x.round() as u32).min(w - 1);
+            let y = (sp.y.round() as u32).min(h - 1);
+            let idx = ((y * w + x) * 4) as usize;
+            [px[idx], px[idx + 1], px[idx + 2]]
+        };
+        let count_cell = |col: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(f32::from(col) * m.cell_width, 0.0), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(f32::from(col + 1) * m.cell_width, -m.cell_height), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        let close = |actual: [u8; 3], expected: [u8; 3]| -> bool {
+            actual[0].abs_diff(expected[0]) <= 2
+                && actual[1].abs_diff(expected[1]) <= 2
+                && actual[2].abs_diff(expected[2]) <= 2
+        };
+
+        let plain = cell_center_rgb(0);
+        let dim = cell_center_rgb(1);
+        let blue = cell_center_rgb(3);
+        let bold_red = cell_center_rgb(4);
+        let panel = cell_center_rgb(5);
+
+        assert!(close(plain, [0xcc, 0xcc, 0xcc]), "default fg must be #cccccc, got {plain:?}");
+        assert!(
+            close(dim, [0x6b, 0x6b, 0x75]),
+            "sRGB 50% dim of #cccccc on #0a0a1e must be #6b6b75 (not linear #969697), got {dim:?}"
+        );
+        assert!(close(blue, [0x1a, 0x1a, 0xe6]), "ANSI blue must be #1a1ae6, got {blue:?}");
+        assert!(
+            close(bold_red, [0xb3, 0x1a, 0x1a]),
+            "bold ANSI red with bold_is_bright=false must stay #b31a1a, got {bold_red:?}"
+        );
+        assert!(close(panel, [0x0a, 0x0a, 0x1e]), "panel bg must be #0a0a1e, got {panel:?}");
+
+        // Col 2: dim inverse 'M' -> #cccccc fill + #6b6b75 ink (not washed-out linear #969697).
+        let dim_inv_fill = count_cell(2, |c| {
+            c[0].abs_diff(0xcc) <= 2 && c[1].abs_diff(0xcc) <= 2 && c[2].abs_diff(0xcc) <= 2
+        });
+        let dim_inv_ink = count_cell(2, |c| {
+            c[0].abs_diff(0x6b) <= 3 && c[1].abs_diff(0x6b) <= 3 && c[2].abs_diff(0x75) <= 3
+        });
+        assert!(dim_inv_fill > 200, "dim inverse fill must be #cccccc ({dim_inv_fill} px)");
+        assert!(dim_inv_ink > 80, "dim inverse ink must be #6b6b75 ({dim_inv_ink} px)");
+
+        // Col 6: focused block cursor uses Theme::default().cursor (#6ee7a0) with #0a0a1e ink.
+        let cursor_fill = count_cell(6, |c| {
+            c[0].abs_diff(0x6e) <= 3 && c[1].abs_diff(0xe7) <= 3 && c[2].abs_diff(0xa0) <= 3
+        });
+        let cursor_ink = count_cell(6, |c| {
+            c[0].abs_diff(0x0a) <= 3 && c[1].abs_diff(0x0a) <= 3 && c[2].abs_diff(0x1e) <= 3
+        });
+        assert!(cursor_fill > 200, "focused block cursor must be #6ee7a0 ({cursor_fill} px)");
+        assert!(cursor_ink > 80, "glyph over focused cursor must be #0a0a1e ({cursor_ink} px)");
+    }
+
+    /// Wide & combining edge cases at the right margin and inside wide cells:
+    /// 1. Wide glyph (`漢`) and wide colour emoji (`🚀`) placed in the last column clip cleanly at
+    ///    the right cell boundary and never bleed into the right padding or past the border.
+    /// 2. Combining-mark cluster (`e\u{0301}`) in the last column draws cleanly inside the cell
+    ///    without bleeding past the right margin.
+    /// 3. Text selections that split a wide cell (ending on its head OR starting on its tail)
+    ///    widen to cover both columns so neither half disappears.
+    /// 4. A focused solid block cursor on the trailing half of a wide cell snaps to the head and
+    ///    spans both columns, drawing inverted dark ink over both halves.
+    #[test]
+    fn gpu_wide_and_combining_right_margin_split_selection_and_trailing_cursor() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let cols = 10u16;
+        let rows = 5u16;
+        let mut screen = Screen::new(cols, rows);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        screen.cursor_color = rgb(0x6e, 0xe7, 0xa0);
+
+        let fg = rgb(0xcc, 0xcc, 0xcc);
+        let cyan = rgb(0x4d, 0xff, 0xff);
+        let magenta = rgb(0xff, 0x4d, 0xff);
+
+        // Row 0: normal wide outline 'W' (width=2, font-covered across both columns) at cols 1..3
+        // and an orphan wide outline 'W' (width=2) in the last column (col 9).
+        screen.row_mut(0)[1] = term_cells::Cell { content: 'W' as u32, fg, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.row_mut(0)[2] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        screen.row_mut(0)[9] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.touch_row(0);
+
+        // Row 1: orphan wide colour emoji '🚀' (width=2) at last column (col 9).
+        screen.row_mut(1)[9] = term_cells::Cell { content: '🚀' as u32, fg, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.touch_row(1);
+
+        // Row 2: combining cluster 'e\u{0301}' (width=1) at last column (col 9).
+        let cid = term_cells::CLUSTER_BASE + screen.clusters.len() as u32;
+        screen.clusters.push("e\u{0301}".to_string());
+        screen.row_mut(2)[9] = term_cells::Cell { content: cid, fg: magenta, bg: 0, ul: 0, attrs: 0, width: 1, _pad: 0 };
+        screen.touch_row(2);
+
+        // Row 3: two wide outline 'W' cells (width=2) at cols 2..4 and 6..8 for split-selection checks.
+        for head in [2usize, 6usize] {
+            screen.row_mut(3)[head] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+            screen.row_mut(3)[head + 1] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        }
+        screen.touch_row(3);
+
+        // Row 4: wide outline 'W' (width=2) at cols 3..5 with focused block cursor landing on TRAILING half col 4!
+        screen.row_mut(4)[3] = term_cells::Cell { content: 'W' as u32, fg: cyan, bg: 0, ul: 0, attrs: 0, width: 2, _pad: 0 };
+        screen.row_mut(4)[4] = term_cells::Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 0, _pad: 0 };
+        screen.touch_row(4);
+        screen.cursor = term_cells::Cursor {
+            col: 4,
+            row: 4,
+            visible: true,
+            shape: CursorShape::Block,
+            blink: false,
+        };
+
+        // Selection splits BOTH wide cells on row 3: starts on tail col 3, ends on head col 6 (excl 7)!
+        let split_sel = CellSelection::linear(3, 3, 3, 7);
+
+        let w = 800u32;
+        let h = 480u32;
+        let m = renderer.metrics();
+        let pad = renderer.style().panel_padding;
+        let bounds = m.panel_rect(Vec2::ZERO, cols, rows, pad);
+        // Frame wider than panel so pixels outside the right border are visible in the buffer.
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.35);
+
+        let draw = TerminalDraw {
+            id: 404,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: Some(split_sel),
+            hover_link: None,
+        };
+        let frame = WallFrame { terminals: &[draw], ..Default::default() };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+
+        if let Ok(path) = std::env::var("GLYPH_WALL_EDGE_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &frame, (w, h), 1, Path::new(&path));
+            }
+        }
+
+        let count_rect = |x0_w: f32, x1_w: f32, y_top_w: f32, y_bot_w: f32, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(x0_w, y_top_w), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(x1_w, y_bot_w), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let count_cell = |col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            count_rect(
+                f32::from(col) * m.cell_width,
+                f32::from(col + 1) * m.cell_width,
+                -f32::from(row) * m.cell_height,
+                -f32::from(row + 1) * m.cell_height,
+                pred,
+            )
+        };
+
+        let is_cyan = |c: [u8; 3]| c[1] > 180 && c[2] > 180 && c[0] < 120;
+        let is_magenta = |c: [u8; 3]| c[0] > 180 && c[2] > 180 && c[1] < 120;
+        let is_non_bg_non_border = |c: [u8; 3]| {
+            // Outside panel: clear colour (#0e1016) or dark navy panel (#0a0a1e).
+            let is_panel = c[0].abs_diff(0x0a) <= 4 && c[1].abs_diff(0x0a) <= 4 && c[2].abs_diff(0x1e) <= 4;
+            let is_clear = c[0].abs_diff(0x0e) <= 4 && c[1].abs_diff(0x10) <= 4 && c[2].abs_diff(0x16) <= 4;
+            let is_green_border = c[1] > 150 && c[0] < 140 && c[2] > 100 && c[2] < 200;
+            !is_panel && !is_clear && !is_green_border
+        };
+        let is_sel_bg = |c: [u8; 3]| c[0].abs_diff(0xcc) <= 3 && c[1].abs_diff(0xcc) <= 3 && c[2].abs_diff(0xcc) <= 3;
+        let is_dark_ink = |c: [u8; 3]| c[0].abs_diff(0x0a) <= 4 && c[1].abs_diff(0x0a) <= 4 && c[2].abs_diff(0x1e) <= 4;
+        let is_cursor = |c: [u8; 3]| c[0].abs_diff(0x6e) <= 4 && c[1].abs_diff(0xe7) <= 4 && c[2].abs_diff(0xa0) <= 4;
+
+        let grid_right = f32::from(cols) * m.cell_width;
+        let outside_right = grid_right + pad + m.cell_width;
+
+        // 1. Last-column wide '漢' (row 0, col 9): visible inside col 9, ZERO cyan bleed past grid_right.
+        assert!(count_cell(9, 0, is_cyan) > 80, "last-column wide '漢' should draw inside col 9");
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, 0.0, -m.cell_height, is_cyan),
+            0,
+            "last-column wide '漢' must clip at grid_right and never bleed past the right margin"
+        );
+
+        // 2. Last-column wide emoji '🚀' (row 1, col 9): visible inside col 9, ZERO bleed past grid_right.
+        assert!(
+            count_cell(9, 1, is_non_bg_non_border) > 60,
+            "last-column emoji '🚀' should draw inside col 9"
+        );
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, -m.cell_height, -2.0 * m.cell_height, is_non_bg_non_border),
+            0,
+            "last-column emoji '🚀' must clip at grid_right and never bleed past the right margin"
+        );
+
+        // 3. Last-column combining cluster 'e\u{0301}' (row 2, col 9): visible inside col 9, ZERO bleed past grid_right.
+        assert!(
+            count_cell(9, 2, is_magenta) > 50,
+            "last-column combining cluster should draw visibly inside col 9"
+        );
+        assert_eq!(
+            count_rect(grid_right + 0.02, outside_right, -2.0 * m.cell_height, -3.0 * m.cell_height, is_magenta),
+            0,
+            "last-column combining cluster must not bleed past grid_right"
+        );
+
+        // 4. Split selection `3..7` on row 3 widens to `2..8` so BOTH halves of BOTH wide '漢' cells
+        //    fill with #cccccc and draw dark #0a0a1e ink (zero cyan left over).
+        for col in [2u16, 3, 6, 7] {
+            assert!(
+                count_cell(col, 3, is_sel_bg) > 120,
+                "split-selected wide cell col {col} must have #cccccc selection fill"
+            );
+            assert!(
+                count_cell(col, 3, is_dark_ink) > 40,
+                "split-selected wide cell col {col} must draw dark #0a0a1e ink"
+            );
+            assert_eq!(
+                count_cell(col, 3, is_cyan),
+                0,
+                "split-selected wide cell col {col} must not leave unselected cyan ink"
+            );
+        }
+
+        // 5. Cursor on trailing half (col 4) of wide '漢' at cols 3..5 snaps to head (col 3)
+        //    and spans BOTH columns 3 and 4 with solid #6ee7a0 fill and #0a0a1e ink.
+        for col in [3u16, 4] {
+            assert!(
+                count_cell(col, 4, is_cursor) > 120,
+                "cursor on trailing half must fill both wide columns (col {col})"
+            );
+            assert!(
+                count_cell(col, 4, is_dark_ink) > 40,
+                "wide glyph under trailing-half cursor must invert ink across both columns (col {col})"
+            );
+            assert_eq!(
+                count_cell(col, 4, is_cyan),
+                0,
+                "wide glyph under trailing-half cursor must not leak un-inverted cyan (col {col})"
+            );
+        }
+    }
+
+    /// Hover-link underline (`TerminalDraw::hover_link` / `CellLinkHover`):
+    /// - Underlines single-row and soft-wrapped multi-row URLs in the cell's own fg or a custom colour
+    /// - Snaps split wide characters so both columns underline cleanly
+    /// - Uploads ONLY the row(s) whose hover-link span changed (0 rows steady, 1–2 rows on hover/clear)
+    #[test]
+    fn gpu_hover_link_underline_single_multi_row_wide_and_dirty_uploads() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Build a 32x4 screen with a plain URL on row 0, a wrapped OSC 8 link across rows 1..2,
+        // and a wide 'W' cell inside row 3.
+        let mut screen = Screen::new(32, 4);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        let cyan = rgb(0x7d, 0xcf, 0xff);
+        let green = rgb(0x6e, 0xe7, 0xa0);
+        let fg = screen.default_fg;
+
+        super::super::test_pattern::write_run(&mut screen, 0, 1, "see ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 0, 5, "https://glyph3d.dev/wall", super::super::test_pattern::RunStyle::fg(cyan));
+        super::super::test_pattern::write_run(&mut screen, 1, 1, "wrapped link: ", super::super::test_pattern::RunStyle::fg(fg));
+        super::super::test_pattern::write_run(&mut screen, 1, 15, "https://example.o", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 2, 0, "rg/docs/rendering", super::super::test_pattern::RunStyle::fg(green));
+        super::super::test_pattern::write_run(&mut screen, 3, 1, "plain text row (no link)", super::super::test_pattern::RunStyle::fg(fg));
+
+        let m = renderer.metrics();
+        let w = 960u32;
+        let h = 240u32;
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.08);
+
+        let make = |hover_link: Option<CellLinkHover>| TerminalDraw {
+            id: 505,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link,
+        };
+
+        // 1. Initial upload without hover link -> all 4 rows uploaded.
+        let s0 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s0.rows_uploaded, 4);
+
+        // 2. Hover row 0 URL `5..29` -> ONLY row 0 uploaded (1 row, 1 write_call)!
+        let link0 = CellLinkHover::single_row(0, 5, 29);
+        let s1 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 1, write_calls: 1 });
+
+        // Steady frame with same hover_link uploads 0 rows.
+        let s1_idle = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+        );
+        assert_eq!(s1_idle.rows_uploaded, 0);
+
+        // Count ink pixels in the underline band below the baseline (bottom 15% of cell height).
+        let count_ul_band = |px: &[u8], col: u16, row: u16, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(f32::from(col) * m.cell_width, -(f32::from(row) + 0.85) * m.cell_height), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(f32::from(col + 1) * m.cell_width, -f32::from(row + 1) * m.cell_height), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let is_cyan = |c: [u8; 3]| c[0].abs_diff(0x7d) <= 15 && c[1].abs_diff(0xcf) <= 15 && c[2] > 220;
+        let is_amber = |c: [u8; 3]| c[0] > 210 && c[1] > 150 && c[2] < 130;
+
+        let px_row0 = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(Some(link0))], ..Default::default() },
+            w,
+            h,
+        );
+        // Col 5 ('h') and col 13 ('l') have cyan hover underline; col 2 ('e' in "see") has none.
+        assert!(count_ul_band(&px_row0, 5, 0, is_cyan) > 12, "hovered URL start cell should draw cyan underline");
+        assert!(count_ul_band(&px_row0, 13, 0, is_cyan) > 12, "hovered URL interior cell should draw cyan underline");
+        assert_eq!(count_ul_band(&px_row0, 2, 0, is_cyan), 0, "unhovered cell before URL must have no cyan underline");
+
+        // 3. Move hover to multi-row wrapped URL (1,15)..(2,17) with custom amber underline colour ->
+        //    ONLY rows 0..3 (3 rows: old row 0 + new rows 1..=2) uploaded; row 3 untouched!
+        let link_wrap = CellLinkHover::new(1, 15, 2, 17).with_color(rgb(0xf0, 0xb4, 0x5a));
+        let s2 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() },
+        );
+        assert_eq!(s2, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 3, write_calls: 1 });
+
+        let wrap_frame = WallFrame { terminals: &[make(Some(link_wrap))], ..Default::default() };
+        let px_wrap = render_rgba_bytes(&ctx, &mut renderer, &cam, &wrap_frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_LINK_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &wrap_frame, (w, h), 1, Path::new(&path));
+            }
+        }
+        // Row 0 underline is gone; rows 1 (col 16) and 2 (col 4) show amber underline!
+        assert_eq!(count_ul_band(&px_wrap, 5, 0, is_cyan), 0, "clearing row 0 hover must remove its underline");
+        assert!(count_ul_band(&px_wrap, 16, 1, is_amber) > 12, "wrapped hover link row 1 must draw amber underline");
+        assert!(count_ul_band(&px_wrap, 4, 2, is_amber) > 12, "wrapped hover link row 2 must draw amber underline");
+        assert_eq!(count_ul_band(&px_wrap, 10, 1, is_amber), 0, "cells before wrapped link must not underline");
+
+        // 4. Clearing hover link uploads ONLY rows 1..3 (2 rows) and removes underline cleanly.
+        let s3 = renderer.prepare(
+            &ctx.device,
+            &ctx.queue,
+            (w, h),
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+        );
+        assert_eq!(s3, UploadStats { terminals_drawn: 1, terminals_uploaded: 1, rows_uploaded: 2, write_calls: 1 });
+        let px_clear = render_rgba_bytes(
+            &ctx,
+            &mut renderer,
+            &cam,
+            &WallFrame { terminals: &[make(None)], ..Default::default() },
+            w,
+            h,
+        );
+        assert_eq!(count_ul_band(&px_clear, 16, 1, is_amber), 0, "cleared hover link must leave zero underline");
+        assert_eq!(count_ul_band(&px_clear, 4, 2, is_amber), 0, "cleared hover link row 2 must leave zero underline");
+    }
+
+    /// Scrolled-back terminal state:
+    /// - Replaying a `g3d-termd` scrollback `REPAINT` (`\x1b[?25l` cursor hidden) draws ZERO
+    ///   focused cursor pixels on the cell grid.
+    /// - `push_scrollback_indicator` draws the right-edge thumb and top-right `↑42` pill in the
+    ///   JS `AgentViewOverlay` `liveChip` palette (`#1a3026` / `#356b4f` / `#8ef0b8`).
+    #[test]
+    fn gpu_scrolled_back_hides_cursor_and_draws_chrome_indicator() {
+        use super::super::metrics::WorldRect;
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        // Simulate g3d-termd's `repaint::view` payload: historical lines + `\x1b[0m\x1b[?25l`.
+        let mut vt_stream = String::from("\x1b[?1049l\x1b[!p\x1b[H\x1b[2J");
+        for i in 1..=10 {
+            vt_stream.push_str(&format!("HISTLINE_{i:02}  scrolled history output from earlier build"));
+            if i < 10 {
+                vt_stream.push_str("\r\n");
+            }
+        }
+        vt_stream.push_str("\x1b[5;12H\x1b[0m\x1b[?25l");
+        let screen = super::super::replay::replay_screen(vt_stream.as_bytes(), 60, 10);
+        assert!(!screen.cursor.visible, "termd scrollback view must hide the cursor via DECTCEM");
+
+        let m = renderer.metrics();
+        let pad = renderer.style().panel_padding;
+        let body_rect = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, pad);
+        let w = 960u32;
+        let h = 360u32;
+        let cam = WallCamera::frame_rect(body_rect, (w, h), 1.10);
+
+        let mut shapes = Vec::new();
+        let mut labels = Vec::new();
+        let family = renderer.font_family();
+        let pill_rect = {
+            let mut fonts = super::super::chrome::ChromeFonts::new(
+                m,
+                renderer.glyphs_mut().atlas_mut(),
+                family,
+            );
+            super::super::chrome::push_scrollback_indicator(
+                &mut shapes,
+                &mut labels,
+                &mut fonts,
+                super::super::chrome::ChromeView::new(cam.zoom, 1.0),
+                &super::super::chrome::ScrollbackIndicatorDesc {
+                    body_rect,
+                    z: 2.0,
+                    offset: 42,
+                    max: 200,
+                    visible_rows: screen.rows,
+                    viewing: true,
+                    focused: true,
+                },
+            )
+        }
+        .expect("scrolled-back terminal must emit scrollback badge");
+
+        let draw = TerminalDraw {
+            id: 606,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+        let frame = WallFrame {
+            paper: None,
+            terminals: &[draw],
+            shapes: &shapes,
+            labels: &labels,
+        };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+        if let Ok(path) = std::env::var("GLYPH_WALL_SCROLL_SHOT") {
+            if !path.is_empty() {
+                render_wall_to_png(&ctx, &mut renderer, &cam, &frame, (w, h), 1, Path::new(&path));
+            }
+        }
+
+        let count_rect = |r: WorldRect, pred: fn([u8; 3]) -> bool| -> usize {
+            let p0 = cam.world_to_screen(Vec2::new(r.min.x, r.max.y), (w, h));
+            let p1 = cam.world_to_screen(Vec2::new(r.max.x, r.min.y), (w, h));
+            let x0 = (p0.x.ceil() as u32).min(w);
+            let x1 = (p1.x.floor() as u32).min(w);
+            let y0 = (p0.y.ceil() as u32).min(h);
+            let y1 = (p1.y.floor() as u32).min(h);
+            let mut n = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if pred([px[idx], px[idx + 1], px[idx + 2]]) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // 1. Cursor at (col 11, row 4) must be completely hidden (0 bright #6ee7a0 cursor pixels).
+        let cur_rect = WorldRect::new(
+            Vec2::new(11.0 * m.cell_width, -5.0 * m.cell_height),
+            Vec2::new(12.0 * m.cell_width, -4.0 * m.cell_height),
+        );
+        let is_cursor = |c: [u8; 3]| c[0].abs_diff(0x6e) <= 6 && c[1].abs_diff(0xe7) <= 6 && c[2].abs_diff(0xa0) <= 6;
+        assert_eq!(count_rect(cur_rect, is_cursor), 0, "hidden scrollback cursor must draw 0 cursor pixels");
+
+        // 2. Top-right pill shows #1a3026 fill and #8ef0b8 text (strictly brighter than #356b4f border g=107).
+        let is_pill_bg = |c: [u8; 3]| c[0].abs_diff(0x1a) <= 4 && c[1].abs_diff(0x30) <= 4 && c[2].abs_diff(0x26) <= 4;
+        let is_pill_fg = |c: [u8; 3]| c[1] >= 135 && c[2] >= 95 && c[1] > c[0] + 35;
+        let bg_px = count_rect(pill_rect, is_pill_bg);
+        let fg_px = count_rect(pill_rect, is_pill_fg);
+        assert!(bg_px > 100, "scrollback pill must draw #1a3026 fill (got {bg_px} px)");
+        assert!(fg_px >= 25, "scrollback pill must draw #8ef0b8 text (got {fg_px} px)");
+
+        // 3. Right-edge thumb appears along the right inside edge of body_rect.
+        let right_strip = WorldRect::new(
+            Vec2::new(body_rect.max.x - 8.0 / cam.zoom, body_rect.min.y + 4.0 / cam.zoom),
+            Vec2::new(body_rect.max.x - 2.0 / cam.zoom, body_rect.max.y - 4.0 / cam.zoom),
+        );
+        let is_thumb = |c: [u8; 3]| c[1] > 120 && c[1] > c[0] + 30;
+        assert!(count_rect(right_strip, is_thumb) > 30, "scrollback right-edge thumb must be visible");
     }
 }

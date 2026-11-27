@@ -5,7 +5,7 @@ use crate::repo::{self, RepoParams, Strategy};
 use crate::{SceneChoice, SceneCullOptions};
 use super::args::{default_text_file, Cli, PresentMode};
 use super::ops::Op;
-use crate::default_emoji_sheet;
+use crate::resolve_emoji_sheet;
 
 /// Top-level action requested via the CLI.
 #[derive(Debug)]
@@ -171,7 +171,7 @@ impl Cli {
             };
         }
 
-        let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
+        let emoji_sheet = resolve_emoji_sheet(self.emoji_sheet.as_deref());
         if self.wall {
             return CliCommand::Wall {
                 emoji_sheet,
@@ -206,6 +206,23 @@ impl Cli {
                 screenshot: self.screenshot.clone(),
                 frames: self.frames.unwrap_or(1),
                 zoom: self.zoom,
+            };
+        }
+        // With no scene, offscreen render, or pick/verb script named, open the wall.
+        let has_glyph_scene = self.demo
+            || self.agent_session.is_some()
+            || self.load_repo.is_some()
+            || self.render_file.is_some()
+            || self.screenshot.is_some()
+            || self.screenshot_frame.is_some()
+            || !self.ops.is_empty()
+            || self.copies != 1;
+        if !has_glyph_scene {
+            return CliCommand::Wall {
+                emoji_sheet,
+                pattern: false,
+                namespace: self.wall_ns.clone(),
+                frames: self.frames,
             };
         }
         let choice = if self.demo {

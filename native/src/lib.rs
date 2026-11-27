@@ -95,12 +95,99 @@ pub enum SceneChoice {
     },
 }
 
+/// Compile-time repository `assets/` root (`<crate>/../assets`).
+pub fn repo_assets_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets")
+}
+
+/// Installed resource roots relative to `exe`:
+/// - macOS `.app` bundle (`Contents/MacOS/<bin>` -> `Contents/Resources`)
+/// - Unix/XDG prefix install (`<prefix>/bin/<bin>` -> `<prefix>/share/glyph3d-wall`)
+fn installed_resource_dirs_for(exe: &Path) -> Vec<PathBuf> {
+    let Some(bin_dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let Some(prefix) = bin_dir.parent() else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::with_capacity(2);
+    if bin_dir.file_name().is_some_and(|n| n == "MacOS") {
+        dirs.push(prefix.join("Resources"));
+    }
+    if bin_dir.file_name().is_some_and(|n| n == "bin") {
+        dirs.push(prefix.join("share/glyph3d-wall"));
+    }
+    dirs
+}
+
+/// Resolve a runtime asset in one place:
+/// 1. `explicit` flag path (`--emoji-sheet PATH`), when given
+/// 2. Bundle `Contents/Resources/<rel>` (macOS `.app`) or `<prefix>/share/glyph3d-wall/<rel>`
+///    (Linux/XDG prefix install), when present on disk
+/// 3. Repository checkout `<repo>/assets/<rel>`
+pub fn resolve_runtime_asset(explicit: Option<&Path>, rel: &str) -> PathBuf {
+    resolve_runtime_asset_with(
+        explicit,
+        std::env::current_exe().ok().as_deref(),
+        &repo_assets_dir(),
+        rel,
+    )
+}
+
+/// Pure, testable core of [`resolve_runtime_asset`].
+pub fn resolve_runtime_asset_with(
+    explicit: Option<&Path>,
+    current_exe: Option<&Path>,
+    repo_assets: &Path,
+    rel: &str,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Some(exe) = current_exe {
+        for resources in installed_resource_dirs_for(exe) {
+            let candidate = resources.join(rel);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    repo_assets.join(rel)
+}
+
 pub fn atlas_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets/atlas")
+    resolve_runtime_asset(None, "atlas/codepoints.bin")
+        .parent()
+        .expect("atlas/codepoints.bin has a parent directory")
+        .to_path_buf()
+}
+
+/// Resolve the colour-emoji sheet path: explicit `--emoji-sheet` flag first,
+/// then bundle `Contents/Resources/atlas/emoji-sheet.bin` (or Linux XDG share),
+/// then the repository checkout's `assets/atlas/emoji-sheet.bin`.
+pub fn resolve_emoji_sheet(explicit: Option<&Path>) -> PathBuf {
+    resolve_runtime_asset(explicit, "atlas/emoji-sheet.bin")
 }
 
 pub fn default_emoji_sheet() -> PathBuf {
-    atlas_dir().join("emoji-sheet.bin")
+    resolve_emoji_sheet(None)
+}
+
+/// Display name set on `NSProcessInfo` before winit builds the macOS application menu.
+pub const WALL_MACOS_APP_NAME: &str = "Glyph3D Wall";
+
+/// Set macOS `NSProcessInfo.processName` so winit 0.30's default application menu
+/// (`About …`, `Hide …`, `Quit …`) and standard About panel show `name` rather
+/// than the binary filename (`glyph3d-native`). Must run before `EventLoop::build`.
+#[cfg(all(feature = "windowed", target_os = "macos"))]
+pub fn set_macos_process_name(name: &str) {
+    let ns_name = objc2_foundation::NSString::from_str(name);
+    // SAFETY: Foundation documents `setProcessName:` as unsynchronised against
+    // concurrent readers of `processName`; callers run this once at startup
+    // before spawning worker threads or creating winit's `EventLoop`.
+    unsafe {
+        objc2_foundation::NSProcessInfo::processInfo().setProcessName(&ns_name);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -492,24 +492,12 @@ pub fn push_title_bar(
     } else {
         style.bar_text_idle
     };
-    let stroke = if desc.selected {
-        Some(style.selection_color)
-    } else if desc.hovered {
-        Some(style.bar_hover_stroke)
-    } else {
-        None
-    };
-
     shapes.push(Shape::Rect(RectShape {
         rect: strip,
         z: desc.z,
         fill: Some(fill),
-        stroke,
-        stroke_px: if stroke.is_some() {
-            view.phys_px(1.0)
-        } else {
-            0.0
-        },
+        stroke: None,
+        stroke_px: 0.0,
         dash: DashStyle::SOLID,
         corner_radius_px: 0.0,
     }));
@@ -1261,6 +1249,168 @@ pub fn build_notice(
     let mut shapes = Vec::with_capacity(1);
     let mut labels = Vec::with_capacity(1);
     let rect = push_notice(&mut shapes, &mut labels, fonts, style, view, desc);
+    (rect, shapes, labels)
+}
+
+// ── 7b. Scrolled-back Indicator (pill in `AgentViewOverlay.jsx` `liveChip` palette + right-edge thumb) ──
+
+/// Plain-data description of a terminal's scrolled-back indicator overlay.
+///
+/// Emits nothing when `offset == 0 && !viewing` so live terminals stay completely
+/// clean (matching the JS wall's `TerminalGrid` / `TitleBar`). When scrolled into
+/// history (`viewing || offset > 0`), draws a subtle right-edge thumb (when `max > 0`)
+/// and a compact top-right `↑<offset>` pill styled in `wall/AgentViewOverlay.jsx`'s
+/// `liveChip` palette (`#1a3026` fill, `#356b4f` border, `#8ef0b8` text).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbackIndicatorDesc {
+    /// World rectangle of the terminal's body panel (`TerminalFrame::body_rect`).
+    pub body_rect: WorldRect,
+    /// World depth of the terminal (indicator renders slightly in front).
+    pub z: f32,
+    /// Rows scrolled back from the live bottom (`0` = live).
+    pub offset: u64,
+    /// Deepest scrollback offset currently available (`0` if unknown).
+    pub max: u64,
+    /// Visible row count of the terminal grid (proportions the scrollbar thumb).
+    pub visible_rows: u16,
+    /// `true` while showing a scrollback view (`REPAINT_FLAG_VIEW`).
+    pub viewing: bool,
+    /// Whether this terminal holds keyboard focus.
+    pub focused: bool,
+}
+
+/// Append a scrolled-back position thumb and compact `↑<offset>` badge inside
+/// `desc.body_rect`. Returns the badge's world rect if one was emitted.
+pub fn push_scrollback_indicator(
+    shapes: &mut Vec<Shape>,
+    labels: &mut Vec<Label<'static>>,
+    fonts: &mut ChromeFonts<'_>,
+    view: ChromeView,
+    desc: &ScrollbackIndicatorDesc,
+) -> Option<WorldRect> {
+    if (!desc.viewing && desc.offset == 0)
+        || desc.body_rect.width() <= 0.0
+        || desc.body_rect.height() <= 0.0
+    {
+        return None;
+    }
+
+    let zoom = view.safe_zoom();
+    let sf = view.safe_scale();
+    let body_w_css = desc.body_rect.width() * zoom / sf;
+    let body_h_css = desc.body_rect.height() * zoom / sf;
+
+    // 1. Subtle right-edge scrollback thumb when total history depth is known.
+    let mut has_thumb = false;
+    if desc.max > 0 && desc.offset > 0 && body_w_css >= 28.0 && body_h_css >= 24.0 {
+        let thumb_w = view.css_to_world(3.0);
+        let inset_x = view.css_to_world(3.0);
+        let inset_y = view.css_to_world(4.0);
+        let track_h = (desc.body_rect.height() - 2.0 * inset_y).max(0.0);
+        if track_h > 1e-4 {
+            let vis = f32::from(desc.visible_rows.max(1));
+            let total = vis + desc.max as f32;
+            let min_thumb = view.css_to_world(14.0).min(track_h);
+            let thumb_h = (track_h * (vis / total)).clamp(min_thumb, track_h);
+            let frac_from_top =
+                (desc.max.saturating_sub(desc.offset) as f32 / desc.max as f32).clamp(0.0, 1.0);
+            let thumb_top = (desc.body_rect.max.y - inset_y) - frac_from_top * (track_h - thumb_h);
+            let thumb_rect = WorldRect::new(
+                Vec2::new(desc.body_rect.max.x - inset_x - thumb_w, thumb_top - thumb_h),
+                Vec2::new(desc.body_rect.max.x - inset_x, thumb_top),
+            );
+            let thumb_fill = if desc.focused {
+                srgb_hex(0x8ef0b8, 0.55)
+            } else {
+                srgb_hex(0x8b95a7, 0.45)
+            };
+            shapes.push(Shape::Rect(RectShape {
+                rect: thumb_rect,
+                z: desc.z + 0.02,
+                fill: Some(thumb_fill),
+                stroke: None,
+                stroke_px: 0.0,
+                dash: DashStyle::SOLID,
+                corner_radius_px: view.phys_px(1.5),
+            }));
+            has_thumb = true;
+        }
+    }
+
+    // 2. Compact top-right scrolled badge in the JS `AgentViewOverlay` `liveChip` palette.
+    if body_w_css < 96.0 || body_h_css < 36.0 {
+        return None;
+    }
+
+    let badge_text = if desc.offset > 0 {
+        format!("↑{}", desc.offset)
+    } else {
+        "↑ history".to_string()
+    };
+    let font_css = 10.5_f32;
+    let font_phys = view.phys_px(font_css);
+    let text_h_world = font_phys / zoom;
+    let pad_x = view.css_to_world(5.0);
+    let pill_h = view.css_to_world(16.0);
+    let text_w = measure_label_width(
+        fonts.metrics,
+        fonts.atlas,
+        fonts.family,
+        &badge_text,
+        text_h_world,
+    );
+    let max_pill_w = (desc.body_rect.width() - view.css_to_world(16.0)).max(0.0);
+    let pill_w = (text_w + 2.0 * pad_x).min(max_pill_w);
+    if pill_w <= 2.0 * pad_x {
+        return None;
+    }
+
+    let right_inset = view.css_to_world(if has_thumb { 9.0 } else { 6.0 });
+    let top_inset = view.css_to_world(5.0);
+    let max_x = desc.body_rect.max.x - right_inset;
+    let max_y = desc.body_rect.max.y - top_inset;
+    let pill_rect = WorldRect::new(
+        Vec2::new(max_x - pill_w, max_y - pill_h),
+        Vec2::new(max_x, max_y),
+    );
+    let z_pill = desc.z + 0.03;
+
+    // Exact `wall/AgentViewOverlay.jsx` `liveChip` colours (#1a3026 / #356b4f / #8ef0b8).
+    shapes.push(Shape::Rect(RectShape {
+        rect: pill_rect,
+        z: z_pill,
+        fill: Some(srgb_hex(0x1a3026, 0.94)),
+        stroke: Some(srgb_hex(0x356b4f, 1.0)),
+        stroke_px: view.phys_px(1.0),
+        dash: DashStyle::SOLID,
+        corner_radius_px: view.phys_px(2.0),
+    }));
+    labels.push(
+        Label::new(
+            badge_text,
+            Vec2::new(
+                pill_rect.min.x + pad_x,
+                pill_rect.center().y + 0.5 * text_h_world,
+            ),
+            LabelHeight::ScreenPx(font_phys),
+            srgb_hex(0x8ef0b8, 1.0),
+            z_pill,
+        )
+        .with_clip(pill_rect),
+    );
+
+    Some(pill_rect)
+}
+
+/// Standalone scrolled-back indicator builder returning `(Option<WorldRect>, Vec<Shape>, Vec<Label<'static>>)`.
+pub fn build_scrollback_indicator(
+    fonts: &mut ChromeFonts<'_>,
+    view: ChromeView,
+    desc: &ScrollbackIndicatorDesc,
+) -> (Option<WorldRect>, Vec<Shape>, Vec<Label<'static>>) {
+    let mut shapes = Vec::with_capacity(2);
+    let mut labels = Vec::with_capacity(1);
+    let rect = push_scrollback_indicator(&mut shapes, &mut labels, fonts, view, desc);
     (rect, shapes, labels)
 }
 
@@ -2286,6 +2436,42 @@ mod tests {
         assert!(amber_rect.is_some());
         assert_eq!(n_shapes.len(), 1);
         assert_eq!(n_labels.len(), 1);
+
+        // Scrollback indicator: silent when live, draws thumb + badge when scrolled back.
+        let body = WorldRect::new(Vec2::new(0.0, -24.0), Vec2::new(40.0, 0.0));
+        let (live_pill, live_s, live_l) = build_scrollback_indicator(
+            &mut fonts,
+            ChromeView::new(20.0, 1.0),
+            &ScrollbackIndicatorDesc {
+                body_rect: body,
+                z: 2.0,
+                offset: 0,
+                max: 200,
+                visible_rows: 24,
+                viewing: false,
+                focused: true,
+            },
+        );
+        assert!(live_pill.is_none());
+        assert!(live_s.is_empty() && live_l.is_empty());
+
+        let (sb_pill, sb_s, sb_l) = build_scrollback_indicator(
+            &mut fonts,
+            ChromeView::new(20.0, 1.0),
+            &ScrollbackIndicatorDesc {
+                body_rect: body,
+                z: 2.0,
+                offset: 42,
+                max: 200,
+                visible_rows: 24,
+                viewing: true,
+                focused: true,
+            },
+        );
+        assert!(sb_pill.is_some());
+        assert_eq!(sb_s.len(), 2, "thumb + badge rect");
+        assert_eq!(sb_l.len(), 1);
+        assert_eq!(sb_l[0].text, "↑42");
     }
 
     #[test]

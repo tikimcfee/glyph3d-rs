@@ -108,6 +108,12 @@ toml_edit = { version = "0.25", optional = true }
 # read through wgpu-hal's Vulkan adapter. The version wgpu-hal itself links.
 [target.'cfg(not(any(target_vendor = "apple", target_family = "wasm")))'.dependencies]
 ash = "0.38"
+
+# winit 0.30's macOS menu bar (`About …`, `Hide …`, `Quit …`) reads
+# `NSProcessInfo.processInfo.processName`; same 0.2.2 crate winit links.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.2.2", optional = true, default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
+
 [features]
 default = ["wgpu", "windowed", "egui-ui", "launcher"]
 # The wgpu renderer (2026-10-31): the device, `GlyphRenderer`, the offscreen
@@ -119,10 +125,9 @@ default = ["wgpu", "windowed", "egui-ui", "launcher"]
 wgpu = ["dep:wgpu", "dep:wgpu-profiler", "dep:pollster", "glyph-field/wgpu", "glyph-field-derived/wgpu"]
 # The window: `windowed/` and winit (2026-10-26). Off, there is no window
 # (the binary refuses a windowed run).
-windowed = ["wgpu", "dep:winit", "dep:arboard"]
-# The terminal launcher. Off, `--launcher` is refused and a bare run opens
-# the default scene, as it did before C27. It starts this binary's window
-# as a child, so it needs one.
+windowed = ["wgpu", "dep:winit", "dep:arboard", "dep:objc2-foundation"]
+# The terminal launcher (`--launcher`). Off, `--launcher` is refused; a bare
+# run opens the wall. It starts this binary's window as a child, so it needs one.
 launcher = ["windowed", "dep:ratatui", "dep:crossterm", "dep:toml_edit"]
 # Stage K: build the windowed egui overlay. With the feature off (or `--no-ui`
 # at runtime) windowed behavior is exactly pre-K.
