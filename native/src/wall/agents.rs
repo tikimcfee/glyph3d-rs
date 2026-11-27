@@ -1111,7 +1111,7 @@ impl WallAgents {
             if !live.pwd.is_empty() {
                 entry.pwd.clone_from(&live.pwd);
             }
-            if entry.title.is_empty() && !live.title.is_empty() {
+            if !live.title.is_empty() {
                 entry.title.clone_from(&live.title);
             }
         }
@@ -2216,6 +2216,116 @@ mod tests {
         agents.note_terminal_scrolled("t1", 12, false, false, false);
 
         assert_eq!(agents.live_meta.get("t1").map(|m| m.scrollback_rows), Some(30));
+        agents.shutdown();
+    }
+
+    #[test]
+    fn live_osc_title_overrides_stale_termd_status_title_and_rebinds_open_view() {
+        let scratch = Scratch::new("osc-title-rebind");
+        let stub = scratch.0.join("agent");
+        let sessions_json = serde_json::json!([
+            {
+                "session_id": "sess-coder-1",
+                "harness": "claude",
+                "path": scratch.0.join("coder.jsonl"),
+                "size": 128,
+                "mtime": "2026-11-26T18:30:00Z",
+                "cwd": scratch.0,
+                "title": "Coder session",
+                "status": "processing",
+                "workgroup": { "name": "coder", "host": "laptop-2" }
+            }
+        ]);
+        let sessions_file = scratch.0.join("sessions.json");
+        fs::write(&sessions_file, sessions_json.to_string()).unwrap();
+        write_stub(
+            &stub,
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --backend-config) shift; shift ;; -q|--quiet) shift ;; --*) shift ;; *) break ;; esac; done\ncase \"${{1:-}}\" in\n  sessions) cat '{}' ;;\n  export) printf '{{\"type\":\"snapshot\",\"host\":\"laptop-2\",\"stores\":[],\"agents\":[]}}\\n'; exec sleep 30 ;;\n  transcript) printf '' ;;\nesac\n",
+                sessions_file.display()
+            ),
+        );
+
+        let mut wall = Wall::in_memory(RulesOptions::default());
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24).with_title("lugo@laptop-2:~"));
+        let _ = wall.drain_effects();
+        // Simulate a live News::Status push populating wall.termd() with zsh's initial shell title.
+        let _ = wall.on_termd_status(
+            serde_json::json!({
+                "daemon": { "ns": "probe", "pid": 1 },
+                "terminals": [{
+                    "id": "t1",
+                    "cols": 80,
+                    "rows": 24,
+                    "title": "lugo@laptop-2:~",
+                    "cwd": "/Users/lugo",
+                    "pwd": "/Users/lugo",
+                    "scrollback_rows": 0
+                }]
+            }),
+            1_000,
+        );
+
+        let mut agents = WallAgents::with_options(
+            WallAgentsOptions {
+                cli: AgentCli::new(&stub),
+                session_poll_interval: Duration::from_secs(10),
+                ..WallAgentsOptions::default()
+            },
+            Arc::new(|| {}),
+        );
+
+        // With zero Agent Views open, termd status sync must NOT trigger a redraw.
+        assert!(!agents.pump(&mut wall));
+        let _ = wall.on_termd_status(
+            serde_json::json!({
+                "daemon": { "ns": "probe", "pid": 1 },
+                "terminals": [{
+                    "id": "t1",
+                    "cols": 80,
+                    "rows": 24,
+                    "title": "lugo@laptop-2:~",
+                    "cwd": "/Users/lugo",
+                    "pwd": "/Users/lugo",
+                    "scrollback_rows": 5
+                }]
+            }),
+            2_000,
+        );
+        assert!(
+            !agents.pump(&mut wall),
+            "background termd status updates with zero open Agent Views must not trigger redraws"
+        );
+
+        // Open Agent View on t1 while title is still shell default -> falls through to /Users/lugo.
+        let _ = agents.run_verb(&mut wall, "wall.agent t1 open");
+        assert!(wait_until(Duration::from_secs(3), || {
+            let _ = agents.pump(&mut wall);
+            !agents.views().sessions().is_empty()
+        }));
+        assert_eq!(agents.views().resolved_session_of("t1"), None);
+
+        // Now live glyph-vt OSC 0 title updates to `gx-coder` while wall.termd() STILL holds the
+        // stale shell title `lugo@laptop-2:~`: live.title must override and rebind immediately!
+        wall.terminal_title("t1", "gx-coder");
+        agents.set_live_terminal_meta(
+            "t1",
+            LiveTerminalMeta {
+                title: "gx-coder".to_string(),
+                pwd: "/Users/lugo".to_string(),
+                ..LiveTerminalMeta::default()
+            },
+        );
+        assert!(
+            agents.pump(&mut wall),
+            "live OSC title change to gx-coder must rebind and request one redraw"
+        );
+        assert_eq!(
+            agents.views().resolved_session_of("t1"),
+            Some("sess-coder-1"),
+            "live OSC title gx-coder must override stale termd status title and pair sess-coder-1"
+        );
+
         agents.shutdown();
     }
 
