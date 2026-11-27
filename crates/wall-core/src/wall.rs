@@ -4504,11 +4504,25 @@ impl Wall {
     /// re-wrapping every terminal's grid to keep its panel footprint and re-laying out groups.
     pub fn set_geometry_preserving_panels(&mut self, geometry: CellGeometry) {
         let core = &mut self.router.context;
+        let old = core.model.geometry();
+        if old == geometry {
+            return;
+        }
         core.model.set_geometry_preserving_panels(geometry);
         if core.fullscreen.active() {
             core.with_fullscreen(|fs, host| {
+                fs.rescale_saved_canvas_for_geometry(host, old, geometry);
                 fs.refit(host);
             });
+        }
+    }
+
+    /// Advance the wall's monotonic clock (`now_ms`) before out-of-band actions
+    /// (`run`, `notify`, `key`, `deliver_clipboard`) on an idle window so timed
+    /// notices and hold timers do not stamp a stale pre-idle timestamp.
+    pub fn set_now_ms(&mut self, now_ms: f64) {
+        if now_ms.is_finite() {
+            self.router.context.now_ms = self.router.context.now_ms.max(now_ms);
         }
     }
 
@@ -4516,6 +4530,12 @@ impl Wall {
     pub fn notify(&mut self, message: &str) {
         let now_ms = self.router.context.now_ms;
         self.router.context.model.notify(message, now_ms);
+    }
+
+    /// Advance the wall's clock to `now_ms` and show a timed notice line for `config.notice_ms`.
+    pub fn notify_at(&mut self, message: &str, now_ms: f64) {
+        self.set_now_ms(now_ms);
+        self.notify(message);
     }
 
     /// Advance camera easing, wheel scroll glides, fullscreen refit settlement,

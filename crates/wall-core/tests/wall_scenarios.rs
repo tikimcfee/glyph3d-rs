@@ -2972,3 +2972,112 @@ fn wall_blur_clears_pressed_keys_cancels_close_hold_and_cancels_active_drag() {
     );
 }
 
+#[test]
+fn notify_refreshes_clock_after_idle_window_so_notice_survives_first_tick() {
+    let mut h = Harness::new();
+    let _t1 = h.spawn();
+    let notice_ms = h.wall.config().notice_ms;
+
+    // Window drew at t = 100 ms, then sat idle for 20 seconds (well past notice_ms).
+    let _ = h.wall.tick(0.016, 100.0);
+    let idle_now = 100.0 + notice_ms + 20_000.0;
+
+    // Refreshing clock before notify (`notify_at` / `set_now_ms`) stamps notice expiry at `idle_now + notice_ms`.
+    h.wall
+        .notify_at("font 'Bogus' is not installed — keeping monaspace-neon", idle_now);
+    let _ = h.wall.tick(0.016, idle_now + 16.0);
+    assert_eq!(
+        h.frame().notice.as_deref(),
+        Some("font 'Bogus' is not installed — keeping monaspace-neon"),
+        "notice posted after idle gap must survive the first draw tick"
+    );
+
+    // Still visible just before expiry, cleared at expiry.
+    let _ = h.wall.tick(0.016, idle_now + notice_ms - 50.0);
+    assert!(h.frame().notice.is_some());
+    let _ = h.wall.tick(0.016, idle_now + notice_ms + 1.0);
+    assert_eq!(h.frame().notice, None);
+
+    // Same for `set_now_ms` before a verb that emits a notice (`wall.attach` with bad target).
+    let later = idle_now + notice_ms + 30_000.0;
+    h.wall.set_now_ms(later);
+    let _ = h.wall.run("wall.attach @bad");
+    let _ = h.wall.tick(0.016, later + 16.0);
+    assert!(
+        h.frame().notice.as_deref().is_some_and(|s| s.starts_with("attach:")),
+        "verb notice after set_now_ms on idle window must not expire on first tick"
+    );
+}
+
+#[test]
+fn fullscreen_saved_canvas_grid_rescales_on_font_geometry_change() {
+    let mut h = Harness::new();
+    let t1 = h.spawn();
+    let t2 = h.spawn();
+    h.settle();
+
+    let old_geom = h.wall.model().geometry();
+    let orig_rect = h.wall.model().terminal_rect(&t1).expect("t1 rect");
+    assert_eq!(
+        (
+            h.wall.terminal(&t1).expect("t1").cols,
+            h.wall.terminal(&t1).expect("t1").rows,
+        ),
+        (100, 30)
+    );
+
+    // 1. Solo fullscreen: double cell stride while fullscreen, then exit.
+    h.run_ok(&format!("wall.fullscreen on {t1}"));
+    h.settle();
+    let doubled = CellGeometry {
+        stride: Point::new(old_geom.stride.x * 2.0, old_geom.stride.y * 2.0),
+        padding: old_geom.padding,
+        scale_z: old_geom.scale_z,
+    };
+    h.wall.set_geometry_preserving_panels(doubled);
+    h.pump();
+    h.settle();
+
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+    let after_solo = h.wall.terminal(&t1).expect("t1 after solo exit");
+    assert_eq!(
+        (after_solo.cols, after_solo.rows),
+        (50, 15),
+        "leaving solo fullscreen after font size doubling must restore rescaled canvas grid"
+    );
+    let restored_rect = h.wall.model().terminal_rect(&t1).expect("restored rect");
+    assert!((restored_rect.width() - orig_rect.width()).abs() < 1e-6);
+    assert!((restored_rect.height() - orig_rect.height()).abs() < 1e-6);
+
+    // 2. Tile-group fullscreen: restore original geometry while in group fullscreen, then exit.
+    h.run_ok(&format!("wall.group {t1} {t2}"));
+    let gid = h.wall.store().group_of(&t1).expect("gid").to_owned();
+    h.settle();
+    let pre_group_cols = h.wall.terminal(&t1).expect("t1").cols;
+    let pre_group_rows = h.wall.terminal(&t1).expect("t1").rows;
+    assert_eq!((pre_group_cols, pre_group_rows), (50, 15));
+
+    h.run_ok(&format!("wall.fullscreen on {gid}"));
+    h.settle();
+    h.wall.set_geometry_preserving_panels(old_geom);
+    h.pump();
+    h.settle();
+
+    h.run_ok("wall.fullscreen off");
+    h.settle();
+    let t1_back = h.wall.terminal(&t1).expect("t1 after group exit");
+    let t2_back = h.wall.terminal(&t2).expect("t2 after group exit");
+    assert_eq!(
+        (t1_back.cols, t1_back.rows),
+        (100, 30),
+        "leaving group fullscreen after font change must restore rescaled grid for t1"
+    );
+    assert_eq!(
+        (t2_back.cols, t2_back.rows),
+        (100, 30),
+        "leaving group fullscreen after font change must restore rescaled grid for t2"
+    );
+}
+
+

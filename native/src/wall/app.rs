@@ -18,7 +18,7 @@
 //! sleeps until input arrives, a terminal's reader thread sends [`Wake`], or
 //! the wall says something is still moving.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -173,8 +173,6 @@ struct App {
     last_ime_area: Option<(i32, i32, u32, u32)>,
     #[cfg(target_os = "macos")]
     macos_option_as_alt: Option<winit::platform::macos::OptionAsAlt>,
-    /// Physical `code`s whose press reached `key_input` and have not yet been released.
-    held_codes: HashSet<String>,
     /// Last text written by `WallEffect::WriteClipboard` (inspected via `app.clipboard`).
     last_copied: Option<String>,
     /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
@@ -691,7 +689,9 @@ impl App {
     /// Apply font family, size, line-height, and text-style knobs from `wall.config()` to the
     /// renderer and cell geometry, re-wrapping terminals to preserve panel footprints.
     fn sync_font_and_text_knobs(&mut self, changed_key: Option<&str>) {
+        let now_ms = self.now_ms();
         let (Some(g), Some(wall)) = (&mut self.gfx, &mut self.wall) else { return };
+        wall.set_now_ms(now_ms);
         let cfg = wall.config();
         let family = cfg.font_family.clone();
         let font_size = cfg.font_size;
@@ -797,7 +797,9 @@ impl App {
                 return;
             }
             WallEffect::ReadClipboard { target } => {
+                let now_ms = self.now_ms();
                 if let (Some(text), Some(wall)) = (self.read_clipboard(), &mut self.wall) {
+                    wall.set_now_ms(now_ms);
                     wall.deliver_clipboard(&target, &text);
                 }
                 return;
@@ -975,8 +977,12 @@ impl App {
                 ran = true;
                 continue;
             }
+            let now_ms = self.now_ms();
             let reply = match (&mut self.wall, &self.terms) {
-                (Some(wall), Some(terms)) => wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text,
+                (Some(wall), Some(terms)) => {
+                    wall.set_now_ms(now_ms);
+                    wall.run_with_screens(line.as_str(), &screen_lookup(|id| terms.screen(id))).text
+                }
                 _ => "ERR: the wall is not open yet".to_string(),
             };
             responder.send(reply);
@@ -1407,13 +1413,6 @@ impl App {
     }
 
     fn key_input(&mut self, key: KeyEvent) {
-        if !key.code.is_empty() {
-            if key.pressed {
-                self.held_codes.insert(key.code.clone());
-            } else {
-                self.held_codes.remove(&key.code);
-            }
-        }
         if self.ime_composing && key.pressed {
             return;
         }
@@ -1429,7 +1428,9 @@ impl App {
             self.redraw();
             return;
         }
+        let now_ms = self.now_ms();
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+        wall.set_now_ms(now_ms);
         #[cfg(feature = "egui-ui")]
         if key.pressed && key.code == "Escape" && !key.mods.ctrl && !key.mods.alt && !key.mods.meta {
             if self.panels.close_open_on_escape(wall) {
@@ -1547,52 +1548,9 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
-            let had_buttons = self.buttons != 0;
             self.buttons = 0;
-            let now_ms = self.now_ms();
-            let cursor = self.cursor;
-            let held: Vec<String> = self.held_codes.drain().collect();
-            if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
-                if had_buttons {
-                    let ev = PointerEvent {
-                        pointer_id: 1,
-                        x: cursor.x,
-                        y: cursor.y,
-                        button: None,
-                        buttons: Buttons(0),
-                        mods: Mods::default(),
-                        time_ms: now_ms,
-                    };
-                    wall.pointer_cancel(&ev);
-                }
-                let lookup = screen_lookup(|id| terms.screen(id));
-                for code in &held {
-                    let key_name = match code.as_str() {
-                        "MetaLeft" | "MetaRight" => "Meta",
-                        "ControlLeft" | "ControlRight" => "Control",
-                        "AltLeft" | "AltRight" => "Alt",
-                        "ShiftLeft" | "ShiftRight" => "Shift",
-                        _ => "a",
-                    };
-                    let up = KeyEvent {
-                        code: code.clone(),
-                        key: key_name.to_string(),
-                        text: None,
-                        mods: Mods::default(),
-                        repeat: false,
-                        pressed: false,
-                    };
-                    let _ = wall.key(&up, &lookup);
-                }
-                let meta_up = KeyEvent {
-                    code: "MetaLeft".to_string(),
-                    key: "Meta".to_string(),
-                    text: None,
-                    mods: Mods::default(),
-                    repeat: false,
-                    pressed: false,
-                };
-                let _ = wall.key(&meta_up, &lookup);
+            if let Some(wall) = &mut self.wall {
+                wall.blur();
             }
             self.apply_effects();
             self.redraw();
@@ -2061,7 +2019,6 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         last_ime_area: None,
         #[cfg(target_os = "macos")]
         macos_option_as_alt: None,
-        held_codes: HashSet::new(),
         last_copied: None,
         memory_clipboard: None,
         use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
