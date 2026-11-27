@@ -113,7 +113,7 @@ impl BarButtonsState {
 /// Per-frame inputs for [`show`].
 #[derive(Clone, Copy, Debug)]
 pub struct BarButtonsInput<'a> {
-    /// Hovered terminal id (or `state.hold_target()` while a hold is pinned).
+    /// Hovered terminal id (or `state.hold_target()` / keyboard-held terminal while a hold is pinned).
     pub terminal_id: Option<&'a str>,
     /// Screen-space rectangle of `terminal_id`'s title bar this frame.
     pub bar_rect: Option<egui::Rect>,
@@ -125,6 +125,14 @@ pub struct BarButtonsInput<'a> {
     pub min_bar_px: f32,
     /// Monotonic frame timestamp in seconds.
     pub now_secs: f64,
+    /// Optional `[0.0, 1.0]` close-hold progress owned externally by `wall-core`
+    /// (`TerminalFrame::close_hold_progress` during keyboard `⌘X` / `Ctrl+Alt+X` hold).
+    /// Paints the close ring without running a second timer or emitting `wall.close`.
+    pub external_hold_progress: Option<f32>,
+    /// Optional screen-space terminal body rectangle used to anchor a small top-right
+    /// close-hold ring badge when `external_hold_progress` is active but the title bar
+    /// is hidden (solo fullscreen, `splitBars = false`, or zoomed below `min_bar_px`).
+    pub fallback_body_rect: Option<egui::Rect>,
 }
 
 impl Default for BarButtonsInput<'static> {
@@ -136,6 +144,8 @@ impl Default for BarButtonsInput<'static> {
             close_hold_ms: DEFAULT_CLOSE_HOLD_MS,
             min_bar_px: DEFAULT_BAR_BUTTONS_MIN_PX,
             now_secs: 0.0,
+            external_hold_progress: None,
+            fallback_body_rect: None,
         }
     }
 }
@@ -203,6 +213,10 @@ pub fn show(
     }
 
     let target_id = input.terminal_id.filter(|id| !id.is_empty());
+    let external_progress = input
+        .external_hold_progress
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.0, 1.0));
     let layout = target_id
         .zip(input.bar_rect)
         .and_then(|(id, rect)| button_cluster_rects(rect, input.min_bar_px).map(|g| (id, g)));
@@ -217,9 +231,16 @@ pub fn show(
         {
             state.hold = None;
         }
+        let fallback_rect = if let (Some(progress), Some(body)) =
+            (external_progress, input.fallback_body_rect)
+        {
+            paint_external_hold_badge(ctx, body, progress)
+        } else {
+            None
+        };
         let (wants_repaint, repaint_after) = tick_active_hold(ctx, state, input.now_secs, out);
         return BarButtonsOutput {
-            cluster_rect: None,
+            cluster_rect: fallback_rect,
             wants_repaint,
             repaint_after,
             wants_pointer: false,
@@ -312,7 +333,8 @@ pub fn show(
                             && h.duration_secs > 0.0
                             && (input.now_secs - h.started_at_secs).max(0.0) < h.duration_secs
                     })
-                    .and_then(|_| state.hold_progress(input.now_secs));
+                    .and_then(|_| state.hold_progress(input.now_secs))
+                    .or(external_progress);
                 paint_bar_button(
                     ui.painter(),
                     close_rect,
@@ -383,6 +405,38 @@ fn tick_active_hold(
     let step = remaining.min(HOLD_REPAINT_STEP);
     ctx.request_repaint_after(step);
     (true, Some(step))
+}
+
+fn paint_external_hold_badge(
+    ctx: &egui::Context,
+    body_rect: egui::Rect,
+    progress: f32,
+) -> Option<egui::Rect> {
+    if body_rect.width() <= 0.0 || body_rect.height() <= 0.0 {
+        return None;
+    }
+    let vp = ctx.viewport_rect();
+    let badge_size = 24.0_f32;
+    let inset = 8.0_f32;
+    let x = (body_rect.max.x - inset - badge_size)
+        .clamp(vp.min.x + 4.0, (vp.max.x - badge_size - 4.0).max(vp.min.x + 4.0));
+    let y = (body_rect.min.y + inset)
+        .clamp(vp.min.y + 4.0, (vp.max.y - badge_size - 4.0).max(vp.min.y + 4.0));
+    let badge_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_size, badge_size));
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("wall_bar_buttons_hold_badge"),
+    ));
+    painter.rect(
+        badge_rect,
+        egui::CornerRadius::same(4),
+        egui::Color32::from_rgb(0x0e, 0x11, 0x18),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x2a, 0x30, 0x3c)),
+        egui::StrokeKind::Inside,
+    );
+    let inner = badge_rect.shrink(3.0);
+    paint_bar_button(&painter, inner, BarIcon::Close, false, false, Some(progress));
+    Some(badge_rect)
 }
 
 #[derive(Clone, Copy)]
@@ -989,6 +1043,7 @@ mod tests {
             close_hold_ms: 650.0,
             min_bar_px: 14.0,
             now_secs: 1.40, // ~62% hold ring filled
+            ..BarButtonsInput::default()
         };
 
         let mut verbs = Vec::new();
@@ -1095,5 +1150,67 @@ mod tests {
             "expected preview PNG at {}",
             out_path.display()
         );
+    }
+
+    #[test]
+    fn external_hold_progress_paints_ring_on_bar_and_fallback_badge_without_duplicate_close() {
+        fn has_ring_shape(shapes: &[egui::epaint::ClippedShape]) -> bool {
+            let want = egui::epaint::ColorMode::Solid(HOLD_RING_COLOR);
+            shapes.iter().any(|cs| match &cs.shape {
+                egui::Shape::Path(p) => p.stroke.color == want && p.points.len() >= 3,
+                egui::Shape::Vec(v) => v.iter().any(|s| {
+                    matches!(s, egui::Shape::Path(p) if p.stroke.color == want && p.points.len() >= 3)
+                }),
+                _ => false,
+            })
+        }
+
+        let ctx = make_ctx();
+        let mut state = BarButtonsState::default();
+        let mut verbs = Vec::new();
+        let bar_rect = egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(400.0, 22.0));
+        let body_rect = egui::Rect::from_min_size(egui::pos2(100.0, 102.0), egui::vec2(400.0, 300.0));
+
+        // 1. External keyboard hold over a normal title bar paints `#e5534b` arc, emits zero verbs.
+        let mut bar_out = BarButtonsOutput::default();
+        let full_bar = run_headless(&ctx, raw_at(1.0, Vec::new()), |c| {
+            bar_out = show(
+                c,
+                &mut state,
+                &BarButtonsInput {
+                    terminal_id: Some("t1"),
+                    bar_rect: Some(bar_rect),
+                    external_hold_progress: Some(0.55),
+                    fallback_body_rect: Some(body_rect),
+                    now_secs: 1.0,
+                    ..BarButtonsInput::default()
+                },
+                &mut verbs,
+            );
+        });
+        assert!(bar_out.cluster_rect.is_some());
+        assert!(has_ring_shape(&full_bar.shapes), "expected #e5534b hold ring on title bar");
+        assert!(verbs.is_empty(), "external hold must not emit duplicate wall.close");
+
+        // 2. When bar_rect is absent (solo fullscreen) or < min_bar_px, paints top-right fallback badge.
+        let mut fb_out = BarButtonsOutput::default();
+        let full_fb = run_headless(&ctx, raw_at(1.1, Vec::new()), |c| {
+            fb_out = show(
+                c,
+                &mut state,
+                &BarButtonsInput {
+                    terminal_id: Some("t1"),
+                    bar_rect: None,
+                    external_hold_progress: Some(0.65),
+                    fallback_body_rect: Some(body_rect),
+                    now_secs: 1.1,
+                    ..BarButtonsInput::default()
+                },
+                &mut verbs,
+            );
+        });
+        assert!(fb_out.cluster_rect.is_some(), "expected fallback hold badge rect");
+        assert!(has_ring_shape(&full_fb.shapes), "expected #e5534b hold ring on fallback badge");
+        assert!(verbs.is_empty());
     }
 }
