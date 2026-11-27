@@ -1,0 +1,59 @@
+[?1049l[!p[?7h[?9l[?1000l[?1002l[?1003l[?1005l[?1006l[?1015l[?1016l[?1004l[?2004l[=0;1u[H[2J[3g[9GH[17GH[25GH[33GH[41GH[49GH[57GH[65GH[73GH[81GH[89GH[97GH[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0m]2;
+[1mdiff --git a/native/src/wall/app.rs b/native/src/wall/app.rs[m
+[1mindex ebdb82b..5dd534d 100644[m
+[1m--- a/native/src/wall/app.rs[m
+[1m+++ b/native/src/wall/app.rs[m
+[36m@@ -92,6 +92,17 @@[m [mimpl Terminals {[m
+             Terminals::Fixed(m) => m.get(id),[m
+         }[m
+     }[m
+[32m+[m
+[32m+[m[32m    fn scrollback(&self, id: &str) -> Option<super::describe::TerminalScrollback> {[m
+[32m+[m[32m        match self {[m
+[32m+[m[32m            Terminals::Live(s) => s.scrollback(id).map(|sb| super::describe::TerminalScrollback {[m
+[32m+[m[32m                offset: sb.offset,[m
+[32m+[m[32m                max: sb.max,[m
+[32m+[m[32m                viewing: sb.viewing,[m
+[32m+[m[32m            }),[m
+[32m+[m[32m            Terminals::Fixed(_) => None,[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+ }[m
+ [m
+ /// What exists once there is a window.[m
+[36m@@ -681,7 +692,16 @@[m [mimpl App {[m
+             let metrics = g.renderer.metrics();[m
+             let family = g.renderer.font_family();[m
+             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);[m
+[31m-            super::describe::describe_frame_chrome(&described, &camera, viewport, sf, &mut fonts, &mut shapes, &mut labels)[m
+[32m+[m[32m            super::describe::describe_frame_chrome_with_scrollback([m
+[32m+[m[32m                &described,[m
