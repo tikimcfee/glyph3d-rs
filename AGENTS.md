@@ -185,7 +185,14 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   throughput, wake-rate, and zero-frame idle CPU harness against scratch
   daemons), and `tools/wall-bundle.sh` (packages `target/bundle/Glyph3D Wall.app`
   on macOS with `glyph3d-native`, `wallctl`, `Info.plist`, generated `.icns`,
-  and bundled `assets/atlas/emoji-sheet.bin`).
+  and bundled `assets/atlas/emoji-sheet.bin`). `tools/wall-install.sh` is how
+  a person gets the wall (2026-11-26): it copies that app into
+  `~/Applications` on macOS, or the binary, its fonts and emoji sheet, a
+  desktop entry and an icon into `~/.local` on Linux, and writes `g3d-wall`
+  (open the wall; arguments pass through; `--fg` stays in the shell;
+  `--installed` names the build) and `wallctl` into `~/.local/bin`. The
+  install is a copy and needs no checkout afterwards; it does not install
+  `g3d-termd`, which is glyph3d-js's `make`.
 - `.agents/` — agent house rules (`rules/rust-engineering.md`), the operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`), and the definition engine's
   answering skill (`skills/definition-engine/SKILL.md`, 2026-10-31).
@@ -1187,7 +1194,7 @@ and the union is not:
   `orphans` check its code; nothing in `pixel-ab` pixel-compares a wall frame
   against a committed baseline, and `tools/wall-smoke.sh`,
   `tools/wall-smoke-text.sh`, `tools/vt-diff.sh`, `tools/wall-perf.sh`, and
-  `tools/wall-bundle.sh` run outside `build.toml`.
+  `tools/wall-bundle.sh` and `tools/wall-install.sh` run outside `build.toml`.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is
