@@ -528,6 +528,7 @@ mod tests {
                     detail: "idle".to_string(),
                     ..BusAgentInput::default()
                 }],
+                stale: None,
             },
         })
     }

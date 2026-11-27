@@ -181,6 +181,24 @@ pub struct BusAgentInput {
     pub cwd: String,
 }
 
+/// The fleet feed is down: the agents listed are the fleet as it was when the feed was
+/// last up, and nothing in the list will change until it is up again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BusStale {
+    /// When the feed went down, Unix milliseconds.
+    pub since_ms: u64,
+    /// That moment on the host's wall clock, `HH:MM` (the host formats it: this
+    /// crate has no time zone).
+    pub clock: String,
+}
+
+impl BusStale {
+    /// What the list says of itself: `agents: last seen 14:32`.
+    pub fn label(&self) -> String {
+        format!("agents: last seen {}", self.clock)
+    }
+}
+
 /// Raw gomuxai fleet snapshot (`wall.busSnapshot()` / `/api/agents`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BusSnapshot {
@@ -190,6 +208,8 @@ pub struct BusSnapshot {
     pub reason: String,
     /// Raw agent list (both live and ended).
     pub agents: Vec<BusAgentInput>,
+    /// `Some` while the feed that fills `agents` is down ([`BusStale`]).
+    pub stale: Option<BusStale>,
 }
 
 /// Resolved live agent entry inside a [`BusHost`].
@@ -638,6 +658,16 @@ impl SidebarRow {
     }
 }
 
+/// The notice that heads the list while the fleet feed is down: the agents under it are
+/// the fleet as it last was, drawn dimmed, never as live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentsStaleNotice {
+    /// `agents: last seen 14:32` ([`BusStale::label`]).
+    pub text: String,
+    /// Hover text: what the feed died of, when the host knows.
+    pub reason: Option<String>,
+}
+
 /// Empty-state row shown when no live agents are listed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentsEmptyNotice {
@@ -658,6 +688,9 @@ pub struct SidebarModel {
     pub terminals_empty: bool,
     /// Set when the bus lists no live agent.
     pub agents_empty: Option<AgentsEmptyNotice>,
+    /// Set while the fleet feed is down and agents are still listed: every agent's
+    /// status in `rows` is then as of that moment, and the panel dims it.
+    pub agents_stale: Option<AgentsStaleNotice>,
 }
 
 impl SidebarModel {
@@ -749,12 +782,14 @@ fn build_group_row(g: &SidebarGroup, collapsed: bool, hosts: Vec<HostCount>) -> 
     }
 }
 
-/// The agent's hover text; `own_terminal` is the terminal row it is merged into.
+/// The agent's hover text; `own_terminal` is the terminal row it is merged into,
+/// and `stale` the feed's outage when what is said here is as of an earlier moment.
 fn build_agent_tooltip(
     a: &BusAgent,
     attachable: bool,
     on_wall: Option<&str>,
     own_terminal: bool,
+    stale: Option<&BusStale>,
 ) -> String {
     let status_line = if a.end_reason.is_empty() {
         a.status.word().to_string()
@@ -767,13 +802,17 @@ fn build_agent_tooltip(
         None if attachable => "click to attach".to_string(),
         None => "no live session to attach to".to_string(),
     };
-    let mut lines = Vec::with_capacity(5);
+    let as_of = stale.map_or_else(String::new, |st| {
+        format!("as of {}: the agents feed is down", st.clock)
+    });
+    let mut lines = Vec::with_capacity(6);
     for candidate in [
         a.target.as_str(),
         status_line.as_str(),
         a.detail.as_str(),
         a.cwd.as_str(),
         footer.as_str(),
+        as_of.as_str(),
     ] {
         if !candidate.is_empty() {
             lines.push(candidate);
@@ -912,7 +951,9 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
         let local = host == local_host;
         let host_label = host_label(&host);
         let tooltip = match (agent, t.attached.as_deref()) {
-            (Some(a), _) => build_agent_tooltip(a, bus_attachable(a.attached), Some(&t.id), true),
+            (Some(a), _) => {
+                build_agent_tooltip(a, bus_attachable(a.attached), Some(&t.id), true, input.bus.stale.as_ref())
+            }
             (None, Some(target)) if !target.is_empty() => format!("attached to {target}"),
             _ => String::new(),
         };
@@ -963,7 +1004,7 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
                 hidden: false,
                 focused: on_wall.is_some() && on_wall.as_deref() == focused,
                 interactive: attachable || on_wall.is_some(),
-                tooltip: build_agent_tooltip(a, attachable, on_wall.as_deref(), false),
+                tooltip: build_agent_tooltip(a, attachable, on_wall.as_deref(), false, input.bus.stale.as_ref()),
                 click_cmd: vec!["wall.attach".to_string(), a.target.clone()],
             },
             group: NO_GROUP,
@@ -1049,11 +1090,23 @@ pub fn build_sidebar(input: &SidebarInput) -> SidebarModel {
         reason: (!input.bus.reason.is_empty()).then(|| input.bus.reason.clone()),
     });
 
+    // Only with agents to mark: an empty list has its own notice, and its reason.
+    let agents_stale = input
+        .bus
+        .stale
+        .as_ref()
+        .filter(|_| !resolved_hosts.is_empty())
+        .map(|st| AgentsStaleNotice {
+            text: st.label(),
+            reason: (!input.bus.reason.is_empty()).then(|| input.bus.reason.clone()),
+        });
+
     SidebarModel {
         mode: input.mode,
         rows,
         terminals_empty: input.terminals.is_empty(),
         agents_empty,
+        agents_stale,
     }
 }
 
@@ -1096,6 +1149,7 @@ mod tests {
                 agent("a-wait", "box-a", "waiting", true),
                 agent("a-proc", "box-a", "processing", true),
             ],
+            stale: None,
         };
         let hosts = bus_hosts(&snap);
         let host_names: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
@@ -1197,6 +1251,7 @@ mod tests {
                     agent("zeta", "alpha-box", "idle", true),
                     agent("gone", "laptop-2", "ended", false),
                 ],
+                stale: None,
             },
             mode,
         }
@@ -1423,6 +1478,7 @@ mod tests {
                     agent("a", "box-a", "idle", true),
                     agent("b", "box-b", "idle", true),
                 ],
+                stale: None,
             },
             ..SidebarInput::default()
         };
@@ -1596,6 +1652,7 @@ mod tests {
                 host: String::new(),
                 reason: "agent not in PATH".to_string(),
                 agents: Vec::new(),
+                stale: None,
             },
             ..SidebarInput::default()
         });
@@ -1641,6 +1698,7 @@ mod tests {
                     agent("helper", "", "idle", true),
                     agent("worker", "remote1", "waiting", true),
                 ],
+                stale: None,
             },
             mode: SidebarMode::Host,
             ..SidebarInput::default()
@@ -1674,6 +1732,48 @@ mod tests {
             panic!("expected the no-group section");
         };
         assert_eq!(rest.count_label, "4 (this host 3, remote1 1)");
+    }
+
+    /// While the fleet feed is down the list is the fleet as it last was. It says so
+    /// at its head and on every agent's hover, and it never passes for live.
+    #[test]
+    fn a_list_from_a_feed_that_is_down_says_when_it_was_last_seen() {
+        let live = build_sidebar(&fleet(SidebarMode::Group));
+        assert_eq!(live.agents_stale, None);
+        assert!(!entry(&live, "t:gx-lead+lead@laptop-2").tooltip.contains("as of"));
+
+        let mut input = fleet(SidebarMode::Group);
+        input.bus.reason = "`agent export --follow` exited with exit status: 1: the bus is down".to_string();
+        input.bus.stale = Some(BusStale { since_ms: 1_795_000_000_000, clock: "14:32".to_string() });
+        let stale = build_sidebar(&input);
+        assert_eq!(
+            stale.agents_stale,
+            Some(AgentsStaleNotice {
+                text: "agents: last seen 14:32".to_string(),
+                reason: Some(input.bus.reason.clone()),
+            })
+        );
+        // The same rows in the same order: what was last known is still listed.
+        assert_eq!(stale.tokens(), live.tokens());
+        // Every agent's hover says its status is as of then, merged into a terminal or not.
+        for token in ["t:gx-lead+lead@laptop-2", "t:t7+worker@workstation", "a:reviewer@laptop-2"] {
+            let tip = &entry(&stale, token).tooltip;
+            assert!(
+                tip.ends_with("as of 14:32: the agents feed is down"),
+                "{token}: {tip}"
+            );
+        }
+        // A plain terminal says nothing of agents.
+        assert_eq!(entry(&stale, "t:t1").tooltip, "");
+
+        // With no agent listed there is nothing to mark: the empty notice has the reason.
+        input.bus.agents.clear();
+        let empty = build_sidebar(&input);
+        assert_eq!(empty.agents_stale, None);
+        assert_eq!(
+            empty.agents_empty.as_ref().and_then(|e| e.reason.as_deref()),
+            Some(input.bus.reason.as_str())
+        );
     }
 
     #[test]

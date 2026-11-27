@@ -47,6 +47,7 @@ use wall_core::agent_views::{
     BusAgentHint, ScrollTarget, TermdTerminalStatus,
 };
 use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+use wall_core::sidebar::BusStale;
 use wall_core::commands::{
     AgentBulkExpandResult, AgentEarlierResult, AgentJumpResult, AgentToggleEventResult,
 };
@@ -226,6 +227,55 @@ fn fleet_snapshot_to_gomux(snap: &FleetSnapshot) -> GomuxSnapshot {
     }
 }
 
+/// `unix_secs` on this machine's wall clock, `HH:MM`: what a person reads beside
+/// "last seen". UTC where the C library cannot say (it always can on macOS and Linux).
+pub(crate) fn local_clock_hhmm(unix_secs: u64) -> String {
+    let utc = || format!("{:02}:{:02}", (unix_secs / 3600) % 24, (unix_secs / 60) % 60);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::raw::{c_char, c_int, c_long};
+        /// `struct tm` as glibc, musl and macOS lay it out.
+        #[repr(C)]
+        struct Tm {
+            tm_sec: c_int,
+            tm_min: c_int,
+            tm_hour: c_int,
+            tm_mday: c_int,
+            tm_mon: c_int,
+            tm_year: c_int,
+            tm_wday: c_int,
+            tm_yday: c_int,
+            tm_isdst: c_int,
+            tm_gmtoff: c_long,
+            tm_zone: *const c_char,
+        }
+        extern "C" {
+            fn localtime_r(time: *const c_long, result: *mut Tm) -> *mut Tm;
+        }
+        let Ok(time) = c_long::try_from(unix_secs) else {
+            return utc();
+        };
+        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+        // SAFETY: `&time` is a valid `time_t` (a `long` on macOS and Linux) and `tm` a
+        // valid, aligned, writable `struct tm`; `localtime_r` writes only into it and
+        // keeps neither pointer.
+        let filled = unsafe { !localtime_r(&time, tm.as_mut_ptr()).is_null() };
+        if !filled {
+            return utc();
+        }
+        // SAFETY: `localtime_r` returned non-null, so it filled every field; the struct
+        // was zeroed first, and all-zero is a valid `Tm` (integers and a null pointer).
+        let tm = unsafe { tm.assume_init() };
+        let _ = (tm.tm_sec, tm.tm_mday, tm.tm_mon, tm.tm_year, tm.tm_wday, tm.tm_yday);
+        let _ = (tm.tm_isdst, tm.tm_gmtoff, tm.tm_zone);
+        format!("{:02}:{:02}", tm.tm_hour.rem_euclid(24), tm.tm_min.rem_euclid(60))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        utc()
+    }
+}
+
 fn session_info_to_agent_session(info: &SessionInfo) -> Option<AgentSession> {
     serde_json::to_value(info)
         .ok()
@@ -395,7 +445,6 @@ pub struct WallAgents {
     scrolled_rows: HashMap<String, u64>,
     live_meta: HashMap<String, LiveTerminalMeta>,
     last_fleet: Option<FleetSnapshot>,
-    last_bus_gen: u64,
     last_bus_reason: String,
     feed_requested: bool,
     bus_requested: bool,
@@ -447,7 +496,6 @@ impl WallAgents {
             scrolled_rows: HashMap::new(),
             live_meta: HashMap::new(),
             last_fleet: None,
-            last_bus_gen: 0,
             last_bus_reason: String::new(),
             feed_requested: false,
             bus_requested: false,
@@ -632,23 +680,40 @@ impl WallAgents {
             .lock()
             .expect("fleet slot mutex poisoned")
             .as_ref()
-            .map(|f| (f.snapshot(), f.last_error()));
+            .map(|f| (f.snapshot(), f.last_error(), f.down_since()));
 
-        if let Some((snap, err)) = fleet_obs {
+        if let Some((snap, err, down_since)) = fleet_obs {
             let reason = err.unwrap_or_default();
-            if snap.gen > 0 && (snap.gen != self.last_bus_gen || reason != self.last_bus_reason) {
-                let gomux = fleet_snapshot_to_gomux(&snap);
-                wall.set_bus_snapshot(Some(gomux), reason.clone());
-                let hints_changed = self.last_fleet.as_ref() != Some(&snap);
-                self.last_fleet = Some(snap);
-                self.last_bus_gen = self.last_fleet.as_ref().map_or(0, |s| s.gen);
-                self.last_bus_reason = reason;
-                bus_changed = true;
-                if hints_changed {
-                    self.rebind_open_views(wall);
+            if snap.gen > 0 {
+                // The fleet itself is compared, not its generation: a follower started
+                // anew (the sidebar closed and opened again) counts from 1 again, so
+                // until 2026-11-27 its first snapshot could carry the generation the
+                // last follower ended on and be taken for the fleet already shown.
+                let fleet_changed = self.last_fleet.as_ref() != Some(&snap);
+                if fleet_changed || reason != self.last_bus_reason {
+                    let gomux = fleet_snapshot_to_gomux(&snap);
+                    wall.set_bus_snapshot(Some(gomux), reason.clone());
+                    self.last_fleet = Some(snap);
+                    self.last_bus_reason = reason;
+                    bus_changed = true;
+                    if fleet_changed {
+                        self.rebind_open_views(wall);
+                    }
                 }
-            } else if snap.gen == 0 && !reason.is_empty() && reason != self.last_bus_reason {
+                // The feed down: the fleet above is as it last was, and the wall says
+                // since when instead of showing a frozen list as live.
+                let stale = down_since.map(|at| {
+                    let since_ms = at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                    BusStale { since_ms, clock: local_clock_hhmm(since_ms / 1000) }
+                });
+                if wall.set_bus_stale(stale) {
+                    bus_changed = true;
+                }
+            } else if !reason.is_empty() && reason != self.last_bus_reason {
                 wall.set_bus_snapshot(None, reason.clone());
+                wall.set_bus_stale(None);
                 self.last_bus_reason = reason;
                 bus_changed = true;
             }
@@ -1712,6 +1777,196 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         pred()
+    }
+
+    /// A stub `agent` whose `export` prints the fleet in `fleet` (one snapshot line) and
+    /// then stays up, writing its pid to `pid` first; while `down` exists it dies at once
+    /// instead, as a CLI whose bus is gone does.
+    fn write_fleet_stub(stub: &Path, fleet: &Path, pid: &Path, down: &Path) {
+        write_stub(
+            stub,
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --backend-config) shift; shift ;; -q|--quiet) shift ;; --*) shift ;; *) break ;; esac; done\n\
+                 case \"${{1:-}}\" in\n\
+                 export)\n\
+                 if [ -f '{down}' ]; then echo 'the bus is down' >&2; exit 1; fi\n\
+                 echo $$ > '{pid}'\n\
+                 cat '{fleet}'\n\
+                 exec sleep 600 ;;\n\
+                 sessions) printf '[]\\n' ;;\n\
+                 esac\n",
+                down = down.display(),
+                pid = pid.display(),
+                fleet = fleet.display(),
+            ),
+        );
+    }
+
+    /// One local agent, `helper`, with `status`, as a snapshot line of the follow stream.
+    fn fleet_line(name: &str, status: &str) -> String {
+        format!(
+            "{{\"type\":\"snapshot\",\"host\":\"laptop-2\",\"stores\":[{{\"dir\":\"/s/main\"}}],\"agents\":[{{\"name\":\"{name}\",\"host\":\"laptop-2\",\"store\":\"/s/main\",\"run\":7,\"created_at\":\"2026-11-27T10:00:00Z\",\"live\":true,\"attached\":true,\"status\":\"{status}\"}}]}}\n"
+        )
+    }
+
+    fn fast_fleet_options(stub: &Path) -> WallAgentsOptions {
+        WallAgentsOptions {
+            cli: AgentCli::new(stub),
+            session_poll_interval: Duration::from_secs(10),
+            fleet_options: FleetOptions {
+                initial_backoff: Duration::from_millis(40),
+                max_backoff: Duration::from_millis(80),
+                ..FleetOptions::default()
+            },
+        }
+    }
+
+    /// What the wall lists of the bus: `(target, status)` per live agent.
+    fn bus_rows(wall: &Wall) -> Vec<(String, String)> {
+        wall_core::bus::bus_hosts(wall.bus_snapshot())
+            .into_iter()
+            .flat_map(|h| h.agents)
+            .map(|a| (a.target.clone(), a.agent.status.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    /// While the fleet feed is down the wall keeps the fleet it last read and says since
+    /// when (`agents: last seen HH:MM`), so a frozen list never passes as live; when a
+    /// child is up again the mark goes.
+    #[test]
+    fn a_fleet_feed_that_goes_down_marks_the_list_stale_until_it_is_back() {
+        let scratch = Scratch::new("feed-down");
+        let (stub, fleet, pid, down) = (
+            scratch.0.join("agent"),
+            scratch.0.join("fleet.jsonl"),
+            scratch.0.join("export.pid"),
+            scratch.0.join("down"),
+        );
+        fs::write(&fleet, fleet_line("helper", "processing")).unwrap();
+        write_fleet_stub(&stub, &fleet, &pid, &down);
+
+        let mut wall = Wall::in_memory(RulesOptions::default());
+        let mut agents = WallAgents::with_options(fast_fleet_options(&stub), Arc::new(|| {}));
+        assert!(wall.run("wall.sidebar open").text.starts_with("OK"));
+        assert!(wait_until(STUB_WAIT, || {
+            let _ = agents.pump(&mut wall);
+            !bus_rows(&wall).is_empty()
+        }));
+        assert_eq!(bus_rows(&wall), vec![("helper@laptop-2".to_string(), "processing".to_string())]);
+        assert_eq!(wall.bus_stale(), None, "a feed that is up marks nothing");
+        assert_eq!(wall.sidebar_bus_snapshot().stale, None);
+
+        // The CLI dies, and cannot come back.
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        fs::write(&down, "").unwrap();
+        let export_pid = fs::read_to_string(&pid).unwrap().trim().to_string();
+        assert!(std::process::Command::new("kill").arg(&export_pid).status().unwrap().success());
+        let mut redrawn = false;
+        assert!(wait_until(STUB_WAIT, || {
+            redrawn |= agents.pump(&mut wall);
+            wall.bus_stale().is_some()
+        }));
+        assert!(redrawn, "going stale asks for a frame");
+        let stale = wall.bus_stale().cloned().unwrap();
+        assert!(stale.since_ms >= before_ms.saturating_sub(1_000), "{stale:?} vs {before_ms}");
+        let clock: Vec<&str> = stale.clock.split(':').collect();
+        assert!(
+            clock.len() == 2 && clock.iter().all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
+            "a wall-clock HH:MM: {:?}",
+            stale.clock
+        );
+        assert_eq!(stale.clock, local_clock_hhmm(stale.since_ms / 1000));
+        // The fleet it last read is still listed, and everything that draws it is told.
+        assert_eq!(bus_rows(&wall), vec![("helper@laptop-2".to_string(), "processing".to_string())]);
+        assert_eq!(wall.sidebar_bus_snapshot().stale, Some(stale.clone()));
+        let said = wall.run("wall.bus").text;
+        assert!(
+            said.starts_with(&format!("agents: last seen {} (the agents feed is down: ", stale.clock))
+                && said.contains("helper@laptop-2 processing"),
+            "{said}"
+        );
+        // Still down several failed restarts later, since the same moment, and saying
+        // what the restarts now die of.
+        assert!(wait_until(STUB_WAIT, || {
+            let _ = agents.pump(&mut wall);
+            wall.bus_reason().contains("the bus is down")
+        }));
+        assert_eq!(wall.bus_stale(), Some(&stale), "down since the first failure");
+
+        // The bus is back, with the helper idle now: the mark goes, the fleet moves.
+        fs::write(&fleet, fleet_line("helper", "idle")).unwrap();
+        fs::remove_file(&down).unwrap();
+        assert!(wait_until(STUB_WAIT, || {
+            let _ = agents.pump(&mut wall);
+            wall.bus_stale().is_none()
+        }));
+        assert_eq!(bus_rows(&wall), vec![("helper@laptop-2".to_string(), "idle".to_string())]);
+        assert!(!wall.run("wall.bus").text.contains("last seen"));
+        agents.shutdown();
+    }
+
+    /// A follower started anew counts its snapshots from 1 again. The sidebar closed (the
+    /// follower stops), the fleet changes, the sidebar opens: the new follower's first
+    /// snapshot has the generation the old one ended on. It is another fleet, and the wall
+    /// must take it. Until 2026-11-27 it compared generations and kept the old list.
+    #[test]
+    fn a_follower_started_anew_replaces_the_fleet_though_its_generation_repeats() {
+        let scratch = Scratch::new("regen");
+        let (stub, fleet, pid, down) = (
+            scratch.0.join("agent"),
+            scratch.0.join("fleet.jsonl"),
+            scratch.0.join("export.pid"),
+            scratch.0.join("down"),
+        );
+        fs::write(&fleet, fleet_line("helper", "processing")).unwrap();
+        write_fleet_stub(&stub, &fleet, &pid, &down);
+
+        let mut wall = Wall::in_memory(RulesOptions::default());
+        let mut agents = WallAgents::with_options(fast_fleet_options(&stub), Arc::new(|| {}));
+        assert!(wall.run("wall.sidebar open").text.starts_with("OK"));
+        assert!(wait_until(STUB_WAIT, || {
+            let _ = agents.pump(&mut wall);
+            !bus_rows(&wall).is_empty()
+        }));
+        assert_eq!(bus_rows(&wall), vec![("helper@laptop-2".to_string(), "processing".to_string())]);
+        assert_eq!(agents.last_fleet.as_ref().map(|f| f.gen), Some(1));
+
+        // Sidebar closed: nothing wants the fleet, and the follower is stopped.
+        assert!(wall.run("wall.sidebar close").text.starts_with("OK"));
+        assert!(wait_until(STUB_WAIT, || {
+            let _ = agents.pump(&mut wall);
+            agents.fleet_slot.lock().unwrap().is_none()
+        }));
+
+        // Meanwhile the helper is cleaned up and another agent is at work.
+        fs::write(&fleet, fleet_line("other", "waiting")).unwrap();
+        assert!(wall.run("wall.sidebar open").text.starts_with("OK"));
+        assert!(
+            wait_until(STUB_WAIT, || {
+                let _ = agents.pump(&mut wall);
+                bus_rows(&wall) == vec![("other@laptop-2".to_string(), "waiting".to_string())]
+            }),
+            "the reopened sidebar still lists {:?}",
+            bus_rows(&wall)
+        );
+        assert_eq!(agents.last_fleet.as_ref().map(|f| f.gen), Some(1), "the same generation, another fleet");
+        agents.shutdown();
+    }
+
+    #[test]
+    fn local_clock_is_an_hh_mm_of_this_machines_zone() {
+        // Every zone's offset from UTC is a multiple of 15 minutes, so the minutes agree
+        // with UTC's to that step whatever zone the test runs in.
+        for secs in [0u64, 1_795_000_000, 1_795_000_000 + 59, 1_795_003_540, 4_102_444_800] {
+            let got = local_clock_hhmm(secs);
+            let (h, m) = got.split_once(':').expect("HH:MM");
+            let (h, m): (u64, u64) = (h.parse().unwrap(), m.parse().unwrap());
+            assert!(got.len() == 5 && h < 24 && m < 60, "{got}");
+            assert_eq!((m + 60 - (secs / 60) % 60) % 15, 0, "{got} at {secs}");
+        }
     }
 
     #[test]

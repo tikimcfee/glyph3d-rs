@@ -811,7 +811,7 @@ impl Panels {
         // with no terminal on the wall; `rows` is the whole list as drawn,
         // top to bottom (`panels::sidebar::SidebarState::rows_drawn`).
         lines.push(format!(
-            "panel sidebar open={} side={} mode={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} mode_group={} mode_host={} folds={} terms={} agents={} rows={}",
+            "panel sidebar open={} side={} mode={} collapsed={} rect={} header={} dock_left={} dock_float={} dock_right={} dock_close={} mode_group={} mode_host={} folds={} terms={} agents={} stale={} rows={}",
             sb.open,
             dock_side_name(sb.side),
             sb.mode.as_str(),
@@ -827,6 +827,16 @@ impl Panels {
             if sb_folds.is_empty() { "none".to_string() } else { sb_folds.join(";") },
             if sb_terms.is_empty() { "none".to_string() } else { sb_terms.join(";") },
             if sb_agents.is_empty() { "none".to_string() } else { sb_agents.join(";") },
+            // `stale=<HH:MM>/<rows dimmed>` while the fleet feed is down and the list
+            // says so (`agents: last seen HH:MM`), else `none`.
+            match &self.sidebar.stale_drawn {
+                Some(text) => format!(
+                    "{}/{}",
+                    text.rsplit(' ').next().unwrap_or("?"),
+                    self.sidebar.stale_rows_dimmed
+                ),
+                None => "none".to_string(),
+            },
             if self.sidebar.rows_drawn.is_empty() {
                 "none".to_string()
             } else {

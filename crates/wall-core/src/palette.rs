@@ -1000,6 +1000,7 @@ mod tests {
                     cwd: "/work".to_string(),
                     ..BusAgentInput::default()
                 }],
+                stale: None,
             },
         }
     }

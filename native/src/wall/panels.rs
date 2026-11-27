@@ -582,6 +582,7 @@ mod tests {
                     ..BusAgentInput::default()
                 },
             ],
+            stale: None,
         };
 
         // The sidebar's one list: a group over two hosts (a local agent in

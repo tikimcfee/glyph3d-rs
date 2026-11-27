@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -668,6 +668,9 @@ pub fn export_once(cli: &AgentCli, opts: &FleetOptions) -> Result<FleetSnapshot,
 struct FollowerShared {
     snap: FleetSnapshot,
     last_error: Option<String>,
+    /// When the feed went down: the child ended (or could not be started) and no child has
+    /// printed a line since. `None` while one is up and talking.
+    down_since: Option<SystemTime>,
     restarts: u64,
     stopped: bool,
 }
@@ -692,6 +695,7 @@ impl FleetFollower {
             Mutex::new(FollowerShared {
                 snap: FleetSnapshot::default(),
                 last_error: None,
+                down_since: None,
                 restarts: 0,
                 stopped: false,
             }),
@@ -738,6 +742,18 @@ impl FleetFollower {
             .expect("fleet follower mutex poisoned")
             .last_error
             .clone()
+    }
+
+    /// When the feed went down, while it is down: the `agent export --follow` child ended (or
+    /// could not be started) and no child has printed a line since. [`Self::snapshot`] is then
+    /// the fleet as it was at that moment, and nothing in it will change until a child is up
+    /// again: a display should say so rather than show it as live. `None` while the feed is up.
+    pub fn down_since(&self) -> Option<SystemTime> {
+        self.shared
+            .0
+            .lock()
+            .expect("fleet follower mutex poisoned")
+            .down_since
     }
 
     /// How many times the child process was restarted after exiting unexpectedly.
@@ -875,6 +891,7 @@ fn run_fleet_loop(
                                         }
                                         guard.snap = snap;
                                         guard.last_error = None;
+                                        guard.down_since = None;
                                     }
                                     wake();
                                 }
@@ -885,13 +902,14 @@ fn run_fleet_loop(
                                 // so a restart onto the same agents left the wall saying
                                 // the feed was down for good.
                                 Ok(false) if is_snapshot => {
-                                    let cleared = shared
-                                        .0
-                                        .lock()
-                                        .expect("fleet follower mutex poisoned")
-                                        .last_error
-                                        .take()
-                                        .is_some();
+                                    let cleared = {
+                                        let mut guard = shared
+                                            .0
+                                            .lock()
+                                            .expect("fleet follower mutex poisoned");
+                                        let was_down = guard.down_since.take().is_some();
+                                        guard.last_error.take().is_some() || was_down
+                                    };
                                     if cleared {
                                         wake();
                                     }
@@ -953,6 +971,8 @@ fn run_fleet_loop(
         }
         if let Some(err) = run_err {
             guard.last_error = Some(err);
+            // Down from the first failure, however many restarts fail after it.
+            guard.down_since.get_or_insert_with(SystemTime::now);
             // The error is news for whoever draws the fleet: say so, as a change is said.
             drop(guard);
             wake();
@@ -1486,18 +1506,71 @@ mod tests {
             wakes_cb.fetch_add(1, AtomicOrdering::SeqCst);
         });
 
+        let started = SystemTime::now();
         wait_until("the first child's exit reported", || {
             follower.last_error().is_some_and(|e| e.contains("bus went away"))
         });
         assert_eq!(follower.snapshot().gen, 1);
+        // Down, since a moment the caller can show: the fleet above is as of then.
+        let down = follower.down_since().expect("the feed is down between children");
+        assert!(down >= started && down <= SystemTime::now(), "{down:?}");
+        assert_eq!(follower.snapshot().local_agent("helper").unwrap().status.as_deref(), Some("idle"));
         wait_until("the restarted child's snapshot read", || {
             follower.restart_count() >= 1 && follower.last_error().is_none()
         });
+        assert_eq!(follower.down_since(), None, "a child is up and talking again");
         assert_eq!(follower.snapshot().gen, 1, "the same fleet is not a change");
         assert_eq!(
             wakes.load(AtomicOrdering::SeqCst),
             3,
             "the fleet, the error, and the error's end"
+        );
+    }
+
+    /// A feed that stays down: the child dies and every restart fails. The follower keeps the
+    /// fleet it last read and says since when it has been down, the moment of the FIRST
+    /// failure, not of the latest restart.
+    #[test]
+    fn fleet_follower_says_since_when_a_feed_that_stays_down_has_been_down() {
+        let scratch = Scratch::new("stays-down");
+        let count_file = scratch.0.join("runs");
+        let stub = scratch.0.join("agent");
+        let snapshot = format!(
+            r#"{{"type":"snapshot","host":"laptop-2","stores":[{{"dir":"/s/main"}}],"agents":[{}]}}"#,
+            export_agent("helper", 95, true, true, "processing", ""),
+        );
+        // Run 1 prints the fleet and dies; every later run dies at once.
+        let script = format!(
+            "#!/bin/sh\n\
+             n=0\n\
+             if [ -f '{runs}' ]; then n=$(cat '{runs}'); fi\n\
+             n=$((n + 1))\n\
+             printf '%s' \"$n\" > '{runs}'\n\
+             if [ \"$n\" -eq 1 ]; then\n\
+             cat <<'LINE'\n{snapshot}\nLINE\n\
+             fi\n\
+             echo 'no bus' >&2\n\
+             exit 1\n",
+            runs = count_file.display(),
+        );
+        write_stub(&stub, &script);
+        let opts = FleetOptions {
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(40),
+            ..FleetOptions::default()
+        };
+        let follower = FleetFollower::start(AgentCli::new(&stub), opts, || {});
+        wait_until("the feed down with its fleet kept", || {
+            follower.down_since().is_some() && follower.snapshot().gen == 1
+        });
+        let first = follower.down_since().unwrap();
+        wait_until("three failed restarts", || follower.restart_count() >= 3);
+        assert_eq!(follower.down_since(), Some(first), "down since the first failure");
+        assert!(follower.last_error().is_some_and(|e| e.contains("no bus")));
+        // The fleet it last read is still there to draw, marked as of `first`.
+        assert_eq!(
+            live_rows(&follower.snapshot()),
+            vec![("helper@laptop-2".to_string(), "processing".to_string())]
         );
     }
 
@@ -1558,6 +1631,7 @@ mod tests {
         assert_eq!(wakes.load(AtomicOrdering::SeqCst), 3);
         assert!(follower.restart_count() >= 1);
         assert_eq!(follower.last_error(), None, "the restarted child's snapshot ends the error");
+        assert_eq!(follower.down_since(), None, "and the feed is up");
 
         wait_until("pid file written", || pid_file.is_file());
         let pid: i32 = fs::read_to_string(&pid_file)

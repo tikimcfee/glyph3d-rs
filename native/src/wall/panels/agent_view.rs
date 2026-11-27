@@ -3317,6 +3317,7 @@ mod tests {
                 snapshot_host: Some("local".to_string()),
                 reason: String::new(),
                 hosts: Vec::new(),
+                stale: None,
             }
         }
         fn terminals_attached_to(&self, _: &str) -> Vec<String> {

@@ -408,6 +408,9 @@ sub="\${1:-}"
 [ \$# -gt 0 ] && shift
 case "\$sub" in
     export)
+        # The feed down (#18): the CLI dies at once, as one whose bus is gone does.
+        if [ -f "$D/data/feed-down" ]; then echo 'the bus is down (smoke)' >&2; exit 1; fi
+        echo \$\$ >"$D/data/export.pid"
         exec tail -n +1 -f "$EXPORT_STREAM"
         ;;
     sessions)
@@ -1404,6 +1407,69 @@ if [[ "$(sb_tok "$W_17_BEFORE" rows)" == *"a:perf-probe@laptop-2=waiting"* \
     record_pass "a cleaned-up agent leaves the list" "perf-probe went waiting -> processing on a changed line, then off the list on its removed line; wall.attach: '${R_17_ATTACH}'"
 else
     record_fail "a cleaned-up agent leaves the list" "before='$(sb_tok "$W_17_BEFORE" rows)' changed='${ROWS_17_CHANGED}' removed='${ROWS_17_REMOVED}' attach='${R_17_ATTACH}'"
+fi
+
+# ── 18. The fleet feed down: the list says when it was last seen ────────────
+# The stub's `export` is killed and cannot come back while `feed-down` exists. The wall
+# keeps the fleet it last read, heads the list with `agents: last seen HH:MM`, and dims
+# every agent's row, so a frozen list never passes as live. With the feed back, the mark goes.
+ctl wall.sidebar left >/dev/null
+ctl wall.sidebar mode group >/dev/null
+W_18_LIVE="$(wait_sidebar_rows "a:reviewer@laptop-2=ended")"
+ROWS_18_LIVE="$(sb_tok "$W_18_LIVE" rows)"
+STALE_18_LIVE="$(sb_tok "$W_18_LIVE" stale)"
+touch "$D/data/feed-down"
+EXPORT_PID="$(cat "$D/data/export.pid" 2>/dev/null || true)"
+CLOCK_A="$(date +%H:%M)"
+[[ -n "$EXPORT_PID" ]] && kill "$EXPORT_PID" 2>/dev/null
+STALE_18_DOWN="none"
+W_18_DOWN=""
+for _ in $(seq 1 200); do
+    W_18_DOWN="$(ctl app.where 2>/dev/null)" || { sleep 0.05; continue; }
+    STALE_18_DOWN="$(sb_tok "$W_18_DOWN" stale)"
+    [[ -n "$STALE_18_DOWN" && "$STALE_18_DOWN" != "none" ]] && break
+    sleep 0.05
+done
+CLOCK_B="$(date +%H:%M)"
+ROWS_18_DOWN="$(sb_tok "$W_18_DOWN" rows)"
+BUS_18_DOWN="$(ctl wall.bus 2>&1 | head -1)"
+ctl app.move "$PARK_X" "$PARK_Y" >/dev/null
+ctl app.shot "$SHOT_DIR/sidebar-stale.png" >/dev/null 2>&1 || true
+# The bus is back: the follower restarts the CLI after its backoff (5 s).
+rm -f "$D/data/feed-down"
+STALE_18_BACK="?"
+for _ in $(seq 1 400); do
+    STALE_18_BACK="$(sb_tok "$(ctl app.where 2>/dev/null)" stale)"
+    [[ "$STALE_18_BACK" == "none" ]] && break
+    sleep 0.05
+done
+BUS_18_BACK="$(ctl wall.bus 2>&1 | head -1)"
+ctl wall.sidebar close >/dev/null
+STALE_CHECK="$(python3 -c '
+import sys
+live_rows, live_stale, down_rows, down_stale, bus_down, back_stale, bus_back, clock_a, clock_b = sys.argv[1:10]
+agents = [r for r in down_rows.split(";") if r.startswith("a:") or (r.startswith("t:") and "+" in r)]
+clock, _, dimmed = down_stale.partition("/")
+checks = {
+    "live-unmarked": live_stale == "none",
+    "marked": clock in (clock_a, clock_b),
+    "dimmed-every-agent": dimmed == str(len(agents)) and len(agents) >= 3,
+    "rows-kept": down_rows == live_rows and bool(live_rows),
+    "wall.bus-says-so": bus_down.startswith(f"agents: last seen {clock} (the agents feed is down"),
+    "back": back_stale == "none" and "last seen" not in bus_back,
+}
+bad = [name for name, ok in checks.items() if not ok]
+if bad:
+    print("0 failed=" + ",".join(bad) + f" | live stale={live_stale} | down stale={down_stale} (clock {clock_a}..{clock_b})"
+          f" rows={down_rows} | bus={bus_down!r} | back stale={back_stale} bus={bus_back!r}")
+else:
+    print(f"1 feed killed: the list kept its {len(agents)} agents, dimmed, under \"agents: last seen {clock}\";"
+          f" wall.bus: {bus_down!r}; feed back: mark gone")
+' "$ROWS_18_LIVE" "$STALE_18_LIVE" "$ROWS_18_DOWN" "$STALE_18_DOWN" "$BUS_18_DOWN" "$STALE_18_BACK" "$BUS_18_BACK" "$CLOCK_A" "$CLOCK_B")"
+if [[ "${STALE_CHECK%% *}" == "1" ]]; then
+    record_pass "a dead feed marks the list stale" "${STALE_CHECK#* }"
+else
+    record_fail "a dead feed marks the list stale" "${STALE_CHECK#* }"
 fi
 
 # ── The wall can only run the stub `agent` ──────────────────────────────────

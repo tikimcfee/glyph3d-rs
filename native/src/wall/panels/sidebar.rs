@@ -160,6 +160,11 @@ pub struct SidebarState {
     /// `g:<group>[<host>=<n>,...]`, `s:none[...]`, `h:<host>[<n>]`,
     /// `t:<terminal>`, `t:<terminal>+<agent>=<status>`, `a:<agent>=<status>`.
     pub rows_drawn: Vec<String>,
+    /// The stale notice drawn last frame (`agents: last seen 14:32`), while the fleet
+    /// feed is down; `None` when the list is live.
+    pub stale_drawn: Option<String>,
+    /// How many agents' rows were drawn dimmed last frame for that reason.
+    pub stale_rows_dimmed: usize,
 }
 
 impl Default for SidebarState {
@@ -188,6 +193,8 @@ impl SidebarState {
             mode_btn_rects: [None; 2],
             title_shown: false,
             rows_drawn: Vec::new(),
+            stale_drawn: None,
+            stale_rows_dimmed: 0,
         }
     }
 
@@ -383,6 +390,11 @@ const FG_HEAD: egui::Color32 = egui::Color32::from_rgb(0xae, 0xb7, 0xc6);
 const FG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x8e, 0xf0, 0xb8);
 const FG_DIM: egui::Color32 = egui::Color32::from_rgb(0x6b, 0x73, 0x83);
 const FG_FAINT: egui::Color32 = egui::Color32::from_rgb(0x5d, 0x65, 0x74);
+/// The stale notice: the amber of an agent that is waiting on a person.
+const FG_STALE: egui::Color32 = egui::Color32::from_rgb(0xf2, 0xb4, 0x5a);
+/// How far an agent's mark and status are dimmed while the fleet feed is down: what
+/// they say is as of the notice's time, and must not read as live.
+const STALE_FADE: f32 = 0.4;
 const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(0x15, 0x1a, 0x24);
 const BG_FOCUS: egui::Color32 = egui::Color32::from_rgb(0x16, 0x25, 0x1e);
 
@@ -718,10 +730,12 @@ fn paint_row_marker(painter: &egui::Painter, center: egui::Pos2, e: &EntryRow, f
 
 /// One row of the list: a terminal (with its tools on hover, and its agent's
 /// status when it shows one) or an agent with no terminal on the wall.
+#[expect(clippy::too_many_arguments, reason = "one row's inputs, each a plain value the caller already holds")]
 fn draw_entry_row(
     ui: &mut egui::Ui,
     panel_w: f32,
     e: &EntryRow,
+    agents_stale: bool,
     platform: Platform,
     close_hold_ms: u64,
     state: &mut SidebarState,
@@ -749,6 +763,13 @@ fn draw_entry_row(
 
         // A hidden terminal's row is dimmed whole.
         let fade = if e.hidden { 0.5 } else { 1.0 };
+        // While the fleet feed is down, an agent's mark and status are as they last
+        // were: dimmed further, so a frozen list never reads as live.
+        let stale_agent = agents_stale && e.agent.is_some();
+        let agent_fade = if stale_agent { fade * STALE_FADE } else { fade };
+        if stale_agent {
+            state.stale_rows_dimmed += 1;
+        }
         if let Some(chip) = &e.chip {
             let color = parse_hex_color(chip.color).unwrap_or(FG_FAINT);
             paint_group_chip(
@@ -762,11 +783,12 @@ fn draw_entry_row(
             ui.painter(),
             egui::pos2(row_rect.left() + 22.0, center_y),
             e,
-            fade,
+            agent_fade,
         );
 
         let name_x = row_rect.left() + NAME_X;
-        let name_fg = if e.hidden || !e.interactive {
+        // An agent with no terminal is all agent: its name dims with it.
+        let name_fg = if e.hidden || !e.interactive || (stale_agent && e.is_agent_only()) {
             FG_DIM
         } else if e.focused {
             FG_FOCUS
@@ -805,7 +827,7 @@ fn draw_entry_row(
             (Some(a), false) => {
                 let color = parse_hex_color(a.status.color())
                     .unwrap_or(egui::Color32::from_rgb(0x8b, 0x95, 0xa7))
-                    .gamma_multiply(fade);
+                    .gamma_multiply(agent_fade);
                 let galley =
                     ui.painter()
                         .layout_no_wrap(a.status.word().to_string(), small.clone(), color);
@@ -1082,6 +1104,8 @@ pub fn show(
     state.term_row_rects.clear();
     state.agent_row_rects.clear();
     state.rows_drawn.clear();
+    state.stale_drawn = None;
+    state.stale_rows_dimmed = 0;
     state.mode_btn_rects = [None; 2];
     if !state.open {
         state.drag_offset = None;
@@ -1305,6 +1329,36 @@ pub fn show(
                                 );
                             }
 
+                            // The fleet feed is down: say when the agents
+                            // below were last seen, before any of them.
+                            let agents_stale = input.model.agents_stale.is_some();
+                            if let Some(stale) = &input.model.agents_stale {
+                                let (srect, sresp) = ui.allocate_exact_size(
+                                    egui::vec2(panel_w, ROW_H),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_stroke(
+                                    egui::pos2(srect.left() + 12.0, srect.center().y),
+                                    3.0,
+                                    egui::Stroke::new(1.3, FG_STALE),
+                                );
+                                ui.painter().text(
+                                    egui::pos2(srect.left() + 22.0, srect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &stale.text,
+                                    egui::FontId::monospace(12.0),
+                                    FG_STALE,
+                                );
+                                let hover = match &stale.reason {
+                                    Some(reason) => format!(
+                                        "the agents feed is down, so the agents below are as they were then\n{reason}"
+                                    ),
+                                    None => "the agents feed is down, so the agents below are as they were then".to_string(),
+                                };
+                                let _ = sresp.on_hover_text(hover);
+                                state.stale_drawn = Some(stale.text.clone());
+                            }
+
                             // A folded group's members are skipped here as
                             // well as left out by the model, so a fold shows
                             // on the click's own frame.
@@ -1345,6 +1399,7 @@ pub fn show(
                                             ui,
                                             panel_w,
                                             e,
+                                            agents_stale,
                                             input.platform,
                                             input.close_hold_ms,
                                             state,
@@ -1447,7 +1502,12 @@ mod tests {
     /// One group (`g1`: `t1`, focused), a hidden loose terminal, a local
     /// agent in its `gx-` terminal, and one with no terminal on the wall.
     fn sample_sidebar_input(viewport: egui::Rect, mode: SidebarMode) -> SidebarInput {
-        let raw = CoreSidebarInput {
+        sidebar_input_of(viewport, &sample_core_input(mode))
+    }
+
+    /// [`sample_sidebar_input`]'s wall state, before it is a model.
+    fn sample_core_input(mode: SidebarMode) -> CoreSidebarInput {
+        CoreSidebarInput {
             terminals: vec![
                 SidebarTerminal {
                     id: "t1".to_string(),
@@ -1512,19 +1572,64 @@ mod tests {
                         ..BusAgentInput::default()
                     },
                 ],
+                stale: None,
             },
             mode,
-        };
+        }
+    }
+
+    /// The panel's input for wall state `raw`, docked left in `viewport`.
+    fn sidebar_input_of(viewport: egui::Rect, raw: &CoreSidebarInput) -> SidebarInput {
         let dock = dock_layout(&DockState {
             sidebar: DockPanel::new(true, DockSide::Left),
             ..DockState::default()
         });
         SidebarInput {
-            model: build_sidebar(&raw),
+            model: build_sidebar(raw),
             dock_rect: sidebar_dock_rect(viewport, DockSide::Left, &dock),
             platform: Platform::Mac,
             close_hold_ms: 400,
         }
+    }
+
+    /// While the fleet feed is down the panel heads the list with when the agents
+    /// were last seen and draws each agent's mark and status dimmed; the rows
+    /// themselves stay, and a live list shows neither.
+    #[test]
+    fn a_stale_fleet_is_headed_by_when_it_was_last_seen_and_its_agents_are_dimmed() {
+        let ctx = egui::Context::default();
+        let vp = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+        let mut out = Vec::new();
+
+        let live = sample_sidebar_input(vp, SidebarMode::Group);
+        let mut state = SidebarState::new(true, DockSide::Left);
+        settle(&ctx, vp, 0.0, &mut state, &live, &mut out);
+        assert_eq!((state.stale_drawn.as_deref(), state.stale_rows_dimmed), (None, 0));
+        let live_rows = state.rows_drawn.clone();
+        let live_height = state.last_rect.expect("drawn").height();
+        // An agent's row is `a:<agent>=..`, or `t:<terminal>+<agent>=..` when a terminal shows it.
+        let agent_rows = live_rows
+            .iter()
+            .filter(|r| r.starts_with("a:") || (r.starts_with("t:") && r.contains('+')))
+            .count();
+        assert_eq!(agent_rows, 3, "the sample lists three agents: {live_rows:?}");
+
+        let mut raw = sample_core_input(SidebarMode::Group);
+        raw.bus.reason = "`agent export --follow` exited with exit status: 1".to_string();
+        raw.bus.stale = Some(wall_core::sidebar::BusStale { since_ms: 1_795_000_000_000, clock: "14:32".to_string() });
+        let stale = sidebar_input_of(vp, &raw);
+        settle(&ctx, vp, 1.0, &mut state, &stale, &mut out);
+        assert_eq!(state.stale_drawn.as_deref(), Some("agents: last seen 14:32"));
+        assert_eq!(state.stale_rows_dimmed, agent_rows, "every agent's row, merged into a terminal or not");
+        assert_eq!(state.rows_drawn, live_rows, "what was last known is still listed, in place");
+        // The notice is a row of its own: the list grew by it (a floating panel would;
+        // a docked one is as tall as the window, so compare what was drawn instead).
+        assert!(state.last_rect.expect("drawn").height() >= live_height);
+
+        // The feed back: no notice, nothing dimmed.
+        settle(&ctx, vp, 2.0, &mut state, &live, &mut out);
+        assert_eq!((state.stale_drawn.as_deref(), state.stale_rows_dimmed), (None, 0));
+        assert!(out.is_empty(), "nothing here was clicked: {out:?}");
     }
 
     /// Two passes with no input: the first sizes the `Area`, the second
