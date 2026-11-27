@@ -436,7 +436,7 @@ pub fn resolve_family_chain(
         .with_line_height_scale(line_height_scale);
     let mut chain = vec![primary];
     for fb in fallback_font_chain(fonts_dir) {
-        chain.push(fb.with_line_height_scale(line_height_scale));
+        chain.push(fb.with_line_height_scale(line_height_scale).with_lazy(true));
     }
     Ok(chain)
 }
@@ -514,5 +514,46 @@ mod tests {
         let monaco = resolve_family_chain(&dir, "Monaco", 1.0).expect("Monaco installed on macOS");
         let mut monaco_atlas = FontAtlas::load(&monaco).expect("load Monaco FontAtlas");
         assert_ne!(monaco_atlas.glyph(monaco_atlas.default_family(), Face::Regular, 'M'), 0);
+    }
+
+    #[test]
+    fn lazy_default_chain_defers_fallbacks_and_sibling_families_matching_eager_curves() {
+        let dir = assets_fonts_dir();
+        let eager_specs = crate::default_font_chain(&dir);
+        let lazy_specs = crate::default_font_chain_lazy(&dir, crate::MONASPACE_NEON_FAMILY);
+
+        let mut eager = FontAtlas::load(&eager_specs).expect("eager load");
+        let mut lazy = FontAtlas::load(&lazy_specs).expect("lazy load");
+
+        // All 14 font entries are registered, but only Monaspace Neon's 4 faces are loaded at startup.
+        assert_eq!(lazy.font_count(), eager.font_count());
+        assert_eq!(lazy.loaded_font_count(), 4);
+        assert!(eager.loaded_font_count() > lazy.loaded_font_count());
+
+        let neon_e = eager.family_id(crate::MONASPACE_NEON_FAMILY).unwrap();
+        let neon_l = lazy.family_id(crate::MONASPACE_NEON_FAMILY).unwrap();
+
+        // ASCII + box sprites stay in Monaspace Neon and load zero fallback/sibling fonts.
+        for ch in ['A', 'z', '0', '╭', '█'] {
+            let se = eager.glyph(neon_e, Face::Regular, ch);
+            let sl = lazy.glyph(neon_l, Face::Regular, ch);
+            assert_eq!(eager.slot_curves(se), lazy.slot_curves(sl));
+        }
+        assert_eq!(lazy.loaded_font_count(), 4);
+
+        // A Nerd Font PUA glyph misses Monaspace Neon and lazily loads MesloLGS NF Mono.
+        let nerd_e = eager.glyph(neon_e, Face::Regular, '\u{F021}');
+        let nerd_l = lazy.glyph(neon_l, Face::Regular, '\u{F021}');
+        assert_ne!(nerd_l, 0);
+        assert_eq!(eager.slot_curves(nerd_e), lazy.slot_curves(nerd_l));
+        assert_eq!(lazy.loaded_font_count(), 5);
+
+        // Switching to Cousine lazily loads Cousine on demand and matches eager curves bit-for-bit.
+        let cous_e = eager.family_id(crate::DEFAULT_FONT_FAMILY).unwrap();
+        let cous_l = lazy.family_id(crate::DEFAULT_FONT_FAMILY).unwrap();
+        let ce = eager.glyph(cous_e, Face::Bold, 'g');
+        let cl = lazy.glyph(cous_l, Face::Bold, 'g');
+        assert_eq!(eager.slot_curves(ce), lazy.slot_curves(cl));
+        assert!(lazy.loaded_font_count() >= 7);
     }
 }

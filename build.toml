@@ -96,7 +96,11 @@
 # `glyph prove`. prove.rs's three (ambiguous finds, --since selection, the
 # gpu-scoped rule), prove_relax's routing and overlay tests, and
 # products_reading's went; relax.rs's target-discovery test arrived.
-test_floor = 405
+# 405 -> 1048 (2026-11-26): the terminal wall (+643): term-cells (2),
+# termd-client (25), glyph-vt (235), term-session (11), glyph-font (18,
+# including its doctest), wall-core (257), agent-feed (16), wall-control (7),
+# and native/src/wall (72 unit and offscreen GPU tests).
+test_floor = 1048
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target `test --relax` runs, each golden render, each kind = "cmd"
