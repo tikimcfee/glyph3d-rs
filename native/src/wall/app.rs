@@ -246,6 +246,15 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
+    /// Last drawn scrolled-back jump-to-live pills (back-to-front by Z), for hover/click.
+    scrollback_pills: Vec<super::describe::ScrollbackPillHit>,
+    /// Terminal whose scrolled-back pill is currently under the pointer.
+    hovered_scrollback_pill: Option<String>,
+    /// Terminal whose scrolled-back pill received a primary press (released click runs jump-live).
+    pressed_scrollback_pill: Option<String>,
+    /// Last seen scrollback state per live terminal so async `ViewReply` / `status_follow`
+    /// metadata updates trigger a redraw even when `screen.generation` did not change.
+    scrollback_snapshot: HashMap<String, super::describe::TerminalScrollback>,
     win: super::window::WindowLifecycle,
     /// Next wake deadline while `termd` is in a restarting/unreachable trouble state
     /// so the rules' notice grace timers advance even while the window is idle.
@@ -1498,7 +1507,28 @@ impl App {
     fn pump(&mut self, request_redraw: bool) {
         let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let (changed, news) = sessions.pump();
+        let (mut changed, news) = sessions.pump();
+        // Catch metadata-only scrollback updates (`ViewReply` offset/max or
+        // `status_follow` scrollback_rows arriving after `Event::Repaint`).
+        let mut live_count = 0usize;
+        for id in sessions.ids() {
+            live_count += 1;
+            if let Some(sb) = sessions.scrollback(id) {
+                let next = super::describe::TerminalScrollback {
+                    offset: sb.offset,
+                    max: sb.max,
+                    viewing: sb.viewing,
+                };
+                if self.scrollback_snapshot.get(id).copied() != Some(next) {
+                    self.scrollback_snapshot.insert(id.to_owned(), next);
+                    changed = true;
+                }
+            }
+        }
+        if self.scrollback_snapshot.len() != live_count {
+            self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
+            changed = true;
+        }
         let mut heard = false;
         let mut ended_any = false;
         for n in news {
@@ -1710,6 +1740,7 @@ impl App {
 
         let mut shapes: Vec<Shape> = Vec::new();
         let mut labels: Vec<Label<'static>> = Vec::new();
+        let mut pill_hits: Vec<super::describe::ScrollbackPillHit> = Vec::new();
         if described.notice.is_none() {
             described.notice = self
                 .starting_termd
@@ -1720,7 +1751,7 @@ impl App {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome_with_scrollback(
+            super::describe::describe_frame_chrome_with_scrollback_hits(
                 &described,
                 &camera,
                 viewport,
@@ -1729,8 +1760,16 @@ impl App {
                 &mut shapes,
                 &mut labels,
                 |id| terms.scrollback(id),
+                self.hovered_scrollback_pill.as_deref(),
+                &mut pill_hits,
             )
         };
+        if let Some(ref hid) = self.hovered_scrollback_pill {
+            if !pill_hits.iter().any(|p| p.terminal_id == *hid) {
+                self.hovered_scrollback_pill = None;
+            }
+        }
+        self.scrollback_pills = pill_hits;
         let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
         self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
         let view = frame
@@ -1919,6 +1958,14 @@ impl App {
         self.apply_effects();
     }
 
+    fn hit_scrollback_pill(&self, x: f64, y: f64) -> Option<&str> {
+        self.scrollback_pills
+            .iter()
+            .rev()
+            .find(|p| p.contains_screen(x, y))
+            .map(|p| p.terminal_id.as_str())
+    }
+
     fn move_cursor(&mut self, x: f64, y: f64) {
         self.cursor = Point::new(x, y);
         if (self.buttons & Buttons::MIDDLE.0) != 0
@@ -1928,12 +1975,36 @@ impl App {
         {
             self.middle_dragged = true;
         }
+        if let Some(pressed_tid) = self.pressed_scrollback_pill.as_deref() {
+            let over = (self.hit_scrollback_pill(x, y) == Some(pressed_tid))
+                .then(|| pressed_tid.to_owned());
+            if over != self.hovered_scrollback_pill {
+                self.hovered_scrollback_pill = over;
+                self.redraw();
+            }
+            return;
+        }
+        let hovered_pill = if self.buttons == 0 {
+            self.hit_scrollback_pill(x, y).map(str::to_owned)
+        } else {
+            None
+        };
+        let pill_hover_changed = hovered_pill != self.hovered_scrollback_pill;
+        self.hovered_scrollback_pill = hovered_pill;
         let ev = self.pointer(None);
         if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
             let lookup = screen_lookup(|id| terms.screen(id));
             wall.pointer_move(&ev, &lookup);
         }
         self.apply_effects();
+        if self.hovered_scrollback_pill.is_some() {
+            if let Some(g) = &self.gfx {
+                g.window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
+        }
+        if pill_hover_changed {
+            self.redraw();
+        }
     }
 
     fn pinch(&mut self, delta: f64, phase: TouchPhase) {
@@ -2168,6 +2239,7 @@ impl App {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
             self.hovered_files.clear();
+            self.pressed_scrollback_pill = None;
             self.buttons = 0;
             if let Some(wall) = &mut self.wall {
                 wall.blur();
@@ -2482,6 +2554,29 @@ impl App {
         }
         let ev = self.pointer(Some(b));
         let secondary = wall_core::menu::is_secondary_press(b, ev.mods, Platform::host());
+        if b == Button::Left && !secondary {
+            if pressed {
+                if let Some(tid) = self.hit_scrollback_pill(ev.x, ev.y).map(str::to_owned) {
+                    self.pressed_scrollback_pill = Some(tid);
+                    return;
+                }
+            } else if let Some(pressed_tid) = self.pressed_scrollback_pill.take() {
+                let still_inside = self.hit_scrollback_pill(ev.x, ev.y) == Some(pressed_tid.as_str());
+                if still_inside {
+                    if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                        let lookup = screen_lookup(|id| terms.screen(id));
+                        let _ = wall.run_with_screens(
+                            format!("terminal.scroll {pressed_tid} live"),
+                            &lookup,
+                        );
+                    }
+                    self.hovered_scrollback_pill = None;
+                    self.apply_effects();
+                    self.redraw();
+                }
+                return;
+            }
+        }
         if pressed && b == Button::Middle {
             self.middle_press_pos = Some(Point::new(ev.x, ev.y));
             self.middle_dragged = false;
@@ -2897,6 +2992,10 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
+        scrollback_pills: Vec::new(),
+        hovered_scrollback_pill: None,
+        pressed_scrollback_pill: None,
+        scrollback_snapshot: HashMap::new(),
         win: super::window::WindowLifecycle::new(),
         termd_tick_at: None,
         pending_termd: None,

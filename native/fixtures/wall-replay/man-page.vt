@@ -1,0 +1,59 @@
+[?1049l[!p[?7h[?9l[?1000l[?1002l[?1003l[?1005l[?1006l[?1015l[?1016l[?1004l[?2004l[=0;1u[H[2J[3g[9GH[17GH[25GH[33GH[41GH[49GH[57GH[65GH[73GH[81GH[89GH[97GH[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0m]2;
+LS(1)                       General Commands Manual                      LS(1)
+
+[1mNAME[0m
+     [1mls[0m – list directory contents
+
+[1mSYNOPSIS[0m
+     [1mls[0m [[1m-@ABCFGHILOPRSTUWabcdefghiklmnopqrstuvwxy1%,[0m] [[1m--color[0m=[4mwhen[24m]
+        [[1m-D[0m [4mformat[24m] [[4mfile[24m [4m...[24m]
+
+[1mDESCRIPTION[0m
+     For each operand that names a [4mfile[24m of a type other than directory, [1mls[0m
+     displays its name as well as any requested, associated information.  For
+     each operand that names a [4mfile[24m of type directory, [1mls[0m displays the names
+     of files contained within that directory, as well as any requested,
+     associated information.
+
+     If no operands are given, the contents of the current directory are
+     displayed.  If more than one operand is given, non-directory operands are
+     displayed first; directory and non-directory operands are sorted
+     separately and in lexicographical order.
+
+     The following options are available:
+
+     [1m-@[0m      Display extended attribute keys and sizes in long ([1m-l[0m) output.
+
+     [1m-A[0m      Include directory entries whose names begin with a dot (‘[4m.[24m’)
+             except for [4m.[24m and [4m..[24m.  Automatically set for the super-user unless
+             [1m-I[0m is specified.
+
