@@ -2470,9 +2470,9 @@ impl App {
                     if let Some(bit) = modifier_bit_of_physical(k.physical) {
                         self.modifiers |= bit;
                     }
-                    let eff = self.modifiers | k.mods;
                     #[cfg(feature = "egui-ui")]
                     if let Some(g) = &mut self.gfx {
+                        let eff = self.modifiers | k.mods;
                         let ekey = super::ui::winit_key_to_egui(k.physical, &k.logical);
                         let emods = super::ui::winit_mods_to_egui(eff);
                         g.ensure_ui(&self.ctx.device)

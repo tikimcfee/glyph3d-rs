@@ -190,7 +190,7 @@ impl LoadedFont {
 }
 
 enum PendingFont {
-    Upright(FontSpec),
+    Upright(Box<FontSpec>),
     Face {
         face_spec: FaceSpec,
         include_line_gap: bool,
@@ -297,7 +297,7 @@ impl FontAtlas {
                 fonts.push(FontEntry::lazy(
                     spec.name.clone(),
                     idx,
-                    PendingFont::Upright(spec.clone()),
+                    PendingFont::Upright(Box::new(spec.clone())),
                 ));
             } else {
                 let bytes = load_source(&spec.name, &spec.source)?;
@@ -1282,10 +1282,6 @@ fn load_face_spec(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal helper constructing one validated LoadedFont with face index and line-height scale"
-)]
 fn build_loaded_font(
     name: String,
     bytes: Arc<[u8]>,

@@ -4819,7 +4819,7 @@ mod tests {
             128,
         );
         assert!(
-            px_paper.chunks_exact(4).any(|p| p[2] > 60),
+            px_paper.as_chunks::<4>().0.iter().any(|p| p[2] > 60),
             "paper grid lines must render immediately on frame 1"
         );
 
