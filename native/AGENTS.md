@@ -181,6 +181,71 @@ framed on alpha.rs and still cannot see it, which is fine — one gate seeing it
 is the point). Do not "tidy up" the empty file, and if the fixture is ever
 rebuilt, put one back.
 
+## The terminal wall (`native/src/wall/`, 2026-11-26)
+
+A bare `glyph3d-native` run (or `--wall`) opens the terminal wall rather than a
+3D `GlyphScene`. Four seams meet in `native/src/wall/app.rs`, and none of them
+imports the others' internals:
+
+- **`term_cells::{Screen, Cell, Cursor, Modes}`**: the passive screen contract
+  between `glyph-vt` and `WallRenderer`. `Cell` carries resolved final sRGB
+  RGBA8 colours (inverse, conceal, and `boldIsBright` already applied by the
+  emulator; a renderer never consults a terminal palette), `CLUSTER_BASE`
+  indices into `Screen::clusters` for multi-codepoint grapheme/emoji clusters,
+  and per-row `row_gen` stamps against `Screen::generation` so
+  `WallRenderer` uploads only rows whose generation advanced since the last
+  frame.
+- **`wall_core::wall::Wall` in, `WallEffect`s and `WallFrame` out**: `app.rs`
+  converts winit pointer, wheel (sign-flipped to W3C delta convention), pinch,
+  and keyboard events in logical pixels into `Wall` calls, drains
+  `Wall::drain_effects` (bounded to eight rounds per event) into `Sessions`,
+  clipboard (`arboard`, or `WallUi`'s Wayland clipboard on Linux), cursor icon,
+  and redraw requests, and never copies `Screen`s into `Wall` — gestures and
+  verbs that inspect terminal text borrow screens through `ScreenLookup`.
+- **`term_session::{Sessions, News}`**: owns the `g3d-termd` protocol 1.5
+  connection and one background `Vt` worker thread per terminal (16 ms / 16 KiB
+  leading-edge coalescer, DECSET 2026 synchronized-output hold, and 16 ms
+  outbound resize coalescing). `Sessions::pump()` swaps dirty screens into
+  window-owned `front_screen` buffers without locking the emulator and yields
+  `News` (`Filled`, `Resized`, `Title`, `Modes`, `Ended`, `Disconnected`),
+  waking the event loop through `EventLoopProxy<Wake>`. `agents.rs`
+  (`WallAgents`) bridges `agent-feed` (`FleetFollower`, `SessionPoller`,
+  `LineFollower`) to `wall_core::agent_views::AgentViews` on a `Condvar`-parked
+  worker thread (zero subprocesses when no agent terminal, Agent View, sidebar,
+  or palette is active) using the same coalesced `Wake` gate.
+- **`wall_core::wall::WallFrame` → `describe.rs` → `chrome.rs` → `WallRenderer`
+  + `WallUi` / `mount.rs`**: `Wall::frame()` produces a device-free description;
+  `describe::describe_frame_chrome_with_scrollback` delegates every canvas
+  chrome element (title bars, group backdrops and headers, selection outlines,
+  Shift-drag lasso, tile/pane drop preview, zoomed-out map labels and leader
+  lines, disjoint fullscreen veil cutouts, notice banner, scrollback bar) to
+  `chrome.rs`, building `PaperStyle` (`wall_paper.wgsl`), `Shape`s
+  (`wall_shapes.wgsl`), and `Label`s drawn alongside `TerminalDraw`s
+  (`wall_cells.wgsl`). Under `egui-ui`, `WallUi` (`ui.rs`) and `Panels`
+  (`mount.rs`, `panels/`) then paint flat overlay chrome (`topbar`, hovered
+  `bar_buttons`, `palette`, `sidebar`, docked/floating `settings`, `status`,
+  `help`, `context_menu`, `agent_view`, and `F1` HUD) into the same encoder
+  and return verb strings executed through `Wall::run_with_screens`.
+- **World-unit scale and DPI**: `WORLD_CELL_HEIGHT = 2.4` and `PANEL_PAD = 0.3`
+  match the JS wall's world space (`y` up), with `cell_scale =
+  (WORLD_CELL_HEIGHT * (font_size / 14.0)) / base_cell_height` so world
+  coordinates, group gaps, snap steps, and imported browser `WallStore` layouts
+  stay invariant across fonts and HiDPI scale factors. `Wall` and `ChromeStyle`
+  speak logical CSS pixels (`viewport = physical / scale_factor`, `camera.zoom`
+  = logical px per world unit); `app.rs` multiplies by `window.scale_factor()`
+  at the `WallRenderer` boundary. In `Gfx`, `WallUi` and `wgpu::Surface` sit
+  before `Arc<Window>` in struct field order and drop in
+  `ApplicationHandler::exiting` while the Wayland display is still alive.
+- **On-demand draw loop**: `about_to_wait` parks on `ControlFlow::Wait` (zero
+  idle redraws). It wakes only on winit events, `EventLoopProxy<Wake>` from
+  `Sessions` or `wall_control::Server` (`wallctl`), `ControlFlow::WaitUntil` at
+  16 ms while `Wall::tick` / `WallFrame::animating` reports an active camera
+  ease, wheel glide, or fullscreen settle (falling back to surface-free
+  `draw(false)` when occluded so `app.shot` and animations still complete), and
+  bounded `WaitUntil` deadlines for cursor blink (`next_cursor_blink`), egui
+  `repaint_after` (such as the hold-to-close ring), and `GLYPH_WALL_SHADER_DIR`
+  hot-reload polling.
+
 ## Style discipline
 
 - **Zero warnings** from `cargo build` and `cargo clippy`, always. Fix lints
@@ -433,6 +498,60 @@ The dev-only CubeCL instruments (`--cubecl-*`) and their env vars
 (`GLYPH_CHAIN_*`, `GLYPH_RECORD_CHUNK`, `GLYPH_REPO_CHECK_*`) were retired with
 the engine on 2026-10-09; `git show 659efdb:native/AGENTS.md` has their
 documentation.
+
+### Terminal wall env vars (2026-11-26)
+
+- `G3D_TERMD_DIR=<dir>` — overrides the socket and state directory (`/run/user/<uid>/g3d`
+  on Linux when present, else `/tmp/g3d-<uid>`) for `termd-client`
+  (`termd-<ns>.sock`), `wall-control` (`wall-<ns>.sock`), daemon logs, and
+  `wall_core::store::default_store_dir` (`wall-<ns>.json`). Tests and scratch
+  probes set this to a short path under `/tmp` so they never touch live
+  namespaces or `~/Library/Application Support/glyph3d/wall` /
+  `${XDG_STATE_HOME:-~/.local/state}/glyph3d/wall`.
+- `G3D_TERMD_BIN=<path>` — explicit path to the `g3d-termd` executable used by
+  `termd_client::paths::find_termd` before searching sibling binaries, sibling
+  `glyph3d-js/bin/g3d-termd`, or `PATH`.
+- `GLYPH_WALL_HUD=1` — windowed (`egui-ui`): opens the `F1` wall debug HUD on
+  startup (any non-empty value other than `"0"`; `wallctl app.hud` toggles it
+  live).
+- `GLYPH_WALL_STARTUP=1` (`wall/startup.rs`) — prints `[wall-startup]
+  t=+...ms dt=...ms phase=<name>` phase spans from `process_start` through
+  first-frame paper paint and background `termd` connect/adopt (`OnceLock`-gated,
+  zero syscalls when unset).
+- `GLYPH_WALL_PERF=1` (plus `GLYPH_WALL_PERF_MAX_MS`,
+  `GLYPH_WALL_PERF_IDLE_MS`, `GLYPH_WALL_PERF_SETTLE_MS`, `wall/perf.rs`) —
+  windowed: activates `WallPerf` per-frame `App::pump` vs `App::draw` CPU
+  timing, upload counters, optional idle zero-frame settle/measure window, and
+  optional flood stall watchdog, printing one `wall-perf:` summary line on exit
+  (`wallctl app.perf [reset]` queries live counters).
+- `GLYPH_WALL_CLIPBOARD=memory` — windowed: routes wall copy/paste and
+  `wallctl app.clipboard` through an in-process clipboard buffer instead of the
+  OS clipboard so smoke scripts never touch a user's clipboard.
+- `GLYPH_WALL_SHOT=<path.png>` — counted `--frames N` wall run: renders the
+  final frame (`N`) offscreen (including the `egui` panel overlay) and saves it
+  as an RGBA PNG (`wallctl app.shot <path.png>` captures a live window frame at
+  any time).
+- `GLYPH_WALL_SPAWN=<count>` — counted `--frames N` wall run: executes
+  `wall.spawn` `<count>` times at frame 10.
+- `GLYPH_WALL_RUN="verb1; verb2; ..."` — counted `--frames N` wall run: executes
+  `;`-separated wall verb lines at frame 10 and prints each `wall> <line>` and
+  reply.
+- `GLYPH_WALL_PASTE=<text>` — counted `--frames N` wall run: pastes `<text>`
+  into the focused terminal at frame 30.
+- `GLYPH_WALL_TYPE=<text>` — counted `--frames N` wall run: feeds `<text>` one
+  character at a time (`\n` as `Enter`) through `Wall::key` at frame 30.
+- `GLYPH_WALL_HOVER=<terminal-id>` — windowed: moves the cursor onto
+  `<terminal-id>`'s title bar right after `open()` so hovered title-bar chrome
+  (`bar_buttons`) is active from frame 0.
+- `GLYPH_WALL_SHADER_DIR=<dir>` — `WallRenderer`: loads
+  `wall_{cells,paper,shapes}.wgsl` from `<dir>` and polls file mtimes every
+  250 ms, validating edits with `naga` and hot-swapping pipelines on the next
+  frame (on compile error, keeps the working pipeline and surfaces the error on
+  the wall notice banner; set automatically by `tools/wall-relax.sh`).
+- `GLYPH_WALL_EDGE_SHOT`, `GLYPH_WALL_LINK_SHOT`, `GLYPH_WALL_SCROLL_SHOT` —
+  `native/src/wall/renderer.rs` `#[cfg(test)]` only: optional PNG dump paths
+  for the offscreen edge-glyph, OSC-8 link underline, and scroll-upload GPU
+  unit tests.
 
 ## Commit cadence
 

@@ -34,6 +34,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-feed"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1766,6 +1774,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-font"
+version = "0.1.0"
+dependencies = [
+ "icu_normalizer",
+ "term-cells",
+ "ttf-parser",
+]
+
+[[package]]
 name = "glyph-scene-graph"
 version = "0.1.0"
 dependencies = [
@@ -1773,9 +1790,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glyph-vt"
+version = "0.1.0"
+dependencies = [
+ "term-cells",
+]
+
+[[package]]
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
+ "agent-feed",
+ "arboard",
  "ash",
  "bevy_ecs",
  "bevy_transform",
@@ -1790,22 +1816,31 @@ dependencies = [
  "glam",
  "glyph-field",
  "glyph-field-derived",
+ "glyph-font",
  "glyph-scene-graph",
+ "glyph-vt",
  "image",
  "log",
  "memchr",
  "memmap2",
  "naga",
+ "objc2-foundation 0.2.2",
  "pollster",
  "ratatui",
  "rayon",
  "serde",
  "serde_json",
  "simdutf8",
+ "smithay-clipboard",
+ "term-cells",
+ "term-session",
+ "termd-client",
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "wall-control",
+ "wall-core",
  "wgpu",
  "wgpu-profiler",
  "winit",
@@ -4016,12 +4051,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "term-cells"
+version = "0.1.0"
+
+[[package]]
+name = "term-session"
+version = "0.1.0"
+dependencies = [
+ "glyph-vt",
+ "log",
+ "serde_json",
+ "term-cells",
+ "termd-client",
+ "wall-core",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "termd-client"
+version = "0.1.0"
+dependencies = [
+ "glyph-vt",
+ "serde",
+ "serde_json",
+ "term-cells",
 ]
 
 [[package]]
@@ -4472,6 +4533,23 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wall-control"
+version = "0.1.0"
+dependencies = [
+ "wall-core",
+]
+
+[[package]]
+name = "wall-core"
+version = "0.1.0"
+dependencies = [
+ "glyph-vt",
+ "serde",
+ "serde_json",
+ "term-cells",
 ]
 
 [[package]]

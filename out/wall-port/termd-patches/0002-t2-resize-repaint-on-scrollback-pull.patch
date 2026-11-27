@@ -1,0 +1,171 @@
+From 3ce63fede96c691f258be8ad88262b9dc40093c5 Mon Sep 17 00:00:00 2001
+From: wall-vt <wall-vt@local>
+Date: Thu, 26 Nov 2026 17:49:10 -0600
+Subject: [PATCH 2/3] t2: resize repaint on scrollback pull
+
+When a primary-screen `resize` grows `cols` or `rows` while `termd` holds
+scrollback (`!alt && sb_before > 0`), `libghostty-vt` pulls history rows back
+onto the active screen. Follow `EVENT size` immediately with a live `REPAINT`
+at the same `seq` for `mode: "raw"` subscribers so zero-scrollback viewers
+stay synchronized without a 1-RTT gap.
+
+Includes `resize_pulling_scrollback_onto_screen_repaints_zero_scrollback_viewer`
+in `crates/g3d-termd/tests/daemon.rs` and updates `docs/termd/PROTOCOL.md`.
+---
+ crates/g3d-termd/src/owner.rs    | 13 ++++-
+ crates/g3d-termd/tests/daemon.rs | 86 ++++++++++++++++++++++++++++++++
+ docs/termd/PROTOCOL.md           |  5 +-
+ 3 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/crates/g3d-termd/src/owner.rs b/crates/g3d-termd/src/owner.rs
+index ab96f46..168671d 100644
+--- a/crates/g3d-termd/src/owner.rs
++++ b/crates/g3d-termd/src/owner.rs
+@@ -1427,7 +1427,8 @@ impl Owner {
+     }
+ 
+     fn resize(&mut self, cols: u16, rows: u16) {
+-        if self.cols_rows() == (cols, rows) {
++        let (old_cols, old_rows) = self.cols_rows();
++        if (old_cols, old_rows) == (cols, rows) {
+             return;
+         }
+         // Bytes the program wrote before the resize were written at the old size.
+@@ -1435,6 +1436,8 @@ impl Owner {
+             let mut buf = vec![0u8; READ_CHUNK];
+             while self.read_once(&mut buf) == Some(true) {}
+         }
++        let sb_before = self.term.scrollback_rows().unwrap_or(0);
++        let alt = self.modes.alt;
+         let (_, _, cw, ch) = self.fx.size.get();
+         if let Err(e) = self.term.resize(cols, rows, cw, ch) {
+             crate::log(&format!("terminal {}: resize {cols}x{rows}: {e}", self.tref.id));
+@@ -1450,8 +1453,14 @@ impl Owner {
+             info.rows = rows;
+         }
+         self.event_all(false, &Event::Size { cols, rows, seq: self.seq });
++        // Growing width or height on the primary screen while scrollback is non-empty pulls
++        // history rows onto the active grid that a zero-scrollback (or late) raw viewer never
++        // held; follow `size` with a live repaint at the same `seq`.
++        let pulled_scrollback = !alt && sb_before > 0 && (cols > old_cols || rows > old_rows);
+         for i in 0..self.subs.len() {
+-            if self.subs[i].view.take().is_some() {
++            if self.subs[i].view.take().is_some()
++                || (pulled_scrollback && self.subs[i].mode == Mode::Raw)
++            {
+                 self.push_live_repaint(i, 0);
+             }
+         }
+diff --git a/crates/g3d-termd/tests/daemon.rs b/crates/g3d-termd/tests/daemon.rs
+index caf48cc..f52841f 100644
+--- a/crates/g3d-termd/tests/daemon.rs
++++ b/crates/g3d-termd/tests/daemon.rs
+@@ -1091,3 +1091,89 @@ fn repaint_preserves_soft_wraps_and_reflows_identically() {
+     b.resize(110, 12, 0, 0).unwrap();
+     assert_eq!(plain(&a), plain(&b), "reflow after REPAINT diverged from live viewer");
+ }
++
++/// T2: When a primary-screen resize grows width or height with non-empty daemon scrollback,
++/// `termd` pulls scrolled-off history rows back onto the active grid. A raw viewer with
++/// `scrollback = 0` cannot synthesize those rows on its own, so `termd` must follow `EVENT size`
++/// with a live `REPAINT` at that `seq`.
++#[test]
++fn resize_pulling_scrollback_onto_screen_repaints_zero_scrollback_viewer() {
++    let d = Daemon::start();
++    let mut c = d.client();
++    create(
++        &mut c,
++        "t",
++        &[
++            "sh",
++            "-c",
++            "stty -opost; i=0; while [ $i -lt 15 ]; do printf 'R%02d\\r\\n' $i; i=$((i+1)); done; printf READY; exec sleep 100",
++        ],
++        40,
++        6,
++    );
++    let s = c.request::<SubscribeReply>(sub_req("t", Mode::Raw, Role::Own, None, None)).unwrap();
++
++    // Drive a zero-scrollback viewer (matching the wall's viewer contract) in exact wire order.
++    let mut v = libghostty_vt::Terminal::new(40, 6).unwrap();
++    v.set_scrollback_max_bytes(Some(0)).unwrap();
++
++    let mut seen = Seen::default();
++    let until = Instant::now() + Duration::from_secs(10);
++    while !contains(&seen.bytes, b"READY") {
++        assert!(Instant::now() < until, "timed out waiting for READY");
++        let f = c.next_frame().unwrap();
++        match f.ty {
++            ty::OUTPUT => {
++                let (_, bytes) = frame::parse_output(&f.payload).unwrap();
++                v.vt_write(bytes);
++            }
++            ty::REPAINT => {
++                let (_, vt) = frame::parse_repaint(&f.payload).unwrap();
++                v.vt_write(vt);
++            }
++            _ => {}
++        }
++        seen.take(&f);
++    }
++
++    let repaints_before = seen.repaints.len();
++    let _: Empty = c.request(Op::Resize(Resize { handle: s.handle, cols: 60, rows: 12 })).unwrap();
++
++    // Read until the post-resize repaint arrives (or time out briefly if missing).
++    let resize_deadline = Instant::now() + Duration::from_secs(2);
++    while seen.repaints.len() <= repaints_before && Instant::now() < resize_deadline {
++        c.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
++        let Ok(f) = c.next_frame() else { break };
++        match f.ty {
++            ty::OUTPUT => {
++                let (_, bytes) = frame::parse_output(&f.payload).unwrap();
++                v.vt_write(bytes);
++            }
++            ty::REPAINT => {
++                let (head, vt) = frame::parse_repaint(&f.payload).unwrap();
++                v.resize(head.cols, head.rows, 0, 0).unwrap();
++                v.vt_write(vt);
++            }
++            ty::EVENT => {
++                if let Ok(Event::Size { cols, rows, .. }) = serde_json::from_slice::<Event>(&f.payload) {
++                    v.resize(cols, rows, 0, 0).unwrap();
++                }
++            }
++            _ => {}
++        }
++        seen.take(&f);
++    }
++    c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
++
++    let cap: CaptureReply =
++        c.request(Op::Capture(Capture { id: "t".into(), format: None, history_rows: None, unwrap: None })).unwrap();
++    let want_lines: Vec<&str> = cap.text.lines().map(str::trim_end).collect();
++    let got_text = plain(&v);
++    let got_lines: Vec<&str> = got_text.lines().map(str::trim_end).collect();
++    assert!(
++        seen.repaints.len() > repaints_before,
++        "expected a live REPAINT after primary-screen resize with scrollback; trace={:?}",
++        seen.trace
++    );
++    assert_eq!(got_lines, want_lines, "zero-scrollback viewer diverged after resize");
++}
+diff --git a/docs/termd/PROTOCOL.md b/docs/termd/PROTOCOL.md
+index cec227e..70ae140 100644
+--- a/docs/termd/PROTOCOL.md
++++ b/docs/termd/PROTOCOL.md
+@@ -482,7 +482,10 @@ The taker gets its `REPLY`, then the `size` event (every subscriber gets one).
+ Only the owner. The daemon resizes its emulator (reflowing the primary screen) and the
+ PTY (the program gets `SIGWINCH`) as one step at one point in the byte stream, then
+ sends every subscriber of the terminal an `EVENT` `size` carrying that point's `seq`.
+-Every byte from that `seq` on was produced at the new size. A resize to the current
++When a primary-screen resize grows `cols` or `rows` while the terminal holds scrollback,
++each `mode: "raw"` subscriber also receives a live `REPAINT` right after `size` at that
++same `seq`, so viewers without scrollback get the history rows pulled back onto the
++screen. Every byte from that `seq` on was produced at the new size. A resize to the current
+ size does nothing and sends no event.
+ 
+ The size belongs to the owner. A subscriber whose own window is a different size sees
+-- 
+2.54.0 (Apple Git-157)
+

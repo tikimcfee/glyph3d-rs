@@ -5,7 +5,7 @@ use crate::repo::{self, RepoParams, Strategy};
 use crate::{SceneChoice, SceneCullOptions};
 use super::args::{default_text_file, Cli, PresentMode};
 use super::ops::Op;
-use crate::default_emoji_sheet;
+use crate::resolve_emoji_sheet;
 
 /// Top-level action requested via the CLI.
 #[derive(Debug)]
@@ -26,6 +26,42 @@ pub enum CliCommand {
     },
     /// Render execution plan (windowed or offscreen).
     Render(RenderPlan),
+    /// Open the wall's window. `pattern`: show the fixed test screen
+    /// instead of live terminals.
+    Wall {
+        emoji_sheet: PathBuf,
+        pattern: bool,
+        /// The termd namespace its terminals live in.
+        namespace: String,
+        /// Extra termd namespaces to attach alongside `namespace` (off by default).
+        extra_namespaces: Vec<String>,
+        /// Exit after this many frames (`--frames`).
+        frames: Option<u32>,
+    },
+    /// Render the wall cell renderer test pattern offscreen.
+    WallTestPattern {
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
+    /// Render the wall chrome showcase pattern offscreen.
+    WallChromePattern {
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
+    /// Replay a recorded terminal byte stream on the wall renderer offscreen.
+    WallReplay {
+        file: PathBuf,
+        cols: u16,
+        rows: u16,
+        emoji_sheet: PathBuf,
+        screenshot: Option<PathBuf>,
+        frames: u32,
+        zoom: f32,
+    },
 }
 
 /// Mode for GPU information inspection.
@@ -137,7 +173,62 @@ impl Cli {
             };
         }
 
-        let emoji_sheet = self.emoji_sheet.clone().unwrap_or_else(default_emoji_sheet);
+        let emoji_sheet = resolve_emoji_sheet(self.emoji_sheet.as_deref());
+        if self.wall {
+            return CliCommand::Wall {
+                emoji_sheet,
+                pattern: self.wall_test_pattern,
+                namespace: self.wall_ns.clone(),
+                extra_namespaces: self.wall_extra_ns.clone(),
+                frames: self.frames,
+            };
+        }
+        if self.wall_test_pattern {
+            return CliCommand::WallTestPattern {
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
+        if self.wall_chrome_pattern {
+            return CliCommand::WallChromePattern {
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
+        if let Some(file) = &self.wall_replay {
+            let (cols, rows) = self.wall_size.unwrap_or((80, 24));
+            return CliCommand::WallReplay {
+                file: file.clone(),
+                cols,
+                rows,
+                emoji_sheet,
+                screenshot: self.screenshot.clone(),
+                frames: self.frames.unwrap_or(1),
+                zoom: self.zoom,
+            };
+        }
+        // With no scene, offscreen render, or pick/verb script named, open the wall.
+        let has_glyph_scene = self.demo
+            || self.agent_session.is_some()
+            || self.load_repo.is_some()
+            || self.render_file.is_some()
+            || self.screenshot.is_some()
+            || self.screenshot_frame.is_some()
+            || !self.ops.is_empty()
+            || self.copies != 1;
+        if !has_glyph_scene {
+            return CliCommand::Wall {
+                emoji_sheet,
+                pattern: false,
+                namespace: self.wall_ns.clone(),
+                extra_namespaces: self.wall_extra_ns.clone(),
+                frames: self.frames,
+            };
+        }
         let choice = if self.demo {
             SceneChoice::Demo
         } else if let Some(session) = &self.agent_session {

@@ -39,6 +39,7 @@ pub struct Settings {
     pub quad_demo: QuadDemoSettings,
     pub library: LibrarySettings,
     pub gpu: GpuSettings,
+    pub wall: WallSettings,
 }
 
 /// The glyph field view (`--render-file`, `--load-repo`, windowed).
@@ -437,6 +438,66 @@ impl GpuSettings {
     pub fn wait_limit(&self) -> std::time::Duration {
         std::time::Duration::from_secs(u64::from(self.wait_timeout_secs))
     }
+}
+
+/// The terminal wall cell renderer (`native/src/wall/`, 2026-11-26).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WallSettings {
+    /// Canvas background clear colour (sRGB 0..1 RGBA).
+    pub clear_color: [f32; 4],
+    /// Default terminal panel background opacity (0..1).
+    pub panel_opacity: f32,
+    /// Padding around the terminal cell grid inside its panel, in world units.
+    pub panel_padding: f32,
+    /// Resting panel border hairline width in screen pixels.
+    pub border_width_px: f32,
+    /// Border thickness multiplier when a terminal is focused.
+    pub border_focused_scale: f32,
+    /// Focused terminal border colour (sRGB 0..1 RGBA).
+    pub border_focused_color: [f32; 4],
+    /// Unfocused terminal border colour (sRGB 0..1 RGBA).
+    pub border_unfocused_color: [f32; 4],
+    /// Terminal cursor colour (sRGB 0..1 RGBA).
+    pub cursor_color: [f32; 4],
+    /// Solid focused block cursor fill opacity (0..1; 1.0 = solid block with background-coloured text).
+    pub cursor_fill_opacity: f32,
+    /// Hollow unfocused cursor outline width in screen pixels.
+    pub cursor_border_px: f32,
+    /// Blinking cursor half-period in milliseconds (`0` disables blinking).
+    pub cursor_blink_ms: u32,
+    /// Cell height in screen pixels below which text greeks into a bar (0 = never).
+    pub greek_px: f32,
+    /// Fallback underline centre height from cell bottom (overridden by the active font's `post` table).
+    pub underline_y: f32,
+    /// Fallback strikethrough centre height from cell bottom (overridden by the active font's `OS/2` table).
+    pub strike_y: f32,
+    /// Fallback line decoration thickness in cell heights (overridden by the active font's `post` table).
+    pub line_thickness: f32,
+    /// User thickness multiplier applied to the font's `line_thickness` (`GLYPH_LINE_DEFAULTS.lineThickness`).
+    pub line_thickness_scale: f32,
+    /// Vertical offset in cell heights added to the font's `underline_y` (`GLYPH_LINE_DEFAULTS.underlineRaise`).
+    pub underline_raise: f32,
+    /// Curly underline wave amplitude as a multiple of line thickness.
+    pub curly_amplitude: f32,
+    /// SGR 2 dim ink/line opacity multiplier (0..1).
+    pub dim_alpha: f32,
+    /// Whether the drafting-paper grid is drawn over the canvas background.
+    pub paper_show: bool,
+    /// Drafting-paper canvas background colour (sRGB 0..1 RGBA).
+    pub paper_background: [f32; 4],
+    /// Minor grid line colour (sRGB 0..1 RGBA).
+    pub paper_minor_color: [f32; 4],
+    /// Major grid line colour (sRGB 0..1 RGBA).
+    pub paper_major_color: [f32; 4],
+    /// World units between adjacent minor grid lines.
+    pub paper_minor_spacing: f32,
+    /// Every Nth minor line is promoted to a major line.
+    pub paper_major_every: u32,
+    /// Grid line width in physical screen pixels.
+    pub paper_line_px: f32,
+    /// Minimum on-screen spacing in pixels below which a grid level hard-switches off.
+    pub paper_min_px: f32,
 }
 
 impl Settings {

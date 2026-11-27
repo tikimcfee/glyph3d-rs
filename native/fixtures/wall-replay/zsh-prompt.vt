@@ -1,0 +1,45 @@
+[?1049l[!p[?7h[?9l[?1000l[?1002l[?1003l[?1005l[?1006l[?1015l[?1016l[?1004l[?2004l[=0;1u[H[2J[3g[9GH[17GH[25GH[33GH[41GH[49GH[57GH[65GH[73GH[81GH[89GH[97GH[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0m]2;
+[40m[39m lugo@laptop-2 [44m[30m[30m ~/localdev/glyph3d-rs/.claude/worktrees/wall-d [43m[34m[30m  wall-cells [49m[33m[39m [36mgit status -sb[39m
+## [32mwall-cells[m
+[31m??[m native/fixtures/wall-replay/git-diff.vt
+[31m??[m native/fixtures/wall-replay/man-page.vt
+[31m??[m native/fixtures/wall-replay/top-live.vt
+[31m??[m native/fixtures/wall-replay/vim-rust.vt
+[31m??[m native/fixtures/wall-replay/zsh-prompt.vt
+
+[40m[39m lugo@laptop-2 [44m[30m[30m ~/localdev/glyph3d-rs/.claude/worktrees/wall-d [43m[34m[30m  wall-cells [49m[33m[39m [36mls --color native/src/wall[39m
+app.rs          describe.rs     metrics.rs      paper.rs        session.rs
+camera.rs       glyphs.rs       mount.rs        renderer.rs     shapes.rs
+cell.rs         keys.rs         [1m[36mpanels[39;49m[0m          replay.rs       test_pattern.rs
+chrome.rs       labels.rs       panels.rs       script.rs       ui.rs
+
+[40m[39m lugo@laptop-2 [44m[30m[30m ~/localdev/glyph3d-rs/.claude/worktrees/wall-d [43m[34m[30m  wall-cells [49m[33m[39m cargo test --release -p glyph3d-native --lib wall::

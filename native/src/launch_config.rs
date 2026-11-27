@@ -65,6 +65,12 @@ pub struct LaunchConfig {
     pub render_file: Option<PathBuf>,
     /// `--demo`: the quad-field demo scene.
     pub demo: Option<bool>,
+    /// `--wall`: the infinite canvas of live terminals.
+    pub wall: Option<bool>,
+    /// `--wall-ns`: the termd namespace the wall keeps its terminals in.
+    pub wall_ns: Option<String>,
+    /// `--wall-extra-ns`: extra termd namespaces the wall also shows (off by default).
+    pub wall_extra_ns: Option<Vec<String>>,
     #[serde(default, with = "value_enum")]
     pub field_mode: Option<GlyphFieldMode>,
     #[serde(default, with = "value_enum")]

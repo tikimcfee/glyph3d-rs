@@ -51,10 +51,13 @@ impl std::str::FromStr for PresentMode {
 /// the hand-rolled parser's --help (nothing user-facing was dropped).
 const AFTER_LONG_HELP: &str = "\
 MODES:
-  no args                the terminal launcher, on a terminal (--launcher
-                         anywhere); otherwise the windowed text field
-                         (default file: this crate's main.rs)
+  no args / --wall       the wall: the infinite canvas of live terminals
+                         (default namespace: rs-wall)
+  --launcher             the terminal launcher: pick the wall or a scene and
+                         its options, Enter starts this binary on them
   --demo                 windowed: Stage A quad-field demo
+  --render-file PATH     windowed: one text file
+  --load-repo DIR        windowed: a repository as a field of code pages
   --screenshot PATH      offscreen: render N frames, write PNG, print timing,
                          exit 0. Deterministic (fixed virtual clock).
 
@@ -96,6 +99,30 @@ pub struct Cli {
     /// Stage A quad-field demo instead of the text field
     #[arg(long)]
     pub demo: bool,
+    /// Open the wall: the infinite canvas of terminals (the default when no
+    /// scene, offscreen render or check flag is given; with --wall-test-pattern,
+    /// the fixed test screen instead of live ones)
+    #[arg(long)]
+    pub wall: bool,
+    /// The termd namespace the wall keeps its terminals in
+    #[arg(long, value_name = "NAME", default_value = "rs-wall")]
+    pub wall_ns: String,
+    /// Extra termd namespaces whose terminals the wall also shows (detached on close,
+    /// lossy flow; e.g. `--wall-extra-ns agents`, repeatable or comma-separated; off by default)
+    #[arg(long, value_name = "NAME", value_delimiter = ',', action = ArgAction::Append)]
+    pub wall_extra_ns: Vec<String>,
+    /// Render the terminal wall test pattern (with --screenshot PATH)
+    #[arg(long)]
+    pub wall_test_pattern: bool,
+    /// Render the terminal wall chrome showcase pattern (with --screenshot PATH)
+    #[arg(long)]
+    pub wall_chrome_pattern: bool,
+    /// Replay a recorded terminal byte stream through crates/glyph-vt (with --screenshot PATH)
+    #[arg(long, value_name = "PATH")]
+    pub wall_replay: Option<PathBuf>,
+    /// Terminal grid dimensions for --wall-replay as COLSxROWS (default 80x24)
+    #[arg(long, value_name = "COLSxROWS", value_parser = parse_wall_size)]
+    pub wall_size: Option<(u16, u16)>,
     /// Text file to stage (UTF-8); default: this crate's main.rs
     #[arg(long, value_name = "PATH")]
     pub render_file: Option<PathBuf>,
@@ -228,10 +255,9 @@ pub struct Cli {
     /// Path to launch configuration file (default: looks for launch_config.toml if present)
     #[arg(long, value_name = "PATH")]
     pub launch_config: Option<PathBuf>,
-    /// Open the terminal launcher (also what no arguments at all opens, on a
-    /// terminal): pick a scene and its options, Enter starts the renderer on
-    /// them and the menu returns when the window closes. With
-    /// --launch-config, the launcher starts from that file.
+    /// Open the terminal launcher: pick the wall or a scene and its options,
+    /// Enter starts the renderer on them and the menu returns when the window
+    /// closes. With --launch-config, the launcher starts from that file.
     #[arg(long)]
     pub launcher: bool,
     /// Render file background cards behind glyph fields
@@ -440,10 +466,22 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(field_mode);
     under!(present_mode);
     under!(Some frames);
-    let scene_typed = ["demo", "agent_session", "load_repo", "render_file"]
-        .into_iter()
-        .any(typed);
+    under!(wall_ns);
+    under!(wall_extra_ns);
+    let scene_typed = [
+        "demo",
+        "wall",
+        "wall_test_pattern",
+        "wall_chrome_pattern",
+        "wall_replay",
+        "agent_session",
+        "load_repo",
+        "render_file",
+    ]
+    .into_iter()
+    .any(typed);
     if !scene_typed {
+        under!(wall);
         under!(demo);
         under!(Some agent_session);
         under!(Some load_repo);

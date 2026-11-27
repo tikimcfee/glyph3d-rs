@@ -1,0 +1,16 @@
+[package]
+name = "wall-core"
+version = "0.1.0"
+edition = "2021"
+description = "The wall's model: terminals on an infinite canvas, their layout, groups, splits, snapping, keys and verbs, with no window or renderer (the wall)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+term-cells = { path = "../term-cells" }
+
+[dev-dependencies]
+glyph-vt = { path = "../glyph-vt" }
+
+[lints]
+workspace = true

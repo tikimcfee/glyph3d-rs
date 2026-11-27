@@ -1,0 +1,11 @@
+[package]
+name = "glyph-vt"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal emulator behind one seam: a terminal's bytes in, a term-cells Screen out (the wall)."
+
+[dependencies]
+term-cells = { path = "../term-cells" }
+
+[lints]
+workspace = true

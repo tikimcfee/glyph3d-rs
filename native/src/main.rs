@@ -3,9 +3,11 @@
 //! coverage.
 //!
 //! Run modes (`--help` has every flag; `cargo glyph run` builds first):
-//!   (no arguments, on a terminal) / `--launcher`
-//!                    the terminal launcher (`launcher/`): pick a scene and
-//!                    its options, Enter starts the renderer on them.
+//!   (no arguments) / `--wall`
+//!                    the wall (`wall/`): the infinite canvas of live
+//!                    terminals in `g3d-termd` (default namespace `rs-wall`).
+//!   `--launcher`     the terminal launcher (`launcher/`): pick the wall or a
+//!                    scene and its options, Enter starts the renderer on them.
 //!   `--load-repo DIR`  a repository as a field of files (HyperLayout;
 //!                    `--field-mode derived`, the one field mode since
 //!                    2026-10-31).
@@ -30,6 +32,7 @@ use glyph3d_native::*;
 /// Parse the CLI and dispatch one run mode: a render (windowed or offscreen),
 /// a repo scan, or one of the exit-driver instruments (fixture, GPU info).
 fn main() {
+    wall::startup::init_process_start();
     // Unified logging & tracing substrate.
     // tracing-log automatically captures all log::* records and routes them into tracing.
     // Filtering precedence:
@@ -86,7 +89,12 @@ fn main() {
             clap_complete::generate(shell, &mut cmd, "glyph3d-native", &mut std::io::stdout());
         }
         #[cfg(not(feature = "wgpu"))]
-        CliCommand::GpuInfo(_) | CliCommand::Render(_) => {
+        CliCommand::GpuInfo(_)
+        | CliCommand::Render(_)
+        | CliCommand::Wall { .. }
+        | CliCommand::WallTestPattern { .. }
+        | CliCommand::WallChromePattern { .. }
+        | CliCommand::WallReplay { .. } => {
             eprintln!("error: this build has no renderer (the `wgpu` feature is off); it lays out and checks, it does not draw");
             std::process::exit(1);
         }
@@ -111,6 +119,89 @@ fn main() {
         } => {
             let load = repo::load_repo(&dir, &params, strategy);
             load.print_stats();
+        }
+        #[cfg(feature = "windowed")]
+        CliCommand::Wall { emoji_sheet, pattern, namespace, extra_namespaces, frames } => {
+            #[cfg(target_os = "macos")]
+            set_macos_process_name(WALL_MACOS_APP_NAME);
+            let ctx = {
+                let _s = wall::startup::span("gpu_adapter_device");
+                pollster::block_on(gpu::init(None))
+            };
+            // The test pattern needs no daemon: one fixed screen.
+            let namespace = (!pattern).then_some(namespace);
+            wall::app::run(
+                ctx,
+                wall::app::WallOptions {
+                    emoji_sheet,
+                    namespace,
+                    extra_namespaces,
+                    exit_after: frames.map(u64::from),
+                },
+            );
+        }
+        #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
+        CliCommand::Wall { .. } => {
+            eprintln!("error: the wall needs a window, and this build has none (the `windowed` feature is off); render a glyph scene offscreen with --screenshot PATH");
+            std::process::exit(1);
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallTestPattern {
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-test-pattern requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_test_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallChromePattern {
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-chrome-pattern requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_chrome_pattern_offscreen(&ctx, &emoji_sheet, &path, frames, zoom);
+        }
+        #[cfg(feature = "wgpu")]
+        CliCommand::WallReplay {
+            file,
+            cols,
+            rows,
+            emoji_sheet,
+            screenshot,
+            frames,
+            zoom,
+        } => {
+            let Some(path) = screenshot else {
+                eprintln!("error: --wall-replay requires --screenshot PATH");
+                std::process::exit(1);
+            };
+            let bytes = std::fs::read(&file).unwrap_or_else(|e| {
+                eprintln!("error: --wall-replay '{}': {e}", file.display());
+                std::process::exit(1);
+            });
+            let ctx = pollster::block_on(gpu::init(None));
+            wall::render_replay_offscreen(
+                &ctx,
+                &bytes,
+                cols,
+                rows,
+                &emoji_sheet,
+                &path,
+                frames,
+                zoom,
+            );
         }
         #[cfg(feature = "wgpu")]
         CliCommand::Render(plan) => {

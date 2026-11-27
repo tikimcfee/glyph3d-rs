@@ -705,29 +705,82 @@ fn cli_action_dispatch_variants() {
         other => panic!("expected Render, got {other:?}"),
     }
 
-    // 8. Render: Windowed with frames
-    let cli = parse(&["--frames", "1"]);
+    // 8. Default (no scene flag) with --frames: opens the wall in `rs-wall` and exits after N frames
+    let cli = parse(&["--frames", "60"]);
     match cli.action() {
-        CliCommand::Render(plan) => match plan.target {
-            RenderTarget::Windowed { frames, .. } => {
-                assert_eq!(frames, Some(1));
-            }
-            _ => panic!("expected Windowed"),
-        },
-        other => panic!("expected Render, got {other:?}"),
+        CliCommand::Wall { pattern, namespace, frames, .. } => {
+            assert!(!pattern);
+            assert_eq!(namespace, "rs-wall");
+            assert_eq!(frames, Some(60));
+        }
+        other => panic!("expected Wall on bare --frames, got {other:?}"),
     }
 
-    // 9. Render: Windowed without frames
-    let cli = parse(&[]);
+    // 9. Bare run (no arguments): opens the wall in `rs-wall`, identical to `--wall`
+    let bare = parse(&[]);
+    let explicit = parse(&["--wall"]);
+    match (bare.action(), explicit.action()) {
+        (
+            CliCommand::Wall {
+                emoji_sheet: sheet_a,
+                pattern: pat_a,
+                namespace: ns_a,
+                extra_namespaces: extra_a,
+                frames: frames_a,
+            },
+            CliCommand::Wall {
+                emoji_sheet: sheet_b,
+                pattern: pat_b,
+                namespace: ns_b,
+                extra_namespaces: extra_b,
+                frames: frames_b,
+            },
+        ) => {
+            assert_eq!(sheet_a, sheet_b);
+            assert!(!pat_a);
+            assert_eq!(pat_a, pat_b);
+            assert_eq!(ns_a, "rs-wall");
+            assert_eq!(ns_a, ns_b);
+            assert!(extra_a.is_empty());
+            assert_eq!(extra_a, extra_b);
+            assert_eq!(frames_a, None);
+            assert_eq!(frames_a, frames_b);
+        }
+        other => panic!("expected Wall for both bare and --wall, got {other:?}"),
+    }
+
+    // 9b. --wall-extra-ns accepts comma-separated and repeated names (off by default)
+    let with_extra = parse(&["--wall", "--wall-ns", "probe", "--wall-extra-ns", "probe2,probe3", "--wall-extra-ns", "agents"]);
+    match with_extra.action() {
+        CliCommand::Wall { namespace, extra_namespaces, .. } => {
+            assert_eq!(namespace, "probe");
+            assert_eq!(extra_namespaces, vec!["probe2", "probe3", "agents"]);
+        }
+        other => panic!("expected Wall with extra_namespaces, got {other:?}"),
+    }
+
+    // 10. Windowed glyph scene when a scene flag IS given (`--render-file` with `--frames`)
+    let cli = parse(&["--render-file", "src/main.rs", "--frames", "1"]);
     match cli.action() {
-        CliCommand::Render(plan) => match plan.target {
-            RenderTarget::Windowed { frames, .. } => {
-                assert_eq!(frames, None);
+        CliCommand::Render(plan) => {
+            assert!(matches!(plan.choice, SceneChoice::Text { .. }));
+            match plan.target {
+                RenderTarget::Windowed { frames, .. } => assert_eq!(frames, Some(1)),
+                _ => panic!("expected Windowed"),
             }
-            _ => panic!("expected Windowed"),
-        },
+        }
         other => panic!("expected Render, got {other:?}"),
     }
+}
+
+#[cfg(all(feature = "windowed", target_os = "macos"))]
+#[test]
+fn macos_process_name_sets_nsprocessinfo_for_winit_menu() {
+    crate::set_macos_process_name(crate::WALL_MACOS_APP_NAME);
+    let got = objc2_foundation::NSProcessInfo::processInfo()
+        .processName()
+        .to_string();
+    assert_eq!(got, crate::WALL_MACOS_APP_NAME);
 }
 
 #[test]
@@ -804,5 +857,150 @@ fn launch_config_scene_yields_to_a_typed_scene() {
     assert_eq!(typed.render_file, Some(PathBuf::from("x.rs")));
     // Non-scene keys still apply.
     assert_eq!(typed.present_mode, PresentMode::Mailbox);
+}
+
+#[test]
+fn wall_test_pattern_and_replay_flags_parse_and_validate() {
+    let cli = parse(&["--wall-test-pattern", "--screenshot", "wall.png", "--zoom", "2"]);
+    match cli.action() {
+        CliCommand::WallTestPattern { screenshot, frames, zoom, .. } => {
+            assert_eq!(screenshot, Some(PathBuf::from("wall.png")));
+            assert_eq!(frames, 1);
+            assert_eq!(zoom, 2.0);
+        }
+        other => panic!("expected WallTestPattern, got {other:?}"),
+    }
+
+    let cli = parse(&["--wall-chrome-pattern", "--screenshot", "chrome.png", "--zoom", "0.14"]);
+    match cli.action() {
+        CliCommand::WallChromePattern { screenshot, frames, zoom, .. } => {
+            assert_eq!(screenshot, Some(PathBuf::from("chrome.png")));
+            assert_eq!(frames, 1);
+            assert!((zoom - 0.14).abs() < 1e-5);
+        }
+        other => panic!("expected WallChromePattern, got {other:?}"),
+    }
+
+    let cli = parse(&["--wall-replay", "session.vt"]);
+    match cli.action() {
+        CliCommand::WallReplay { file, cols, rows, .. } => {
+            assert_eq!(file, PathBuf::from("session.vt"));
+            assert_eq!((cols, rows), (80, 24));
+        }
+        other => panic!("expected WallReplay, got {other:?}"),
+    }
+
+    let cli = parse(&["--wall-replay", "session.vt", "--wall-size", "132x43", "--screenshot", "out.png"]);
+    match cli.action() {
+        CliCommand::WallReplay { file, cols, rows, screenshot, .. } => {
+            assert_eq!(file, PathBuf::from("session.vt"));
+            assert_eq!((cols, rows), (132, 43));
+            assert_eq!(screenshot, Some(PathBuf::from("out.png")));
+        }
+        other => panic!("expected WallReplay, got {other:?}"),
+    }
+
+    for bad in ["0x24", "80x0", "80", "abcx24", "80x99999"] {
+        let text = match try_parse(&["--wall-replay", "a.vt", "--wall-size", bad]) {
+            Ok(_) => panic!("clap must refuse --wall-size {bad}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(text.contains("--wall-size"), "error must name the flag: {text}");
+    }
+}
+
+#[test]
+fn runtime_asset_lookup_orders_explicit_then_bundle_then_repo() {
+    let root = std::env::temp_dir().join(format!("glyph3d-asset-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let missing_repo = root.join("missing-repo-assets");
+    let app_macos = root.join("Glyph3D Wall.app/Contents/MacOS/glyph3d-native");
+    let app_resources = root.join("Glyph3D Wall.app/Contents/Resources");
+    std::fs::create_dir_all(app_macos.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(app_resources.join("atlas")).unwrap();
+    std::fs::create_dir_all(app_resources.join("fonts")).unwrap();
+
+    let bundled_sheet = app_resources.join("atlas/emoji-sheet.bin");
+    let bundled_font = app_resources.join("fonts/Cousine-Regular.ttf");
+    std::fs::write(&bundled_sheet, b"bundle-sheet").unwrap();
+    std::fs::write(&bundled_font, b"bundle-font").unwrap();
+
+    // 1. Explicit flag beats bundle Resources and repo checkout.
+    let explicit = PathBuf::from("/custom/override-sheet.bin");
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            Some(&explicit),
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        explicit
+    );
+    let cli = parse(&["--emoji-sheet", "/custom/override-sheet.bin"]);
+    match cli.action() {
+        CliCommand::Wall { emoji_sheet, .. } => assert_eq!(emoji_sheet, explicit),
+        other => panic!("expected Wall, got {other:?}"),
+    }
+
+    // 2. Inside a macOS .app bundle with no repo checkout, Contents/Resources wins.
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        bundled_sheet
+    );
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "fonts/Cousine-Regular.ttf",
+        ),
+        bundled_font
+    );
+    // Code-scene atlas files not placed in Contents/Resources/atlas still fall back to repo_assets.
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&app_macos),
+            &missing_repo,
+            "atlas/codepoints.bin",
+        ),
+        missing_repo.join("atlas/codepoints.bin")
+    );
+
+    // 3. On Linux/XDG prefix installs (<prefix>/bin/glyph3d-native), <prefix>/share/glyph3d-wall wins.
+    let xdg_exe = root.join("local/bin/glyph3d-native");
+    let xdg_sheet = root.join("local/share/glyph3d-wall/atlas/emoji-sheet.bin");
+    std::fs::create_dir_all(xdg_exe.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(xdg_sheet.parent().unwrap()).unwrap();
+    std::fs::write(&xdg_sheet, b"xdg-sheet").unwrap();
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&xdg_exe),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        xdg_sheet
+    );
+
+    // 4. Unbundled dev binary (target/release/glyph3d-native) falls back to repo assets.
+    let dev_exe = root.join("target/release/glyph3d-native");
+    assert_eq!(
+        crate::resolve_runtime_asset_with(
+            None,
+            Some(&dev_exe),
+            &missing_repo,
+            "atlas/emoji-sheet.bin",
+        ),
+        missing_repo.join("atlas/emoji-sheet.bin")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 

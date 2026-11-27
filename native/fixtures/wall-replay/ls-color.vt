@@ -1,0 +1,31 @@
+[?1049l[!p[?7h[?9l[?1000l[?1002l[?1003l[?1005l[?1006l[?1015l[?1016l[?1004l[?2004l[=0;1u[H[2J[3g[9GH[17GH[25GH[33GH[41GH[49GH[57GH[65GH[73GH[H
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[1;1H[0m]2;
+[34mast-grep[39;49m[0m                emoji_font.py           [31mgen_schema.py[39;49m[0m
+[31mbench_hyper.py[39;49m[0m          emoji_inventory.py      preview_glyphs.py
+[31mcheck_atlas.py[39;49m[0m          export-atlas.mjs        [34mrelax-fidelity[39;49m[0m
+[31mcheck-all.sh[39;49m[0m            g_pick_oracle.py        repro_pick_oblique.py
+[31mcheck-fixture-parity.sh[39;49m[0m gen_cluster_table.py    [34mvendor[39;49m[0m
+[31mcheck-pick-oracle.sh[39;49m[0m    gen_emoji_corpus.py     [31mvendor-manifest.py[39;49m[0m
+decode-slug-core.mjs    gen_emoji_sheet.py      verify_atlas.py

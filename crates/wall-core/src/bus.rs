@@ -1,0 +1,711 @@
+//! Port of the pure helpers in `wall/WallBus.js`: gomuxai status ranks and colours
+//! ([`BUS_STATUSES`], [`bus_status`]), target syntax validation and formatting
+//! ([`is_bus_target`], [`bus_target`], [`local_bus_name`], [`gomux_screen_id`]),
+//! attachability ([`bus_attachable`]), host/agent ordering and lookup ([`bus_hosts`],
+//! [`find_bus_agent`]), and the remote attach shell command ([`attach_argv`]).
+
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+/// Display rank, colour (`#rrggbb`), and canonical label for an agent status (`BUS_STATUSES`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusStatusInfo {
+    pub rank: u8,
+    pub colour: &'static str,
+    pub word: &'static str,
+}
+
+/// Known gomuxai agent statuses in display priority order (`WallBus.BUS_STATUSES`).
+pub const BUS_STATUSES: &[(&str, BusStatusInfo)] = &[
+    (
+        "waiting",
+        BusStatusInfo {
+            rank: 0,
+            colour: "#f2b45a",
+            word: "waiting",
+        },
+    ),
+    (
+        "error",
+        BusStatusInfo {
+            rank: 1,
+            colour: "#ef6f6c",
+            word: "error",
+        },
+    ),
+    (
+        "processing",
+        BusStatusInfo {
+            rank: 2,
+            colour: "#7fb0ff",
+            word: "processing",
+        },
+    ),
+    (
+        "idle",
+        BusStatusInfo {
+            rank: 3,
+            colour: "#8ef0b8",
+            word: "idle",
+        },
+    ),
+    (
+        "unknown",
+        BusStatusInfo {
+            rank: 4,
+            colour: "#8b95a7",
+            word: "unknown",
+        },
+    ),
+    (
+        "ended",
+        BusStatusInfo {
+            rank: 5,
+            colour: "#5d6574",
+            word: "ended",
+        },
+    ),
+];
+
+/// Look up [`BusStatusInfo`] for `status`, falling back to `unknown` (`WallBus.busStatus`).
+pub fn bus_status(status: Option<&str>) -> BusStatusInfo {
+    if let Some(s) = status {
+        if let Some((_, info)) = BUS_STATUSES.iter().find(|(k, _)| *k == s) {
+            return *info;
+        }
+    }
+    BusStatusInfo {
+        rank: 4,
+        colour: "#8b95a7",
+        word: "unknown",
+    }
+}
+
+fn is_valid_bus_name(part: &str) -> bool {
+    let mut bytes = part.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Whether `s` is a valid gomuxai attach target (`name` or `name@host`, matching
+/// `^[A-Za-z0-9][A-Za-z0-9_-]*(@[A-Za-z0-9][A-Za-z0-9_-]*)?$`; `WallBus.isBusTarget`).
+pub fn is_bus_target(s: &str) -> bool {
+    match s.split_once('@') {
+        None => is_valid_bus_name(s),
+        Some((name, host)) => is_valid_bus_name(name) && is_valid_bus_name(host),
+    }
+}
+
+/// One agent entry in a [`GomuxSnapshot`] (`GomuxProvider.GomuxAgent`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GomuxAgent {
+    pub name: String,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub parent: String,
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub data_dir: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub attached: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub end_reason: Option<String>,
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<String>,
+    #[serde(default)]
+    pub status_at: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub transcript: Option<String>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub transcript_size: Option<u64>,
+    #[serde(default)]
+    pub transcript_mtime: Option<u64>,
+}
+
+/// Snapshot of gomuxai agents across one or more hosts (`GomuxProvider.GomuxSnapshot`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GomuxSnapshot {
+    #[serde(default)]
+    pub gen: u64,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    #[serde(default)]
+    pub agents: Vec<GomuxAgent>,
+}
+
+/// Format the target `agent attach` takes for `agent`: `name`, or `name@host` when `host` is
+/// non-empty (`WallBus.busTarget`).
+pub fn bus_target(agent: &GomuxAgent) -> String {
+    match agent.host.as_deref().filter(|h| !h.is_empty()) {
+        Some(host) => format!("{}@{host}", agent.name),
+        None => agent.name.clone(),
+    }
+}
+
+/// If `target` (`name` or `name@host`) names an agent on THIS machine (no `@host`, or
+/// `@<snap.host>` when `snap` names this machine), return its bare local `name`; otherwise
+/// `None` (`WallBus.localBusName`).
+pub fn local_bus_name<'a>(target: &'a str, snap: Option<&GomuxSnapshot>) -> Option<&'a str> {
+    if !is_bus_target(target) {
+        return None;
+    }
+    match target.split_once('@') {
+        None => Some(target),
+        Some((name, host)) => {
+            let local_host = snap
+                .and_then(|s| s.host.as_deref())
+                .filter(|h| !h.is_empty())?;
+            (host == local_host).then_some(name)
+        }
+    }
+}
+
+/// Display terminal id for a local gomuxai agent's direct `termd` subscription
+/// (`gx-<sanitized>`, matching `WallBus.gomuxScreenId` and `cli/gomux.go`).
+pub fn gomux_screen_id(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(61)
+        .collect();
+    format!("gx-{sanitized}")
+}
+
+/// Whether `agent` has a live session to attach to (`WallBus.busAttachable`).
+///
+/// An omitted `attached` (`None`, when a remote host could not report it) is treated as
+/// attachable; only an explicit `Some(false)` refuses.
+pub fn bus_attachable(agent: &GomuxAgent) -> bool {
+    agent.attached != Some(false)
+}
+
+/// Enriched agent entry returned inside [`BusHostGroup`], carrying its computed `target`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusAgent {
+    pub agent: GomuxAgent,
+    pub target: String,
+}
+
+impl std::ops::Deref for BusAgent {
+    type Target = GomuxAgent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.agent
+    }
+}
+
+/// One host's sorted live agents as returned by [`bus_hosts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusHostGroup {
+    pub host: String,
+    pub agents: Vec<BusAgent>,
+}
+
+fn locale_like_cmp(a: &str, b: &str) -> Ordering {
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        let la = ca.to_ascii_lowercase();
+        let lb = cb.to_ascii_lowercase();
+        match la.cmp(&lb) {
+            Ordering::Equal => match ca.cmp(&cb) {
+                Ordering::Equal => continue,
+                // In JS `localeCompare`, lowercase sorts before uppercase for the same letter.
+                other => return other.reverse(),
+            },
+            other => return other,
+        }
+    }
+    a.chars().count().cmp(&b.chars().count())
+}
+
+/// Group live agents by host: this machine's host first (`""` or `snap.host`), then remote
+/// hosts alphabetically; within each host, `waiting` first (`bus_status` rank), then by name
+/// (`WallBus.busHosts`).
+pub fn bus_hosts(snap: Option<&GomuxSnapshot>) -> Vec<BusHostGroup> {
+    let Some(snap) = snap else {
+        return Vec::new();
+    };
+    let mut by_host: BTreeMap<String, Vec<BusAgent>> = BTreeMap::new();
+    let mut host_order: Vec<String> = Vec::new();
+
+    for a in &snap.agents {
+        if !a.live || a.name.is_empty() {
+            continue;
+        }
+        let host = a.host.clone().unwrap_or_default();
+        if !by_host.contains_key(&host) {
+            host_order.push(host.clone());
+        }
+        by_host.entry(host).or_default().push(BusAgent {
+            target: bus_target(a),
+            agent: a.clone(),
+        });
+    }
+
+    for list in by_host.values_mut() {
+        list.sort_by(|x, y| {
+            bus_status(x.status.as_deref())
+                .rank
+                .cmp(&bus_status(y.status.as_deref()).rank)
+                .then_with(|| locale_like_cmp(&x.name, &y.name))
+        });
+    }
+
+    let local_host = snap.host.as_deref().unwrap_or("");
+    let here = |h: &str| -> u8 {
+        if h.is_empty() || (!local_host.is_empty() && h == local_host) {
+            0
+        } else {
+            1
+        }
+    };
+    host_order.sort_by(|x, y| here(x).cmp(&here(y)).then_with(|| locale_like_cmp(x, y)));
+
+    host_order
+        .into_iter()
+        .filter_map(|host| {
+            by_host
+                .remove(&host)
+                .map(|agents| BusHostGroup { host, agents })
+        })
+        .collect()
+}
+
+/// Find the live agent named by `target` (`name` or `name@host`) in `snap` (`WallBus.find`).
+///
+/// A bare `name` also matches `name@<snap.host>` when `snap.host` is populated.
+pub fn find_bus_agent(snap: Option<&GomuxSnapshot>, target: &str) -> Option<BusAgent> {
+    let hosts = bus_hosts(snap);
+    for h in &hosts {
+        for a in &h.agents {
+            if a.target == target {
+                return Some(a.clone());
+            }
+        }
+    }
+    if !target.is_empty() && !target.contains('@') {
+        if let Some(local_host) = snap
+            .and_then(|s| s.host.as_deref())
+            .filter(|h| !h.is_empty())
+        {
+            for h in hosts {
+                if h.host != local_host {
+                    continue;
+                }
+                for a in h.agents {
+                    if a.name == target {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+const ATTACH_RESET: &str = "\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?1015l\\033[?1004l\\033[?2004l\\033[?1049l\\033[?25h\\033[0m";
+
+/// Build the `sh -c` argv a remote `wall.attach <name>@<host>` terminal runs (`WallBus.attachArgv`).
+///
+/// Validated with [`is_bus_target`] first; `target` is passed exclusively as positional `$1`,
+/// never interpolated into the shell script text.
+pub fn attach_argv(target: &str) -> Result<Vec<String>, String> {
+    if !is_bus_target(target) {
+        return Err(format!(
+            "'{target}' isn't an agent name (name or name@host)"
+        ));
+    }
+    let script = [
+        "command -v agent >/dev/null 2>&1 || PATH=\"$(\"${SHELL:-/bin/sh}\" -lc 'printf %s \"$PATH\"' 2>/dev/null):$PATH\"".to_string(),
+        "while :; do".to_string(),
+        "  agent attach \"$1\"; s=$?".to_string(),
+        "  [ \"$s\" -eq 0 ] && exit 0".to_string(),
+        format!("  printf '{ATTACH_RESET}'"),
+        "  stty sane 2>/dev/null".to_string(),
+        "  printf '\\r\\n[agent attach %s ended with status %d. Enter attaches again; q then Enter closes.]\\r\\n' \"$1\" \"$s\"".to_string(),
+        "  read -r a || exit 0".to_string(),
+        "  [ \"$a\" = q ] && exit 0".to_string(),
+        "done".to_string(),
+    ]
+    .join("\n");
+    Ok(vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script,
+        "wall-attach".to_string(),
+        target.to_string(),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    use super::*;
+    use crate::store::WallStore;
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(prefix: &str) -> Self {
+            let n = TEST_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "wall-core-bus-{prefix}-{}-{n}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_agent(name: &str) -> GomuxAgent {
+        GomuxAgent {
+            name: name.to_string(),
+            live: true,
+            attached: Some(true),
+            status: Some("idle".to_string()),
+            ..GomuxAgent::default()
+        }
+    }
+
+    #[test]
+    fn target_is_name_here_and_name_at_host_on_another_host() {
+        assert_eq!(bus_target(&make_agent("helper")), "helper");
+        let remote = GomuxAgent {
+            host: Some("workstation".to_string()),
+            ..make_agent("helper")
+        };
+        assert_eq!(bus_target(&remote), "helper@workstation");
+
+        for ok in ["helper", "helper-m2", "a_b@workstation", "X@laptop-2"] {
+            assert!(is_bus_target(ok), "expected valid target: {ok}");
+        }
+        for bad in ["", "-x", "a b", "a@", "@h", "a@b@c", "a;rm", "a.b", "$(x)"] {
+            assert!(!is_bus_target(bad), "expected invalid target: {bad}");
+        }
+    }
+
+    #[test]
+    fn hosts_live_agents_only_this_host_first_then_by_name_waiting_first_within_host() {
+        let snap = GomuxSnapshot {
+            gen: 1,
+            host: None,
+            dirs: Vec::new(),
+            agents: vec![
+                GomuxAgent {
+                    host: Some("workstation".into()),
+                    status: Some("processing".into()),
+                    ..make_agent("zeta")
+                },
+                GomuxAgent {
+                    status: Some("idle".into()),
+                    ..make_agent("b")
+                },
+                GomuxAgent {
+                    status: Some("ended".into()),
+                    ..make_agent("a")
+                },
+                GomuxAgent {
+                    status: Some("waiting".into()),
+                    ..make_agent("c")
+                },
+                GomuxAgent {
+                    live: false,
+                    ..make_agent("gone")
+                },
+                GomuxAgent {
+                    host: Some("aardvark".into()),
+                    ..make_agent("alpha")
+                },
+                GomuxAgent {
+                    status: Some("idle".into()),
+                    ..make_agent("d")
+                },
+            ],
+        };
+        let hosts = bus_hosts(Some(&snap));
+        let host_names: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(host_names, vec!["", "aardvark", "workstation"]);
+        let local_names: Vec<&str> = hosts[0].agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(local_names, vec!["c", "b", "d", "a"]);
+        assert_eq!(hosts[2].agents[0].target, "zeta@workstation");
+        assert!(bus_hosts(None).is_empty());
+
+        let named_snap = GomuxSnapshot {
+            gen: 1,
+            host: Some("workstation".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                GomuxAgent {
+                    host: Some("aardvark".into()),
+                    ..make_agent("far")
+                },
+                GomuxAgent {
+                    host: Some("workstation".into()),
+                    ..make_agent("here")
+                },
+                GomuxAgent {
+                    host: Some("laptop".into()),
+                    attached: None,
+                    ..make_agent("far")
+                },
+            ],
+        };
+        let named = bus_hosts(Some(&named_snap));
+        let named_hosts: Vec<&str> = named.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(named_hosts, vec!["workstation", "aardvark", "laptop"]);
+        let targets: Vec<&str> = named.iter().map(|h| h.agents[0].target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["here@workstation", "far@aardvark", "far@laptop"]
+        );
+    }
+
+    #[test]
+    fn attachable_unless_host_says_session_is_gone_and_unknown_status_reads_as_unknown() {
+        assert!(bus_attachable(&make_agent("a")));
+        assert!(bus_attachable(&GomuxAgent {
+            attached: None,
+            ..make_agent("a")
+        }));
+        assert!(!bus_attachable(&GomuxAgent {
+            attached: Some(false),
+            ..make_agent("a")
+        }));
+        assert_eq!(bus_status(Some("nonsense")).word, "unknown");
+        assert_eq!(bus_status(None).word, "unknown");
+    }
+
+    #[test]
+    fn attach_argv_refuses_non_agent_names_and_never_embeds_target_in_script() {
+        assert!(attach_argv("a b")
+            .unwrap_err()
+            .contains("isn't an agent name"));
+        assert!(attach_argv("$(touch x)").is_err());
+        let argv = attach_argv("helper@workstation").unwrap();
+        assert_eq!(&argv[0..2], &["sh", "-c"]);
+        assert!(!argv[2].contains("helper"));
+        assert_eq!(argv.last().unwrap(), "helper@workstation");
+    }
+
+    #[test]
+    fn attach_program_exits_on_clean_detach_resets_terminal_on_failure_and_retries_on_enter() {
+        let dir = ScratchDir::new("sh");
+        let log_path = dir.0.join("args");
+        let agent_path = dir.0.join("agent");
+        let stub_script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit \"${{AGENT_EXIT:-0}}\"\n",
+            log_path.display()
+        );
+        fs::write(&agent_path, stub_script).unwrap();
+        fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |exit_code: i32, input: &str| -> std::process::Output {
+            let _ = fs::remove_file(&log_path);
+            let argv = attach_argv("helper@workstation").unwrap();
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.0.display()))
+                .env("AGENT_EXIT", exit_code.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+            child.wait_with_output().unwrap()
+        };
+
+        let ok = run(0, "");
+        assert_eq!(ok.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "");
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "attach\nhelper@workstation\n"
+        );
+
+        let reason =
+            "[agent attach helper@workstation ended with status 255. Enter attaches again; q then Enter closes.]";
+        let closed = run(255, "q\n");
+        assert_eq!(closed.status.code(), Some(0));
+        let closed_out = String::from_utf8_lossy(&closed.stdout);
+        assert_eq!(closed_out.matches(reason).count(), 1);
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "attach\nhelper@workstation\n"
+        );
+        let reason_pos = closed_out.find(reason).unwrap();
+        let before = &closed_out[..reason_pos];
+        for off in [
+            "?1000l", "?1002l", "?1003l", "?1006l", "?1004l", "?2004l", "?1049l", "?25h",
+        ] {
+            assert!(
+                before.contains(&format!("\x1b[{off}")),
+                "missing reset sequence {off} before reason"
+            );
+        }
+
+        // Enter attaches again; EOF closes.
+        let again = run(1, "\n");
+        assert_eq!(again.status.code(), Some(0));
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            "attach\nhelper@workstation\nattach\nhelper@workstation\n"
+        );
+        let again_out = String::from_utf8_lossy(&again.stdout);
+        assert_eq!(again_out.matches("ended with status 1.").count(), 2);
+
+        // When termd's PATH lacks `agent`, `$SHELL -lc` supplies the login PATH.
+        let bin = ScratchDir::new("login-sh");
+        let login_sh = bin.0.join("login-sh");
+        fs::write(
+            &login_sh,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -lc ] && printf %s \"{}:/usr/bin:/bin\"\n",
+                dir.0.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&login_sh, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_file(&log_path);
+        let argv = attach_argv("helper").unwrap();
+        let child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", &login_sh)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let via_login = child.wait_with_output().unwrap();
+        assert_eq!(via_login.status.code(), Some(0));
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "attach\nhelper\n");
+    }
+
+    #[test]
+    fn store_remembers_attached_agent_per_scope_and_forgets_with_terminal() {
+        let dir = ScratchDir::new("store-attach");
+        let mut s = WallStore::open(&dir.0, "8099");
+        s.set_attached("term-1", Some("helper"));
+        s.set_attached("term-2", Some("far@workstation"));
+        assert_eq!(
+            WallStore::open(&dir.0, "8099").attached("term-2"),
+            Some("far@workstation")
+        );
+        assert_eq!(WallStore::open(&dir.0, "8093").attached("term-2"), None);
+        assert_eq!(s.attached_to("helper"), vec!["term-1"]);
+        s.forget("term-1");
+        assert_eq!(s.attached("term-1"), None);
+        assert_eq!(s.prune([] as [&str; 0]), vec!["term-2"]);
+        assert!(WallStore::open(&dir.0, "8099")
+            .attached_to("far@workstation")
+            .is_empty());
+    }
+
+    #[test]
+    fn local_bus_name_and_find_bus_agent_distinguish_local_and_remote_targets() {
+        let snap = GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                GomuxAgent {
+                    host: Some("laptop-2".into()),
+                    session: "agent-wall-m2-agy".into(),
+                    namespace: Some("agents".into()),
+                    ..make_agent("wall-m2-agy")
+                },
+                GomuxAgent {
+                    host: Some("workstation".into()),
+                    session: "agent-glyph3d-lead".into(),
+                    ..make_agent("glyph3d-lead")
+                },
+            ],
+        };
+        assert_eq!(
+            local_bus_name("wall-m2-agy", Some(&snap)),
+            Some("wall-m2-agy")
+        );
+        assert_eq!(
+            local_bus_name("wall-m2-agy@laptop-2", Some(&snap)),
+            Some("wall-m2-agy")
+        );
+        assert_eq!(local_bus_name("glyph3d-lead@workstation", Some(&snap)), None);
+        assert_eq!(local_bus_name("glyph3d-lead@workstation", None), None);
+        assert_eq!(gomux_screen_id("wall-m2-agy"), "gx-wall-m2-agy");
+
+        assert_eq!(
+            find_bus_agent(Some(&snap), "wall-m2-agy")
+                .unwrap()
+                .name,
+            "wall-m2-agy"
+        );
+        assert_eq!(
+            find_bus_agent(Some(&snap), "wall-m2-agy@laptop-2")
+                .unwrap()
+                .name,
+            "wall-m2-agy"
+        );
+        assert_eq!(
+            find_bus_agent(Some(&snap), "glyph3d-lead@workstation")
+                .unwrap()
+                .name,
+            "glyph3d-lead"
+        );
+        assert!(find_bus_agent(Some(&snap), "glyph3d-lead").is_none());
+    }
+}

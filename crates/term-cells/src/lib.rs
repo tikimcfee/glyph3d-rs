@@ -1,0 +1,472 @@
+//! A terminal's screen as plain data: what an emulator hands a renderer.
+//!
+//! This crate is the seam between the two (2026-11-26, the wall): `glyph-vt`
+//! fills a [`Screen`] from a terminal's bytes, and the cell renderer in
+//! `native/src/wall` draws one. Neither knows the other. Nothing here does
+//! any work beyond holding and indexing the data, so it has no dependencies.
+//!
+//! A [`Cell`] is drawn as its producer resolved it: colours are final sRGB,
+//! with inverse, conceal and "bold is bright" already applied. A renderer
+//! never looks at a palette.
+
+/// A cell's attributes, one bit per SGR attribute. The layout is the JS
+/// renderer's `core/cellAttrs.js`, which is also the layout termd's packed
+/// cells are planned to carry, so a word can be copied across unchanged.
+pub mod attrs {
+    /// SGR 1. Picks the bold face; changes no colour.
+    pub const BOLD: u16 = 1 << 0;
+    /// SGR 2 (faint).
+    pub const DIM: u16 = 1 << 1;
+    /// SGR 3. Picks the italic face.
+    pub const ITALIC: u16 = 1 << 2;
+    /// SGR 5/6. Held, not drawn.
+    pub const BLINK: u16 = 1 << 3;
+    /// SGR 7. Already applied to `fg`/`bg`; kept so a reader can tell.
+    pub const INVERSE: u16 = 1 << 4;
+    /// SGR 8. Already applied (the content is blank); kept so a reader can tell.
+    pub const CONCEAL: u16 = 1 << 5;
+    /// SGR 9.
+    pub const STRIKE: u16 = 1 << 6;
+    /// SGR 53.
+    pub const OVERLINE: u16 = 1 << 7;
+    /// Bits 8..10: the underline style, one of the `UNDERLINE_*` values.
+    pub const UNDERLINE_SHIFT: u16 = 8;
+    pub const UNDERLINE_MASK: u16 = 7 << UNDERLINE_SHIFT;
+    /// SGR 58 named a colour for the underline: it is the cell's `ul`.
+    /// Without this bit the underline takes the text's colour.
+    pub const UNDERLINE_COLOR: u16 = 1 << 11;
+
+    pub const UNDERLINE_NONE: u16 = 0;
+    pub const UNDERLINE_SINGLE: u16 = 1;
+    pub const UNDERLINE_DOUBLE: u16 = 2;
+    pub const UNDERLINE_CURLY: u16 = 3;
+    pub const UNDERLINE_DOTTED: u16 = 4;
+    pub const UNDERLINE_DASHED: u16 = 5;
+
+    /// The underline style of an attributes word (`UNDERLINE_NONE` ..).
+    pub const fn underline(attrs: u16) -> u16 {
+        (attrs & UNDERLINE_MASK) >> UNDERLINE_SHIFT
+    }
+
+    /// The face a cell draws in: bit 0 bold, bit 1 italic ([`super::Face`]).
+    pub const fn face(attrs: u16) -> u8 {
+        ((attrs & BOLD != 0) as u8) | (((attrs & ITALIC != 0) as u8) << 1)
+    }
+}
+
+/// Which of a font family's four faces draws a glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Face {
+    #[default]
+    Regular = 0,
+    Bold = 1,
+    Italic = 2,
+    BoldItalic = 3,
+}
+
+impl Face {
+    pub const fn from_bits(bits: u8) -> Face {
+        match bits & 3 {
+            0 => Face::Regular,
+            1 => Face::Bold,
+            2 => Face::Italic,
+            _ => Face::BoldItalic,
+        }
+    }
+}
+
+/// A colour as the engine's colour lanes hold it: sRGB, 8 bits a channel,
+/// red in the low byte, alpha in the high one.
+pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
+    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
+}
+
+/// An opaque colour ([`rgba`] with alpha 255).
+pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    rgba(r, g, b, 255)
+}
+
+/// A `Cell::content` at or above this is a cluster: `content -
+/// CLUSTER_BASE` indexes [`Screen::clusters`]. Below it, content is a
+/// Unicode scalar value (every one is under 0x11_0000).
+pub const CLUSTER_BASE: u32 = 0x11_0000;
+
+/// One cell of the screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct Cell {
+    /// What the cell shows: 0 for nothing, a Unicode scalar value, or a
+    /// cluster (a base and its combining marks, or an emoji sequence) as
+    /// `CLUSTER_BASE + index` into [`Screen::clusters`].
+    pub content: u32,
+    /// The colour the text draws in ([`rgba`] packing), always resolved.
+    pub fg: u32,
+    /// The cell's fill. Alpha 0 means no fill: the terminal's own
+    /// background shows.
+    pub bg: u32,
+    /// The underline's own colour; read only under `attrs::UNDERLINE_COLOR`.
+    pub ul: u32,
+    /// The `attrs` flags.
+    pub attrs: u16,
+    /// How many columns the content spans: 1, or 2 for a wide character's
+    /// first cell. Its second cell has width 0 and content 0, and carries
+    /// the same `bg`.
+    pub width: u8,
+    pub _pad: u8,
+}
+
+impl Cell {
+    /// A blank cell that draws nothing and fills nothing.
+    pub const BLANK: Cell = Cell { content: 0, fg: 0, bg: 0, ul: 0, attrs: 0, width: 1, _pad: 0 };
+}
+
+/// The cursor's shape (DECSCUSR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+}
+
+/// Where the cursor is and how it draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Cursor {
+    pub col: u16,
+    pub row: u16,
+    /// False while the program hid it (DECTCEM off) or a scrollback view
+    /// is showing.
+    pub visible: bool,
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+/// Which pointer events the program asked to hear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseTracking {
+    #[default]
+    Off,
+    /// DECSET 9: presses only.
+    X10,
+    /// DECSET 1000: presses and releases.
+    Normal,
+    /// DECSET 1002: and moves with a button held.
+    Button,
+    /// DECSET 1003: and every move.
+    Any,
+}
+
+/// How pointer coordinates and buttons are encoded when [`MouseTracking`] is
+/// active (DECSET 1005 / 1006 / 1015 / 1016, the last set winning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MouseFormat {
+    /// Classic X10/X11 byte encoding (default when 1005/1006/1015/1016 are off).
+    #[default]
+    X10,
+    /// DECSET 1005: UTF-8 multibyte cell coordinates.
+    Utf8,
+    /// DECSET 1006: SGR `CSI < Pb ; Px ; Py M/m` cell coordinates.
+    Sgr,
+    /// DECSET 1015: urxvt `CSI Pb ; Px ; Py M` decimal cell coordinates.
+    Urxvt,
+    /// DECSET 1016: SGR `CSI < Pb ; Px ; Py M/m` pixel coordinates.
+    SgrPixels,
+}
+
+/// The modes a host needs to route input and frame updates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Modes {
+    pub alt_screen: bool,
+    pub mouse: MouseTracking,
+    pub mouse_format: MouseFormat,
+    pub bracketed_paste: bool,
+    pub app_cursor: bool,
+    pub focus_events: bool,
+    /// Active screen's Kitty keyboard protocol flags (`0..=31`, `CSI > / = / < u`).
+    pub kitty_keyboard: u8,
+    /// DECSET 2026: program is mid-frame and asked the viewer to hold presentation.
+    pub synchronized_output: bool,
+}
+
+/// One contiguous run of columns on a single row carrying an `OSC 8` hyperlink.
+///
+/// `start_col..end_col` is half-open in cell columns (`0..=cols`, `start_col < end_col`),
+/// including any trailing wide-character half belonging to a linked cell.
+/// `link_id` is a 0-based index into [`Screen::hyperlinks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub link_id: u32,
+}
+
+/// Resolved `OSC 8` hyperlink under a cell, joined across soft-wrapped rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenLink<'a> {
+    pub uri: &'a str,
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    /// End-exclusive column on `end_row` (`1..=cols`).
+    pub end_col: u16,
+}
+
+/// A terminal's visible screen.
+///
+/// Rows are top to bottom, cells left to right, `cols * rows` of them.
+/// `row_gen[r]` is the value of `generation` when row `r` last changed, so
+/// a renderer that remembers the generation it last drew uploads only the
+/// rows above it.
+#[derive(Clone, Debug, Default)]
+pub struct Screen {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<Cell>,
+    /// Per row: `generation` when it last changed.
+    pub row_gen: Vec<u64>,
+    /// Per row: the row continues on the next one (a soft wrap). Selection
+    /// joins such rows into one line.
+    pub wrapped: Vec<bool>,
+    /// Bumped by every change to the cells, the cursor, the modes, the
+    /// title or the size.
+    pub generation: u64,
+    pub cursor: Cursor,
+    pub modes: Modes,
+    pub title: String,
+    /// The texts `Cell::content` refers to at `CLUSTER_BASE + index`.
+    pub clusters: Vec<String>,
+    /// Deduplicated `OSC 8` hyperlink URIs referenced by [`Screen::link_spans`].
+    pub hyperlinks: Vec<String>,
+    /// Sorted by `(row, start_col)`, non-overlapping runs of cells carrying an `OSC 8` hyperlink.
+    pub link_spans: Vec<LinkSpan>,
+    /// The terminal's own colours: what an unstyled cell draws in, and the
+    /// panel behind every cell with no fill.
+    pub default_fg: u32,
+    pub default_bg: u32,
+    /// The colour the program asked its cursor to be (OSC 12), or the
+    /// theme's. Alpha 0 means it named none: the host draws its own.
+    pub cursor_color: u32,
+}
+
+impl Screen {
+    /// A blank screen of `cols` by `rows`.
+    pub fn new(cols: u16, rows: u16) -> Screen {
+        let mut s = Screen { default_fg: rgb(0xd8, 0xde, 0xe9), default_bg: rgb(0x0d, 0x10, 0x17), ..Screen::default() };
+        s.resize(cols, rows);
+        s
+    }
+
+    /// Change the size, blanking every cell. Bumps `generation` and marks
+    /// every row changed.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        self.generation += 1;
+        self.cells.clear();
+        self.cells.resize(cols as usize * rows as usize, Cell::BLANK);
+        self.row_gen.clear();
+        self.row_gen.resize(rows as usize, self.generation);
+        self.wrapped.clear();
+        self.wrapped.resize(rows as usize, false);
+        self.hyperlinks.clear();
+        self.link_spans.clear();
+    }
+
+    /// Row `r`'s cells.
+    pub fn row(&self, r: u16) -> &[Cell] {
+        let c = self.cols as usize;
+        &self.cells[r as usize * c..(r as usize + 1) * c]
+    }
+
+    /// Row `r`'s cells, to write. The caller marks the row changed
+    /// ([`Screen::touch_row`]) if it changed one.
+    pub fn row_mut(&mut self, r: u16) -> &mut [Cell] {
+        let c = self.cols as usize;
+        &mut self.cells[r as usize * c..(r as usize + 1) * c]
+    }
+
+    /// Mark row `r` changed: bumps `generation` and stamps the row with it.
+    pub fn touch_row(&mut self, r: u16) {
+        self.generation += 1;
+        self.row_gen[r as usize] = self.generation;
+    }
+
+    /// The text of a cell's content: the scalar as a string, the cluster's
+    /// text, or empty.
+    pub fn content_str(&self, cell: &Cell) -> std::borrow::Cow<'_, str> {
+        if cell.content == 0 {
+            std::borrow::Cow::Borrowed("")
+        } else if cell.content >= CLUSTER_BASE {
+            match self.clusters.get((cell.content - CLUSTER_BASE) as usize) {
+                Some(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                None => std::borrow::Cow::Borrowed(""),
+            }
+        } else {
+            match char::from_u32(cell.content) {
+                Some(c) => std::borrow::Cow::Owned(c.to_string()),
+                None => std::borrow::Cow::Borrowed(""),
+            }
+        }
+    }
+
+    /// Return the single-row [`LinkSpan`] covering `(col, row)`, if any.
+    pub fn hyperlink_span_at(&self, col: u16, row: u16) -> Option<LinkSpan> {
+        if col >= self.cols || row >= self.rows || self.link_spans.is_empty() {
+            return None;
+        }
+        let idx = self.link_spans.partition_point(|s| (s.row, s.start_col) <= (row, col));
+        if idx == 0 {
+            return None;
+        }
+        let cand = self.link_spans[idx - 1];
+        (cand.row == row && col >= cand.start_col && col < cand.end_col).then_some(cand)
+    }
+
+    /// Return the `OSC 8` hyperlink URI at `(col, row)`, if any.
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<&str> {
+        let span = self.hyperlink_span_at(col, row)?;
+        self.hyperlinks.get(span.link_id as usize).map(String::as_str)
+    }
+
+    /// Return the `OSC 8` hyperlink at `(col, row)` together with its full
+    /// contiguous span joined across soft-wrapped rows (`Screen::wrapped`).
+    pub fn hyperlink_range_at(&self, col: u16, row: u16) -> Option<ScreenLink<'_>> {
+        if col >= self.cols || row >= self.rows || self.link_spans.is_empty() {
+            return None;
+        }
+        let pos = self.link_spans.partition_point(|s| (s.row, s.start_col) <= (row, col));
+        if pos == 0 {
+            return None;
+        }
+        let hit_idx = pos - 1;
+        let hit = self.link_spans[hit_idx];
+        if hit.row != row || col < hit.start_col || col >= hit.end_col {
+            return None;
+        }
+        let uri = self.hyperlinks.get(hit.link_id as usize)?.as_str();
+        let target_id = hit.link_id;
+
+        let mut lo_idx = hit_idx;
+        while lo_idx > 0 && self.link_spans[lo_idx].start_col == 0 && self.link_spans[lo_idx].row > 0 {
+            let prev_row = self.link_spans[lo_idx].row - 1;
+            let prev = self.link_spans[lo_idx - 1];
+            if self.wrapped.get(usize::from(prev_row)).copied().unwrap_or(false)
+                && prev.row == prev_row
+                && prev.end_col == self.cols
+                && prev.link_id == target_id
+            {
+                lo_idx -= 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut hi_idx = hit_idx;
+        while hi_idx + 1 < self.link_spans.len()
+            && self.link_spans[hi_idx].end_col == self.cols
+            && usize::from(self.link_spans[hi_idx].row) + 1 < usize::from(self.rows)
+        {
+            let cur_row = self.link_spans[hi_idx].row;
+            let next = self.link_spans[hi_idx + 1];
+            if self.wrapped.get(usize::from(cur_row)).copied().unwrap_or(false)
+                && next.row == cur_row + 1
+                && next.start_col == 0
+                && next.link_id == target_id
+            {
+                hi_idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        let first = self.link_spans[lo_idx];
+        let last = self.link_spans[hi_idx];
+        Some(ScreenLink {
+            uri,
+            start_row: first.row,
+            start_col: first.start_col,
+            end_row: last.row,
+            end_col: last.end_col,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_stays_20_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 20);
+    }
+
+    #[test]
+    fn hyperlink_lookup_single_and_soft_wrapped_spans() {
+        let mut s = Screen::new(10, 4);
+        s.hyperlinks.push("https://example.org/wrapped".into());
+        s.hyperlinks.push("https://example.org/second".into());
+        // Row 0 wraps onto row 1; row 1 does NOT wrap onto row 2.
+        s.wrapped[0] = true;
+        s.link_spans = vec![
+            LinkSpan { row: 0, start_col: 4, end_col: 10, link_id: 0 },
+            LinkSpan { row: 1, start_col: 0, end_col: 6, link_id: 0 },
+            LinkSpan { row: 2, start_col: 0, end_col: 5, link_id: 0 },
+            LinkSpan { row: 2, start_col: 6, end_col: 10, link_id: 1 },
+        ];
+
+        assert_eq!(s.hyperlink_at(3, 0), None);
+        assert_eq!(s.hyperlink_at(4, 0), Some("https://example.org/wrapped"));
+        assert_eq!(s.hyperlink_at(2, 1), Some("https://example.org/wrapped"));
+        assert_eq!(s.hyperlink_at(6, 1), None);
+        assert_eq!(s.hyperlink_at(7, 2), Some("https://example.org/second"));
+
+        let expected_wrapped = Some(ScreenLink {
+            uri: "https://example.org/wrapped",
+            start_row: 0,
+            start_col: 4,
+            end_row: 1,
+            end_col: 6,
+        });
+        assert_eq!(s.hyperlink_range_at(5, 0), expected_wrapped);
+        assert_eq!(s.hyperlink_range_at(2, 1), expected_wrapped);
+
+        // Hard break between row 1 and row 2 must NOT merge even for the same link_id.
+        assert_eq!(
+            s.hyperlink_range_at(1, 2),
+            Some(ScreenLink {
+                uri: "https://example.org/wrapped",
+                start_row: 2,
+                start_col: 0,
+                end_row: 2,
+                end_col: 5,
+            })
+        );
+
+        s.resize(10, 4);
+        assert!(s.hyperlinks.is_empty());
+        assert!(s.link_spans.is_empty());
+    }
+
+    #[test]
+    fn a_screen_indexes_its_rows_and_stamps_what_changed() {
+        let mut s = Screen::new(4, 3);
+        assert_eq!(s.cells.len(), 12);
+        let before = s.generation;
+        s.row_mut(1)[2].content = 'x' as u32;
+        s.touch_row(1);
+        assert_eq!(s.row(1)[2].content, 'x' as u32);
+        assert!(s.row_gen[1] > before);
+        assert_eq!(s.row_gen[0], before);
+        assert_eq!(s.content_str(&s.row(1)[2]), "x");
+    }
+
+    #[test]
+    fn attributes_give_their_face_and_underline() {
+        let a = attrs::BOLD | attrs::ITALIC | (attrs::UNDERLINE_CURLY << attrs::UNDERLINE_SHIFT);
+        assert_eq!(Face::from_bits(attrs::face(a)), Face::BoldItalic);
+        assert_eq!(attrs::underline(a), attrs::UNDERLINE_CURLY);
+        assert_eq!(rgb(1, 2, 3), 0xff03_0201);
+    }
+}
