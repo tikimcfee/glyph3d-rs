@@ -527,16 +527,12 @@ impl TerminalSession {
     }
 
     /// Updates known scrollback history length (`max`) from `g3d-termd`'s pushed `status_follow`
-    /// document (`scrollback_rows`), keeping `max >= offset` while scrolled back.
+    /// document (`scrollback_rows`), keeping `max >= offset` while scrolled back without
+    /// fast-forwarding `seen_meta_gen` (which would swallow pending worker metadata updates such
+    /// as `Role`, `Title`, `Modes`, or `Closed`).
     pub(crate) fn note_status_scrollback(&mut self, scrollback_rows: u64) {
         let mut guard = self.shared.published.lock().expect("published mutex poisoned");
-        let next_max = scrollback_rows.max(guard.meta.scrollback.offset);
-        if guard.meta.scrollback.max != next_max {
-            guard.meta.scrollback.max = next_max;
-            guard.meta.meta_gen += 1;
-            self.meta.scrollback = guard.meta.scrollback;
-            self.seen_meta_gen = guard.meta.meta_gen;
-        }
+        apply_status_scrollback(&mut guard.meta, &mut self.meta, scrollback_rows);
     }
 
     /// Cumulative bell count observed on this session.
@@ -986,7 +982,7 @@ fn session_worker_loop(
                     Event::Role { role, .. } => {
                         role_override = Some(role);
                         meta_dirty = true;
-                        coalescer.mark_dirty();
+                        coalescer.mark_immediate();
                     }
                     Event::Lagged { .. } => {
                         // `termd-client` already triggers a repaint and `termd` pushes resync
@@ -1358,6 +1354,21 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, queue: Arc<AsyncCmdQueue>
     }
 }
 
+fn apply_status_scrollback(
+    published_meta: &mut PublishedMeta,
+    front_meta: &mut PublishedMeta,
+    scrollback_rows: u64,
+) {
+    let next_max = scrollback_rows.max(published_meta.scrollback.offset);
+    if published_meta.scrollback.max != next_max {
+        published_meta.scrollback.max = next_max;
+    }
+    let front_max = scrollback_rows.max(front_meta.scrollback.offset);
+    if front_meta.scrollback.max != front_max {
+        front_meta.scrollback.max = front_max;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,5 +1556,30 @@ mod tests {
         assert!(sync_screen_into(&src, "", &mut dst));
         assert!(dst.generation > g1);
         assert_eq!(dst.cursor_color, src.cursor_color);
+    }
+
+    #[test]
+    fn status_scrollback_update_preserves_unread_worker_meta_gen() {
+        let shared = dummy_shared();
+        let mut front = shared.published.lock().unwrap().meta.clone();
+        let seen_meta_gen = front.meta_gen;
+
+        // Simulate worker thread publishing `Role::Attach` (`meta_gen` 0 -> 1) before `pump()`.
+        {
+            let mut slot = shared.published.lock().unwrap();
+            slot.meta.role = Role::Attach;
+            slot.meta.meta_gen += 1;
+        }
+
+        // `DaemonEvent::Status` arrives in the same `Sessions::pump` pass with new `scrollback_rows`.
+        {
+            let mut slot = shared.published.lock().unwrap();
+            apply_status_scrollback(&mut slot.meta, &mut front, 42);
+            assert_eq!(slot.meta.scrollback.max, 42);
+            assert_eq!(front.scrollback.max, 42);
+            // Unread worker metadata change must still be visible (`meta_gen != seen_meta_gen`).
+            assert_ne!(slot.meta.meta_gen, seen_meta_gen);
+            assert_eq!(slot.meta.role, Role::Attach);
+        }
     }
 }

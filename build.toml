@@ -100,8 +100,8 @@
 # termd-client (25), glyph-vt (235), term-session (11), glyph-font (18,
 # including its doctest), wall-core (257), agent-feed (16), wall-control (7),
 # and native/src/wall (72 unit and offscreen GPU tests).
-# 1154 -> 1173 (2026-11-26): wall-root parity, perf, and idle/status-wake tests (+19).
-test_floor = 1173
+# 1154 -> 1174 (2026-11-26): wall-root parity, perf, and idle/status-wake tests (+20).
+test_floor = 1174
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target `test --relax` runs, each golden render, each kind = "cmd"
