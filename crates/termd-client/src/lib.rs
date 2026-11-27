@@ -12,7 +12,7 @@ pub mod msg;
 pub mod paths;
 
 pub use client::{
-    ConnectOptions, Error, Event, Termd, TermdHandle, DEFAULT_RECONNECT_WINDOW,
+    namespace_left, ConnectOptions, Error, Event, Termd, TermdHandle, DEFAULT_RECONNECT_WINDOW,
     DEFAULT_REQUEST_TIMEOUT, NAMESPACE_LEFT,
 };
 pub use msg::{

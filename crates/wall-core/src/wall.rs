@@ -38,7 +38,8 @@ use term_cells::{Modes, Screen};
 
 use crate::agent_view::{self, AgentViewDims};
 use crate::bus::{
-    attach_argv, bus_attachable, bus_hosts, find_bus_agent, gomux_screen_id,
+    attach_argv, bus_attachable, bus_hosts, find_bus_agent, find_departed_bus_agent,
+    gomux_screen_id,
     is_bus_target, local_bus_name, GomuxSnapshot,
 };
 use crate::camera::{CameraPose, ScreenBox, WallCamera};
@@ -636,6 +637,9 @@ struct WallCore {
     /// True when the local `agents` extra `termd` namespace is connected (`--wall-extra-ns agents`),
     /// so `wall.attach` prefers direct local subscription (`gx-<name>`) over spawning a shell wrapper.
     agents_extra_connected: bool,
+    /// The `agent` binary the host's fleet feed runs, when it resolved one to a path: what a
+    /// `wall.attach` terminal runs ([`attach_argv`]).
+    agent_program: Option<String>,
     platform: Platform,
     char_widths: CharWidths,
     scale_factor: f64,
@@ -1417,6 +1421,7 @@ impl WallCore {
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
             agents_extra_connected: false,
+            agent_program: None,
             platform: opts.platform,
             char_widths: opts.char_widths.sanitized(),
             scale_factor: opts.scale_factor.max(0.1),
@@ -3981,8 +3986,18 @@ impl WallApi for WallCore {
                 };
                 return Err(format!("{target} has no live session to attach to ({why})"));
             }
+        } else if let Some(gone) = find_departed_bus_agent(self.bus.as_ref(), target) {
+            // The fleet holds the record of its end: a terminal for it could only say
+            // `agent "x" not found` (2026-11-27, a click on a stale row did exactly that).
+            let how = match gone.end_reason.as_deref() {
+                Some(r) if !r.is_empty() => format!("ended ({r})"),
+                _ => "ended".to_owned(),
+            };
+            return Err(format!(
+                "{target} is not an agent any more: it {how} and was cleaned up"
+            ));
         }
-        let argv = attach_argv(target)?;
+        let argv = attach_argv(target, self.agent_program.as_deref())?;
         let zoom = self.model.camera().zoom();
         let canonical_target = found
             .map(|a| a.target)
@@ -5648,12 +5663,13 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
-    /// Notify that the `termd` connection ended for good, with the client's reason: `Lost`
-    /// at once when the namespace left on purpose with shells in it, else as
+    /// Notify that the `termd` connection ended for good: `Lost` at once, saying which way
+    /// it left, when the namespace left on purpose with shells in it (its last status
+    /// document said so: [`Self::on_termd_status`] comes first), else as
     /// [`Self::on_termd_disconnected`] ([`TermdStatus::on_gone`]).
-    pub fn on_termd_gone(&mut self, reason: &str, now_ms: u64) {
+    pub fn on_termd_gone(&mut self, now_ms: u64) {
         self.router.context.record_termd_now_ms(now_ms);
-        self.router.context.termd.on_gone(reason, now_ms);
+        self.router.context.termd.on_gone(now_ms);
         self.router.context.model.notify_changed();
     }
 
@@ -5715,6 +5731,19 @@ impl Wall {
     /// Whether the local `agents` extra `termd` namespace is marked connected.
     pub fn agents_extra_connected(&self) -> bool {
         self.router.context.agents_extra_connected
+    }
+
+    /// Name the `agent` binary a `wall.attach` terminal runs: the one the host's own fleet
+    /// feed runs, so the agents the wall lists and the ones it attaches come from one CLI.
+    /// `None` (or a bare name the host could not resolve) leaves the terminal to look
+    /// `agent` up on its own PATH, then its login shell's.
+    pub fn set_agent_program(&mut self, program: Option<String>) {
+        self.router.context.agent_program = program.filter(|p| !p.is_empty());
+    }
+
+    /// The binary [`Self::set_agent_program`] named, if any.
+    pub fn agent_program(&self) -> Option<&str> {
+        self.router.context.agent_program.as_deref()
     }
 
     // ── Verbs ────────────────────────────────────────────────────────────────

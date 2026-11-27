@@ -1308,7 +1308,7 @@ mod tests {
             ..Default::default()
         };
         let mut verbs = Vec::new();
-        let out = ctx.run_ui(raw, |ui| {
+        let out = crate::wall::ui::headless_pass(ctx, raw, |ui| {
             verbs = panels.show(ui.ctx(), wall, &described);
         });
         let shapes = out.shapes.len();
@@ -1359,7 +1359,7 @@ mod tests {
                 time: Some(1.0 + f64::from(step) * 0.1),
                 ..Default::default()
             };
-            let out = ctx.run_ui(raw, |ui| {
+            let out = crate::wall::ui::headless_pass(&ctx, raw, |ui| {
                 let _ = panels.show(ui.ctx(), &wall, &described);
             });
             last_delay = out
@@ -1567,8 +1567,8 @@ mod tests {
                 host: Some("workstation".to_owned()),
                 agents: vec![
                     live("coder", "workstation", "processing"),
-                    live("gate", "workstation", "idle"),
-                    live("probe", "workstation", "waiting"),
+                    live("gate", "far-host", "idle"),
+                    live("probe", "far-host", "waiting"),
                 ],
                 ..Default::default()
             }),
@@ -1576,10 +1576,10 @@ mod tests {
         );
         // `gate` is attached from another host: the wall asks for a terminal
         // (no process runs here), and the one that appears is its attach terminal.
-        assert!(wall.run("wall.attach gate@workstation").text.starts_with("OK"));
+        assert!(wall.run("wall.attach gate@far-host").text.starts_with("OK"));
         wall.terminal_appeared(TerminalAppeared::new("t9", 100, 30));
         let _ = wall.drain_effects();
-        assert_eq!(wall.store().attached("t9"), Some("gate@workstation"));
+        assert_eq!(wall.store().attached("t9"), Some("gate@far-host"));
         assert!(wall.run("wall.group t9 t1 gx-coder").text.starts_with("OK"));
         assert!(wall.run("wall.sidebar left").text.starts_with("OK"));
         assert_eq!(wall.store().sidebar().mode, SidebarMode::Group);
@@ -1587,18 +1587,18 @@ mod tests {
         let _ = run_pass_at(&ctx, 1.1, Vec::new(), &mut panels, &mut wall);
 
         // By group: `coder` and `gate` are in their terminals' rows, this
-        // machine's members before workstation's though `t9` was grouped first;
+        // machine's members before far-host's though `t9` was grouped first;
         // `probe` has no terminal.
         assert_eq!(
             panels.sidebar.rows_drawn,
             vec![
-                "g:g-1[workstation=2,workstation=1]",
+                "g:g-1[workstation=2,far-host=1]",
                 "t:t1",
                 "t:gx-coder+coder@workstation=processing",
-                "t:t9+gate@workstation=idle",
-                "s:none[workstation=1,workstation=1]",
+                "t:t9+gate@far-host=idle",
+                "s:none[workstation=1,far-host=1]",
                 "t:t2",
-                "a:probe@workstation=waiting",
+                "a:probe@far-host=waiting",
             ]
         );
 
@@ -1645,9 +1645,9 @@ mod tests {
                 "t:t1",
                 "t:gx-coder+coder@workstation=processing",
                 "t:t2",
-                "h:workstation[2]",
-                "t:t9+gate@workstation=idle",
-                "a:probe@workstation=waiting",
+                "h:far-host[2]",
+                "t:t9+gate@far-host=idle",
+                "a:probe@far-host=waiting",
             ]
         );
 
@@ -1660,17 +1660,17 @@ mod tests {
             .expect("app.where has a sidebar line");
         assert!(line.contains(" mode=host "), "{line}");
         assert!(!line.contains("mode_host=none"), "{line}");
-        assert!(line.contains(" agents=probe@workstation:"), "{line}");
+        assert!(line.contains(" agents=probe@far-host:"), "{line}");
         assert!(
             line.ends_with(
-                " rows=h:workstation[3];t:t1;t:gx-coder+coder@workstation=processing;t:t2;h:workstation[2];t:t9+gate@workstation=idle;a:probe@workstation=waiting"
+                " rows=h:workstation[3];t:t1;t:gx-coder+coder@workstation=processing;t:t2;h:far-host[2];t:t9+gate@far-host=idle;a:probe@far-host=waiting"
             ),
             "{line}"
         );
 
         assert!(wall.run("wall.sidebar mode group").text.starts_with("OK"));
         let _ = run_pass_at(&ctx, 1.4, Vec::new(), &mut panels, &mut wall);
-        assert_eq!(panels.sidebar.rows_drawn[0], "g:g-1[workstation=2,workstation=1]");
+        assert_eq!(panels.sidebar.rows_drawn[0], "g:g-1[workstation=2,far-host=1]");
     }
 
     #[test]
@@ -1708,7 +1708,7 @@ mod tests {
         assert!(hold_p > 0.4 && hold_p < 0.7, "expected mid-hold progress, got {hold_p}");
 
         let want = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(0xe5, 0x53, 0x4b));
-        let full = ctx.run_ui(
+        let full = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::pos2(0.0, 0.0),

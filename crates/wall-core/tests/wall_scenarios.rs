@@ -2552,8 +2552,8 @@ fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice(
     assert!(h.frame().notice.is_some());
 
     // A namespace that leaves on purpose with a shell in it (`g3d stop`): its last document
-    // says `exiting`, the connection ends for good, and the Lost notice is in the very next
-    // frame with the reason, no clock tick between.
+    // says `exiting` and which way, the connection ends for good, and the Lost notice is in
+    // the very next frame saying so, no clock tick between.
     let live_doc = serde_json::json!({
         "daemon": { "ns": "test", "exiting": false },
         "terminals": [{ "id": t1, "cols": 100, "rows": 30, "flow": "ok", "subscribers": [] }]
@@ -2562,20 +2562,20 @@ fn frame_status_notice_tracks_termd_lifecycle_independently_of_transient_notice(
     assert_eq!(h.frame().status_notice, None);
     h.wall
         .on_termd_status(
-            serde_json::json!({ "daemon": { "ns": "test", "exiting": true }, "terminals": [] }),
+            serde_json::json!({
+                "daemon": { "ns": "test", "exiting": true, "exit_reason": "stop" },
+                "terminals": []
+            }),
             9_400,
         )
         .expect("status ok");
-    h.wall.on_termd_gone(
-        "the namespace left on purpose: its terminals are ended and nothing listens there now",
-        9_401,
-    );
+    h.wall.on_termd_gone(9_401);
     let left = h.frame().status_notice.expect("Lost notice at once");
     assert_eq!(left.kind, NoticeKind::Lost);
     assert!(left.dismiss);
     assert_eq!(
         left.text,
-        "termd lost: the namespace left on purpose: its terminals are ended and nothing listens there now"
+        "termd stopped: the shells in namespace \"rs-wall\" ended with it · a new terminal starts a fresh termd"
     );
     assert!(h.wall.dismiss_termd_lost());
     assert_eq!(h.frame().status_notice, None);
@@ -3828,6 +3828,73 @@ fn pointer_leave_clears_hover_and_link_without_canceling_active_drag() {
     );
     assert!(!h.wall.pointer_leave(), "pointer_leave must not interfere with an active drag");
     assert!(h.wall.pointer().busy());
+}
+
+/// A target the fleet holds as cleaned up opens no terminal: the verb says it is gone. One
+/// the fleet does not know at all still gets its terminal (the fleet may simply not have
+/// arrived), where the attach program finds out and says so.
+#[test]
+fn attach_refuses_an_agent_the_fleet_holds_as_cleaned_up() {
+    use wall_core::bus::{GomuxAgent, GomuxSnapshot};
+
+    let mut h = Harness::new();
+    let agent = |name: &str, host: &str, live: bool| GomuxAgent {
+        name: name.into(),
+        host: Some(host.into()),
+        live,
+        attached: Some(live),
+        status: Some(if live { "idle" } else { "ended" }.into()),
+        end_reason: (!live).then(|| "quit".to_owned()),
+        ..GomuxAgent::default()
+    };
+    h.wall.set_bus_snapshot(
+        Some(GomuxSnapshot {
+            gen: 1,
+            host: Some("laptop-2".into()),
+            dirs: Vec::new(),
+            agents: vec![
+                agent("helper", "laptop-2", false),
+                agent("lead", "laptop-2", true),
+                agent("bench", "far-host", false),
+            ],
+        }),
+        "",
+    );
+
+    for target in ["helper@laptop-2", "helper", "bench@far-host"] {
+        let reply = h.wall.run(format!("wall.attach {target}"));
+        assert!(reply.is_err(), "{target}: {}", reply.text);
+        assert!(
+            reply.text.contains(&format!(
+                "{target} is not an agent any more: it ended (quit) and was cleaned up"
+            )),
+            "{target}: {}",
+            reply.text
+        );
+        let effects = h.wall.drain_effects();
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                WallEffect::SpawnTerminal { .. } | WallEffect::ReattachTerminal { .. }
+            )),
+            "{target} must open no terminal: {effects:?}"
+        );
+    }
+    assert!(h.wall.model().order().is_empty(), "no terminal was made");
+
+    // A bare name on another host is not this host's `bench`: unknown, so it is tried.
+    let unknown = h.wall.run("wall.attach bench");
+    assert!(!unknown.is_err(), "{}", unknown.text);
+    // And a live agent attaches as before.
+    let live = h.wall.run("wall.attach lead@laptop-2");
+    assert!(!live.is_err(), "{}", live.text);
+    let spawned = h
+        .wall
+        .drain_effects()
+        .iter()
+        .filter(|e| matches!(e, WallEffect::SpawnTerminal { argv: Some(_), .. }))
+        .count();
+    assert_eq!(spawned, 2);
 }
 
 #[test]

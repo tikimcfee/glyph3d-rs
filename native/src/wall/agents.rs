@@ -2401,6 +2401,6 @@ mod tests {
         };
         assert_eq!(hosts(None), "all", "unset follows every host, as the JS relay did");
         assert_eq!(hosts(Some("")), "", "an empty value keeps this machine only");
-        assert_eq!(hosts(Some("workstation,tinybot")), "workstation,tinybot");
+        assert_eq!(hosts(Some("workstation,far-host")), "workstation,far-host");
     }
 }

@@ -14,9 +14,11 @@
 //! - When `g3d-termd` stops (`DaemonEvent::Gone`), [`Sessions`] passively watches for a daemon
 //!   returning on the same [`Target`] (`SessionHub::connect_with`, never restarting a stopped
 //!   daemon behind the user's back) and surfaces the restored hub via [`Sessions::take_reconnected`].
+//!   A person asking for a new terminal is not "behind the user's back": the host then calls
+//!   [`Sessions::revive`], which starts a fresh daemon and hands it over the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -144,6 +146,13 @@ pub struct Sessions {
     reconnected_hub: Arc<Mutex<Option<SessionHub>>>,
     watching_reconnect: Arc<AtomicBool>,
     reconnect_socket_absent: Arc<AtomicBool>,
+    /// Which passive watch of the primary target is current. A watcher thread publishes a
+    /// hub only while this still holds the value it started with, so [`Self::revive`] can
+    /// withdraw one that is mid-poll.
+    reconnect_epoch: Arc<AtomicU64>,
+    /// The primary daemon went away and none has been handed over since
+    /// ([`Self::take_reconnected`]): `hub` is a dead connection.
+    primary_gone: bool,
     dropped: Arc<AtomicBool>,
 }
 
@@ -257,6 +266,8 @@ impl Sessions {
             reconnected_hub: Arc::new(Mutex::new(None)),
             watching_reconnect: Arc::new(AtomicBool::new(false)),
             reconnect_socket_absent: Arc::new(AtomicBool::new(false)),
+            reconnect_epoch: Arc::new(AtomicU64::new(0)),
+            primary_gone: false,
             dropped: Arc::new(AtomicBool::new(false)),
         };
         for idx in 0..sessions.extras.len() {
@@ -332,9 +343,64 @@ impl Sessions {
             .expect("reconnected_hub mutex poisoned")
             .take()?;
         self.hub = next_hub;
+        self.primary_gone = false;
         self.hub.set_theme(self.options.theme.clone());
         let ids = self.list().unwrap_or_default();
         Some(ids)
+    }
+
+    /// Whether the primary daemon is gone (it left on purpose, or was lost) and none has
+    /// been handed over since: a [`Self::spawn`] now could only fail on the dead connection.
+    pub fn primary_gone(&self) -> bool {
+        self.primary_gone
+    }
+
+    /// Starts a fresh `g3d-termd` on the primary target, for a host whose user asked for a
+    /// new terminal while the namespace is gone. Returns `Ok(true)` when a daemon is ready
+    /// for [`Self::take_reconnected`] (the fresh one, or one the passive watcher had already
+    /// found), `Ok(false)` when the primary was never gone.
+    ///
+    /// Until 2026-11-27 nothing did this: the wall's outage notice said "a new terminal
+    /// starts a fresh termd", and a new terminal failed on the dead connection instead.
+    ///
+    /// Blocks for the daemon's start (tens of milliseconds; the connect options' startup
+    /// timeout at most).
+    pub fn revive(&mut self) -> Result<bool, String> {
+        if !self.primary_gone {
+            return Ok(false);
+        }
+        // Withdraw the passive watcher first: from here on it publishes nothing, so the hub
+        // handed over is the one decided below and no second one replaces it later.
+        self.reconnect_epoch.fetch_add(1, Ordering::AcqRel);
+        self.watching_reconnect.store(false, Ordering::Release);
+        let found = self
+            .reconnected_hub
+            .lock()
+            .expect("reconnected_hub mutex poisoned")
+            .is_some();
+        if !found {
+            let opened = SessionHub::open_with(
+                &self.target,
+                (*self.options).clone(),
+                Arc::clone(&self.wake),
+            );
+            match opened {
+                Ok(hub) => {
+                    let _ = hub.status_follow(Some(500));
+                    *self
+                        .reconnected_hub
+                        .lock()
+                        .expect("reconnected_hub mutex poisoned") = Some(hub);
+                }
+                Err(e) => {
+                    // Keep watching: a daemon someone starts later is still picked up.
+                    self.start_passive_reconnect_watcher();
+                    return Err(format!("could not start a fresh termd: {e}"));
+                }
+            }
+        }
+        self.reconnect_socket_absent.store(false, Ordering::Release);
+        Ok(true)
     }
 
     /// Drains terminal ids that appeared externally in the primary or any extra namespace
@@ -361,6 +427,7 @@ impl Sessions {
             Arc::clone(&self.reconnected_hub),
             Arc::clone(&self.watching_reconnect),
             Some(Arc::clone(&self.reconnect_socket_absent)),
+            Arc::clone(&self.reconnect_epoch),
             Arc::clone(&self.dropped),
         );
     }
@@ -375,6 +442,8 @@ impl Sessions {
             Arc::clone(&extra.reconnected_hub),
             Arc::clone(&extra.watching_reconnect),
             None,
+            // An extra namespace's watch is never withdrawn: an epoch of its own.
+            Arc::new(AtomicU64::new(0)),
             Arc::clone(&self.dropped),
         );
     }
@@ -388,6 +457,7 @@ impl Sessions {
         slot: Arc<Mutex<Option<SessionHub>>>,
         watching: Arc<AtomicBool>,
         socket_absent: Option<Arc<AtomicBool>>,
+        epoch: Arc<AtomicU64>,
         dropped: Arc<AtomicBool>,
     ) {
         if dropped.load(Ordering::Acquire) {
@@ -400,6 +470,9 @@ impl Sessions {
             return;
         }
         opts.connect.reconnect_window = WALL_RECONNECT_WINDOW;
+        // This watch, of however many this target has had: a later epoch means it was
+        // withdrawn (`Sessions::revive`), and whatever it finds is not to be published.
+        let mine = epoch.load(Ordering::Acquire);
 
         let _ = thread::Builder::new()
             .name(thread_name.to_owned())
@@ -409,10 +482,23 @@ impl Sessions {
                     if dropped.load(Ordering::Acquire) {
                         break;
                     }
+                    if epoch.load(Ordering::Acquire) != mine {
+                        // Withdrawn: `watching` now belongs to whoever withdrew it.
+                        return;
+                    }
                     match SessionHub::connect_with(&target, opts.clone(), Arc::clone(&wake)) {
                         Ok(new_hub) => {
                             let _ = new_hub.status_follow(Some(500));
-                            *slot.lock().expect("reconnected_hub mutex poisoned") = Some(new_hub);
+                            {
+                                // Decided under the slot's lock, which the withdrawer takes
+                                // after moving the epoch: either this hub lands before it
+                                // looks, or it is dropped here.
+                                let mut held = slot.lock().expect("reconnected_hub mutex poisoned");
+                                if epoch.load(Ordering::Acquire) != mine {
+                                    return;
+                                }
+                                *held = Some(new_hub);
+                            }
                             if let Some(flag) = &socket_absent {
                                 flag.store(false, Ordering::Release);
                             }
@@ -915,9 +1001,21 @@ impl Sessions {
             }
             self.external_appeared
                 .retain(|id| resolve_extra_id_in(&self.extras, id).is_some());
+            self.primary_gone = true;
             for id in lingering {
                 news.insert(0, News::Ended { id });
             }
+            // Wire order: a namespace ends its terminals, then says it is leaving, then
+            // closes. A terminal's own end reaches this pump through its session's worker
+            // thread, the document and the close through the hub, so when all three land
+            // in one pump the end could be handed over last (seen 2026-11-27 against a
+            // daemon whose stop tells its connections at once; the one before it took
+            // 200 ms, which hid this). Every end goes first.
+            let (ended, rest): (Vec<News>, Vec<News>) = std::mem::take(&mut news)
+                .into_iter()
+                .partition(|n| matches!(n, News::Ended { .. }));
+            news = ended;
+            news.extend(rest);
             self.start_passive_reconnect_watcher();
         }
 

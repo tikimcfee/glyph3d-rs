@@ -317,6 +317,64 @@ struct WakeGate {
     redraw_armed: std::sync::atomic::AtomicBool,
 }
 
+/// A daemon answers on the wall's namespace again (one the passive watcher found, or the
+/// fresh one a new terminal started): swap it in, tell the wall, and adopt what it holds.
+/// `false` when no daemon was waiting to be handed over.
+fn adopt_returned_termd(
+    wall: &mut Wall,
+    sessions: &mut Sessions,
+    render_ids: &mut RenderIds,
+    renderer: Option<&mut WallRenderer>,
+) -> bool {
+    let Some(live_ids) = sessions.take_reconnected() else {
+        return false;
+    };
+    log::info!("termd came back ({} terminal(s))", live_ids.len());
+    let welcome = sessions.hub().welcome();
+    wall.on_termd_welcome(welcome.instance.as_deref().unwrap_or(""), &welcome.features, epoch_now_ms());
+    wall.dismiss_termd_lost();
+    if !live_ids.is_empty() {
+        wall.set_live_terminals(&live_ids);
+    }
+    render_ids.retain_live(&live_ids, renderer);
+    for id in &live_ids {
+        match sessions.adopt(id) {
+            Ok((cols, rows)) => {
+                let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                if let Some(title) = sessions.default_title_for(id) {
+                    appeared = appeared.with_title(title);
+                }
+                wall.terminal_appeared(appeared);
+            }
+            Err(e) => log::error!("{e}"),
+        }
+    }
+    wall.set_connected(true);
+    true
+}
+
+/// A person asked for a terminal and the wall's namespace is gone (it was stopped, or
+/// lost): start a fresh termd for it, as the outage notice says a new terminal does, and
+/// take it over as any daemon that comes back. Does nothing while a daemon answers. Until
+/// 2026-11-27 the spawn that follows just failed on the dead connection, into the log.
+fn revive_gone_termd(
+    wall: &mut Wall,
+    sessions: &mut Sessions,
+    render_ids: &mut RenderIds,
+    renderer: Option<&mut WallRenderer>,
+) {
+    if !sessions.primary_gone() {
+        return;
+    }
+    match sessions.revive() {
+        Ok(_) => {
+            adopt_returned_termd(wall, sessions, render_ids, renderer);
+        }
+        // The spawn after this fails too, and says so on the wall.
+        Err(e) => log::error!("{e}"),
+    }
+}
+
 /// Maps terminal string ids to monotonic `u64` renderer keys so closed terminals can be
 /// freed from [`WallRenderer`] without ever colliding ids across spawn/close cycles.
 #[derive(Default)]
@@ -947,13 +1005,19 @@ impl App {
             self.draw(true);
         }
         let launch_cfg = crate::launch_config::LaunchConfig::load_or_default();
-        self.agents = Some(match super::agents::WallAgentsOptions::from_launch_config(&launch_cfg) {
-            Ok(agent_opts) => super::agents::WallAgents::with_options(agent_opts, session_wake),
-            Err(e) => {
-                log::warn!("{e}");
-                super::agents::WallAgents::new(session_wake)
-            }
+        let agent_opts = super::agents::WallAgentsOptions::from_launch_config(&launch_cfg).unwrap_or_else(|e| {
+            log::warn!("{e}");
+            super::agents::WallAgentsOptions::default()
         });
+        // An attach terminal runs the `agent` this wall's own feed runs, when that is a
+        // binary the wall found: one CLI and one store for what is listed and what is
+        // attached (a configured `agent_binary` included), and a test's stub CLI the only
+        // one its terminals can reach. A bare name (nothing found) is left to the terminal.
+        if let Some(wall) = &mut self.wall {
+            let program = &agent_opts.cli.program;
+            wall.set_agent_program(program.is_absolute().then(|| program.to_string_lossy().into_owned()));
+        }
+        self.agents = Some(super::agents::WallAgents::with_options(agent_opts, session_wake));
         self.poll_pending_termd();
         self.sync_macos_option_as_alt();
         self.perf.mark_opened(&self.proxy);
@@ -1350,11 +1414,15 @@ impl App {
                 let Terminals::Live(sessions) = terms else { return };
                 match other {
                     WallEffect::SpawnTerminal { argv, cols, rows, .. } => {
+                        revive_gone_termd(wall, sessions, &mut self.render_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
                         match sessions.spawn(argv, cols.min(u32::from(u16::MAX)) as u16, rows.min(u32::from(u16::MAX)) as u16) {
                             Ok((id, cols, rows)) => {
                                 wall.terminal_appeared(TerminalAppeared::new(id, u32::from(cols), u32::from(rows)));
                             }
-                            Err(e) => log::error!("the wall could not start a terminal: {e}"),
+                            Err(e) => {
+                                log::error!("the wall could not start a terminal: {e}");
+                                wall.notify(&format!("could not start a terminal: {e}"));
+                            }
                         }
                         self.refresh_termd_status();
                     }
@@ -1369,6 +1437,9 @@ impl App {
                             }
                             Err(e) => {
                                 log::info!("local reattach of {id} unavailable ({e}); falling back to attach shell wrapper");
+                                // Only here: a reattach that works is in the agents' own
+                                // namespace and needs no daemon in the wall's.
+                                revive_gone_termd(wall, sessions, &mut self.render_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
                                 match sessions.spawn(
                                     Some(fallback_argv),
                                     cols.min(u32::from(u16::MAX)) as u16,
@@ -1377,7 +1448,10 @@ impl App {
                                     Ok((spawn_id, c, r)) => {
                                         wall.terminal_appeared(TerminalAppeared::new(spawn_id, u32::from(c), u32::from(r)));
                                     }
-                                    Err(err) => log::error!("the wall could not attach terminal: {err}"),
+                                    Err(err) => {
+                                        log::error!("the wall could not attach terminal: {err}");
+                                        wall.notify(&format!("could not start a terminal: {err}"));
+                                    }
                                 }
                             }
                         }
@@ -1751,39 +1825,20 @@ impl App {
                     News::Disconnected { message } => {
                         log::error!("termd is gone: {message}");
                         wall.set_connected(false);
-                        // A namespace that left on purpose is an outage now, with its
-                        // reason, not a restart to wait out.
-                        wall.on_termd_gone(&message, epoch_now_ms());
+                        // A namespace that left on purpose is an outage now, not a
+                        // restart to wait out; its last status document (handed over
+                        // just before this) said which way it left.
+                        wall.on_termd_gone(epoch_now_ms());
                         heard = true;
                     }
                 }
             }
-            if let Some(live_ids) = sessions.take_reconnected() {
-                log::info!("termd came back ({} terminal(s))", live_ids.len());
-                let welcome = sessions.hub().welcome();
-                wall.on_termd_welcome(
-                    welcome.instance.as_deref().unwrap_or(""),
-                    &welcome.features,
-                    epoch_now_ms(),
-                );
-                wall.dismiss_termd_lost();
-                if !live_ids.is_empty() {
-                    wall.set_live_terminals(&live_ids);
-                }
-                self.render_ids.retain_live(&live_ids, self.gfx.as_mut().map(|g| &mut g.renderer));
-                for id in &live_ids {
-                    match sessions.adopt(id) {
-                        Ok((cols, rows)) => {
-                            let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
-                            if let Some(title) = sessions.default_title_for(id) {
-                                appeared = appeared.with_title(title);
-                            }
-                            wall.terminal_appeared(appeared);
-                        }
-                        Err(e) => log::error!("{e}"),
-                    }
-                }
-                wall.set_connected(true);
+            if adopt_returned_termd(
+                wall,
+                sessions,
+                &mut self.render_ids,
+                self.gfx.as_mut().map(|g| &mut g.renderer),
+            ) {
                 heard = true;
                 ended_any = true;
             }
@@ -2803,6 +2858,18 @@ impl App {
                             "\npaper grid_show={} grid_minor={}",
                             described.paper.grid_show, described.paper.grid.grid_minor
                         ));
+                        // The daemon as the Status window has it: its state, which way a
+                        // namespace that left on purpose went, and the window's own words
+                        // (to the end of the line).
+                        // The `agent` binary an attach terminal runs (the wall's own feed's),
+                        // or `unresolved` when the terminal is left to look one up.
+                        out.push_str(&format!("\nagent_cli {}", wall.agent_program().unwrap_or("unresolved")));
+                        out.push_str(&format!(
+                            "\ntermd state={} left={} says={}",
+                            wall.termd().state().as_str(),
+                            wall.termd().left().map_or("none", wall_core::status::ExitReason::as_str),
+                            wall_core::status::empty_daemon_message(wall.termd()),
+                        ));
                         if let Some(g) = &self.gfx {
                             out.push_str(&format!(
                                 "\nrenderer cached_terminals={}",
@@ -3666,7 +3733,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        let full = ctx.run_ui(raw, |root_ui| {
+        let full = crate::wall::ui::headless_pass(ctx, raw, |root_ui| {
             egui::Area::new(egui::Id::new("test_panel"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(egui::pos2(952.0, 0.0))

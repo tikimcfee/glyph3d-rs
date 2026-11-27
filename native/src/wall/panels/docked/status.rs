@@ -1128,7 +1128,7 @@ mod tests {
             egui::vec2(viewport.0, viewport.1),
         ));
         let had_no_events = events.is_empty();
-        let mut full = ctx.run_ui(
+        let mut full = crate::wall::ui::headless_pass(ctx, 
             egui::RawInput {
                 screen_rect,
                 events,
@@ -1141,7 +1141,7 @@ mod tests {
         );
         // Settle newly created `egui::Area` sizing passes on zero-event inspection frames.
         if had_no_events {
-            full = ctx.run_ui(
+            full = crate::wall::ui::headless_pass(ctx, 
                 egui::RawInput {
                     screen_rect,
                     ..Default::default()
@@ -1305,7 +1305,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let full = ctx.run_ui(raw, |root_ui| {
+        let full = crate::wall::ui::headless_pass(&ctx, raw, |root_ui| {
             let mut unused = Vec::new();
             show(root_ui.ctx(), &mut state, &input, &mut unused);
         });
@@ -1346,7 +1346,7 @@ mod tests {
         );
 
         // Locate the notice's text rect so we click its `×` dismiss button just to the right of the text.
-        let full_notice = ctx.run_ui(
+        let full_notice = crate::wall::ui::headless_pass(&ctx, 
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,

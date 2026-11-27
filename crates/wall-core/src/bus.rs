@@ -340,38 +340,98 @@ pub fn find_bus_agent(snap: Option<&GomuxSnapshot>, target: &str) -> Option<BusA
     None
 }
 
+/// Find the DEPARTED agent (cleaned up: `live: false`) `target` names in `snap`, matched as
+/// [`find_bus_agent`] matches a live one. `None` when the target is live, unknown to the
+/// snapshot, or there is no snapshot: only a record of its end says an agent is gone.
+pub fn find_departed_bus_agent<'a>(
+    snap: Option<&'a GomuxSnapshot>,
+    target: &str,
+) -> Option<&'a GomuxAgent> {
+    let snap = snap?;
+    if target.is_empty() || find_bus_agent(Some(snap), target).is_some() {
+        return None;
+    }
+    let local = local_bus_name(target, Some(snap));
+    let local_host = snap.host.as_deref().unwrap_or("");
+    snap.agents.iter().find(|a| {
+        !a.live
+            && (bus_target(a) == target
+                || local.is_some_and(|name| {
+                    a.name == name && a.host.as_deref().unwrap_or("") == local_host
+                }))
+    })
+}
+
 const ATTACH_RESET: &str = "\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1006l\\033[?1015l\\033[?1004l\\033[?2004l\\033[?1049l\\033[?25h\\033[0m";
+
+/// What the attach terminal says, once, when its agent is not an agent any more. `%s` is the
+/// target.
+pub const ATTACH_GONE_NOTE: &str =
+    "[%s is not an agent any more (it was cleaned up), so there is nothing to attach to. Enter closes.]";
 
 /// Build the `sh -c` argv a remote `wall.attach <name>@<host>` terminal runs (`WallBus.attachArgv`).
 ///
 /// Validated with [`is_bus_target`] first; `target` is passed exclusively as positional `$1`,
-/// never interpolated into the shell script text.
-pub fn attach_argv(target: &str) -> Result<Vec<String>, String> {
+/// never interpolated into the shell script text. `agent_program` is passed as `$2` in the
+/// same way.
+///
+/// **Which `agent`.** `agent_program` is the binary the wall's own fleet feed runs, when the
+/// wall resolved one to a path: the terminal then runs that same binary and looks nowhere
+/// else. The agents it lists and the agents it attaches come from one CLI and one store, a
+/// configured `agent_binary` is honoured here too, and a test's stub CLI is the only one its
+/// terminals can reach. Until 2026-11-27 the script always looked `agent` up itself: termd
+/// gives a terminal `PATH=/usr/bin:/bin`, so it took the login shell's PATH, and a smoke
+/// whose wall was fed by a stub attached with the REAL CLI. With `None` (the wall found no
+/// binary) the script still looks it up that way.
+///
+/// **When it ends.** A clean detach closes the terminal. A failed attach offers another try,
+/// since most failures pass (the bus or ssh was down, the agent's session is gone until it
+/// is resumed). One does not: the agent was cleaned up. Until 2026-11-27 that looped: every
+/// Enter ran `agent attach` again, which said `agent "x" not found` again. `agent attach`
+/// exits 1 for every failure, so after one the script asks `agent status` (which needs no
+/// terminal) and, when the answer is that there is no such agent, says so and closes on the
+/// next Enter.
+pub fn attach_argv(target: &str, agent_program: Option<&str>) -> Result<Vec<String>, String> {
     if !is_bus_target(target) {
         return Err(format!(
             "'{target}' isn't an agent name (name or name@host)"
         ));
     }
     let script = [
-        "command -v agent >/dev/null 2>&1 || PATH=\"$(\"${SHELL:-/bin/sh}\" -lc 'printf %s \"$PATH\"' 2>/dev/null):$PATH\"".to_string(),
+        "A=\"${2:-}\"".to_string(),
+        "if [ -z \"$A\" ]; then".to_string(),
+        "  command -v agent >/dev/null 2>&1 || PATH=\"$(\"${SHELL:-/bin/sh}\" -lc 'printf %s \"$PATH\"' 2>/dev/null):$PATH\"".to_string(),
+        "  A=agent".to_string(),
+        "fi".to_string(),
+        "n=\"${1%%@*}\"".to_string(),
         "while :; do".to_string(),
-        "  agent attach \"$1\"; s=$?".to_string(),
+        "  \"$A\" attach \"$1\"; s=$?".to_string(),
         "  [ \"$s\" -eq 0 ] && exit 0".to_string(),
         format!("  printf '{ATTACH_RESET}'"),
         "  stty sane 2>/dev/null".to_string(),
+        // Both agent CLIs (Go and Rust) word a missing agent `agent "<name>" not found`.
+        "  w=\"$(\"$A\" status \"$1\" 2>&1 </dev/null)\"".to_string(),
+        "  case \"$w\" in *\"agent \\\"$n\\\" not found\"*)".to_string(),
+        format!("    printf '\\r\\n{ATTACH_GONE_NOTE}\\r\\n' \"$1\""),
+        "    read -r a; exit 0;;".to_string(),
+        "  esac".to_string(),
         "  printf '\\r\\n[agent attach %s ended with status %d. Enter attaches again; q then Enter closes.]\\r\\n' \"$1\" \"$s\"".to_string(),
         "  read -r a || exit 0".to_string(),
         "  [ \"$a\" = q ] && exit 0".to_string(),
         "done".to_string(),
     ]
     .join("\n");
-    Ok(vec![
+    let mut argv = vec![
         "sh".to_string(),
         "-c".to_string(),
         script,
         "wall-attach".to_string(),
         target.to_string(),
-    ])
+    ];
+    if let Some(program) = agent_program.filter(|p| !p.is_empty()) {
+        argv.push(program.to_string());
+    }
+    Ok(argv)
 }
 
 #[cfg(test)]
@@ -427,7 +487,7 @@ mod tests {
         };
         assert_eq!(bus_target(&remote), "helper@workstation");
 
-        for ok in ["helper", "helper-m2", "a_b@workstation", "X@laptop-2"] {
+        for ok in ["helper", "helper-2", "a_b@workstation", "X@laptop-2"] {
             assert!(is_bus_target(ok), "expected valid target: {ok}");
         }
         for bad in ["", "-x", "a b", "a@", "@h", "a@b@c", "a;rm", "a.b", "$(x)"] {
@@ -528,14 +588,99 @@ mod tests {
 
     #[test]
     fn attach_argv_refuses_non_agent_names_and_never_embeds_target_in_script() {
-        assert!(attach_argv("a b")
+        assert!(attach_argv("a b", None)
             .unwrap_err()
             .contains("isn't an agent name"));
-        assert!(attach_argv("$(touch x)").is_err());
-        let argv = attach_argv("helper@workstation").unwrap();
+        assert!(attach_argv("$(touch x)", None).is_err());
+        let argv = attach_argv("helper@workstation", None).unwrap();
         assert_eq!(&argv[0..2], &["sh", "-c"]);
         assert!(!argv[2].contains("helper"));
         assert_eq!(argv.last().unwrap(), "helper@workstation");
+
+        // The wall's own `agent` binary rides as `$2`, never in the script's text either.
+        let named = attach_argv("helper@workstation", Some("/opt/tools/bin/agent")).unwrap();
+        assert_eq!(named[2], argv[2], "one script, whoever names the binary");
+        assert!(!named[2].contains("/opt/tools"));
+        assert_eq!(&named[3..], &["wall-attach", "helper@workstation", "/opt/tools/bin/agent"]);
+        assert_eq!(attach_argv("helper", Some("")).unwrap().len(), 5, "an empty program is none");
+    }
+
+    /// The bug of 2026-11-27: a smoke's wall listed agents through a stub CLI, and the
+    /// terminal a click opened ran the real one, found through the login shell's PATH.
+    /// Given the wall's binary, the attach program runs that and looks nowhere else.
+    #[test]
+    fn attach_program_runs_the_named_agent_binary_and_never_looks_another_up() {
+        let dir = ScratchDir::new("named");
+        let log_path = dir.0.join("ran");
+        let script_for = |who: &str, exit: i32| {
+            format!(
+                "#!/bin/sh\nprintf '{who} %s\\n' \"$*\" >> \"{}\"\nexit {exit}\n",
+                log_path.display()
+            )
+        };
+        let write = |path: &std::path::Path, body: String| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // The wall's binary, off every PATH; a decoy `agent` first on PATH; and a login
+        // shell whose PATH leads to another decoy.
+        let named = dir.0.join("wall/agent");
+        let on_path = dir.0.join("path/agent");
+        let login_agent = dir.0.join("login/agent");
+        let login_sh = dir.0.join("login-sh");
+        write(&named, script_for("named", 0));
+        write(&on_path, script_for("on-path", 0));
+        write(&login_agent, script_for("login", 0));
+        write(
+            &login_sh,
+            format!(
+                "#!/bin/sh\nprintf 'login-shell\\n' >> \"{}\"\n[ \"$1\" = -lc ] && printf %s \"{}:/usr/bin:/bin\"\n",
+                log_path.display(),
+                login_agent.parent().unwrap().display()
+            ),
+        );
+
+        let run = |program: Option<&str>, path: String| -> String {
+            let _ = fs::remove_file(&log_path);
+            let argv = attach_argv("helper@workstation", program).unwrap();
+            let out = Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("PATH", path)
+                .env("SHELL", &login_sh)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0));
+            fs::read_to_string(&log_path).unwrap_or_default()
+        };
+        let decoy_first = format!("{}:/usr/bin:/bin", on_path.parent().unwrap().display());
+
+        // Named: that binary, though another `agent` is first on PATH, and no login shell.
+        assert_eq!(
+            run(Some(named.to_str().unwrap()), decoy_first.clone()),
+            "named attach helper@workstation\n"
+        );
+        // And with no `agent` on PATH at all, still no login shell asked.
+        assert_eq!(
+            run(Some(named.to_str().unwrap()), "/usr/bin:/bin".to_string()),
+            "named attach helper@workstation\n"
+        );
+        // Not named: looked up as before, PATH first, then the login shell's.
+        assert_eq!(run(None, decoy_first), "on-path attach helper@workstation\n");
+        assert_eq!(
+            run(None, "/usr/bin:/bin".to_string()),
+            "login-shell\nlogin attach helper@workstation\n"
+        );
+
+        // A failed attach asks the SAME binary whether the agent is still there.
+        write(&named, script_for("named", 1));
+        assert_eq!(
+            run(Some(named.to_str().unwrap()), "/usr/bin:/bin".to_string()),
+            "named attach helper@workstation\nnamed status helper@workstation\n"
+        );
     }
 
     #[test]
@@ -543,8 +688,9 @@ mod tests {
         let dir = ScratchDir::new("sh");
         let log_path = dir.0.join("args");
         let agent_path = dir.0.join("agent");
+        // `attach` exits `$AGENT_EXIT`; `status` answers a live agent.
         let stub_script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nexit \"${{AGENT_EXIT:-0}}\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n[ \"$1\" = status ] && {{ echo 'helper: idle'; exit 0; }}\nexit \"${{AGENT_EXIT:-0}}\"\n",
             log_path.display()
         );
         fs::write(&agent_path, stub_script).unwrap();
@@ -552,7 +698,7 @@ mod tests {
 
         let run = |exit_code: i32, input: &str| -> std::process::Output {
             let _ = fs::remove_file(&log_path);
-            let argv = attach_argv("helper@workstation").unwrap();
+            let argv = attach_argv("helper@workstation", None).unwrap();
             let mut child = Command::new(&argv[0])
                 .args(&argv[1..])
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.0.display()))
@@ -583,9 +729,10 @@ mod tests {
         assert_eq!(closed.status.code(), Some(0));
         let closed_out = String::from_utf8_lossy(&closed.stdout);
         assert_eq!(closed_out.matches(reason).count(), 1);
+        // After a failed attach the script asks once whether the agent still exists.
         assert_eq!(
             fs::read_to_string(&log_path).unwrap(),
-            "attach\nhelper@workstation\n"
+            "attach\nhelper@workstation\nstatus\nhelper@workstation\n"
         );
         let reason_pos = closed_out.find(reason).unwrap();
         let before = &closed_out[..reason_pos];
@@ -603,7 +750,7 @@ mod tests {
         assert_eq!(again.status.code(), Some(0));
         assert_eq!(
             fs::read_to_string(&log_path).unwrap(),
-            "attach\nhelper@workstation\nattach\nhelper@workstation\n"
+            "attach\nhelper@workstation\nstatus\nhelper@workstation\nattach\nhelper@workstation\nstatus\nhelper@workstation\n"
         );
         let again_out = String::from_utf8_lossy(&again.stdout);
         assert_eq!(again_out.matches("ended with status 1.").count(), 2);
@@ -621,7 +768,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&login_sh, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_file(&log_path);
-        let argv = attach_argv("helper").unwrap();
+        let argv = attach_argv("helper", None).unwrap();
         let child = Command::new(&argv[0])
             .args(&argv[1..])
             .env("PATH", "/usr/bin:/bin")
@@ -634,6 +781,85 @@ mod tests {
         let via_login = child.wait_with_output().unwrap();
         assert_eq!(via_login.status.code(), Some(0));
         assert_eq!(fs::read_to_string(&log_path).unwrap(), "attach\nhelper\n");
+    }
+
+    /// The bug of 2026-11-27: a row for a cleaned-up agent was clicked, and its terminal
+    /// printed `agent "x" not found` and "Enter attaches again" for as long as Enter was
+    /// pressed. A missing agent is said once and never tried again; any other failure still
+    /// offers the retry.
+    #[test]
+    fn attach_program_never_retries_an_agent_that_is_gone_and_still_retries_other_failures() {
+        let dir = ScratchDir::new("gone");
+        let log_path = dir.0.join("args");
+        let agent_path = dir.0.join("agent");
+        // `attach` always fails, printing `$AGENT_SAYS` as the real CLI prints its error;
+        // `status` prints the same and fails too.
+        let stub_script = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" >> \"{log}\"\nprintf '\\n' >> \"{log}\"\nprintf '%s\\n' \"$AGENT_SAYS\" >&2\nexit 1\n",
+            log = log_path.display()
+        );
+        fs::write(&agent_path, stub_script).unwrap();
+        fs::set_permissions(&agent_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let run = |target: &str, says: &str, input: &str| -> (String, String) {
+            let _ = fs::remove_file(&log_path);
+            let argv = attach_argv(target, None).unwrap();
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.0.display()))
+                .env("AGENT_SAYS", says)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "the wrapper itself always ends cleanly");
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                fs::read_to_string(&log_path).unwrap(),
+            )
+        };
+        let gone_note = |target: &str| ATTACH_GONE_NOTE.replace("%s", target);
+        let retry = "Enter attaches again";
+
+        // Another host's agent, as the Rust CLI words it. Three Enters: one attach, no more.
+        let (out, log) = run(
+            "helper@workstation",
+            r#"Error: agent "helper" not found on host workstation (3 agents there: agent list --host workstation)"#,
+            "\n\n\n",
+        );
+        assert_eq!(log, "attach helper@workstation \nstatus helper@workstation \n");
+        assert_eq!(out.matches(&gone_note("helper@workstation")).count(), 1, "{out}");
+        assert!(!out.contains(retry), "a missing agent offers no retry: {out}");
+
+        // This host's, as the Go CLI words it (no host), and `q` closes it as well.
+        let (out, log) = run("helper", r#"Error: agent "helper" not found"#, "q\n");
+        assert_eq!(log, "attach helper \nstatus helper \n");
+        assert_eq!(out.matches(&gone_note("helper")).count(), 1, "{out}");
+        assert!(!out.contains(retry));
+
+        // The terminal going away (EOF) closes it too.
+        let (out, log) = run("helper", r#"Error: agent "helper" not found"#, "");
+        assert_eq!(log.matches("attach").count(), 1);
+        assert!(out.contains(&gone_note("helper")));
+
+        // Anything else can pass, so Enter tries again: the bus down, the session gone
+        // until `agent resume`, and a not-found that names ANOTHER agent.
+        for says in [
+            "Error: asking workstation where its agent binary is: the bus is not running",
+            "Error: helper has ended (quit): its session agent-helper is gone, so there is nothing to attach to. agent resume helper --attach starts it again",
+            r#"Error: agent "helper-2" not found on host workstation"#,
+        ] {
+            let (out, log) = run("helper@workstation", says, "\n");
+            assert_eq!(log.matches("attach helper@workstation").count(), 2, "{says}: {log}");
+            assert_eq!(out.matches(retry).count(), 2, "{says}: {out}");
+            assert!(!out.contains("is not an agent any more"), "{says}: {out}");
+        }
     }
 
     #[test]

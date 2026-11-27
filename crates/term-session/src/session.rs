@@ -824,6 +824,13 @@ impl TerminalSession {
 
 // ── Background session worker ────────────────────────────────────────────────
 
+/// Whether a daemon speaking `proto` repaints a raw subscriber by itself after a resize that
+/// pulled scrollback rows onto the screen (protocol 1.6, PROTOCOL.md `resize`). One that does
+/// is never asked for a repaint after a grow.
+pub(crate) fn daemon_repaints_after_grow(proto: [u32; 2]) -> bool {
+    proto[0] > 1 || (proto[0] == 1 && proto[1] >= 6)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "worker entrypoint owns all per-session handles moved onto its dedicated OS thread"
@@ -933,16 +940,20 @@ fn session_worker_loop(
                         coalescer.mark_dirty();
                         // A primary-screen terminal that grows `cols` or `rows` pulls history
                         // rows out of the daemon's scrollback, and a raw subscriber needs a
-                        // `REPAINT` to see them. A `g3d-termd` with the T2 fix (PROTOCOL.md
-                        // `resize`; the protocol 1.6 daemon has it) sends one itself right after
-                        // `size` whenever there is scrollback to pull, which cancels this request
-                        // (the `Repaint` arm above). One from before it sent `size` alone, so:
-                        // debounce and ask once after the drag settles (`grow_repaint_settle`)
-                        // rather than on every intermediate step, and never on the alternate
-                        // screen where the program redraws itself. Against a daemon that
-                        // repaints, the request still goes out once after a grow whose last
-                        // step had nothing left to pull (its `size` came with no `REPAINT`).
-                        if on_alt {
+                        // `REPAINT` to see them. A protocol 1.6 daemon (PROTOCOL.md `resize`,
+                        // the T2 fix) sends one itself right after `size` whenever there is
+                        // scrollback to pull, and a `size` it sends alone pulled nothing: asking
+                        // it is never needed, and until 2026-11-27 this still asked once per
+                        // drag, for a second copy of the screen it had just sent. A 1.5 daemon
+                        // sends `size` alone either way, so: debounce and ask once after the
+                        // drag settles (`grow_repaint_settle`) rather than on every
+                        // intermediate step. Never on the alternate screen, where the program
+                        // redraws itself. The daemon is asked for its protocol here, not once:
+                        // an upgrade can change the brain under a live session.
+                        let daemon_repaints = hub_weak.upgrade().is_some_and(|hub| {
+                            daemon_repaints_after_grow(hub.termd_handle().welcome().proto)
+                        });
+                        if on_alt || daemon_repaints {
                             grow_repaint_due = None;
                         } else if grew_primary || grow_repaint_due.is_some() {
                             if policy.grow_repaint_settle.is_zero() {
@@ -1405,6 +1416,22 @@ mod tests {
             resizes_sent: AtomicU64::new(0),
             repaints_sent: AtomicU64::new(0),
         })
+    }
+
+    #[test]
+    fn a_daemon_repaints_after_a_grow_from_protocol_1_6_on() {
+        for (proto, repaints) in [
+            ([1, 0], false),
+            ([1, 4], false),
+            ([1, 5], false),
+            ([1, 6], true),
+            ([1, 7], true),
+            ([1, 60], true),
+            ([2, 0], true),
+            ([0, 9], false),
+        ] {
+            assert_eq!(daemon_repaints_after_grow(proto), repaints, "protocol {proto:?}");
+        }
     }
 
     #[test]

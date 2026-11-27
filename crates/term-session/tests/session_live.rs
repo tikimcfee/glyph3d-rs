@@ -1210,18 +1210,15 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         );
     }
 
-    // The rows above are back on the screen, and that is the claim. Who brought them is the
-    // daemon's business: since the T2 fix (PROTOCOL.md `resize`: a primary-screen resize that
+    // The rows above are back on the screen, and that is the claim. Who brought them is by
+    // the daemon's protocol. A 1.6 daemon (PROTOCOL.md `resize`: a primary-screen resize that
     // grows while the terminal holds scrollback sends each raw subscriber a live `REPAINT`
-    // right after `size`), g3d-termd pulls them itself, and the session's own debounced
-    // request is no longer what does it. Until 2026-11-27 this asserted `repaints_sent == 1`
-    // here, true of a daemon that sent `size` alone; against one that repaints, the screen is
-    // right before the session's settle timer has run, and the count read 0 or 1 by timing.
-    //
-    // What stays the session's to hold: at most ONE request for the whole 14-step drag, never
-    // one per step. (Against this daemon it still sends that one: the drag's last steps have no
-    // scrollback left to pull, so their `size` comes with no `REPAINT` to cancel the timer.)
-    // Let the timer run out, then count, and see the screen is still right.
+    // right after `size`) pulls them itself, and the session asks for nothing: not even after
+    // the drag's last steps, whose `size` comes alone because no scrollback was left to pull.
+    // A 1.5 daemon sends `size` alone, and the session asks ONCE for the whole 14-step drag,
+    // after it settles. (`grow_repaint.rs` holds both against a mock; this is whichever the
+    // daemon under test speaks.) Let the settle time run out, then count, and see the screen
+    // is still right.
     std::thread::sleep(term_session::DEFAULT_GROW_REPAINT_SETTLE * 4);
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(5), || {
@@ -1235,14 +1232,16 @@ fn primary_grow_resize_pulls_scrollback_coalesced_and_burst_settles() {
         screen_lines(&session)
     );
     let grow_stats = session.stats();
+    let proto = hub.welcome().proto;
+    let want_repaints = u64::from(proto < [1, 6]);
     println!(
-        "[bench T2 14-step primary grow 80x24->132x40] resizes_sent={} (of 14) · repaints_sent={} (at most 1 for the drag)",
-        grow_stats.resizes_sent, grow_stats.repaints_sent
+        "[bench T2 14-step primary grow 80x24->132x40] protocol {}.{} · resizes_sent={} (of 14) · repaints_sent={} (want {want_repaints})",
+        proto[0], proto[1], grow_stats.resizes_sent, grow_stats.repaints_sent
     );
-    assert!(
-        grow_stats.repaints_sent <= 1,
-        "a 14-step primary grow asks termd for a repaint at most once, after it settles, got {}",
-        grow_stats.repaints_sent
+    assert_eq!(
+        grow_stats.repaints_sent, want_repaints,
+        "a 14-step primary grow asks a protocol {}.{} termd for {want_repaints} repaint(s)",
+        proto[0], proto[1]
     );
     let asked_for_the_grow = grow_stats.repaints_sent;
 
@@ -2103,8 +2102,9 @@ fn sessions_pump_surfaces_live_news_status_updates() {
 #[test]
 fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
     // A namespace that leaves on purpose (protocol 1.6) tells a status follower with a last
-    // document, `daemon.exiting: true`, and then closes. `Sessions` follows status, and the
-    // wall reads the close by what that document said: the news must come in wire order.
+    // document, `daemon.exiting: true` (and, from a daemon that has it, `daemon.exit_reason`),
+    // and then closes. `Sessions` follows status, and the wall reads the close by what that
+    // document said: the news must come in wire order.
     use term_session::News;
 
     let scratch = ScratchDaemon::new("stexit");
@@ -2121,6 +2121,9 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
 
     let mut seen = wake.current();
     let mut order: Vec<String> = Vec::new();
+    // What the daemon under test says of its way out: `stop` from one that has
+    // `daemon.exit_reason`, nothing from one before it.
+    let mut said: Option<String> = None;
     assert!(
         wait_for(&wake, &mut seen, Duration::from_secs(10), || {
             let (_, news) = sessions.pump();
@@ -2129,6 +2132,7 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
                     News::Ended { id } => order.push(format!("ended {id}")),
                     News::Status(doc) => {
                         if doc["daemon"]["exiting"] == true {
+                            said = doc["daemon"]["exit_reason"].as_str().map(str::to_owned);
                             order.push("exiting document".into());
                         }
                     }
@@ -2140,12 +2144,106 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
         }),
         "no News::Disconnected within 10 s of the stop: {order:?}"
     );
+    assert!(
+        matches!(said.as_deref(), None | Some("stop")),
+        "a stop's exit_reason is `stop`, or absent before the field: {said:?}"
+    );
     assert_eq!(
         order,
         vec![
             format!("ended {id}"),
             "exiting document".to_string(),
-            format!("disconnected: {}", termd_client::NAMESPACE_LEFT),
+            format!("disconnected: {}", termd_client::namespace_left(said.as_deref())),
         ]
     );
+    eprintln!("the daemon under test said exit_reason = {said:?}");
 }
+
+#[test]
+fn sessions_revive_starts_a_fresh_daemon_after_a_stop_and_a_terminal_lands_on_it() {
+    // The wall's outage notice has always said "a new terminal starts a fresh termd". Until
+    // 2026-11-27 it did not: after a stop `Sessions` only watched for a daemon someone else
+    // started, and a new terminal failed on the dead connection.
+    use term_session::News;
+
+    let scratch = ScratchDaemon::new("revive");
+    let sock = scratch.dir.join(format!("termd-{}.sock", scratch.ns));
+    let wake = Arc::new(WakeSignal::default());
+    let mut sessions =
+        term_session::Sessions::open_target(&scratch.target(), wake.waker()).expect("open");
+    assert!(!sessions.primary_gone());
+    assert_eq!(sessions.revive(), Ok(false), "nothing to revive while the daemon answers");
+    sessions
+        .spawn(Some(vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()]), 80, 24)
+        .expect("spawn");
+
+    let stopper = Termd::connect(&scratch.target(), "stopper", Box::new(|| {})).expect("connect");
+    stopper.stop().expect("stop the scratch daemon");
+    drop(stopper);
+    let mut seen = wake.current();
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            let (_, news) = sessions.pump();
+            news.iter().any(|n| matches!(n, News::Disconnected { .. }))
+        }),
+        "no News::Disconnected within 10 s of the stop"
+    );
+    assert!(sessions.primary_gone());
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(5), || !sock.exists()),
+        "the stopped daemon's socket is still there"
+    );
+    assert!(sessions.take_reconnected().is_none(), "nobody started a daemon");
+
+    // What a new terminal did until now: fail, on the connection of the daemon that left.
+    let dead = sessions.spawn(None, 80, 24);
+    assert!(dead.is_err(), "a spawn on the dead connection cannot work: {dead:?}");
+
+    // The person asked for a terminal: start a daemon for it.
+    assert_eq!(sessions.revive(), Ok(true));
+    assert!(sock.exists(), "a fresh daemon listens on the namespace");
+    let ids = sessions.take_reconnected().expect("the fresh daemon is handed over");
+    assert!(ids.is_empty(), "a fresh daemon holds no terminal: {ids:?}");
+    assert!(!sessions.primary_gone());
+    assert_eq!(sessions.revive(), Ok(false));
+
+    let (id, _, _) = sessions
+        .spawn(
+            Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo REVIVED_$((40+2)); exec sleep 30".into(),
+            ]),
+            80,
+            24,
+        )
+        .expect("spawn on the fresh daemon");
+    assert!(
+        wait_for(&wake, &mut seen, Duration::from_secs(10), || {
+            sessions.pump();
+            sessions
+                .session(&id)
+                .is_some_and(|s| screen_lines(s).iter().any(|l| l.contains("REVIVED_42")))
+        }),
+        "the new terminal's output never arrived"
+    );
+
+    // The passive watcher was withdrawn by `revive`: it must not find the fresh daemon a
+    // moment later and hand a second connection over, under the terminal just made. It
+    // polls every 300 ms; three polls' worth of waiting.
+    let until = Instant::now() + Duration::from_millis(1000);
+    while Instant::now() < until {
+        let (_, news) = sessions.pump();
+        assert!(
+            !news.iter().any(|n| matches!(n, News::Ended { .. } | News::Disconnected { .. })),
+            "the revived daemon's terminal was disturbed: {news:?}"
+        );
+        assert!(
+            sessions.take_reconnected().is_none(),
+            "a second daemon connection was handed over after the revive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(sessions.session(&id).is_some());
+}
+

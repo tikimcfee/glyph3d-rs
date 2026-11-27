@@ -266,6 +266,10 @@ struct ExportAgent {
     host: String,
     #[serde(default)]
     store: String,
+    /// Which run of `name` this is (the store's run id; 0 for a store from before runs and
+    /// for another host's agents).
+    #[serde(default)]
+    run: i64,
     #[serde(default)]
     parent: String,
     #[serde(default)]
@@ -316,8 +320,12 @@ struct ExportLine {
     host: serde_json::Value,
     #[serde(default)]
     stores: Vec<ExportStore>,
+    /// An event line (`spawned`, `changed`, `removed`) names its store's directory as a
+    /// string; a `store` line carries the store as an object. Typed as the object alone
+    /// until 2026-11-27, every event line failed to parse and this host's agents never
+    /// changed after the snapshot.
     #[serde(default)]
-    store: Option<ExportStore>,
+    store: serde_json::Value,
     #[serde(default)]
     agents: Vec<ExportAgent>,
     #[serde(default)]
@@ -364,6 +372,15 @@ fn to_fleet_agent(a: &ExportAgent, snap_host: &str) -> FleetAgent {
         if end_reason.is_empty() {
             end_reason = "closed".to_string();
         }
+    }
+    // Export prints the last REPORT, not the resolved status: an agent whose terminal
+    // session is gone (its daemon stopped, a reboot) reports nothing more and would read
+    // `processing` for good. `agent status` resolves that to `ended (gone)`; so does this.
+    // Only this host's agents (the ones a store records): another host sends the status it
+    // resolved itself. And only an explicit `false`: absent means unknown.
+    if a.live && !a.store.is_empty() && a.attached == Some(false) && status != "ended" {
+        status = "ended".to_string();
+        end_reason = "gone".to_string();
     }
 
     let mut ns = a.namespace.clone();
@@ -445,6 +462,26 @@ impl FleetState {
         self.agents.insert(key, a);
     }
 
+    /// Whether `a`, from a `changed` line, describes a run this fold already holds as
+    /// departed. The exporter prints a status report that lands after cleanup (a hook of a
+    /// tool still running when its pane closed) as the run "as it was": `live: true`, with
+    /// the reported status. Folded in, the cleaned-up agent would be back in the live list
+    /// with a status nothing will ever correct. A run that departed stays departed; the
+    /// name spawned again is another run.
+    fn is_report_of_departed_run(&self, a: &ExportAgent) -> bool {
+        if !a.live || a.run == 0 {
+            return false;
+        }
+        let key = AgentKey {
+            host: a.host.clone(),
+            store: a.store.clone(),
+            name: a.name.clone(),
+        };
+        self.agents
+            .get(&key)
+            .is_some_and(|held| !held.live && held.run == a.run)
+    }
+
     /// Fold one JSONL line from `agent export --json --follow` and return `Ok(true)` iff the
     /// published [`FleetSnapshot`] changed (`gen` incremented).
     pub fn apply_line(&mut self, raw: &str) -> Result<bool, String> {
@@ -482,15 +519,21 @@ impl FleetState {
                     self.put_agent(a);
                 }
             }
-            "spawned" | "changed" | "removed" => {
+            "spawned" | "removed" => {
                 if let Some(a) = line.agent {
                     self.put_agent(a);
                 }
             }
+            "changed" => {
+                if let Some(a) = line.agent {
+                    if !self.is_report_of_departed_run(&a) {
+                        self.put_agent(a);
+                    }
+                }
+            }
             "store" => {
-                let st = line
-                    .store
-                    .ok_or_else(|| "export `store` line missing `store` object".to_string())?;
+                let st: ExportStore = serde_json::from_value(line.store)
+                    .map_err(|e| format!("export `store` line invalid `store` object: {e}"))?;
                 self.agents.retain(|k, _| k.store != st.dir);
                 for a in line.agents {
                     self.put_agent(a);
@@ -812,10 +855,12 @@ fn run_fleet_loop(
                             if trimmed.is_empty() {
                                 continue;
                             }
+                            let mut is_snapshot = false;
                             if trimmed.contains("\"type\":\"snapshot\"")
                                 || trimmed.contains("\"type\": \"snapshot\"")
                             {
                                 saw_snapshot = true;
+                                is_snapshot = true;
                             }
                             match state.apply_line(trimmed) {
                                 Ok(true) => {
@@ -832,6 +877,24 @@ fn run_fleet_loop(
                                         guard.last_error = None;
                                     }
                                     wake();
+                                }
+                                // A child's snapshot replaces the whole fold, so whatever
+                                // the last child died of (or could not read) is over, even
+                                // when the fleet it describes is the one already published.
+                                // Until 2026-11-27 only a CHANGED fleet cleared the error,
+                                // so a restart onto the same agents left the wall saying
+                                // the feed was down for good.
+                                Ok(false) if is_snapshot => {
+                                    let cleared = shared
+                                        .0
+                                        .lock()
+                                        .expect("fleet follower mutex poisoned")
+                                        .last_error
+                                        .take()
+                                        .is_some();
+                                    if cleared {
+                                        wake();
+                                    }
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
@@ -890,6 +953,13 @@ fn run_fleet_loop(
         }
         if let Some(err) = run_err {
             guard.last_error = Some(err);
+            // The error is news for whoever draws the fleet: say so, as a change is said.
+            drop(guard);
+            wake();
+            guard = lock.lock().expect("fleet follower mutex poisoned");
+            if guard.stopped {
+                return;
+            }
         }
         let (next_guard, _) = cvar
             .wait_timeout_while(guard, backoff, |s| !s.stopped)
@@ -1043,9 +1113,9 @@ mod tests {
         // remote namespace stays None when omitted, and local_agent("lead") ignores remote "lead".
         assert!(apply(
             &mut st,
-            r#"{"type":"host","host":{"host":"m2"},"agents":[
-                {"name":"lead","host":"m2","backend":"claude","session":"lead","created_at":"2026-10-12T11:00:00Z","live":true,"status":"idle"},
-                {"name":"dead","host":"m2","backend":"claude","session":"dead","created_at":"2026-10-12T11:01:00Z","live":true,"attached":false,"status":"error"}
+            r#"{"type":"host","host":{"host":"far-host"},"agents":[
+                {"name":"lead","host":"far-host","backend":"claude","session":"lead","created_at":"2026-10-12T11:00:00Z","live":true,"status":"idle"},
+                {"name":"dead","host":"far-host","backend":"claude","session":"dead","created_at":"2026-10-12T11:01:00Z","live":true,"attached":false,"status":"error"}
             ]}"#,
         ));
         let snap = st.snapshot();
@@ -1057,7 +1127,7 @@ mod tests {
         let remote_lead = snap
             .agents
             .iter()
-            .find(|a| a.name == "lead" && a.host.as_deref() == Some("m2"))
+            .find(|a| a.name == "lead" && a.host.as_deref() == Some("far-host"))
             .unwrap();
         assert_eq!(remote_lead.attached, None);
         assert!(remote_lead.attachable());
@@ -1067,7 +1137,7 @@ mod tests {
         let remote_dead = snap
             .agents
             .iter()
-            .find(|a| a.name == "dead" && a.host.as_deref() == Some("m2"))
+            .find(|a| a.name == "dead" && a.host.as_deref() == Some("far-host"))
             .unwrap();
         assert_eq!(remote_dead.attached, Some(false));
         assert!(!remote_dead.attachable());
@@ -1078,14 +1148,14 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].host, "workstation");
         assert_eq!(groups[0].agents.len(), 1, "departed worker excluded from by_host");
-        assert_eq!(groups[1].host, "m2");
+        assert_eq!(groups[1].host, "far-host");
         assert_eq!(
             groups[1]
                 .agents
                 .iter()
                 .map(|a| a.target.as_str())
                 .collect::<Vec<_>>(),
-            vec!["dead@m2", "lead@m2"]
+            vec!["dead@far-host", "lead@far-host"]
         );
 
         // Unknown line type errors cleanly without corrupting snapshot.
@@ -1117,6 +1187,318 @@ mod tests {
         assert!(pretty_state.apply_json_stream(pretty).unwrap());
         assert_eq!(pretty_state.snapshot().host.as_deref(), Some("laptop-2"));
         assert_eq!(pretty_state.snapshot().agents.len(), 1);
+    }
+
+    /// One agent object as `agent export` prints it, every field present.
+    fn export_agent(name: &str, run: u64, live: bool, attached: bool, status: &str, rest: &str) -> String {
+        format!(
+            r#"{{"name":"{name}","host":"laptop-2","kind":"termd","run":{run},"parent":"lead","backend":"claude","session":"agent-{name}","namespace":"agents","store":"/s/main","cwd":"/repo","created_at":"2026-11-27T19:01:44.945484Z","live":{live},"attached":{attached},"resumable":false,"status":"{status}"{rest}}}"#
+        )
+    }
+
+    /// An event line as `agent export --json --follow` prints it: beside the agent, its `id`,
+    /// the store's directory as a STRING, `at`, and for `changed` a `reason`.
+    fn event_line(kind: &str, id: u64, reason: &str, agent: &str) -> String {
+        let reason = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(r#","reason":"{reason}""#)
+        };
+        format!(
+            r#"{{"type":"{kind}","id":{id},"store":"/s/main","at":"2026-11-27T20:34:54.278997Z"{reason},"agent":{agent}}}"#
+        )
+    }
+
+    /// The live rows a display draws: `(target, status)` in [`FleetSnapshot::by_host`] order.
+    fn live_rows(snap: &FleetSnapshot) -> Vec<(String, String)> {
+        snap.by_host()
+            .into_iter()
+            .flat_map(|h| h.agents)
+            .map(|a| (a.target.clone(), a.status.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    /// The bug of 2026-11-27: the sidebar showed a helper as `processing` an hour after it was
+    /// cleaned up. The follow stream's event lines name their store as a string
+    /// (`"store":"/dir"`), a `store` line as an object, and the fold read only the object: every
+    /// `spawned`, `changed` and `removed` line failed to parse, so this host's agents kept the
+    /// status the wall started with. (The fold's older test wrote its event lines without the
+    /// keys the CLI prints, which is how it passed.)
+    #[test]
+    fn follow_lines_as_the_cli_prints_them_take_a_cleaned_up_agent_out_of_the_live_list() {
+        let mut st = FleetState::new();
+        let snapshot = format!(
+            r#"{{"type":"snapshot","host":"laptop-2","stores":[{{"dir":"/s/main","this":true,"cursor":65740,"events":true}}],"hosts":[],"agents":[{},{}],"unrecorded":[]}}"#,
+            export_agent("lead", 79, true, true, "idle", ""),
+            export_agent("helper", 95, true, true, "processing", r#","event":"PostToolUse","tool":"Bash""#),
+        );
+        assert!(st.apply_line(&snapshot).unwrap());
+        assert_eq!(
+            live_rows(st.snapshot()),
+            vec![
+                ("helper@laptop-2".to_string(), "processing".to_string()),
+                ("lead@laptop-2".to_string(), "idle".to_string()),
+            ]
+        );
+
+        // Its turn ends: a status report is a `changed` line.
+        let idle = event_line(
+            "changed",
+            65750,
+            "status",
+            &export_agent("helper", 95, true, true, "idle", r#","event":"Stop","detail":"turn finished""#),
+        );
+        assert!(st.apply_line(&idle).unwrap(), "a changed line as the CLI prints it must fold");
+        assert_eq!(
+            st.snapshot().local_agent("helper").unwrap().status.as_deref(),
+            Some("idle")
+        );
+
+        // Its CLI quits, then cleanup deletes the record.
+        let quit = event_line(
+            "changed",
+            65782,
+            "status",
+            &export_agent("helper", 95, true, true, "ended", r#","end_reason":"quit","event":"SessionEnd""#),
+        );
+        assert!(st.apply_line(&quit).unwrap());
+        let removed = event_line(
+            "removed",
+            65783,
+            "",
+            &export_agent(
+                "helper",
+                95,
+                false,
+                false,
+                "ended",
+                r#","end_reason":"quit","ended_at":"2026-11-27T20:34:54.278997Z""#,
+            ),
+        );
+        assert!(st.apply_line(&removed).unwrap());
+        let gone = st.snapshot().local_agent("helper").unwrap();
+        assert!(!gone.live, "a removed agent is departed");
+        assert_eq!(gone.status.as_deref(), Some("ended"));
+        assert_eq!(gone.end_reason.as_deref(), Some("quit"));
+        assert_eq!(
+            live_rows(st.snapshot()),
+            vec![("lead@laptop-2".to_string(), "idle".to_string())],
+            "a cleaned-up agent leaves the live list"
+        );
+
+        // A hook that reports after cleanup (a tool still running when its pane closed): the
+        // exporter describes the run "as it was", live, since nothing in its tree holds it any
+        // more. The run has departed, and a late report does not bring it back.
+        let late = event_line(
+            "changed",
+            65790,
+            "status",
+            &export_agent("helper", 95, true, false, "processing", r#","event":"PostToolUse""#),
+        );
+        assert!(!st.apply_line(&late).unwrap(), "a late report of a departed run changes nothing");
+        assert!(!st.snapshot().local_agent("helper").unwrap().live);
+        assert_eq!(live_rows(st.snapshot()).len(), 1);
+
+        // The name spawned again is another run, and is live.
+        let again = event_line(
+            "spawned",
+            65800,
+            "",
+            &export_agent("helper", 96, true, true, "processing", ""),
+        );
+        assert!(st.apply_line(&again).unwrap());
+        assert_eq!(
+            live_rows(st.snapshot()),
+            vec![
+                ("helper@laptop-2".to_string(), "processing".to_string()),
+                ("lead@laptop-2".to_string(), "idle".to_string()),
+            ]
+        );
+
+        // A store found while following is a `store` line, whose `store` is an object.
+        assert!(st
+            .apply_line(r#"{"type":"store","store":{"dir":"/s/other","cursor":0,"events":false},"agents":[]}"#)
+            .unwrap());
+        assert_eq!(st.snapshot().dirs, vec!["/s/main", "/s/other"]);
+        assert!(st.apply_line(r#"{"type":"store","store":"/s/other","agents":[]}"#).is_err());
+    }
+
+    /// An agent whose record is live but whose terminal session is gone (its `g3d-termd` was
+    /// stopped, the machine rebooted) reports nothing more, so export keeps its last status
+    /// for good. `agent status` calls it `ended (gone)`, and so does the fold: a status that
+    /// can never change again is not a live one.
+    #[test]
+    fn a_live_agent_whose_session_is_gone_reads_as_ended_not_by_its_last_report() {
+        let mut st = FleetState::new();
+        let snapshot = format!(
+            r#"{{"type":"snapshot","host":"laptop-2","stores":[{{"dir":"/s/main"}}],"agents":[{},{},{}]}}"#,
+            export_agent("stranded", 7, true, false, "processing", ""),
+            export_agent("quit-in-pane", 8, true, true, "ended", r#","end_reason":"quit""#),
+            export_agent("working", 9, true, true, "processing", ""),
+        );
+        assert!(st.apply_line(&snapshot).unwrap());
+        let snap = st.snapshot();
+
+        let stranded = snap.local_agent("stranded").unwrap();
+        assert!(stranded.live, "its record is still there");
+        assert_eq!(stranded.status.as_deref(), Some("ended"));
+        assert_eq!(stranded.end_reason.as_deref(), Some("gone"));
+        assert!(!stranded.attachable());
+
+        let quit = snap.local_agent("quit-in-pane").unwrap();
+        assert_eq!(
+            (quit.status.as_deref(), quit.end_reason.as_deref()),
+            (Some("ended"), Some("quit")),
+            "an end the agent reported keeps its own reason"
+        );
+        assert_eq!(snap.local_agent("working").unwrap().status.as_deref(), Some("processing"));
+
+        // Another host resolves its own agents' status, so what it sends stands: one that
+        // predates `attached` leaves it out (unknown, not gone).
+        assert!(st
+            .apply_line(
+                r#"{"type":"host","host":{"host":"far-host","agents":2},"agents":[{"name":"old","host":"far-host","live":true,"status":"processing"},{"name":"stuck","host":"far-host","live":true,"attached":false,"status":"error"}]}"#
+            )
+            .unwrap());
+        let remote = |name: &str| {
+            st.snapshot()
+                .agents
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(remote("old").as_deref(), Some("processing"));
+        assert_eq!(remote("stuck").as_deref(), Some("error"));
+
+        // The session comes back (its daemon restarted under it): the last report stands again.
+        let back = event_line(
+            "changed",
+            12,
+            "session",
+            &export_agent("stranded", 7, true, true, "processing", ""),
+        );
+        assert!(st.apply_line(&back).unwrap());
+        assert_eq!(
+            st.snapshot().local_agent("stranded").unwrap().status.as_deref(),
+            Some("processing")
+        );
+    }
+
+    /// The same bug end to end: a stub `agent` that prints what the real one prints, followed
+    /// by [`FleetFollower`].
+    #[test]
+    fn fleet_follower_drops_a_cleaned_up_agent_from_a_stream_shaped_like_the_clis() {
+        let scratch = Scratch::new("cleanup");
+        let stream = scratch.0.join("stream.jsonl");
+        let stub = scratch.0.join("agent");
+        let lines = [
+            format!(
+                r#"{{"type":"snapshot","host":"laptop-2","stores":[{{"dir":"/s/main","this":true,"cursor":65740,"events":true}}],"hosts":[],"agents":[{}],"unrecorded":[]}}"#,
+                export_agent("helper", 95, true, true, "processing", r#","event":"PostToolUse""#),
+            ),
+            event_line(
+                "changed",
+                65782,
+                "status",
+                &export_agent("helper", 95, true, true, "ended", r#","end_reason":"quit","event":"SessionEnd""#),
+            ),
+            event_line(
+                "removed",
+                65783,
+                "",
+                &export_agent(
+                    "helper",
+                    95,
+                    false,
+                    false,
+                    "ended",
+                    r#","end_reason":"quit","ended_at":"2026-11-27T20:34:54.278997Z""#,
+                ),
+            ),
+        ];
+        fs::write(&stream, lines.join("\n") + "\n").unwrap();
+        write_stub(
+            &stub,
+            &format!("#!/bin/sh\ncat '{}'\nexec sleep 60\n", stream.display()),
+        );
+
+        let follower = FleetFollower::start(AgentCli::new(&stub), FleetOptions::default(), || {});
+        wait_until("the removed line folded", || {
+            follower
+                .snapshot()
+                .local_agent("helper")
+                .is_some_and(|a| !a.live)
+        });
+        let snap = follower.snapshot();
+        assert_eq!(snap.gen, 3, "the snapshot and both event lines each changed the fleet");
+        assert_eq!(
+            follower.last_error(),
+            None,
+            "every line the CLI prints parses"
+        );
+        assert!(
+            follower.hosts().is_empty(),
+            "no live agent is left to draw: {:?}",
+            live_rows(&snap)
+        );
+        let helper = snap.local_agent("helper").unwrap();
+        assert_eq!(
+            (helper.status.as_deref(), helper.end_reason.as_deref()),
+            (Some("ended"), Some("quit"))
+        );
+    }
+
+    /// A child that dies and comes back onto the same agents: the fleet does not change, and
+    /// the error it died with must not outlive it.
+    #[test]
+    fn fleet_follower_error_ends_when_a_restart_reads_the_same_fleet() {
+        let scratch = Scratch::new("same-fleet");
+        let count_file = scratch.0.join("runs");
+        let stub = scratch.0.join("agent");
+        let snapshot = format!(
+            r#"{{"type":"snapshot","host":"laptop-2","stores":[{{"dir":"/s/main"}}],"agents":[{}]}}"#,
+            export_agent("helper", 95, true, true, "idle", ""),
+        );
+        let script = format!(
+            "#!/bin/sh\n\
+             n=0\n\
+             if [ -f '{runs}' ]; then n=$(cat '{runs}'); fi\n\
+             n=$((n + 1))\n\
+             printf '%s' \"$n\" > '{runs}'\n\
+             cat <<'LINE'\n{snapshot}\nLINE\n\
+             if [ \"$n\" -eq 1 ]; then echo 'bus went away' >&2; exit 1; fi\n\
+             exec sleep 60\n",
+            runs = count_file.display(),
+        );
+        write_stub(&stub, &script);
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_cb = Arc::clone(&wakes);
+        let opts = FleetOptions {
+            // Long enough to read the error while the follower waits to restart.
+            initial_backoff: Duration::from_millis(400),
+            max_backoff: Duration::from_millis(400),
+            ..FleetOptions::default()
+        };
+        let follower = FleetFollower::start(AgentCli::new(&stub), opts, move || {
+            wakes_cb.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+
+        wait_until("the first child's exit reported", || {
+            follower.last_error().is_some_and(|e| e.contains("bus went away"))
+        });
+        assert_eq!(follower.snapshot().gen, 1);
+        wait_until("the restarted child's snapshot read", || {
+            follower.restart_count() >= 1 && follower.last_error().is_none()
+        });
+        assert_eq!(follower.snapshot().gen, 1, "the same fleet is not a change");
+        assert_eq!(
+            wakes.load(AtomicOrdering::SeqCst),
+            3,
+            "the fleet, the error, and the error's end"
+        );
     }
 
     #[test]
@@ -1170,10 +1552,12 @@ mod tests {
                 == Some("waiting")
         });
 
-        // Two distinct snapshots across two runs -> exact gen 2 and 2 wake calls (quiet repeat ignored).
+        // Two distinct snapshots across two runs -> exact gen 2 (quiet repeat ignored), and 3
+        // wake calls: each changed fleet, and the first child's exit (its error is news too).
         assert_eq!(follower.snapshot().gen, 2);
-        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(wakes.load(AtomicOrdering::SeqCst), 3);
         assert!(follower.restart_count() >= 1);
+        assert_eq!(follower.last_error(), None, "the restarted child's snapshot ends the error");
 
         wait_until("pid file written", || pid_file.is_file());
         let pid: i32 = fs::read_to_string(&pid_file)

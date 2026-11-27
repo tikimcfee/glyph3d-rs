@@ -3,16 +3,32 @@
 #
 # Starts an isolated scratch g3d-termd + glyph3d-native --wall in namespace `wsexit` under
 # /tmp/g3d-ws-$$ (never touching `wall`, `agents`, `default`, or `rs-wall`, never the system
-# clipboard, and killing only the window PID started here), with a stub `agent` on PATH, and
-# checks, with the installed `g3d`:
+# clipboard, and signalling only the window PID and the scratch daemon it started here), with
+# a stub `agent` on PATH, and checks, with the installed `g3d` and `g3d-termd` (or the ones
+# `G3D_BIN` and `G3D_TERMD_BIN` name):
 #   1. `g3d upgrade` (the brain alone): the wall rides it. Its terminal stays and takes typing
 #      afterwards, and no outage notice is left behind.
 #   2. `g3d stop` with a shell on the wall (protocol 1.6, "A namespace that leaves"): the red
-#      termd notice is up straight away, with the reason, measured from the moment the daemon
-#      removes its socket (which it does as it tells its connections); the terminal is gone.
-#   3. a daemon started again on the namespace is picked up by the wall's passive watcher:
-#      the notice clears and a new terminal lands on it. (The wall does not start one itself
-#      after a stop: `Sessions` never restarts a stopped daemon behind the user's back.)
+#      termd notice is up straight away, saying termd stopped, measured from the moment the
+#      daemon removes its socket (which it does as it tells its connections); the terminal is
+#      gone.
+#   3. a new terminal asked for then (`wall.spawn`, nothing else): the wall starts a fresh
+#      termd itself, as the notice says, the notice clears, and the terminal takes typing.
+#   4. after another stop, a daemon someone else starts on the namespace is picked up by the
+#      wall's passive watcher: the notice clears and a new terminal lands on it.
+#   5. `SIGTERM` to that daemon's holder: the notice says termd was ended by SIGTERM.
+#
+# The notice names the cause from `daemon.exit_reason` in the namespace's last status
+# document. A daemon from before that field says only that it is leaving, and the wall then
+# says "termd left on purpose": the script reads which daemon it has from the binary and
+# expects accordingly, saying so.
+#
+# Not here: the idle exit (`exit_reason: idle`), which the wall keeps silent. termd counts a
+# connection that has asked for anything but status as keeping the namespace alive, and the
+# wall lists the terminals of every daemon it connects to, so a namespace never idles out
+# under a running wall (measured 2026-11-27: a `--idle-exit 1` daemon the wall had picked up
+# was still there 10 s later, where one with only `g3d status --follow` left after 1.6 s).
+# `wall_core::status`'s tests hold the silence, with the field as the daemon sends it.
 #
 # Prints a PASS/FAIL table; failure PNGs land in target/glyph-scratch/wall-smoke-termd/.
 
@@ -23,17 +39,27 @@ cd "$REPO_ROOT"
 
 BIN="$REPO_ROOT/target/release/glyph3d-native"
 WALLCTL="$REPO_ROOT/target/release/wallctl"
-G3D="${HOME}/.local/bin/g3d"
-G3D_TERMD="${HOME}/.local/bin/g3d-termd"
+G3D="${G3D_BIN:-${HOME}/.local/bin/g3d}"
+G3D_TERMD="${G3D_TERMD_BIN:-${HOME}/.local/bin/g3d-termd}"
 NS="wsexit"
 
 if [[ ! -x "$BIN" || ! -x "$WALLCTL" ]]; then
     echo "ERR: missing $BIN or $WALLCTL (build --release -p glyph3d-native -p wall-control first)" >&2
     exit 1
 fi
-if [[ ! -x "$G3D" ]]; then
-    echo "ERR: missing $G3D (the g3d CLI that stops and upgrades the scratch daemon)" >&2
+if [[ ! -x "$G3D" || ! -x "$G3D_TERMD" ]]; then
+    echo "ERR: missing $G3D or $G3D_TERMD (the g3d CLI that stops and upgrades the scratch daemon, and the daemon)" >&2
     exit 1
+fi
+# The wall starts the scratch daemon itself: have it start the one under test.
+export G3D_TERMD_BIN="$G3D_TERMD"
+# Does this daemon say which way it leaves (`daemon.exit_reason`, protocol 1.6)?
+if grep -aq 'exit_reason' "$G3D_TERMD"; then
+    SAYS_WHY=1
+    echo "NOTE  $G3D_TERMD says why a namespace leaves (daemon.exit_reason): expecting the cause in the notice"
+else
+    SAYS_WHY=0
+    echo "NOTE  $G3D_TERMD predates daemon.exit_reason: expecting \"termd left on purpose\", the wall's words for a cause not given"
 fi
 
 D="/tmp/g3d-ws-$$"
@@ -125,6 +151,34 @@ notice_line() {
     ctl app.where 2>/dev/null | grep '^termd_notice ' || echo "termd_notice ?"
 }
 
+termd_line() {
+    ctl app.where 2>/dev/null | grep '^termd ' || echo "termd ?"
+}
+
+# The notice the wall shows when the namespace left the way $1 names (stop, sigterm) with
+# shells in it.
+lost_notice() {
+    local phrase="termd left on purpose"
+    if [[ "$SAYS_WHY" -eq 1 ]]; then
+        case "$1" in
+            stop) phrase="termd stopped" ;;
+            sigterm) phrase="termd ended by SIGTERM" ;;
+        esac
+    fi
+    printf 'termd_notice kind=lost dismiss=true text=%s: the shells in namespace "%s" ended with it · a new terminal starts a fresh termd' "$phrase" "$NS"
+}
+
+# The pid of the scratch namespace's holder, from its lock file, when that pid is a
+# g3d-termd of this namespace (the only daemon this script ever signals).
+scratch_holder_pid() {
+    local pid cmd
+    pid="$(tr -cd '0-9' <"$SOCK.lock" 2>/dev/null)"
+    [[ -n "$pid" ]] || return 1
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
+    [[ "$cmd" == *g3d-termd* && "$cmd" == *"--ns $NS"* ]] || return 1
+    printf '%s\n' "$pid"
+}
+
 # The wall, from `$D` so no repo-local launch_config overrides PATH discovery of the stub.
 (cd "$D" && "$BIN" --wall --wall-ns "$NS") >"$SHOT_DIR/wall.log" 2>&1 &
 WALL_PID=$!
@@ -164,12 +218,10 @@ else
 fi
 
 # ── 2. `g3d stop` with a shell on the wall: the outage notice, straight away ──
-STOP_CHECK="$(python3 - "$G3D" "$NS" "$SOCK" "$WALLCTL" <<'PY'
+STOP_CHECK="$(python3 - "$G3D" "$NS" "$SOCK" "$WALLCTL" "$(lost_notice stop)" <<'PY'
 import os, subprocess, sys, time
 
-g3d, ns, sock, wallctl = sys.argv[1:5]
-WANT = ("termd_notice kind=lost dismiss=true text=termd lost: the namespace left on purpose: "
-        "its terminals are ended and nothing listens there now")
+g3d, ns, sock, wallctl, WANT = sys.argv[1:6]
 
 def where():
     out = subprocess.run([wallctl, "--ns", ns, "app.where"], capture_output=True, text=True).stdout
@@ -222,7 +274,42 @@ else
     record_fail "g3d stop shows the outage" "${STOP_CHECK#* }"
 fi
 
-# ── 3. A daemon back on the namespace is picked up, and the notice clears ────
+# ── 3. A new terminal starts a fresh termd ──────────────────────────────────
+# Nothing but the wall may start it: no socket before, and no daemon of this namespace.
+PRE_SOCK="$([[ -e "$SOCK" ]] && echo yes || echo no)"
+PRE_DAEMON="$(scratch_holder_pid || echo none)"
+R_FRESH="$(ctl wall.spawn 2>&1)"
+FRESH_ID=""
+for _ in $(seq 1 200); do
+    W_FRESH="$(ctl app.where 2>/dev/null)" || { sleep 0.05; continue; }
+    FRESH_ID="$(awk '/^terminal / {print $2; exit}' <<<"$W_FRESH")"
+    [[ -n "$FRESH_ID" ]] && break
+    sleep 0.05
+done
+TYPED=0
+if [[ -n "$FRESH_ID" ]]; then
+    ctl terminal.focus "$FRESH_ID" >/dev/null
+    ctl app.type "echo FRESH_\$((50+5))" >/dev/null
+    ctl app.key enter >/dev/null
+    wait_for_text "$FRESH_ID" "FRESH_55" 200 && TYPED=1
+fi
+FRESH_NOTICE="$(notice_line)"
+FRESH_TERMD="$(termd_line)"
+FRESH_HOLDER="$(scratch_holder_pid || echo none)"
+if [[ "$PRE_SOCK" == "no" && "$PRE_DAEMON" == "none" && -n "$FRESH_ID" && "$TYPED" -eq 1 \
+    && -S "$SOCK" && "$FRESH_HOLDER" != "none" \
+    && "$FRESH_NOTICE" == "termd_notice none" && "$FRESH_TERMD" == "termd state=ok "* ]]; then
+    record_pass "a new terminal starts a termd" "no daemon before; wall.spawn alone gave holder $FRESH_HOLDER and $FRESH_ID, which took typing; ${FRESH_NOTICE}; ${FRESH_TERMD%% says=*}"
+else
+    record_fail "a new terminal starts a termd" "socket before=$PRE_SOCK daemon before=$PRE_DAEMON reply='${R_FRESH}' id='${FRESH_ID}' typed=$TYPED holder=$FRESH_HOLDER ${FRESH_NOTICE} | ${FRESH_TERMD}"
+fi
+
+# ── 4. A daemon someone else starts is picked up, and the notice clears ──────
+"$G3D" --ns "$NS" stop >/dev/null 2>&1
+for _ in $(seq 1 200); do
+    [[ ! -e "$SOCK" && "$(notice_line)" == "termd_notice kind=lost"* ]] && break
+    sleep 0.05
+done
 "$G3D_TERMD" --ns "$NS" --daemon >/dev/null 2>&1
 BACK=0
 for _ in $(seq 1 200); do
@@ -246,6 +333,34 @@ if [[ "$BACK" -eq 1 && "$FRESH" -eq 1 ]]; then
     record_pass "a daemon back is picked up" "notice cleared; $(grep -c '^terminal ' <<<"$W_NEW") new terminal on the new daemon; $(grep '^termd_notice ' <<<"$W_NEW")"
 else
     record_fail "a daemon back is picked up" "back=$BACK fresh=$FRESH socket=$([[ -S "$SOCK" ]] && echo yes || echo no) $(notice_line)"
+fi
+
+# ── 5. SIGTERM to the holder: the notice says so ────────────────────────────
+HOLDER_PID="$(scratch_holder_pid || true)"
+TERM_NOTICE="termd_notice ?"
+if [[ -n "$HOLDER_PID" ]]; then
+    kill -TERM "$HOLDER_PID"
+    for _ in $(seq 1 200); do
+        TERM_NOTICE="$(notice_line)"
+        [[ "$TERM_NOTICE" == "termd_notice kind=lost"* ]] && break
+        sleep 0.05
+    done
+fi
+if [[ -n "$HOLDER_PID" && "$TERM_NOTICE" == "$(lost_notice sigterm)" ]]; then
+    record_pass "SIGTERM shows the outage" "holder $HOLDER_PID; '${TERM_NOTICE#termd_notice kind=lost dismiss=true text=}'"
+else
+    record_fail "SIGTERM shows the outage" "holder='${HOLDER_PID:-none found}' notice='${TERM_NOTICE}' want='$(lost_notice sigterm)'"
+fi
+
+# ── The wall can only run the stub `agent` ──────────────────────────────────
+# Its fleet feed runs the `agent` it found first on PATH (the stub above), and since
+# 2026-11-27 it hands that same binary to every attach terminal, whose own PATH (termd gives
+# a terminal /usr/bin:/bin) would otherwise lead through the login shell to the real CLI.
+AGENT_CLI="$(ctl app.where 2>/dev/null | sed -n 's/^agent_cli //p')"
+if [[ "$AGENT_CLI" == "$D/bin/agent" ]]; then
+    record_pass "only the stub agent CLI" "the wall's feed and its attach terminals run $AGENT_CLI"
+else
+    record_fail "only the stub agent CLI" "the wall would run '${AGENT_CLI:-nothing reported}', not the stub $D/bin/agent"
 fi
 
 echo ""

@@ -496,7 +496,8 @@ mod tests {
             };
             let mut out = Vec::new();
             let state = &mut self.state;
-            let _ = self.ctx.run_ui(
+            let _ = crate::wall::ui::headless_pass(
+                &self.ctx,
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, VIEW)),
                     time: Some(self.time),
