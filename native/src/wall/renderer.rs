@@ -3946,4 +3946,130 @@ mod tests {
         let is_thumb = |c: [u8; 3]| c[1] > 120 && c[1] > c[0] + 30;
         assert!(count_rect(right_strip, is_thumb) > 30, "scrollback right-edge thumb must be visible");
     }
+
+    /// Cell-renderer parity regressions:
+    /// 1. Shade sprites (`░` 25%, `▒` 50%, `▓` 75%, `█` 100%) blend in sRGB on `Rgba8UnormSrgb`
+    ///    so the ramp matches JS WebGL2 (`(58,58,74)`, `(107,107,117)`, `(156,156,160)`, `(204,204,204)`).
+    /// 2. Colour emoji (`🚀`) preserve native bitmap aspect ratio and keep symmetric top/bottom
+    ///    breathing room inside a cell fill (matching `EmojiRasterWorker.js`).
+    #[test]
+    fn gpu_shade_sprites_srgb_ramp_and_emoji_aspect_vertical_centering() {
+        let ctx = crate::gpu::test_device::context();
+        let mut renderer = WallRenderer::new(
+            &ctx.device,
+            &ctx.queue,
+            &crate::default_emoji_sheet(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WallStyle::default(),
+        );
+
+        let mut screen = Screen::new(10, 2);
+        screen.default_bg = rgb(0x0a, 0x0a, 0x1e);
+        screen.default_fg = rgb(0xcc, 0xcc, 0xcc);
+        screen.cursor.visible = false;
+
+        // Row 0: ░ (col 1), ▒ (col 3), ▓ (col 5), █ (col 7) over panel bg #0a0a1e.
+        for (col, ch) in [(1usize, '░'), (3, '▒'), (5, '▓'), (7, '█')] {
+            screen.row_mut(0)[col] = term_cells::Cell {
+                content: ch as u32,
+                fg: screen.default_fg,
+                bg: 0,
+                ul: 0,
+                attrs: 0,
+                width: 1,
+                _pad: 0,
+            };
+        }
+        screen.touch_row(0);
+
+        // Row 1: wide rocket emoji 🚀 on a #005f87 fill at cols 2..4.
+        let fill_bg = rgb(0x00, 0x5f, 0x87);
+        screen.row_mut(1)[2] = term_cells::Cell {
+            content: '🚀' as u32,
+            fg: screen.default_fg,
+            bg: fill_bg,
+            ul: 0,
+            attrs: 0,
+            width: 2,
+            _pad: 0,
+        };
+        screen.row_mut(1)[3] = term_cells::Cell {
+            content: 0,
+            fg: screen.default_fg,
+            bg: fill_bg,
+            ul: 0,
+            attrs: 0,
+            width: 0,
+            _pad: 0,
+        };
+        screen.touch_row(1);
+
+        let m = renderer.metrics();
+        let bounds = m.panel_rect(Vec2::ZERO, screen.cols, screen.rows, renderer.style().panel_padding);
+        let w = 640u32;
+        let h = 280u32;
+        let cam = WallCamera::frame_rect(bounds, (w, h), 1.15);
+        let draw = TerminalDraw {
+            id: 707,
+            screen: &screen,
+            position: Vec2::ZERO,
+            z: 2.0,
+            scale: 1.0,
+            focused: true,
+            panel_opacity: Some(1.0),
+            border_color: None,
+            selection: None,
+            hover_link: None,
+        };
+        let frame = WallFrame { terminals: &[draw], ..Default::default() };
+        let px = render_rgba_bytes(&ctx, &mut renderer, &cam, &frame, w, h);
+
+        let sample = |col: f32, row: f32| -> [u8; 3] {
+            let p = cam.world_to_screen(Vec2::new(col * m.cell_width, -row * m.cell_height), (w, h));
+            let x = (p.x.round() as u32).min(w - 1);
+            let y = (p.y.round() as u32).min(h - 1);
+            let i = ((y * w + x) * 4) as usize;
+            [px[i], px[i + 1], px[i + 2]]
+        };
+
+        // 1. Shade ramp on #0a0a1e -> #cccccc matches sRGB mixing within +/-2 LSB.
+        let expected = [
+            (1.5_f32, [59u8, 59, 74], "░ 25%"),
+            (3.5_f32, [107u8, 107, 117], "▒ 50%"),
+            (5.5_f32, [156u8, 156, 160], "▓ 75%"),
+            (7.5_f32, [204u8, 204, 204], "█ 100%"),
+        ];
+        for (col_c, exp, label) in expected {
+            let got = sample(col_c, 0.5);
+            for ch in 0..3 {
+                assert!(
+                    got[ch].abs_diff(exp[ch]) <= 2,
+                    "{label}: expected sRGB {exp:?}, got {got:?}"
+                );
+            }
+        }
+
+        // 2. Emoji vertical centring: top 4% and bottom 4% strips of row 1 cols 2..4 show pure fill
+        //    (#005f87), while the middle of the cell shows rocket ink.
+        let top_band = sample(3.0, 1.03);
+        let bot_band = sample(3.0, 1.97);
+        for (band, name) in [(top_band, "top"), (bot_band, "bottom")] {
+            assert!(
+                band[0] <= 4 && band[1].abs_diff(0x5f) <= 4 && band[2].abs_diff(0x87) <= 4,
+                "emoji {name} breathing strip must stay pure cell fill #005f87, got {band:?}"
+            );
+        }
+        let mut rocket_ink = 0usize;
+        let p0 = cam.world_to_screen(Vec2::new(2.0 * m.cell_width, -1.0 * m.cell_height), (w, h));
+        let p1 = cam.world_to_screen(Vec2::new(4.0 * m.cell_width, -2.0 * m.cell_height), (w, h));
+        for y in (p0.y.ceil() as u32)..(p1.y.floor() as u32).min(h) {
+            for x in (p0.x.ceil() as u32)..(p1.x.floor() as u32).min(w) {
+                let i = ((y * w + x) * 4) as usize;
+                if px[i] > 120 {
+                    rocket_ink += 1;
+                }
+            }
+        }
+        assert!(rocket_ink > 150, "rocket emoji must draw inside centred box (got {rocket_ink} px)");
+    }
 }
