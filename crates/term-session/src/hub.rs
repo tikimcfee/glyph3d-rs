@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use termd_client::{
-    Colors, ConnectOptions, Create, Error, Event, IfExists, Role, Target, TermInfo, Termd,
-    TermdHandle, Welcome,
+    Colors, ConnectOptions, Create, Error, Event, Flow, IfExists, Mode, Role, Subscribe,
+    Subscription, Target, TermInfo, Termd, TermdHandle, Welcome,
 };
 
 /// Current lifecycle state of the underlying `g3d-termd` connection.
@@ -350,7 +350,29 @@ impl SessionHub {
         size: Option<(u16, u16)>,
         history_rows: u32,
     ) -> Result<TerminalSession, Error> {
-        let sub = self.inner.termd_handle().subscribe(id, role, size, history_rows)?;
+        self.attach_with_options(&Subscribe {
+            id: id.to_owned(),
+            mode: Mode::Raw,
+            role,
+            history_rows: (history_rows > 0).then_some(history_rows),
+            flow: None,
+            cols: size.map(|pair| pair.0),
+            rows: size.map(|pair| pair.1),
+        })
+    }
+
+    /// Subscribes to existing terminal `opts.id` with explicit [`Subscribe`] options (such as
+    /// [`Role::Own`] paired with [`Flow::Lossy`] for cross-namespace agent views).
+    pub fn attach_with_options(&self, opts: &Subscribe) -> Result<TerminalSession, Error> {
+        let sub = self.inner.termd_handle().subscribe_with(opts)?;
+        self.start_subscribed_session(&opts.id, sub)
+    }
+
+    fn start_subscribed_session(
+        &self,
+        id: &str,
+        sub: Subscription,
+    ) -> Result<TerminalSession, Error> {
         let inbox = Arc::new(SessionInbox::new(self.inner.options.coalesce.inbox_max_bytes));
         self.inner.register_session(sub.handle, Arc::clone(&inbox));
         match TerminalSession::spawn_worker(
@@ -374,10 +396,11 @@ impl SessionHub {
         }
     }
 
-    /// Creates (or adopts) a terminal in `g3d-termd`, subscribes to it as [`Role::Own`] at its
-    /// size, and returns its running [`TerminalSession`].
+    /// Creates (or adopts) a terminal in `g3d-termd`, pipelining `create` and `subscribe` in one
+    /// socket write so startup `BEL`/mode/title events are caught without a client RTT gap, and
+    /// returns its running [`TerminalSession`].
     pub fn spawn(&self, opts: &SpawnOptions) -> Result<TerminalSession, Error> {
-        let created = self.inner.termd_handle().create(&Create {
+        let create_req = Create {
             id: opts.id.clone(),
             argv: opts.argv.clone(),
             cols: opts.cols,
@@ -389,13 +412,22 @@ impl SessionHub {
             scrollback_bytes: opts.scrollback_bytes,
             colors: opts.colors.clone(),
             cell_px: opts.cell_px,
-        })?;
-        let target_size = if created.created {
-            Some((opts.cols, opts.rows))
-        } else {
-            None
         };
-        self.attach_owner(&created.id, target_size)
+        let sub_req = Subscribe {
+            id: opts.id.clone(),
+            mode: Mode::Raw,
+            role: Role::Own,
+            history_rows: None,
+            flow: None,
+            cols: None,
+            rows: None,
+        };
+        let (created, sub) = self
+            .inner
+            .termd_handle()
+            .create_and_subscribe(&create_req, &sub_req)?;
+        let _ = Flow::Lossy;
+        self.start_subscribed_session(&created.id, sub)
     }
 
     /// Lists all live terminals in the namespace (sorted by `id`) and attaches to each as its

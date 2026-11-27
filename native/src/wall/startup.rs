@@ -178,11 +178,20 @@ impl PendingTermd {
     /// Start connecting (or spawning `g3d-termd` if absent), listing, and adopting existing
     /// terminals on a background thread; calls `wake()` when ready.
     pub fn spawn(ns: String, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self::spawn_with_extra(ns, Vec::new(), wake)
+    }
+
+    /// Like [`Self::spawn`], also attaching any extra `g3d-termd` namespaces (`--wall-extra-ns`).
+    pub fn spawn_with_extra(
+        ns: String,
+        extra_namespaces: Vec<String>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("wall-termd-connect".to_string())
             .spawn(move || {
-                let res = connect_and_adopt(&ns, wake.clone());
+                let res = connect_and_adopt(&ns, &extra_namespaces, wake.clone());
                 let _ = tx.send(res);
                 wake();
             });
@@ -198,11 +207,12 @@ impl PendingTermd {
 #[cfg(feature = "windowed")]
 fn connect_and_adopt(
     ns: &str,
+    extra_namespaces: &[String],
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<TermdReady, String> {
     let mut sessions = {
         let _s = span("termd_connect_spawn");
-        term_session::Sessions::open(ns, wake)
+        term_session::Sessions::open_with_extra(ns, extra_namespaces, wake)
             .map_err(|e| format!("the wall could not reach its terminals: {e}"))?
     };
     let live_ids = {

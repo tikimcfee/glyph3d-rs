@@ -13,15 +13,41 @@ use std::time::Instant;
 use term_cells::{Modes, Screen};
 use termd_client::{Error, Event, Key, Mouse, Role, TermdHandle, View, ViewReply};
 
-/// Scrollback view position of a subscription (`offset = 0` is live).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Scrollback view position and history depth of a subscription (`offset = 0` is live).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScrollbackState {
     /// Rows scrolled back from the live bottom (`0` = live).
     pub offset: u64,
-    /// Deepest scrollback offset currently available in `g3d-termd`.
+    /// History length (`max` scrollback rows reported by `g3d-termd` via `view` replies and
+    /// `status_follow`'s `scrollback_rows`).
     pub max: u64,
+    /// `true` when the viewer sits at the live bottom (`offset == 0 && !viewing`).
+    pub at_bottom: bool,
     /// `true` while showing a scrollback view (`REPAINT` had `view` flag set; cursor hidden).
     pub viewing: bool,
+}
+
+impl Default for ScrollbackState {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            max: 0,
+            at_bottom: true,
+            viewing: false,
+        }
+    }
+}
+
+impl ScrollbackState {
+    /// Known scrollback history depth in rows (`self.max`).
+    pub fn history_len(&self) -> u64 {
+        self.max
+    }
+
+    /// Whether this terminal view sits at the live bottom (`self.at_bottom`).
+    pub fn is_at_bottom(&self) -> bool {
+        self.at_bottom
+    }
 }
 
 /// How a terminal's process exited (`Event::Exit`).
@@ -495,14 +521,32 @@ impl TerminalSession {
         self.meta.mouse_sgr
     }
 
-    /// Current scrollback view state (`offset`, `max`, `viewing`).
+    /// Current scrollback view state (`offset`, `max`, `at_bottom`, `viewing`).
     pub fn scrollback(&self) -> ScrollbackState {
         self.meta.scrollback
+    }
+
+    /// Updates known scrollback history length (`max`) from `g3d-termd`'s pushed `status_follow`
+    /// document (`scrollback_rows`), keeping `max >= offset` while scrolled back.
+    pub(crate) fn note_status_scrollback(&mut self, scrollback_rows: u64) {
+        let mut guard = self.shared.published.lock().expect("published mutex poisoned");
+        let next_max = scrollback_rows.max(guard.meta.scrollback.offset);
+        if guard.meta.scrollback.max != next_max {
+            guard.meta.scrollback.max = next_max;
+            guard.meta.meta_gen += 1;
+            self.meta.scrollback = guard.meta.scrollback;
+            self.seen_meta_gen = guard.meta.meta_gen;
+        }
     }
 
     /// Cumulative bell count observed on this session.
     pub fn bell_count(&self) -> u64 {
         self.meta.bell_total
+    }
+
+    /// Unread bell count waiting to be drained via [`Self::take_bell`].
+    pub fn unread_bells(&self) -> u64 {
+        self.meta.bell_total.saturating_sub(self.seen_bells)
     }
 
     /// Returns the number of bells rung since the previous call to `take_bell`.
@@ -610,6 +654,17 @@ impl TerminalSession {
         self.vt.lock().expect("vt mutex poisoned").row_text(row)
     }
 
+    /// Returns the `OSC 8` hyperlink URI at `(col, row)` (`0`-based), or `None` when the cell
+    /// carries no link or is out of bounds. Wide-character continuation cells resolve to their
+    /// leading cell.
+    pub fn link_at(&self, col: u16, row: u16) -> Option<String> {
+        self.vt
+            .lock()
+            .expect("vt mutex poisoned")
+            .hyperlink(col, row)
+            .map(str::to_owned)
+    }
+
     // ── Synchronous RPCs (block caller until daemon REPLY) ───────────────────
 
     /// Resizes the terminal in `g3d-termd` (requires [`Role::Own`]).
@@ -644,7 +699,7 @@ impl TerminalSession {
     }
 
     /// Scrolls this subscriber's view into scrollback (`View::Delta`) or returns to live
-    /// (`View::Live`), updating [`Self::scrollback`] with `(offset, max)` from the reply.
+    /// (`View::Live`), updating [`Self::scrollback`] with `(offset, max, at_bottom)` from the reply.
     pub fn view(&mut self, view: View) -> Result<ViewReply, Error> {
         let reply = self.hub.termd_handle().view(self.handle, view)?;
         {
@@ -654,6 +709,8 @@ impl TerminalSession {
             if reply.offset == 0 {
                 guard.meta.scrollback.viewing = false;
             }
+            guard.meta.scrollback.at_bottom =
+                guard.meta.scrollback.offset == 0 && !guard.meta.scrollback.viewing;
             guard.meta.meta_gen += 1;
             self.meta.scrollback = guard.meta.scrollback;
             self.seen_meta_gen = guard.meta.meta_gen;
@@ -1128,6 +1185,11 @@ fn publish_snapshot(
             metadata_updated = true;
         }
     }
+    let at_bottom = slot.meta.scrollback.offset == 0 && !slot.meta.scrollback.viewing;
+    if slot.meta.scrollback.at_bottom != at_bottom {
+        slot.meta.scrollback.at_bottom = at_bottom;
+        metadata_updated = true;
+    }
     if *bell_delta > 0 {
         slot.meta.bell_total += *bell_delta;
         *bell_delta = 0;
@@ -1258,6 +1320,8 @@ pub(crate) fn run_async_cmd_worker(termd: TermdHandle, queue: Arc<AsyncCmdQueue>
                     if reply.offset == 0 {
                         guard.meta.scrollback.viewing = false;
                     }
+                    guard.meta.scrollback.at_bottom =
+                        guard.meta.scrollback.offset == 0 && !guard.meta.scrollback.viewing;
                     guard.meta.meta_gen += 1;
                     drop(guard);
                     shared.has_news.store(true, Ordering::Release);

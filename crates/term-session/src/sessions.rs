@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use term_cells::{Modes, Screen};
 use termd_client::{
-    ConnectOptions, Create, Key, KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Target,
-    View,
+    ConnectOptions, Flow, Key, KeyAction, Mode, Mouse, MouseAction, MouseButton, OptionAsAlt,
+    Role, Subscribe, Target, View,
 };
 use wall_core::keymap::{self, TerminalKey, TerminalKeyAction};
 use wall_core::mouse::MouseAction as WallMouseAction;
@@ -74,6 +74,9 @@ pub enum News {
 
 struct TrackedSession {
     session: TerminalSession,
+    /// `None` for primary-namespace terminals; `Some((extra_index, raw_termd_id))` for terminals
+    /// attached from an extra namespace.
+    extra_origin: Option<(usize, String)>,
     reported_size: (u16, u16),
     reported_osc_title: String,
     reported_modes: Modes,
@@ -82,11 +85,12 @@ struct TrackedSession {
 }
 
 impl TrackedSession {
-    fn new(session: TerminalSession) -> Self {
+    fn new(session: TerminalSession, extra_origin: Option<(usize, String)>) -> Self {
         let reported_size = (session.screen().cols, session.screen().rows);
         let reported_modes = session.modes();
         Self {
             session,
+            extra_origin,
             reported_size,
             reported_osc_title: String::new(),
             reported_modes,
@@ -96,15 +100,45 @@ impl TrackedSession {
     }
 }
 
-/// All live terminals attached in one `g3d-termd` namespace, keyed by terminal `id`, with one
-/// background emulator thread per terminal.
+struct ExtraNamespace {
+    name: String,
+    target: Target,
+    hub: Option<SessionHub>,
+    reconnected_hub: Arc<Mutex<Option<SessionHub>>>,
+    watching_reconnect: Arc<AtomicBool>,
+    detached_raw_ids: BTreeSet<String>,
+}
+
+/// Maps an extra namespace name and its raw `g3d-termd` terminal id onto a collision-free canvas
+/// terminal id (`gx-<name>` for `gomuxai` `agent-<name>` sessions in namespace `"agents"`, else
+/// `<ns>/<id>`).
+pub fn wall_id_for_extra(ns: &str, raw_id: &str) -> String {
+    if ns == "agents" {
+        if let Some(agent_name) = raw_id.strip_prefix("agent-").filter(|s| !s.is_empty()) {
+            let clean = agent_name.len() <= 61
+                && agent_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if clean {
+                return format!("gx-{agent_name}");
+            }
+        }
+    }
+    format!("{ns}/{raw_id}")
+}
+
+/// All live terminals attached in one primary `g3d-termd` namespace (plus optional extra
+/// namespaces such as `agents`), keyed by canvas terminal `id`, with one background emulator
+/// thread per terminal.
 pub struct Sessions {
     target: Target,
-    options: HubOptions,
+    options: Box<HubOptions>,
     wake: Arc<dyn Fn() + Send + Sync>,
     hub: SessionHub,
+    extras: Vec<ExtraNamespace>,
     live: BTreeMap<String, TrackedSession>,
     external_appeared: BTreeSet<String>,
+    detached_ended: Vec<String>,
     reconnected_hub: Arc<Mutex<Option<SessionHub>>>,
     watching_reconnect: Arc<AtomicBool>,
     dropped: Arc<AtomicBool>,
@@ -120,8 +154,28 @@ impl Sessions {
     /// Connects to `namespace`, starting its `g3d-termd` daemon if none runs. `wake` is called
     /// whenever a terminal publishes a coalesced screen update or a daemon lifecycle event arrives.
     pub fn open(namespace: &str, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        Self::open_with_extra(namespace, &[], wake)
+    }
+
+    /// Connects to primary `namespace` (starting `g3d-termd` if absent) and passively attaches to
+    /// each extra namespace in `extra_namespaces` (never starting extra daemons; watching for them
+    /// in the background if not yet running).
+    pub fn open_with_extra(
+        namespace: &str,
+        extra_namespaces: &[String],
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, String> {
         let target = Target::namespace(namespace);
-        Self::open_with(&target, default_wall_hub_options(), wake)
+        let mut seen = BTreeSet::new();
+        let mut extra_targets = Vec::new();
+        for raw in extra_namespaces {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed == namespace || !seen.insert(trimmed.to_owned()) {
+                continue;
+            }
+            extra_targets.push((trimmed.to_owned(), Target::namespace(trimmed)));
+        }
+        Self::open_targets_with(&target, &extra_targets, default_wall_hub_options(), wake)
             .map_err(|e| format!("termd namespace `{namespace}`: {e}"))
     }
 
@@ -132,28 +186,75 @@ impl Sessions {
             .map_err(|e| format!("termd target: {e}"))
     }
 
+    /// Connects to an explicit primary [`Target`] plus named extra [`Target`]s (used by isolated
+    /// multi-namespace scratch tests).
+    pub fn open_targets(
+        target: &Target,
+        extra_targets: &[(String, Target)],
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, String> {
+        Self::open_targets_with(target, extra_targets, default_wall_hub_options(), wake)
+            .map_err(|e| format!("termd target: {e}"))
+    }
+
     /// Connects to `target` with custom [`HubOptions`].
     pub fn open_with(
         target: &Target,
         options: HubOptions,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, termd_client::Error> {
+        Self::open_targets_with(target, &[], options, wake)
+    }
+
+    /// Connects to `target` with custom [`HubOptions`] and optional passive extra targets.
+    pub fn open_targets_with(
+        target: &Target,
+        extra_targets: &[(String, Target)],
+        options: HubOptions,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, termd_client::Error> {
         let hub = SessionHub::open_with(target, options.clone(), Arc::clone(&wake))?;
         let _ = hub.status_follow(Some(500));
-        Ok(Self {
+
+        let mut extras = Vec::with_capacity(extra_targets.len());
+        for (name, extra_target) in extra_targets {
+            let connected =
+                SessionHub::connect_with(extra_target, options.clone(), Arc::clone(&wake)).ok();
+            if let Some(ref ehub) = connected {
+                let _ = ehub.status_follow(Some(500));
+            }
+            extras.push(ExtraNamespace {
+                name: name.clone(),
+                target: extra_target.clone(),
+                hub: connected,
+                reconnected_hub: Arc::new(Mutex::new(None)),
+                watching_reconnect: Arc::new(AtomicBool::new(false)),
+                detached_raw_ids: BTreeSet::new(),
+            });
+        }
+
+        let sessions = Self {
             target: target.clone(),
-            options,
+            options: Box::new(options),
             wake,
             hub,
+            extras,
             live: BTreeMap::new(),
             external_appeared: BTreeSet::new(),
+            detached_ended: Vec::new(),
             reconnected_hub: Arc::new(Mutex::new(None)),
             watching_reconnect: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicBool::new(false)),
-        })
+        };
+        for idx in 0..sessions.extras.len() {
+            if sessions.extras[idx].hub.is_none() {
+                sessions.start_extra_reconnect_watcher(idx);
+            }
+        }
+        Ok(sessions)
     }
 
-    /// Underlying [`SessionHub`].
+    /// Underlying primary [`SessionHub`].
     pub fn hub(&self) -> &SessionHub {
         &self.hub
     }
@@ -169,9 +270,35 @@ impl Sessions {
         self.live.get(id).map(|t| &t.session)
     }
 
-    /// If a stopped daemon has returned and our passive watcher connected to it, swaps in the new
-    /// [`SessionHub`] and returns the sorted list of live terminal ids on that daemon so the host
-    /// can re-adopt them at their saved spots and clear its offline state.
+    /// Initial display title for `id` when adopted onto the wall: its program's `OSC 0`/`2` title
+    /// if non-empty, else `<name>` for a `gomuxai` `gx-<name>` session from namespace `"agents"`,
+    /// else `None` (so `Wall` falls back to `id`).
+    pub fn default_title_for(&self, id: &str) -> Option<String> {
+        if let Some(tracked) = self.live.get(id) {
+            let osc = tracked.session.osc_title();
+            if !osc.is_empty() {
+                return Some(osc.to_owned());
+            }
+            if let Some((idx, ref raw_id)) = tracked.extra_origin {
+                if self.extras[idx].name == "agents" {
+                    if let Some(agent_name) =
+                        raw_id.strip_prefix("agent-").filter(|s| !s.is_empty())
+                    {
+                        return Some(agent_name.to_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_extra_id(&self, wall_id: &str) -> Option<(usize, String)> {
+        resolve_extra_id_in(&self.extras, wall_id)
+    }
+
+    /// If a stopped primary daemon has returned and our passive watcher connected to it, swaps in
+    /// the new [`SessionHub`] and returns the sorted list of live terminal ids so the host can
+    /// re-adopt them at their saved spots and clear its offline state.
     pub fn take_reconnected(&mut self) -> Option<Vec<String>> {
         let next_hub = self
             .reconnected_hub
@@ -180,13 +307,13 @@ impl Sessions {
             .take()?;
         self.hub = next_hub;
         self.hub.set_theme(self.options.theme.clone());
-        self.external_appeared.clear();
         let ids = self.list().unwrap_or_default();
         Some(ids)
     }
 
-    /// Drains terminal ids that appeared externally in this namespace (discovered via
-    /// `status_follow`) and are not yet adopted in `self.live`.
+    /// Drains terminal ids that appeared externally in the primary or any extra namespace
+    /// (discovered via `status_follow` or extra-daemon connect) and are not yet adopted in
+    /// `self.live`.
     pub fn take_external_appeared(&mut self) -> Vec<String> {
         let ids: Vec<String> = self
             .external_appeared
@@ -199,26 +326,52 @@ impl Sessions {
     }
 
     fn start_passive_reconnect_watcher(&self) {
-        if self.dropped.load(Ordering::Acquire) {
+        Self::spawn_reconnect_thread(
+            "term-reconnect",
+            self.target.clone(),
+            (*self.options).clone(),
+            Arc::clone(&self.wake),
+            Arc::clone(&self.reconnected_hub),
+            Arc::clone(&self.watching_reconnect),
+            Arc::clone(&self.dropped),
+        );
+    }
+
+    fn start_extra_reconnect_watcher(&self, idx: usize) {
+        let extra = &self.extras[idx];
+        Self::spawn_reconnect_thread(
+            &format!("term-extra-{}", extra.name),
+            extra.target.clone(),
+            (*self.options).clone(),
+            Arc::clone(&self.wake),
+            Arc::clone(&extra.reconnected_hub),
+            Arc::clone(&extra.watching_reconnect),
+            Arc::clone(&self.dropped),
+        );
+    }
+
+    fn spawn_reconnect_thread(
+        thread_name: &str,
+        target: Target,
+        mut opts: HubOptions,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        slot: Arc<Mutex<Option<SessionHub>>>,
+        watching: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    ) {
+        if dropped.load(Ordering::Acquire) {
             return;
         }
-        if self
-            .watching_reconnect
+        if watching
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
-        let target = self.target.clone();
-        let mut opts = self.options.clone();
         opts.connect.reconnect_window = WALL_RECONNECT_WINDOW;
-        let wake = Arc::clone(&self.wake);
-        let slot = Arc::clone(&self.reconnected_hub);
-        let watching = Arc::clone(&self.watching_reconnect);
-        let dropped = Arc::clone(&self.dropped);
 
         let _ = thread::Builder::new()
-            .name("term-reconnect".into())
+            .name(thread_name.to_owned())
             .spawn(move || {
                 while !dropped.load(Ordering::Acquire) {
                     thread::sleep(PASSIVE_RECONNECT_POLL);
@@ -239,8 +392,7 @@ impl Sessions {
             });
     }
 
-    /// The ids of the terminals the daemon holds, sorted.
-    pub fn list(&self) -> Result<Vec<String>, String> {
+    fn primary_list(&self) -> Result<Vec<String>, String> {
         let mut ids: Vec<String> = self
             .hub
             .list()
@@ -252,53 +404,94 @@ impl Sessions {
         Ok(ids)
     }
 
+    /// The ids of the terminals held by the primary daemon and any connected extra namespaces
+    /// (excluding extra-namespace terminals the user explicitly detached on this wall), sorted.
+    pub fn list(&self) -> Result<Vec<String>, String> {
+        let mut ids = self.primary_list()?;
+        for extra in &self.extras {
+            let Some(ref ehub) = extra.hub else {
+                continue;
+            };
+            if let Ok(terms) = ehub.list() {
+                for t in terms {
+                    if extra.detached_raw_ids.contains(&t.id) {
+                        continue;
+                    }
+                    ids.push(wall_id_for_extra(&extra.name, &t.id));
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// The ids of the terminals this `Sessions` instance is currently drawing.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.live.keys().map(String::as_str)
     }
 
-    /// Takes terminal `id` as its size owner (`Role::Own`), spawns its dedicated emulator thread,
+    /// Takes terminal `id` as its size owner (`Role::Own`, with `Flow::Lossy` for extra-namespace
+    /// terminals so a viewer never stalls an agent's PTY), spawns its dedicated emulator thread,
     /// and starts drawing it. Returns its `(cols, rows)`.
     pub fn adopt(&mut self, id: &str) -> Result<(u16, u16), String> {
         self.external_appeared.remove(id);
+        if let Some((idx, raw_id)) = self.resolve_extra_id(id) {
+            self.extras[idx].detached_raw_ids.remove(&raw_id);
+            let ns_name = self.extras[idx].name.clone();
+            let Some(ref ehub) = self.extras[idx].hub else {
+                return Err(format!("extra termd namespace `{ns_name}` is not running"));
+            };
+            let session = ehub
+                .attach_with_options(&Subscribe {
+                    id: raw_id.clone(),
+                    mode: Mode::Raw,
+                    role: Role::Own,
+                    history_rows: None,
+                    flow: Some(Flow::Lossy),
+                    cols: None,
+                    rows: None,
+                })
+                .map_err(|e| format!("termd ({ns_name}) subscribe {raw_id}: {e}"))?;
+            let dims = (session.screen().cols, session.screen().rows);
+            self.live.insert(
+                id.to_owned(),
+                TrackedSession::new(session, Some((idx, raw_id))),
+            );
+            return Ok(dims);
+        }
+
         let session = self
             .hub
             .attach_owner(id, None)
             .map_err(|e| format!("termd subscribe {id}: {e}"))?;
         let dims = (session.screen().cols, session.screen().rows);
-        self.live.insert(id.to_owned(), TrackedSession::new(session));
+        self.live
+            .insert(id.to_owned(), TrackedSession::new(session, None));
         Ok(dims)
     }
 
-    /// Starts a terminal (the account's login shell when `argv` is `None`) under the first free
-    /// `tN` id, and adopts it as size owner. Returns `(id, cols, rows)`.
+    /// Starts a terminal (the account's login shell when `argv` is `None`) in the primary
+    /// namespace under the first free `tN` id, pipelining `create` and `subscribe` in one socket
+    /// write, and adopts it as size owner. Returns `(id, cols, rows)`.
     pub fn spawn(
         &mut self,
         argv: Option<Vec<String>>,
         cols: u16,
         rows: u16,
     ) -> Result<(String, u16, u16), String> {
-        let taken = self.list()?;
+        let taken = self.primary_list()?;
         let id = (1u64..)
             .map(|n| format!("t{n}"))
             .find(|cand| !taken.contains(cand) && !self.live.contains_key(cand))
             .expect("some tN is free");
-        let made = self
-            .hub
-            .client()
-            .create(&Create {
-                id,
-                argv,
-                cols,
-                rows,
-                ..Create::default()
-            })
-            .map_err(|e| format!("termd create: {e}"))?;
-        let (cols, rows) = self.adopt(&made.id)?;
-        Ok((made.id, cols, rows))
+        self.spawn_with(&SpawnOptions {
+            argv,
+            ..SpawnOptions::shell(id, cols, rows)
+        })
     }
 
-    /// Starts a terminal with full [`SpawnOptions`] (cwd, env, scrollback, colours) and adopts it.
+    /// Starts a terminal in the primary namespace with full [`SpawnOptions`] and adopts it.
     pub fn spawn_with(&mut self, opts: &SpawnOptions) -> Result<(String, u16, u16), String> {
         let session = self
             .hub
@@ -307,7 +500,8 @@ impl Sessions {
         let id = session.id().to_owned();
         let dims = (session.screen().cols, session.screen().rows);
         self.external_appeared.remove(&id);
-        self.live.insert(id.clone(), TrackedSession::new(session));
+        self.live
+            .insert(id.clone(), TrackedSession::new(session, None));
         Ok((id, dims.0, dims.1))
     }
 
@@ -343,6 +537,11 @@ impl Sessions {
         self.live.get(id).map(|t| t.session.row_text(row))
     }
 
+    /// `OSC 8` hyperlink URI at `(col, row)` (`0`-based) on terminal `id`, if the cell carries one.
+    pub fn link_at(&self, id: &str, col: u16, row: u16) -> Option<String> {
+        self.live.get(id).and_then(|t| t.session.link_at(col, row))
+    }
+
     /// Working directory last reported via `OSC 7` for terminal `id`.
     pub fn pwd(&self, id: &str) -> Option<&str> {
         self.live.get(id).and_then(|t| t.session.pwd())
@@ -353,14 +552,37 @@ impl Sessions {
         self.live.get(id).map(|t| t.session.modes())
     }
 
-    /// Current scrollback view state (`offset`, `max`, `viewing`) of `id`.
+    /// Current scrollback view state (`offset`, `max`, `at_bottom`, `viewing`) of `id`.
     pub fn scrollback(&self, id: &str) -> Option<ScrollbackState> {
         self.live.get(id).map(|t| t.session.scrollback())
+    }
+
+    /// Cumulative bell count observed on terminal `id`.
+    pub fn bell_count(&self, id: &str) -> u64 {
+        self.live.get(id).map_or(0, |t| t.session.bell_count())
+    }
+
+    /// Unread bell count waiting to be drained on terminal `id`.
+    pub fn unread_bells(&self, id: &str) -> u64 {
+        self.live.get(id).map_or(0, |t| t.session.unread_bells())
     }
 
     /// Drains any unread bells rung on `id` since the previous call.
     pub fn take_bell(&mut self, id: &str) -> u64 {
         self.live.get_mut(id).map_or(0, |t| t.session.take_bell())
+    }
+
+    /// Drains unread bell counts across every live terminal, returning `(id, count)` for each
+    /// terminal that rang at least once since the last drain.
+    pub fn take_bells(&mut self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        for (id, tracked) in &mut self.live {
+            let n = tracked.session.take_bell();
+            if n > 0 {
+                out.push((id.clone(), n));
+            }
+        }
+        out
     }
 
     /// Exit status of `id`, if its process has exited.
@@ -374,6 +596,9 @@ impl Sessions {
     /// The returned `bool` is `true` iff at least one terminal's [`Screen`] changed.
     pub fn pump(&mut self) -> (bool, Vec<News>) {
         let mut news = Vec::new();
+        for id in self.detached_ended.drain(..) {
+            news.push(News::Ended { id });
+        }
         let mut daemon_gone = false;
 
         for ev in self.hub.poll_daemon_events() {
@@ -396,13 +621,100 @@ impl Sessions {
                                 continue;
                             }
                             if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                if !self.live.contains_key(id) {
+                                if let Some(tracked) = self.live.get_mut(id) {
+                                    if let Some(sb_rows) =
+                                        item.get("scrollback_rows").and_then(|v| v.as_u64())
+                                    {
+                                        tracked.session.note_status_scrollback(sb_rows);
+                                    }
+                                } else {
                                     self.external_appeared.insert(id.to_owned());
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        let mut extra_gone_indices = Vec::new();
+        for idx in 0..self.extras.len() {
+            let arrived_hub = self.extras[idx]
+                .reconnected_hub
+                .lock()
+                .expect("reconnected_hub mutex poisoned")
+                .take();
+            if let Some(new_hub) = arrived_hub {
+                log::info!("extra termd ({}) connected", self.extras[idx].name);
+                if let Ok(terms) = new_hub.list() {
+                    let alive_raw: BTreeSet<&str> = terms.iter().map(|t| t.id.as_str()).collect();
+                    self.extras[idx]
+                        .detached_raw_ids
+                        .retain(|r| alive_raw.contains(r.as_str()));
+                    let ns_name = self.extras[idx].name.clone();
+                    for t in terms {
+                        if self.extras[idx].detached_raw_ids.contains(&t.id) {
+                            continue;
+                        }
+                        let wall_id = wall_id_for_extra(&ns_name, &t.id);
+                        if !self.live.contains_key(&wall_id) {
+                            self.external_appeared.insert(wall_id);
+                        }
+                    }
+                }
+                self.extras[idx].hub = Some(new_hub);
+            }
+
+            let events = match &self.extras[idx].hub {
+                Some(ehub) => ehub.poll_daemon_events(),
+                None => Vec::new(),
+            };
+            let ns_name = self.extras[idx].name.clone();
+            let mut this_extra_gone = false;
+            for ev in events {
+                match ev {
+                    DaemonEvent::Reconnected { restart, .. } => {
+                        log::info!("extra termd ({ns_name}) came back (restart: {restart})");
+                    }
+                    DaemonEvent::Gone { message, .. } => {
+                        log::info!("extra termd ({ns_name}) stopped: {message}");
+                        this_extra_gone = true;
+                    }
+                    DaemonEvent::UpgradeFailed { message } => {
+                        log::warn!("extra termd ({ns_name}) upgrade failed: {message}");
+                    }
+                    DaemonEvent::Status(doc) => {
+                        if let Some(terms) = doc.get("terminals").and_then(|v| v.as_array()) {
+                            let mut alive_raw = BTreeSet::new();
+                            for item in terms {
+                                let exited = item.get("exit").is_some_and(|e| !e.is_null());
+                                if exited {
+                                    continue;
+                                }
+                                if let Some(raw_id) = item.get("id").and_then(|v| v.as_str()) {
+                                    alive_raw.insert(raw_id.to_owned());
+                                    let wall_id = wall_id_for_extra(&ns_name, raw_id);
+                                    if let Some(tracked) = self.live.get_mut(&wall_id) {
+                                        if let Some(sb_rows) =
+                                            item.get("scrollback_rows").and_then(|v| v.as_u64())
+                                        {
+                                            tracked.session.note_status_scrollback(sb_rows);
+                                        }
+                                    } else if !self.extras[idx].detached_raw_ids.contains(raw_id) {
+                                        self.external_appeared.insert(wall_id);
+                                    }
+                                }
+                            }
+                            self.extras[idx]
+                                .detached_raw_ids
+                                .retain(|r| alive_raw.contains(r));
+                        }
+                    }
+                }
+            }
+            if this_extra_gone {
+                self.extras[idx].hub = None;
+                extra_gone_indices.push(idx);
             }
         }
 
@@ -489,13 +801,36 @@ impl Sessions {
             self.live.remove(&id);
         }
 
+        for idx in extra_gone_indices {
+            let lingering: Vec<String> = self
+                .live
+                .iter()
+                .filter(|(_, t)| t.extra_origin.as_ref().is_some_and(|(i, _)| *i == idx))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in lingering {
+                self.live.remove(&id);
+                news.push(News::Ended { id });
+            }
+            self.start_extra_reconnect_watcher(idx);
+        }
+
         if daemon_gone {
-            // Any remaining sessions whose socket dropped at EOF before `EVENT closed` arrived
-            // belong to the dead daemon: unmount them cleanly (preserving their saved spots in
-            // `WallStore`) and start passively watching for a daemon returning on `target`.
-            let lingering: Vec<String> = self.live.keys().cloned().collect();
-            self.live.clear();
-            self.external_appeared.clear();
+            // Any remaining primary-namespace sessions whose socket dropped at EOF before
+            // `EVENT closed` arrived belong to the dead primary daemon: unmount them cleanly
+            // (preserving their saved spots in `WallStore`, while leaving extra-namespace sessions
+            // intact) and start passively watching for a daemon returning on `target`.
+            let lingering: Vec<String> = self
+                .live
+                .iter()
+                .filter(|(_, t)| t.extra_origin.is_none())
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &lingering {
+                self.live.remove(id);
+            }
+            self.external_appeared
+                .retain(|id| resolve_extra_id_in(&self.extras, id).is_some());
             for id in lingering {
                 news.insert(0, News::Ended { id });
             }
@@ -505,8 +840,24 @@ impl Sessions {
         (any_screen_changed, news)
     }
 
-    /// Ends terminal `id` and its process tree in `g3d-termd` without stalling the window thread.
+    /// Ends a primary-namespace terminal `id` (and its process tree) in `g3d-termd`, or — when
+    /// `id` belongs to an extra namespace (`agents`, etc.) — detaches the wall's subscription
+    /// without killing the running process (`--detach-on-kill` parity with `cli/gomux.go`).
     pub fn kill(&mut self, id: &str) {
+        if let Some((idx, raw_id)) = self
+            .live
+            .get(id)
+            .and_then(|t| t.extra_origin.clone())
+            .or_else(|| self.resolve_extra_id(id))
+        {
+            self.extras[idx].detached_raw_ids.insert(raw_id);
+            self.external_appeared.remove(id);
+            if self.live.remove(id).is_some() {
+                self.detached_ended.push(id.to_owned());
+                (self.wake)();
+            }
+            return;
+        }
         self.hub.send_kill(id);
     }
 
@@ -581,11 +932,13 @@ impl Sessions {
     }
 
     /// Scrolls terminal `id` by `lines` at cell `(col, row)` (`lines < 0` scrolls up into history).
-    /// On the primary screen this moves this subscriber's scrollback `view` in `g3d-termd`; on the
+    /// On the primary screen this moves this subscriber's scrollback `view` in `g3d-termd` (and a
+    /// zero delta jumps back to live output, bridging `wall.agent.jump <id> live`); on the
     /// alternate screen there is no scrollback, so wheel notches at `(col, row)` are sent to the
     /// program instead.
     pub fn scroll(&mut self, id: &str, lines: i32, col: f64, row: f64) {
         if lines == 0 {
+            self.scroll_to_live(id);
             return;
         }
         let Some(tracked) = self.live.get(id) else {
@@ -614,8 +967,8 @@ impl Sessions {
         }
     }
 
-    /// Returns terminal `id`'s scrollback view immediately to live (`View::Live`, offset 0).
-    /// No-op while the terminal is ended or showing the alternate screen.
+    /// Returns terminal `id`'s scrollback view immediately to live (`View::Live`, offset 0,
+    /// `at_bottom = true`). No-op while the terminal is ended or showing the alternate screen.
     pub fn scroll_live(&mut self, id: &str) {
         let Some(tracked) = self.live.get(id) else {
             return;
@@ -624,6 +977,11 @@ impl Sessions {
             return;
         }
         tracked.session.send_view(View::Live);
+    }
+
+    /// Alias for [`Self::scroll_live`] (`offset = 0`, `at_bottom = true`).
+    pub fn scroll_to_live(&mut self, id: &str) {
+        self.scroll_live(id);
     }
 
     /// Requests `g3d-termd` to send a fresh `REPAINT` for terminal `id`.
@@ -643,6 +1001,11 @@ impl Sessions {
         self.options.theme.bold_is_bright = bold_is_bright;
         let theme = self.options.theme.clone();
         self.hub.set_theme(theme.clone());
+        for extra in &self.extras {
+            if let Some(hub) = &extra.hub {
+                hub.set_theme(theme.clone());
+            }
+        }
         for tracked in self.live.values() {
             tracked.session.set_theme(theme.clone());
         }
@@ -652,6 +1015,22 @@ impl Sessions {
     pub fn bold_is_bright(&self) -> bool {
         self.options.theme.bold_is_bright
     }
+}
+
+fn resolve_extra_id_in(extras: &[ExtraNamespace], wall_id: &str) -> Option<(usize, String)> {
+    if let Some((ns, raw)) = wall_id.split_once('/') {
+        if !raw.is_empty() {
+            if let Some(idx) = extras.iter().position(|e| e.name == ns) {
+                return Some((idx, raw.to_owned()));
+            }
+        }
+    }
+    if let Some(agent_name) = wall_id.strip_prefix("gx-").filter(|s| !s.is_empty()) {
+        if let Some(idx) = extras.iter().position(|e| e.name == "agents") {
+            return Some((idx, format!("agent-{agent_name}")));
+        }
+    }
+    None
 }
 
 fn default_wall_hub_options() -> HubOptions {

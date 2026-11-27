@@ -268,6 +268,142 @@ impl TermdHandle {
         self.request(WireOp::Create(opts))
     }
 
+    /// Pipelines `create` and `subscribe` in a single atomic socket write so `g3d-termd`
+    /// registers this connection's subscription on the very next frame of its connection loop
+    /// without waiting for a client round-trip (eliminating the host-side `create`-to-`subscribe`
+    /// gap where startup `BEL` events could fire before a subscriber joined).
+    pub fn create_and_subscribe(
+        &self,
+        create_opts: &Create,
+        sub_opts: &Subscribe,
+    ) -> Result<(CreateReply, Subscription), Error> {
+        paths::validate_name("terminal id", &create_opts.id).map_err(Error::Start)?;
+        paths::validate_name("terminal id", &sub_opts.id).map_err(Error::Start)?;
+
+        let timeout = self.shared.request_timeout();
+        let start = Instant::now();
+        self.wait_until_writable()?;
+
+        let req_create = self.shared.next_req.fetch_add(2, Ordering::Relaxed);
+        let req_sub = req_create + 1;
+        let create_bytes = frame::encode_json(
+            ty::REQUEST,
+            0,
+            &WireRequest { req: req_create, op: WireOp::Create(create_opts) },
+        );
+        let sub_bytes = frame::encode_json(
+            ty::REQUEST,
+            0,
+            &WireRequest { req: req_sub, op: WireOp::Subscribe(sub_opts) },
+        );
+
+        let max_frame = self.shared.max_frame_bytes();
+        for (op_name, bytes) in [("create", &create_bytes), ("subscribe", &sub_bytes)] {
+            let payload_len = bytes.len() - frame::HEADER_LEN;
+            if payload_len > max_frame {
+                return Err(Error::Wire(WireError::new(
+                    code::TOO_LARGE,
+                    format!(
+                        "the `{op_name}` request is {payload_len} B as JSON; daemon max_frame is {max_frame} B"
+                    ),
+                )));
+            }
+        }
+
+        let mut combined = Vec::with_capacity(create_bytes.len() + sub_bytes.len());
+        combined.extend_from_slice(&create_bytes);
+        combined.extend_from_slice(&sub_bytes);
+
+        let (create_tx, create_rx) = mpsc::sync_channel(1);
+        let (sub_tx, sub_rx) = mpsc::sync_channel(1);
+        {
+            let mut state = self.shared.conn.lock().expect("conn mutex poisoned");
+            if let Some((restart, ref msg)) = state.fatal {
+                return Err(Error::Disconnected { restart, message: msg.clone() });
+            }
+            state.pending.insert(req_create, create_tx);
+            state.pending.insert(req_sub, sub_tx);
+        }
+
+        let write_result = {
+            let mut writer_guard = self.shared.writer.lock().expect("writer mutex poisoned");
+            match writer_guard.as_mut() {
+                Some(stream) => stream.write_all(&combined),
+                None => Err(io::Error::new(io::ErrorKind::NotConnected, "socket reconnecting")),
+            }
+        };
+
+        if let Err(io_err) = write_result {
+            let fatal = {
+                let mut state = self.shared.conn.lock().expect("conn mutex poisoned");
+                state.pending.remove(&req_create);
+                state.pending.remove(&req_sub);
+                state.fatal.clone()
+            };
+            if let Some((restart, msg)) = fatal {
+                return Err(Error::Disconnected { restart, message: msg });
+            }
+            return Err(Error::Io(io_err));
+        }
+
+        let recv_reply = |rx: mpsc::Receiver<Result<Vec<u8>, Error>>,
+                          req: u64,
+                          op_name: &'static str|
+         -> Result<Vec<u8>, Error> {
+            let remaining = timeout.saturating_sub(start.elapsed()).max(Duration::from_millis(1));
+            match rx.recv_timeout(remaining) {
+                Ok(Ok(payload)) => Ok(payload),
+                Ok(Err(err)) => Err(err),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut state = self.shared.conn.lock().expect("conn mutex poisoned");
+                    state.pending.remove(&req);
+                    Err(Error::Timeout { op: op_name, timeout })
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.disconnected_err()),
+            }
+        };
+
+        let create_res = recv_reply(create_rx, req_create, "create").and_then(|payload| {
+            serde_json::from_slice::<CreateReply>(&payload)
+                .map_err(|err| Error::Protocol(format!("create reply: {err}")))
+        });
+        let sub_res = recv_reply(sub_rx, req_sub, "subscribe").and_then(|payload| {
+            serde_json::from_slice::<Subscription>(&payload)
+                .map_err(|err| Error::Protocol(format!("subscribe reply: {err}")))
+        });
+
+        match (create_res, sub_res) {
+            (Ok(created), Ok(sub)) => {
+                let recorded_size = if sub.role == Role::Own {
+                    Some((sub.cols, sub.rows))
+                } else {
+                    None
+                };
+                let mut table = self.shared.subs.lock().expect("subs mutex poisoned");
+                table.by_handle.insert(
+                    sub.handle,
+                    TrackedSub {
+                        id: sub_opts.id.clone(),
+                        handle: sub.handle,
+                        mode: sub_opts.mode,
+                        role: sub.role,
+                        history_rows: sub_opts.history_rows.unwrap_or(0),
+                        flow: sub_opts.flow,
+                        size: recorded_size,
+                    },
+                );
+                Ok((created, sub))
+            }
+            (Err(create_err), Ok(sub)) => {
+                // `create` failed (e.g. `exists`), so tear down the pipelined subscription cleanly.
+                let _ = self.unsubscribe(sub.handle);
+                Err(create_err)
+            }
+            (Err(create_err), Err(_)) => Err(create_err),
+            (Ok(_), Err(sub_err)) => Err(sub_err),
+        }
+    }
+
     /// Subscribes to terminal `id` in `raw` mode with `role`.
     ///
     /// When `role` is [`Role::Own`] and `size` is `Some((cols, rows))`, resizes the terminal as

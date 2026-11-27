@@ -107,6 +107,10 @@ pub struct Cli {
     /// The termd namespace the wall keeps its terminals in
     #[arg(long, value_name = "NAME", default_value = "rs-wall")]
     pub wall_ns: String,
+    /// Extra termd namespaces whose terminals the wall also shows (detached on close,
+    /// lossy flow; e.g. `--wall-extra-ns agents`, repeatable or comma-separated; off by default)
+    #[arg(long, value_name = "NAME", value_delimiter = ',', action = ArgAction::Append)]
+    pub wall_extra_ns: Vec<String>,
     /// Render the terminal wall test pattern (with --screenshot PATH)
     #[arg(long)]
     pub wall_test_pattern: bool,
@@ -463,6 +467,7 @@ fn merge_launch_config(cli: &mut Cli, matches: &clap::ArgMatches, cfg: crate::la
     under!(present_mode);
     under!(Some frames);
     under!(wall_ns);
+    under!(wall_extra_ns);
     let scene_typed = [
         "demo",
         "wall",

@@ -25,10 +25,10 @@ pub use coalesce::{
 pub use glyph_vt::Theme;
 pub use hub::{DaemonEvent, DaemonState, HubOptions, SessionHub, SpawnOptions};
 pub use session::{ExitInfo, ScreenFillDelta, ScrollbackState, SessionStats, TerminalSession};
-pub use sessions::{NAMESPACE, News, Sessions};
+pub use sessions::{wall_id_for_extra, NAMESPACE, News, Sessions};
 pub use term_cells::{Modes, MouseTracking, Screen};
 pub use termd_client::{
-    code, Capture, CaptureFormat, CaptureReply, Colors, ConnectOptions, Error, IfExists, Key,
-    KeyAction, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Target, TermInfo, View,
-    ViewReply, Welcome, WireError,
+    code, Capture, CaptureFormat, CaptureReply, Colors, ConnectOptions, Error, Flow, IfExists, Key,
+    KeyAction, Mode, Mouse, MouseAction, MouseButton, OptionAsAlt, Role, Subscribe, Target,
+    TermInfo, View, ViewReply, Welcome, WireError,
 };

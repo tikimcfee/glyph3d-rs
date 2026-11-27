@@ -121,7 +121,7 @@ fn main() {
             load.print_stats();
         }
         #[cfg(feature = "windowed")]
-        CliCommand::Wall { emoji_sheet, pattern, namespace, frames } => {
+        CliCommand::Wall { emoji_sheet, pattern, namespace, extra_namespaces, frames } => {
             #[cfg(target_os = "macos")]
             set_macos_process_name(WALL_MACOS_APP_NAME);
             let ctx = {
@@ -130,7 +130,15 @@ fn main() {
             };
             // The test pattern needs no daemon: one fixed screen.
             let namespace = (!pattern).then_some(namespace);
-            wall::app::run(ctx, wall::app::WallOptions { emoji_sheet, namespace, exit_after: frames.map(u64::from) });
+            wall::app::run(
+                ctx,
+                wall::app::WallOptions {
+                    emoji_sheet,
+                    namespace,
+                    extra_namespaces,
+                    exit_after: frames.map(u64::from),
+                },
+            );
         }
         #[cfg(all(feature = "wgpu", not(feature = "windowed")))]
         CliCommand::Wall { .. } => {
