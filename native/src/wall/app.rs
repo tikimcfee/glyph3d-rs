@@ -18,15 +18,19 @@
 //! sleeps until input arrives, a terminal's reader thread sends [`Wake`], or
 //! the wall says something is still moving.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::Vec2;
 use term_cells::Screen;
+use wall_core::config::OptionAsAlt;
 use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
+use wall_core::keymap::FieldFocus;
+#[cfg(feature = "egui-ui")]
+use wall_core::keymap::KeyDecision;
 use wall_core::layout::{ResizeCursor, Size};
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
@@ -34,11 +38,9 @@ use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
 use wall_core::scroll::DeltaMode;
 use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-#[cfg(feature = "egui-ui")]
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
@@ -82,7 +84,7 @@ pub struct WallOptions {
 enum Terminals {
     /// Connecting/spawning `g3d-termd` off the window thread.
     Connecting,
-    Live(Sessions),
+    Live(Box<Sessions>),
     /// Screens that never change (the test pattern), by id.
     Fixed(BTreeMap<String, Screen>),
 }
@@ -170,6 +172,20 @@ struct App {
     /// True while waiting for initial `g3d-termd` startup (shows `"starting termd..."` notice).
     starting_termd: bool,
     perf: WallPerf,
+    /// True while an OS dead-key or IME preedit composition is active (`e.isComposing`).
+    ime_composing: bool,
+    /// Last quantized logical `(x, y, w, h)` sent to `Window::set_ime_cursor_area`.
+    last_ime_area: Option<(i32, i32, u32, u32)>,
+    #[cfg(target_os = "macos")]
+    macos_option_as_alt: Option<winit::platform::macos::OptionAsAlt>,
+    /// Physical `code`s whose press reached `key_input` and have not yet been released.
+    held_codes: HashSet<String>,
+    /// Last text written by `WallEffect::WriteClipboard` (inspected via `app.clipboard`).
+    last_copied: Option<String>,
+    /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
+    /// smoke tests never read or overwrite a user's live OS clipboard.
+    memory_clipboard: Option<String>,
+    use_memory_clipboard: bool,
 }
 
 #[derive(Default)]
@@ -275,6 +291,31 @@ fn cursor_of(c: CursorIcon) -> winit::window::CursorIcon {
         CursorIcon::Resize(ResizeCursor::EwResize) => W::EwResize,
         CursorIcon::Resize(ResizeCursor::NsResize) => W::NsResize,
     }
+}
+
+/// Whether `key` is a wall-level chord that must bypass a focused panel search box
+/// (`SettingsPanel`, `HelpPanel`, `Palette`) when no context menu is open.
+fn chord_bypasses_panel_input(platform: Platform, key: &KeyEvent) -> bool {
+    if wall_core::chord::focus_history_dir(key).is_some()
+        || wall_core::chord::group_cycle_dir(key).is_some()
+    {
+        return true;
+    }
+    if !wall_core::chord::is_chord(platform, key) {
+        return false;
+    }
+    // On macOS, `⌘A` (Select All), `⌘X` (Cut), and `⌘+Arrow` (line start/end) belong
+    // to a focused `egui::TextEdit` search/input box (`WallKeys.js` `inField` rule).
+    if matches!(platform, Platform::Mac)
+        && matches!(
+            key.code.as_str(),
+            "KeyA" | "KeyX" | "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown"
+        )
+    {
+        return false;
+    }
+    wall_core::keymap::KEYMAP.iter().any(|c| c.code == key.code)
+        || matches!(key.code.as_str(), "KeyQ" | "F1")
 }
 
 #[cfg(feature = "egui-ui")]
@@ -468,11 +509,13 @@ impl App {
 
         let window = {
             let _s = super::startup::span("window_create");
-            Arc::new(
+            let w = Arc::new(
                 event_loop
                     .create_window(Window::default_attributes().with_title("glyph3d — the wall").with_inner_size(winit::dpi::LogicalSize::new(1600.0, 1000.0)))
                     .expect("window creation failed"),
-            )
+            );
+            w.set_ime_allowed(true);
+            w
         };
         let (surface, format, config, depth) = {
             let _s = super::startup::span("surface_configure");
@@ -561,6 +604,7 @@ impl App {
             self.draw(true);
         }
         self.poll_pending_termd();
+        self.sync_macos_option_as_alt();
         self.redraw();
     }
 
@@ -573,7 +617,7 @@ impl App {
         self.starting_termd = false;
         match res {
             Ok(ready) => {
-                self.terms = Some(Terminals::Live(ready.sessions));
+                self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
                 if let Some(wall) = &mut self.wall {
                     wall.set_live_terminals(&ready.live_ids);
                     for (id, cols, rows) in ready.adopted {
@@ -615,7 +659,66 @@ impl App {
                 self.quit = true;
             }
         }
+        self.sync_macos_option_as_alt();
         true
+    }
+
+    fn sync_macos_option_as_alt(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::{OptionAsAlt as WinitOptAlt, WindowExtMacOS};
+            let Some(g) = &self.gfx else { return };
+            let ui_text_focus = {
+                #[cfg(feature = "egui-ui")]
+                {
+                    self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w))
+                        || g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input())
+                }
+                #[cfg(not(feature = "egui-ui"))]
+                {
+                    false
+                }
+            };
+            let want = match self.wall.as_ref().map(|w| w.config().option_as_alt) {
+                Some(OptionAsAlt::True) if !ui_text_focus => WinitOptAlt::Both,
+                _ => WinitOptAlt::None,
+            };
+            if self.macos_option_as_alt != Some(want) {
+                g.window.set_option_as_alt(want);
+                self.macos_option_as_alt = Some(want);
+            }
+        }
+    }
+
+    fn sync_ime_cursor_area(&mut self, described: &Described) {
+        let (Some(g), Some(terms)) = (&self.gfx, &self.terms) else { return };
+        #[cfg(feature = "egui-ui")]
+        if g.ui.as_ref().is_some_and(|ui| ui.context().egui_wants_keyboard_input()) {
+            return;
+        }
+        let Some(focused) = described.terminals.iter().find(|t| t.focused) else { return };
+        let Some(screen) = terms.screen(&focused.id) else { return };
+        let sb = described.camera.to_screen_box(focused.body_rect, described.viewport.w, described.viewport.h);
+        let pad_px = f64::from(PANEL_PAD) * focused.scale * described.camera.zoom;
+        let inner_w = ((sb.right - sb.left) - 2.0 * pad_px).max(1.0);
+        let inner_h = ((sb.bottom - sb.top) - 2.0 * pad_px).max(1.0);
+        let cw = (inner_w / f64::from(screen.cols.max(1))).max(1.0);
+        let ch = (inner_h / f64::from(screen.rows.max(1))).max(1.0);
+        let cx = (sb.left + pad_px + f64::from(screen.cursor.col) * cw).clamp(0.0, described.viewport.w.max(1.0));
+        let cy = (sb.top + pad_px + f64::from(screen.cursor.row) * ch).clamp(0.0, described.viewport.h.max(1.0));
+        let area = (
+            cx.round() as i32,
+            cy.round() as i32,
+            cw.round().max(1.0) as u32,
+            ch.round().max(1.0) as u32,
+        );
+        if self.last_ime_area != Some(area) {
+            self.last_ime_area = Some(area);
+            g.window.set_ime_cursor_area(
+                LogicalPosition::new(f64::from(area.0), f64::from(area.1)),
+                LogicalSize::new(f64::from(area.2), f64::from(area.3)),
+            );
+        }
     }
 
     /// Apply font family, size, line-height, and text-style knobs from `wall.config()` to the
@@ -685,6 +788,9 @@ impl App {
     /// clipboard, which speaks Wayland; a fresh `arboard` there speaks X11
     /// alone.
     fn read_clipboard(&mut self) -> Option<String> {
+        if self.use_memory_clipboard {
+            return self.memory_clipboard.clone();
+        }
         #[cfg(all(target_os = "linux", feature = "egui-ui"))]
         if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
             return ui.clipboard_text();
@@ -699,6 +805,11 @@ impl App {
     }
 
     fn write_clipboard(&mut self, text: String) {
+        self.last_copied = Some(text.clone());
+        if self.use_memory_clipboard {
+            self.memory_clipboard = Some(text);
+            return;
+        }
         #[cfg(all(target_os = "linux", feature = "egui-ui"))]
         if let Some(ui) = self.gfx.as_mut().and_then(|g| g.ui.as_mut()) {
             ui.set_clipboard_text(text);
@@ -723,6 +834,9 @@ impl App {
             }
             WallEffect::ConfigKnobChanged { key, value } => {
                 log::debug!("wall knob {key} is now {value:?}");
+                if key == "optionAsAlt" {
+                    self.sync_macos_option_as_alt();
+                }
                 self.sync_font_and_text_knobs(Some(&key));
                 self.redraw();
                 return;
@@ -861,6 +975,22 @@ impl App {
                         None => "ERR: the wall is not open yet".to_string(),
                     };
                     responder.send(reply);
+                    ran = true;
+                    continue;
+                }
+                #[cfg(feature = "egui-ui")]
+                Some("app.hud") => {
+                    let next = match argv.get(1).map(String::as_str) {
+                        Some("open") => true,
+                        Some("close") => false,
+                        Some("toggle") | None => !self.hud_open,
+                        Some(other) => {
+                            responder.send(format!("ERR: takes toggle|open|close, not '{other}'"));
+                            continue;
+                        }
+                    };
+                    self.hud_open = next;
+                    responder.send(format!("OK: hud {}", if next { "open" } else { "closed" }));
                     ran = true;
                     continue;
                 }
@@ -1239,6 +1369,8 @@ impl App {
                 self.apply_effects();
             }
         }
+        self.sync_ime_cursor_area(&described);
+        self.sync_macos_option_as_alt();
         self.frames += 1;
         self.scripted();
     }
@@ -1317,9 +1449,26 @@ impl App {
     }
 
     fn key_input(&mut self, key: KeyEvent) {
+        if !key.code.is_empty() {
+            if key.pressed {
+                self.held_codes.insert(key.code.clone());
+            } else {
+                self.held_codes.remove(&key.code);
+            }
+        }
+        if self.ime_composing && key.pressed {
+            return;
+        }
+        let host_chord = wall_core::chord::chord_mods(Platform::host());
         // Quitting is the window's, not the wall's (Command+Q on macOS, Ctrl+Alt+Q elsewhere).
-        if key.pressed && key.code == "KeyQ" && key.mods == wall_core::chord::chord_mods(Platform::host()) {
+        if key.pressed && !key.repeat && key.code == "KeyQ" && key.mods == host_chord {
             self.quit = true;
+            return;
+        }
+        #[cfg(feature = "egui-ui")]
+        if key.pressed && !key.repeat && key.code == "F1" && key.mods == host_chord {
+            self.hud_open = !self.hud_open;
+            self.redraw();
             return;
         }
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
@@ -1327,6 +1476,7 @@ impl App {
         if key.pressed && key.code == "Escape" && !key.mods.ctrl && !key.mods.alt && !key.mods.meta {
             if self.panels.close_open_on_escape(wall) {
                 self.apply_effects();
+                self.sync_macos_option_as_alt();
                 self.redraw();
                 return;
             }
@@ -1336,17 +1486,164 @@ impl App {
                 return;
             }
         }
+        let bypass_panel_focus = wall.menu().is_none()
+            && chord_bypasses_panel_input(Platform::host(), &key)
+            && !matches!(key.code.as_str(), "BracketLeft" | "BracketRight")
+            && wall_core::chord::group_cycle_dir(&key).is_none();
+        let saved_focus = bypass_panel_focus.then(|| {
+            // Non-text-editing wall chords (`⌘,`, `⌘/`, `⌘K`, `⌘B`, `⌘S`, `⌘\`, `⌘D`, …)
+            // execute even while a panel search field is active.
+            let cur = if wall.palette_open() {
+                FieldFocus::Input
+            } else {
+                FieldFocus::None
+            };
+            wall.set_field_focus(FieldFocus::None);
+            cur
+        });
         let lookup = screen_lookup(|id| terms.screen(id));
-        let _decision = wall.key(&key, &lookup);
+        let decision = wall.key(&key, &lookup);
+        if let Some(prev) = saved_focus {
+            if prev != FieldFocus::None && wall.palette_open() {
+                wall.set_field_focus(prev);
+            }
+        }
+        #[cfg(feature = "egui-ui")]
+        if matches!(decision, KeyDecision::Chord { blur_field: true, .. }) {
+            self.panels.blur_docked_inputs();
+            if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
+                ui.surrender_focus();
+            }
+        }
+        #[cfg(not(feature = "egui-ui"))]
+        let _ = decision;
         self.apply_effects();
+        self.sync_macos_option_as_alt();
         self.redraw();
     }
 
     fn key(&mut self, ev: &winit::event::KeyEvent, event_loop: &ActiveEventLoop) {
-        let key = super::keys::key_event(ev, self.modifiers);
+        let opt_alt = self
+            .wall
+            .as_ref()
+            .map_or(OptionAsAlt::Auto, |w| w.config().option_as_alt);
+        let key = super::keys::key_event(ev, self.modifiers, opt_alt);
         self.key_input(key);
         if self.quit {
             event_loop.exit();
+        }
+    }
+
+    fn ime(&mut self, ime: &Ime) {
+        match ime {
+            Ime::Enabled => {}
+            Ime::Preedit(text, _) => {
+                self.ime_composing = !text.is_empty();
+            }
+            Ime::Commit(text) => {
+                self.ime_composing = false;
+                self.ime_commit(text);
+            }
+            Ime::Disabled => {
+                self.ime_composing = false;
+            }
+        }
+    }
+
+    fn ime_commit(&mut self, text: &str) {
+        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+        let lookup = screen_lookup(|id| terms.screen(id));
+        let mut rest = cleaned.as_str();
+        while !rest.is_empty() {
+            let mut end = rest.len().min(4096);
+            while end > 0 && !rest.is_char_boundary(end) {
+                end -= 1;
+            }
+            let chunk = &rest[..end];
+            rest = &rest[end..];
+            let key_name = match chunk {
+                "Shift" | "Control" | "Alt" | "Meta" | "AltGraph" | "CapsLock" | "NumLock"
+                | "ScrollLock" | "Fn" | "FnLock" | "Hyper" | "Super" | "Symbol"
+                | "SymbolLock" | "Dead" | "Process" | "Unidentified" | "Escape" => " ".to_string(),
+                other => other.to_string(),
+            };
+            let ev = KeyEvent {
+                code: String::new(),
+                key: key_name,
+                text: Some(chunk.to_string()),
+                mods: Mods::default(),
+                repeat: false,
+                pressed: true,
+            };
+            let _ = wall.key(&ev, &lookup);
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
+    fn focused(&mut self, focused: bool) {
+        if !focused {
+            self.modifiers = ModifiersState::empty();
+            self.ime_composing = false;
+            let had_buttons = self.buttons != 0;
+            self.buttons = 0;
+            let now_ms = self.now_ms();
+            let cursor = self.cursor;
+            let held: Vec<String> = self.held_codes.drain().collect();
+            if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                if had_buttons {
+                    let ev = PointerEvent {
+                        pointer_id: 1,
+                        x: cursor.x,
+                        y: cursor.y,
+                        button: None,
+                        buttons: Buttons(0),
+                        mods: Mods::default(),
+                        time_ms: now_ms,
+                    };
+                    wall.pointer_cancel(&ev);
+                }
+                let lookup = screen_lookup(|id| terms.screen(id));
+                for code in &held {
+                    let key_name = match code.as_str() {
+                        "MetaLeft" | "MetaRight" => "Meta",
+                        "ControlLeft" | "ControlRight" => "Control",
+                        "AltLeft" | "AltRight" => "Alt",
+                        "ShiftLeft" | "ShiftRight" => "Shift",
+                        _ => "a",
+                    };
+                    let up = KeyEvent {
+                        code: code.clone(),
+                        key: key_name.to_string(),
+                        text: None,
+                        mods: Mods::default(),
+                        repeat: false,
+                        pressed: false,
+                    };
+                    let _ = wall.key(&up, &lookup);
+                }
+                let meta_up = KeyEvent {
+                    code: "MetaLeft".to_string(),
+                    key: "Meta".to_string(),
+                    text: None,
+                    mods: Mods::default(),
+                    repeat: false,
+                    pressed: false,
+                };
+                let _ = wall.key(&meta_up, &lookup);
+            }
+            self.apply_effects();
+            self.redraw();
+        } else {
+            if let Some(g) = &self.gfx {
+                g.window.set_ime_allowed(true);
+            }
+            self.sync_macos_option_as_alt();
+            self.redraw();
         }
     }
 
@@ -1431,14 +1728,49 @@ impl App {
                 format!("OK: pinch {factor:.4} at ({x:.2}, {y:.2})")
             }
             ScriptCommand::Key(k) => {
-                let prev = self.modifiers;
-                self.modifiers = k.mods;
-                let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
-                let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
-                self.key_input(down);
-                self.key_input(up);
-                self.modifiers = prev;
-                "OK: key".to_string()
+                use super::script::{modifier_bit_of_physical, ScriptKeyPhase};
+                match k.phase {
+                    ScriptKeyPhase::Tap => {
+                        let prev = self.modifiers;
+                        self.modifiers |= k.mods;
+                        let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                        let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                        self.key_input(down);
+                        self.key_input(up);
+                        self.modifiers = prev;
+                        "OK: key".to_string()
+                    }
+                    ScriptKeyPhase::Repeat => {
+                        let prev = self.modifiers;
+                        self.modifiers |= k.mods;
+                        let rep = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, true, self.modifiers);
+                        self.key_input(rep);
+                        self.modifiers = prev;
+                        "OK: key repeat".to_string()
+                    }
+                    ScriptKeyPhase::Down => {
+                        if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                            self.modifiers |= bit;
+                        }
+                        let eff = self.modifiers | k.mods;
+                        let prev = self.modifiers;
+                        self.modifiers = eff;
+                        let down = super::keys::key_from_parts(k.physical, &k.logical, k.text.as_deref(), ElementState::Pressed, false, self.modifiers);
+                        self.key_input(down);
+                        if modifier_bit_of_physical(k.physical).is_none() {
+                            self.modifiers = prev | k.mods;
+                        }
+                        "OK: key down".to_string()
+                    }
+                    ScriptKeyPhase::Up => {
+                        if let Some(bit) = modifier_bit_of_physical(k.physical) {
+                            self.modifiers.remove(bit);
+                        }
+                        let up = super::keys::key_from_parts(k.physical, &k.logical, None, ElementState::Released, false, self.modifiers);
+                        self.key_input(up);
+                        "OK: key up".to_string()
+                    }
+                }
             }
             ScriptCommand::Type(text) => {
                 let seq = keys_for_typed_text(&text);
@@ -1453,6 +1785,51 @@ impl App {
                 }
                 self.modifiers = prev;
                 format!("OK: typed {count} key(s)")
+            }
+            ScriptCommand::Ime(ime_cmd) => {
+                use super::script::ScriptIme;
+                match ime_cmd {
+                    ScriptIme::Preedit(text) => {
+                        let cursor = (!text.is_empty()).then_some((0, text.len()));
+                        self.ime(&Ime::Preedit(text, cursor));
+                        "OK: ime preedit".to_string()
+                    }
+                    ScriptIme::Commit(text) => {
+                        self.ime(&Ime::Preedit(String::new(), None));
+                        self.ime(&Ime::Commit(text));
+                        "OK: ime commit".to_string()
+                    }
+                    ScriptIme::Disable => {
+                        self.ime(&Ime::Disabled);
+                        "OK: ime disabled".to_string()
+                    }
+                }
+            }
+            ScriptCommand::Focus(on) => {
+                self.focused(on);
+                format!("OK: focus {}", if on { "on" } else { "off" })
+            }
+            ScriptCommand::Clipboard(clip_cmd) => {
+                use super::script::ScriptClipboard;
+                match clip_cmd {
+                    ScriptClipboard::Get => self.last_copied.clone().unwrap_or_default(),
+                    ScriptClipboard::Clear => {
+                        self.last_copied = None;
+                        if self.use_memory_clipboard {
+                            self.memory_clipboard = None;
+                        }
+                        "OK: clipboard cleared".to_string()
+                    }
+                    ScriptClipboard::Set(text) => {
+                        if !self.use_memory_clipboard {
+                            "ERR: app.clipboard set requires GLYPH_WALL_CLIPBOARD=memory".to_string()
+                        } else {
+                            self.last_copied = Some(text.clone());
+                            self.memory_clipboard = Some(text);
+                            "OK: clipboard set".to_string()
+                        }
+                    }
+                }
             }
         }
     }
@@ -1471,6 +1848,13 @@ impl App {
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
         let lookup = screen_lookup(|id| terms.screen(id));
         if pressed {
+            #[cfg(feature = "egui-ui")]
+            {
+                self.panels.blur_docked_inputs();
+                if let Some(ui) = self.gfx.as_ref().and_then(|g| g.ui.as_ref()) {
+                    ui.surrender_focus();
+                }
+            }
             // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
             // mouse-reporting program claims it; no browser-menu passthrough.
             if secondary {
@@ -1524,11 +1908,25 @@ impl ApplicationHandler<Wake> for App {
             self.cursor = Point::new(position.x / sf, position.y / sf);
         }
         #[cfg(feature = "egui-ui")]
+        let wall_chord_bypass = match &event {
+            WindowEvent::KeyboardInput { event: kev, is_synthetic: false, .. } => {
+                let menu_open = self.wall.as_ref().is_some_and(|w| w.menu().is_some());
+                let opt_alt = self
+                    .wall
+                    .as_ref()
+                    .map_or(OptionAsAlt::Auto, |w| w.config().option_as_alt);
+                let mapped = super::keys::key_event(kev, self.modifiers, opt_alt);
+                !menu_open && chord_bypasses_panel_input(Platform::host(), &mapped)
+            }
+            _ => false,
+        };
+        #[cfg(feature = "egui-ui")]
         let panels_want_keys = self.wall.as_ref().is_some_and(|w| self.panels.wants_keyboard(w));
         #[cfg(feature = "egui-ui")]
-        let feed_ui = !matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
-            || panels_want_keys
-            || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| ui.context().egui_wants_keyboard_input());
+        let feed_ui = !wall_chord_bypass
+            && (!matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+                || panels_want_keys
+                || self.gfx.as_ref().and_then(|g| g.ui.as_ref()).is_some_and(|ui| ui.context().egui_wants_keyboard_input()));
         #[cfg(feature = "egui-ui")]
         let ui_outcome = match (&mut self.gfx, feed_ui) {
             (Some(g), true) => g.ui.as_mut().map_or_else(UiEventOutcome::default, |ui| ui.on_window_event(&g.window, &event)),
@@ -1541,13 +1939,15 @@ impl ApplicationHandler<Wake> for App {
         #[cfg(feature = "egui-ui")]
         let (ui_pointer, ui_keys) = (
             self.pointer_goes_to_ui(&ui_outcome),
-            ui_outcome.consumed || ui_outcome.wants_keyboard || panels_want_keys,
+            !wall_chord_bypass
+                && (ui_outcome.consumed || ui_outcome.wants_keyboard || panels_want_keys),
         );
         #[cfg(not(feature = "egui-ui"))]
         let (ui_pointer, ui_keys) = (false, false);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => self.focused(focused),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(g) = &self.gfx {
@@ -1579,21 +1979,9 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::MouseWheel { delta, .. } if !ui_pointer => self.wheel(delta),
             WindowEvent::PinchGesture { delta, .. } if !ui_pointer => self.pinch(delta),
-            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
-                #[cfg(feature = "egui-ui")]
-                if event.state == ElementState::Pressed && self.modifiers.super_key() && !self.modifiers.control_key() && !self.modifiers.alt_key() && event.physical_key == PhysicalKey::Code(KeyCode::KeyQ) {
-                    event_loop.exit();
-                    return;
-                }
-                #[cfg(feature = "egui-ui")]
-                if event.state == ElementState::Pressed && !event.repeat && event.physical_key == PhysicalKey::Code(KeyCode::F1) && !ui_outcome.consumed {
-                    self.hud_open = !self.hud_open;
-                    self.redraw();
-                    return;
-                }
-                if !ui_keys {
-                    self.key(&event, event_loop);
-                }
+            WindowEvent::Ime(ime) if !ui_keys => self.ime(&ime),
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if !ui_keys => {
+                self.key(&event, event_loop);
             }
             _ => {}
         }
@@ -1710,6 +2098,15 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
             log_enabled: std::env::var("GLYPH_WALL_PERF").is_ok_and(|v| !v.is_empty() && v != "0"),
             ..WallPerf::default()
         },
+        ime_composing: false,
+        last_ime_area: None,
+        #[cfg(target_os = "macos")]
+        macos_option_as_alt: None,
+        held_codes: HashSet::new(),
+        last_copied: None,
+        memory_clipboard: None,
+        use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("memory")),
     };
     event_loop.run_app(&mut app).expect("event loop error");
     println!("the wall drew {} frames", app.frames);
