@@ -1232,6 +1232,8 @@ fn publish_snapshot(
 fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bool {
     let dims_changed = dst.cols != src.cols || dst.rows != src.rows;
     let title_changed = dst.title != effective_title;
+    let links_changed = dst.hyperlinks != src.hyperlinks || dst.link_spans != src.link_spans;
+    let cursor_color_changed = dst.cursor_color != src.cursor_color;
     let grid_changed = dims_changed
         || dst.row_gen != src.row_gen
         || dst.wrapped != src.wrapped
@@ -1239,6 +1241,8 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
         || dst.modes != src.modes
         || dst.default_fg != src.default_fg
         || dst.default_bg != src.default_bg
+        || cursor_color_changed
+        || links_changed
         || dst.clusters.len() != src.clusters.len();
     if !grid_changed && !title_changed {
         return false;
@@ -1269,12 +1273,17 @@ fn sync_screen_into(src: &Screen, effective_title: &str, dst: &mut Screen) -> bo
     } else if dst.clusters.len() < src.clusters.len() {
         dst.clusters.extend(src.clusters[dst.clusters.len()..].iter().cloned());
     }
+    if links_changed {
+        dst.hyperlinks.clone_from(&src.hyperlinks);
+        dst.link_spans.clone_from(&src.link_spans);
+    }
 
     dst.generation = dst.generation.saturating_add(1).max(src.generation);
     dst.cursor = src.cursor;
     dst.modes = src.modes;
     dst.default_fg = src.default_fg;
     dst.default_bg = src.default_bg;
+    dst.cursor_color = src.cursor_color;
     if title_changed {
         dst.title.clear();
         dst.title.push_str(effective_title);
@@ -1505,5 +1514,36 @@ mod tests {
         let d = resized.take().expect("resized");
         assert!(d.resized);
         assert!(d.rewritten_cols.is_empty());
+    }
+
+    #[test]
+    fn sync_screen_into_copies_osc8_links_and_cursor_color_and_bumps_generation() {
+        let mut src = Screen::new(20, 4);
+        let mut dst = Screen::new(20, 4);
+        assert!(sync_screen_into(&src, "", &mut dst) || dst.generation == src.generation);
+        let g0 = dst.generation;
+
+        // No changes -> returns false without bumping generation.
+        assert!(!sync_screen_into(&src, "", &mut dst));
+        assert_eq!(dst.generation, g0);
+
+        // Mutating ONLY OSC 8 links on src must sync into dst and bump generation.
+        src.hyperlinks.push("https://example.org/osc8".to_owned());
+        src.link_spans.push(term_cells::LinkSpan {
+            row: 0,
+            start_col: 2,
+            end_col: 10,
+            link_id: 0,
+        });
+        assert!(sync_screen_into(&src, "", &mut dst));
+        assert!(dst.generation > g0);
+        assert_eq!(dst.hyperlink_at(5, 0), Some("https://example.org/osc8"));
+        let g1 = dst.generation;
+
+        // Mutating ONLY cursor_color (OSC 12) must also sync and bump generation.
+        src.cursor_color = term_cells::rgb(0xff, 0xaa, 0x00);
+        assert!(sync_screen_into(&src, "", &mut dst));
+        assert!(dst.generation > g1);
+        assert_eq!(dst.cursor_color, src.cursor_color);
     }
 }
