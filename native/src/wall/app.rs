@@ -76,6 +76,8 @@ pub struct WallOptions {
     /// The termd namespace whose terminals the wall shows. None: no daemon,
     /// one fixed test screen instead.
     pub namespace: Option<String>,
+    /// Extra termd namespaces to attach alongside `namespace` (off by default).
+    pub extra_namespaces: Vec<String>,
     /// Draw this many frames, one after another, then exit (`--frames`): how
     /// a script checks the window came up and drew.
     pub exit_after: Option<u64>,
@@ -177,6 +179,15 @@ struct App {
     #[cfg(feature = "egui-ui")]
     ui_repaint_at: Option<Instant>,
     blink_repaint_at: Option<Instant>,
+    /// Last drawn scrolled-back jump-to-live pills (back-to-front by Z), for hover/click.
+    scrollback_pills: Vec<super::describe::ScrollbackPillHit>,
+    /// Terminal whose scrolled-back pill is currently under the pointer.
+    hovered_scrollback_pill: Option<String>,
+    /// Terminal whose scrolled-back pill received a primary press (released click runs jump-live).
+    pressed_scrollback_pill: Option<String>,
+    /// Last seen scrollback state per live terminal so async `ViewReply` / `status_follow`
+    /// metadata updates trigger a redraw even when `screen.generation` did not change.
+    scrollback_snapshot: HashMap<String, super::describe::TerminalScrollback>,
     win: super::window::WindowLifecycle,
     /// Next wake deadline while `termd` is in a restarting/unreachable trouble state
     /// so the rules' notice grace timers advance even while the window is idle.
@@ -486,10 +497,13 @@ impl App {
         });
         // Start `g3d-termd` connect/spawn/list/adopt off the window thread right away so it
         // overlaps macOS AppKit window creation and never blocks Frame 1.
-        let pending_termd = opts
-            .namespace
-            .as_ref()
-            .map(|ns| super::startup::PendingTermd::spawn(ns.clone(), session_wake));
+        let pending_termd = opts.namespace.as_ref().map(|ns| {
+            super::startup::PendingTermd::spawn_with_extra(
+                ns.clone(),
+                opts.extra_namespaces.clone(),
+                session_wake,
+            )
+        });
 
         let store = store_dir();
         let window = {
@@ -605,6 +619,15 @@ impl App {
         match res {
             Ok(ready) => {
                 let welcome = ready.sessions.hub().welcome().clone();
+                let mut appeared_list = Vec::with_capacity(ready.adopted.len());
+                for (id, cols, rows) in ready.adopted {
+                    let mut appeared =
+                        TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                    if let Some(title) = ready.sessions.default_title_for(&id) {
+                        appeared = appeared.with_title(title);
+                    }
+                    appeared_list.push(appeared);
+                }
                 self.terms = Some(Terminals::Live(Box::new(ready.sessions)));
                 if let Some(wall) = &mut self.wall {
                     wall.on_termd_welcome(
@@ -613,8 +636,8 @@ impl App {
                         epoch_now_ms(),
                     );
                     wall.set_live_terminals(&ready.live_ids);
-                    for (id, cols, rows) in ready.adopted {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    for appeared in appeared_list {
+                        wall.terminal_appeared(appeared);
                     }
                     wall.set_connected(true);
                     if ready.live_ids.is_empty() {
@@ -1129,7 +1152,28 @@ impl App {
     fn pump(&mut self, request_redraw: bool) {
         let _perf = self.perf.pump_scope();
         let (Some(wall), Some(Terminals::Live(sessions))) = (&mut self.wall, &mut self.terms) else { return };
-        let (changed, news) = sessions.pump();
+        let (mut changed, news) = sessions.pump();
+        // Catch metadata-only scrollback updates (`ViewReply` offset/max or
+        // `status_follow` scrollback_rows arriving after `Event::Repaint`).
+        let mut live_count = 0usize;
+        for id in sessions.ids() {
+            live_count += 1;
+            if let Some(sb) = sessions.scrollback(id) {
+                let next = super::describe::TerminalScrollback {
+                    offset: sb.offset,
+                    max: sb.max,
+                    viewing: sb.viewing,
+                };
+                if self.scrollback_snapshot.get(id).copied() != Some(next) {
+                    self.scrollback_snapshot.insert(id.to_owned(), next);
+                    changed = true;
+                }
+            }
+        }
+        if self.scrollback_snapshot.len() != live_count {
+            self.scrollback_snapshot.retain(|id, _| sessions.screen(id).is_some());
+            changed = true;
+        }
         let mut heard = false;
         let mut ended_any = false;
         for n in news {
@@ -1184,7 +1228,11 @@ impl App {
             for id in &live_ids {
                 match sessions.adopt(id) {
                     Ok((cols, rows)) => {
-                        wall.terminal_appeared(TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows)));
+                        let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                        if let Some(title) = sessions.default_title_for(id) {
+                            appeared = appeared.with_title(title);
+                        }
+                        wall.terminal_appeared(appeared);
                     }
                     Err(e) => log::error!("{e}"),
                 }
@@ -1196,7 +1244,11 @@ impl App {
         for id in sessions.take_external_appeared() {
             match sessions.adopt(&id) {
                 Ok((cols, rows)) => {
-                    wall.terminal_appeared(TerminalAppeared::adopted(id, u32::from(cols), u32::from(rows)));
+                    let mut appeared = TerminalAppeared::adopted(id.clone(), u32::from(cols), u32::from(rows));
+                    if let Some(title) = sessions.default_title_for(&id) {
+                        appeared = appeared.with_title(title);
+                    }
+                    wall.terminal_appeared(appeared);
                     heard = true;
                 }
                 Err(e) => log::error!("{e}"),
@@ -1305,60 +1357,57 @@ impl App {
         let camera = WallCamera::new(Vec2::new(described.camera.x as f32, described.camera.y as f32), described.camera.zoom as f32 * sf);
         let viewport = (g.config.width, g.config.height);
 
-        let build_scene = frame.is_some() || need_offscreen;
-        let mut draws: Vec<TerminalDraw<'_>> = Vec::new();
-        if build_scene {
-            draws.reserve(described.terminals.len());
-            for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
-                let Some(screen) = terms.screen(&t.id) else { continue };
-                let (focused, border_color) = self.win.terminal_draw_focus(t.focused, t.hovered);
-                draws.push(TerminalDraw {
-                    id: *render_id,
-                    screen,
-                    position: v2(t.cell_origin),
-                    z: t.z as f32,
-                    scale: g.cell_scale * t.scale as f32,
-                    focused,
-                    panel_opacity: None,
-                    border_color,
-                    selection: t.text_selection.as_ref().map(|sel| {
-                        let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
-                            .then(|| css_rgb_u32(&sel.foreground));
-                        CellSelection {
-                            start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
-                            start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
-                            end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
-                            end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
-                            block: sel.block,
-                            background: css_rgb_u32(&sel.background),
-                            foreground: fg,
-                        }
-                    }),
-                    hover_link: t.hovered_link.as_ref().map(|link| {
-                        CellLinkHover::new(
-                            link.start_row.min(usize::from(u16::MAX)) as u16,
-                            link.start_col.min(usize::from(u16::MAX)) as u16,
-                            link.end_row.min(usize::from(u16::MAX)) as u16,
-                            link.end_col.min(usize::from(u16::MAX)) as u16,
-                        )
-                    }),
-                });
-            }
+        let mut draws: Vec<TerminalDraw<'_>> = Vec::with_capacity(described.terminals.len());
+        for (t, (_, render_id)) in described.terminals.iter().zip(&ids) {
+            let Some(screen) = terms.screen(&t.id) else { continue };
+            let (focused, border_color) = self.win.terminal_draw_focus(t.focused, t.hovered);
+            draws.push(TerminalDraw {
+                id: *render_id,
+                screen,
+                position: v2(t.cell_origin),
+                z: t.z as f32,
+                scale: g.cell_scale * t.scale as f32,
+                focused,
+                panel_opacity: None,
+                border_color,
+                selection: t.text_selection.as_ref().map(|sel| {
+                    let fg = (!sel.foreground.trim().eq_ignore_ascii_case("keep"))
+                        .then(|| css_rgb_u32(&sel.foreground));
+                    CellSelection {
+                        start_row: sel.r0.min(usize::from(u16::MAX)) as u16,
+                        start_col: sel.c0.min(usize::from(u16::MAX)) as u16,
+                        end_row: sel.r1.min(usize::from(u16::MAX)) as u16,
+                        end_col: sel.c1.min(usize::from(u16::MAX)) as u16,
+                        block: sel.block,
+                        background: css_rgb_u32(&sel.background),
+                        foreground: fg,
+                    }
+                }),
+                hover_link: t.hovered_link.as_ref().map(|link| {
+                    CellLinkHover::new(
+                        link.start_row.min(usize::from(u16::MAX)) as u16,
+                        link.start_col.min(usize::from(u16::MAX)) as u16,
+                        link.end_row.min(usize::from(u16::MAX)) as u16,
+                        link.end_col.min(usize::from(u16::MAX)) as u16,
+                    )
+                }),
+            });
         }
 
         let mut shapes: Vec<Shape> = Vec::new();
         let mut labels: Vec<Label<'static>> = Vec::new();
+        let mut pill_hits: Vec<super::describe::ScrollbackPillHit> = Vec::new();
         if described.notice.is_none() {
             described.notice = self
                 .starting_termd
                 .then(|| "starting termd...".to_string())
                 .or_else(|| g.renderer.shader_error_notice().map(str::to_owned));
         }
-        let paper = build_scene.then(|| {
+        let paper = {
             let metrics = g.renderer.metrics();
             let family = g.renderer.font_family();
             let mut fonts = super::chrome::ChromeFonts::new(metrics, g.renderer.glyphs_mut().atlas_mut(), family);
-            super::describe::describe_frame_chrome_with_scrollback(
+            super::describe::describe_frame_chrome_with_scrollback_hits(
                 &described,
                 &camera,
                 viewport,
@@ -1367,12 +1416,18 @@ impl App {
                 &mut shapes,
                 &mut labels,
                 |id| terms.scrollback(id),
+                self.hovered_scrollback_pill.as_deref(),
+                &mut pill_hits,
             )
-        });
-        let wall_frame = WallFrame { paper: paper.as_ref(), terminals: &draws, shapes: &shapes, labels: &labels };
-        if build_scene {
-            self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
+        };
+        if let Some(ref hid) = self.hovered_scrollback_pill {
+            if !pill_hits.iter().any(|p| p.terminal_id == *hid) {
+                self.hovered_scrollback_pill = None;
+            }
         }
+        self.scrollback_pills = pill_hits;
+        let wall_frame = WallFrame { paper: Some(&paper), terminals: &draws, shapes: &shapes, labels: &labels };
+        self.blink_repaint_at = g.renderer.next_cursor_blink(&draws, Instant::now());
         let view = frame
             .as_ref()
             .map(|f| f.texture.create_view(&Default::default()))
@@ -1569,14 +1624,47 @@ impl App {
         self.apply_effects();
     }
 
+    fn hit_scrollback_pill(&self, x: f64, y: f64) -> Option<&str> {
+        self.scrollback_pills
+            .iter()
+            .rev()
+            .find(|p| p.contains_screen(x, y))
+            .map(|p| p.terminal_id.as_str())
+    }
+
     fn move_cursor(&mut self, x: f64, y: f64) {
         self.cursor = Point::new(x, y);
+        if let Some(pressed_tid) = self.pressed_scrollback_pill.as_deref() {
+            let over = (self.hit_scrollback_pill(x, y) == Some(pressed_tid))
+                .then(|| pressed_tid.to_owned());
+            if over != self.hovered_scrollback_pill {
+                self.hovered_scrollback_pill = over;
+                self.redraw();
+            }
+            return;
+        }
+        let hovered_pill = if self.buttons == 0 {
+            self.hit_scrollback_pill(x, y).map(str::to_owned)
+        } else {
+            None
+        };
+        let pill_hover_changed = hovered_pill != self.hovered_scrollback_pill;
+        self.hovered_scrollback_pill = hovered_pill;
+
         let ev = self.pointer(None);
         if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
             let lookup = screen_lookup(|id| terms.screen(id));
             wall.pointer_move(&ev, &lookup);
         }
         self.apply_effects();
+        if self.hovered_scrollback_pill.is_some() {
+            if let Some(g) = &self.gfx {
+                g.window.set_cursor(winit::window::CursorIcon::Pointer);
+            }
+        }
+        if pill_hover_changed {
+            self.redraw();
+        }
     }
 
     fn pinch(&mut self, delta: f64) {
@@ -1741,6 +1829,7 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
+            self.pressed_scrollback_pill = None;
             self.buttons = 0;
             if let Some(wall) = &mut self.wall {
                 wall.blur();
@@ -2160,6 +2249,29 @@ impl App {
         }
         let ev = self.pointer(Some(b));
         let secondary = wall_core::menu::is_secondary_press(b, ev.mods, Platform::host());
+        if b == Button::Left && !secondary {
+            if pressed {
+                if let Some(tid) = self.hit_scrollback_pill(ev.x, ev.y).map(str::to_owned) {
+                    self.pressed_scrollback_pill = Some(tid);
+                    return;
+                }
+            } else if let Some(pressed_tid) = self.pressed_scrollback_pill.take() {
+                let still_inside = self.hit_scrollback_pill(ev.x, ev.y) == Some(pressed_tid.as_str());
+                if still_inside {
+                    if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
+                        let lookup = screen_lookup(|id| terms.screen(id));
+                        let _ = wall.run_with_screens(
+                            format!("terminal.scroll {pressed_tid} live"),
+                            &lookup,
+                        );
+                    }
+                    self.hovered_scrollback_pill = None;
+                    self.apply_effects();
+                    self.redraw();
+                }
+                return;
+            }
+        }
         let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
         let lookup = screen_lookup(|id| terms.screen(id));
         if pressed {
@@ -2515,6 +2627,10 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         #[cfg(feature = "egui-ui")]
         ui_repaint_at: None,
         blink_repaint_at: None,
+        scrollback_pills: Vec::new(),
+        hovered_scrollback_pill: None,
+        pressed_scrollback_pill: None,
+        scrollback_snapshot: HashMap::new(),
         win: super::window::WindowLifecycle::new(),
         termd_tick_at: None,
         pending_termd: None,

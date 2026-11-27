@@ -729,6 +729,86 @@ fn keycap_variation_selector_matches_libghostty_in_mode_2027_off_and_on() {
 }
 
 #[test]
+fn osc8_hyperlinks_populate_screen_span_table_without_bloating_cell() {
+    use term_cells::{Cell, LinkSpan, ScreenLink};
+
+    assert_eq!(std::mem::size_of::<Cell>(), 20, "Cell must stay 20 B");
+
+    let (mut vt, mut screen, _theme) = setup(16, 6);
+
+    // 1. Single-row OSC 8 link + non-linked neighbour + wide emoji inside link.
+    vt.feed("hi \x1b]8;;https://glyph3d.dev/wall\x1b\\go🚀!\x1b]8;;\x1b\\ end".as_bytes());
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.hyperlinks, vec!["https://glyph3d.dev/wall"]);
+    // "hi " = cols 0..3, "go" = 3..5, "🚀" = 5..7 (wide lead+tail), "!" = 7..8 -> 3..8.
+    assert_eq!(
+        screen.link_spans,
+        vec![LinkSpan {
+            row: 0,
+            start_col: 3,
+            end_col: 8,
+            link_id: 0,
+        }]
+    );
+    assert_eq!(screen.hyperlink_at(2, 0), None);
+    assert_eq!(screen.hyperlink_at(3, 0), Some("https://glyph3d.dev/wall"));
+    assert_eq!(
+        screen.hyperlink_at(6, 0),
+        Some("https://glyph3d.dev/wall"),
+        "wide trailing half must stay inside the link span"
+    );
+    assert_eq!(screen.hyperlink_at(8, 0), None);
+
+    // 2. Soft-wrapped multi-row link joins across row 1 -> row 2 via `hyperlink_range_at`.
+    vt.feed(b"\r\n0123456789\x1b]8;;https://example.org/long\x1b\\ABCDEFGHIJ\x1b]8;;\x1b\\");
+    assert!(vt.fill(&mut screen));
+    assert!(screen.wrapped[1], "row 1 must soft-wrap into row 2");
+    let expected_wrap = Some(ScreenLink {
+        uri: "https://example.org/long",
+        start_row: 1,
+        start_col: 10,
+        end_row: 2,
+        end_col: 4,
+    });
+    assert_eq!(screen.hyperlink_range_at(12, 1), expected_wrap);
+    assert_eq!(screen.hyperlink_range_at(1, 2), expected_wrap);
+    assert_eq!(screen.hyperlink_range_at(4, 2), None);
+
+    // 3. Same URI on a separate hard-broken line deduplicates URI table without merging rows.
+    vt.feed(b"\r\n\x1b]8;;https://example.org/long\x1b\\again\x1b]8;;\x1b\\");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.hyperlinks.len(), 2, "duplicate URI must share link_id");
+    assert_eq!(
+        screen.hyperlink_range_at(2, 3),
+        Some(ScreenLink {
+            uri: "https://example.org/long",
+            start_row: 3,
+            start_col: 0,
+            end_row: 3,
+            end_col: 5,
+        })
+    );
+
+    // 4. Alternate screen isolates links, and returning restores primary links.
+    vt.feed(b"\x1b[?1049hplain alt");
+    assert!(vt.fill(&mut screen));
+    assert!(screen.hyperlinks.is_empty());
+    assert!(screen.link_spans.is_empty());
+    vt.feed(b"\x1b[?1049l");
+    assert!(vt.fill(&mut screen));
+    assert_eq!(screen.hyperlink_at(3, 0), Some("https://glyph3d.dev/wall"));
+    assert_eq!(screen.hyperlink_range_at(1, 2), expected_wrap);
+
+    // 5. Clearing the screen empties both tables and bumps screen generation.
+    let gen_before = screen.generation;
+    vt.feed(b"\x1b[2J\x1b[H");
+    assert!(vt.fill(&mut screen));
+    assert!(screen.generation > gen_before);
+    assert!(screen.hyperlinks.is_empty());
+    assert!(screen.link_spans.is_empty());
+}
+
+#[test]
 fn text_trims_trailing_spaces_across_soft_wrapped_continuation_row() {
     // Reproduces Claude Code's 78-col inline diff background bar reflowed to 60 cols:
     // row 0 ends with spaces and soft-wraps onto row 1, which holds only trailing spaces.
@@ -744,5 +824,3 @@ fn text_trims_trailing_spaces_across_soft_wrapped_continuation_row() {
         "  2 -  console.log(\"Hello, World!\");\nnext"
     );
 }
-
-
