@@ -1,9 +1,11 @@
-//! CLI door onto a running native wall (`wallctl [--ns NAME] <verb and args...>`).
+//! CLI door onto a running native wall (`wallctl [--ns NAME] <verb and args...>`),
+//! plus offline browser-wall store import when no window is open on `--ns NAME`.
 
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use wall_control::{format_command_line, Client, Target, DEFAULT_NAMESPACE};
+use wall_control::{format_command_line, Client, Error as ControlError, Target, DEFAULT_NAMESPACE};
 
 const USAGE: &str = "\
 usage: wallctl [--ns NAME | --socket PATH] [<verb> [args...]]
@@ -14,7 +16,11 @@ Send command verbs to a running native wall over its local Unix control socket.
   -h, --help     Print this help
 
 With <verb> [args...], sends one command, prints the reply, and exits 0 (or 1 on ERR:).
-With no <verb>, reads command lines from stdin over one connection until EOF.";
+With no <verb>, reads command lines from stdin over one connection until EOF.
+
+Browser-wall store import (runs live on an open window, or writes the namespace store
+offline when no window is open on --ns NAME):
+  wallctl [--ns NAME] wall.import <browser-export.json> [browser-scope]";
 
 struct ParsedCli {
     target: Target,
@@ -93,6 +99,61 @@ where
     })
 }
 
+fn resolve_for_peer_cwd(raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+fn prepare_argv(argv: &[String]) -> Result<Vec<String>, String> {
+    if argv.first().map(String::as_str) == Some("wall.import") {
+        if !(2..=3).contains(&argv.len()) {
+            return Err("usage: wall.import <browser-export.json> [browser-scope]".to_string());
+        }
+        let mut out = argv.to_vec();
+        out[1] = resolve_for_peer_cwd(&argv[1]).to_string_lossy().into_owned();
+        return Ok(out);
+    }
+    Ok(argv.to_vec())
+}
+
+fn is_not_listening(err: &ControlError) -> bool {
+    matches!(
+        err,
+        ControlError::Io(io_err)
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            )
+    )
+}
+
+fn run_offline_import(
+    target: &Target,
+    argv: &[String],
+    default_dir: &Path,
+) -> Result<String, String> {
+    let (store_dir, ns) = match target {
+        Target::Namespace(ns) => (default_dir, ns.as_str()),
+        Target::NamespaceIn { dir, ns } => (dir.as_path(), ns.as_str()),
+        Target::Socket(p) => {
+            return Err(format!(
+                "no wall window is listening on {}, and offline wall.import requires --ns <namespace>",
+                p.display()
+            ));
+        }
+    };
+    let export_path = Path::new(&argv[1]);
+    let source_scope = argv.get(2).map(String::as_str);
+    let report = wall_core::import::import_browser_file(export_path, source_scope, store_dir, ns)?;
+    Ok(report.summary_text())
+}
+
 fn print_reply(stdout: &mut impl Write, text: &str) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -118,18 +179,45 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut client = match Client::connect(&cli.target) {
-        Ok(client) => client,
-        Err(err) => {
-            let _ = writeln!(io::stderr(), "ERR: {err}");
+    let command_argv = match prepare_argv(&cli.command_argv) {
+        Ok(argv) => argv,
+        Err(msg) => {
+            let _ = writeln!(io::stderr(), "ERR: {msg}");
             return ExitCode::FAILURE;
         }
     };
 
     let mut stdout = io::stdout().lock();
 
-    if !cli.command_argv.is_empty() {
-        let line = format_command_line(&cli.command_argv);
+    let mut client = match Client::connect(&cli.target) {
+        Ok(client) => client,
+        Err(ref err)
+            if is_not_listening(err)
+                && command_argv.first().map(String::as_str) == Some("wall.import") =>
+        {
+            let store_dir = wall_core::store::default_store_dir();
+            return match run_offline_import(&cli.target, &command_argv, &store_dir) {
+                Ok(summary) => {
+                    if let Err(err) = print_reply(&mut stdout, &summary) {
+                        let _ = writeln!(io::stderr(), "ERR: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(msg) => {
+                    let _ = writeln!(io::stderr(), "ERR: {msg}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Err(err) => {
+            let _ = writeln!(io::stderr(), "ERR: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if !command_argv.is_empty() {
+        let line = format_command_line(&command_argv);
         return match client.send(&line) {
             Ok(reply) => {
                 if let Err(err) = print_reply(&mut stdout, &reply.text) {
@@ -183,5 +271,40 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use wall_core::geom::Point;
+    use wall_core::store::WallStore;
+
+    #[test]
+    fn offline_wall_import_writes_target_namespace_store() {
+        let dir = std::env::temp_dir().join(format!("wallctl-imp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let export_file = dir.join("browser.json");
+        fs::write(
+            &export_file,
+            r#"{"glyph3d.wall.relay-8765.positions":"{\"t1\":{\"x\":12,\"y\":-24}}","glyph3d.wall.relay-8765.names":"{\"t1\":\"api\"}"}"#,
+        )
+        .unwrap();
+
+        let argv = vec![
+            "wall.import".to_string(),
+            export_file.to_string_lossy().into_owned(),
+        ];
+        let summary = run_offline_import(&Target::namespace("probe"), &argv, &dir)
+            .expect("offline import succeeds");
+        assert!(summary.starts_with("OK: imported browser localStorage (relay-8765)"), "{summary}");
+
+        let store = WallStore::open(&dir, "probe");
+        assert_eq!(store.position("t1"), Some(Point::new(12.0, -24.0)));
+        assert_eq!(store.name("t1"), Some("api"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

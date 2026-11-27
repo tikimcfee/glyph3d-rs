@@ -23,6 +23,7 @@ use crate::dock::{dock_layout, DockPanel, DockState};
 use crate::geom::{Point, Rect};
 use crate::input::Platform;
 use crate::layout::{fit_rect, tile_layout, union_rect, GridSize, Size, TileOptions, BAR_ROOM};
+use crate::model::{CellGeometry, MIN_PANE_COLS, MIN_PANE_ROWS};
 use crate::split;
 use crate::store::{
     CameraPose, FullscreenMode, FullscreenState, SavedCanvasPane, WallGroup, WallStore,
@@ -848,6 +849,56 @@ impl WallFullscreen {
         }
         host.ease_camera(s.camera);
         host.emit();
+    }
+
+    /// Rescale every saved pre-fullscreen canvas grid (`canvas` / `saved`) from `old`
+    /// to `next` cell geometry so leaving fullscreen after a font family, size, or
+    /// line-height change restores each terminal's world panel footprint rather than
+    /// snapping back to pre-font-change `(cols, rows)`.
+    ///
+    /// Split-group members are left untouched because `relayout_group` re-wraps them
+    /// against the split rectangle on fullscreen exit.
+    pub fn rescale_saved_canvas_for_geometry(
+        &mut self,
+        host: &mut impl FullscreenHost,
+        old: CellGeometry,
+        next: CellGeometry,
+    ) {
+        if old == next {
+            return;
+        }
+        let Some(ref mut s) = self.state else {
+            return;
+        };
+        let is_split_member = |id: &str| {
+            host.group_of(id)
+                .and_then(|gid| host.group(gid))
+                .is_some_and(|g| g.layout == GroupLayout::Split)
+        };
+        let rescale = |pane: &mut SavedCanvasPane| {
+            let panel_w = f64::from(pane.cols) * old.stride.x + 2.0 * old.padding.x;
+            let panel_h = f64::from(pane.rows) * old.stride.y + 2.0 * old.padding.y;
+            pane.cols = MIN_PANE_COLS.max(
+                ((panel_w - 2.0 * next.padding.x) / next.stride.x.max(1e-9)).round() as u32,
+            );
+            pane.rows = MIN_PANE_ROWS.max(
+                ((panel_h - 2.0 * next.padding.y) / next.stride.y.max(1e-9)).round() as u32,
+            );
+        };
+        if let Some(ref mut canvas) = s.canvas {
+            let skip = s.id.as_deref().is_some_and(&is_split_member);
+            if !skip {
+                rescale(canvas);
+            }
+        }
+        if let Some(ref mut saved) = s.saved {
+            for (id, pane) in saved.iter_mut() {
+                if !is_split_member(id) {
+                    rescale(pane);
+                }
+            }
+        }
+        host.set_saved_fullscreen(Some(s.clone()));
     }
 
     /// Give `id` its canvas size and spot back before it hides; in single-pane
