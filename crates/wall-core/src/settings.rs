@@ -15,57 +15,56 @@ pub struct SettingsSection {
     pub subtitle: &'static str,
 }
 
-/// The settings panel's sections, in display order (`wallSettings.SECTIONS`).
+/// The settings window's sections, in the order its list shows them
+/// (`wallSettings.SECTIONS`, regrouped 2026-11-27 under names a person would
+/// look for: what the browser panel kept under `menu` is with the terminals
+/// it resizes, and every notice's timing is under `status`). The ids are the
+/// knobs' `section` values and what `wall.settings section` takes.
 pub const SECTIONS: &[SettingsSection] = &[
-    SettingsSection {
-        id: "canvas",
-        title: "Canvas",
-        subtitle: "background · drafting grid · snapping",
-    },
     SettingsSection {
         id: "terminals",
         title: "Terminals",
-        subtitle: "closing · title-bar buttons",
-    },
-    SettingsSection {
-        id: "agent",
-        title: "Agent view",
-        subtitle: "transcript side · dimensions · gap",
-    },
-    SettingsSection {
-        id: "fullscreen",
-        title: "Fullscreen",
-        subtitle: "text size · room at the edge",
+        subtitle: "size · closing · title bar · cursor",
     },
     SettingsSection {
         id: "text",
         title: "Text",
-        subtitle: "font family · size · line height · bold · underline · dim",
+        subtitle: "font · size · spacing · underlines",
+    },
+    SettingsSection {
+        id: "canvas",
+        title: "Canvas & grid",
+        subtitle: "background · grid · snapping",
     },
     SettingsSection {
         id: "groups",
-        title: "Groups",
-        subtitle: "what a new group is born with · backdrop",
+        title: "Groups & splits",
+        subtitle: "what a new group or split starts with",
     },
     SettingsSection {
-        id: "status",
-        title: "Status",
-        subtitle: "the termd status window · notices",
-    },
-    SettingsSection {
-        id: "input",
-        title: "Input",
-        subtitle: "keyboard · wheel",
+        id: "fullscreen",
+        title: "Fullscreen",
+        subtitle: "text size · margin",
     },
     SettingsSection {
         id: "selection",
-        title: "Selection",
-        subtitle: "selecting text · copy · paste",
+        title: "Selection & copy",
+        subtitle: "colours · double-click · copying",
     },
     SettingsSection {
-        id: "menu",
-        title: "Menu",
-        subtitle: "the right-click menu",
+        id: "input",
+        title: "Keyboard & mouse",
+        subtitle: "Option key · zoom · scrolling",
+    },
+    SettingsSection {
+        id: "agent",
+        title: "Agent View",
+        subtitle: "where it opens · how big",
+    },
+    SettingsSection {
+        id: "status",
+        title: "Notices",
+        subtitle: "how long they stay · termd status",
     },
 ];
 
@@ -183,11 +182,16 @@ impl KnobKind {
     }
 }
 
-/// Schema definition of one wall knob: its section, label, description, and type constraints.
+/// Schema definition of one wall knob: its section, label, meaning, and type constraints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KnobDef {
     pub section: &'static str,
     pub label: &'static str,
+    /// What the setting does, in one plain line: the words under its label
+    /// in the settings window (2026-11-27). Never the knob's key.
+    pub summary: &'static str,
+    /// The whole of it: its values, units and consequences. The window
+    /// shows it on hover, and where a search matched it.
     pub description: &'static str,
     pub kind: KnobKind,
 }
@@ -205,133 +209,27 @@ pub(crate) const GROUP_LAYOUT_OPTIONS: &[&str] = &["tile", "freeform", "split"];
 pub(crate) const OPTION_AS_ALT_OPTIONS: &[&str] = &["auto", "true", "false"];
 pub(crate) const COPY_ON_SELECT_OPTIONS: &[&str] = &["true", "clipboard", "false"];
 
-/// Every wall knob's definition, in the settings panel's order within each section (`wallSettings.KNOBS`).
+/// Every wall knob's definition, in the settings window's order: section by section
+/// ([`SECTIONS`]), and within each as its list shows them (`wallSettings.KNOBS`).
 pub const KNOBS: &[(&str, KnobDef)] = &[
-    (
-        "background",
-        KnobDef {
-            section: "canvas",
-            label: "Background",
-            kind: KnobKind::Color,
-            description: "The canvas colour behind every terminal and group.",
-        },
-    ),
-    (
-        "renderLoop",
-        KnobDef {
-            section: "canvas",
-            label: "Render loop",
-            kind: KnobKind::Enum { options: RENDER_LOOP_OPTIONS },
-            description: "demand draws the canvas only when something changed (input, output, a move) and idles the GPU otherwise; always draws every display frame — a check when something looks stale.",
-        },
-    ),
-    (
-        "gridShow",
-        KnobDef {
-            section: "canvas",
-            label: "Show grid",
-            kind: KnobKind::Bool,
-            description: "Draw the drafting-paper grid on the canvas. Snapping works with the grid hidden too.",
-        },
-    ),
-    (
-        "gridMinor",
-        KnobDef {
-            section: "canvas",
-            label: "Grid spacing",
-            kind: KnobKind::Number {
-                min: None,
-                above: Some(0.0),
-                max: None,
-                step: Some(1.0),
-                whole: false,
-                unit: Some("world units"),
-            },
-            description: "Distance between the fine grid lines — the step moves and resizes snap to.",
-        },
-    ),
-    (
-        "gridMajorEvery",
-        KnobDef {
-            section: "canvas",
-            label: "Major line every",
-            kind: KnobKind::Number {
-                min: Some(1.0),
-                above: None,
-                max: None,
-                step: Some(1.0),
-                whole: true,
-                unit: Some("lines"),
-            },
-            description: "Every Nth line is a major (brighter) line; 1 makes every line major.",
-        },
-    ),
-    (
-        "gridMinPx",
-        KnobDef {
-            section: "canvas",
-            label: "Hide lines closer than",
-            kind: KnobKind::Number {
-                min: Some(0.0),
-                above: None,
-                max: None,
-                step: Some(1.0),
-                whole: false,
-                unit: Some("px"),
-            },
-            description: "Zoomed out, a level of lines packed closer than this on screen is not drawn, and snapping steps to the major lines.",
-        },
-    ),
-    (
-        "gridLinePx",
-        KnobDef {
-            section: "canvas",
-            label: "Line width",
-            kind: KnobKind::Number {
-                min: None,
-                above: Some(0.0),
-                max: None,
-                step: Some(1.0),
-                whole: false,
-                unit: Some("px"),
-            },
-            description: "How thick each grid line is on screen.",
-        },
-    ),
-    (
-        "gridMinorColor",
-        KnobDef {
-            section: "canvas",
-            label: "Line colour",
-            kind: KnobKind::Color,
-            description: "The colour of the fine grid lines.",
-        },
-    ),
-    (
-        "gridMajorColor",
-        KnobDef {
-            section: "canvas",
-            label: "Major line colour",
-            kind: KnobKind::Color,
-            description: "The colour of every major grid line.",
-        },
-    ),
-    (
-        "snap",
-        KnobDef {
-            section: "canvas",
-            label: "Snap to grid",
-            kind: KnobKind::Bool,
-            description: "Moving a terminal puts its top-left corner on a grid crossing; resizing lands the dragged edge on or just inside a line. Hold Ctrl (⌃) while dragging to do the opposite.",
-        },
-    ),
     (
         "newTerminalSize",
         KnobDef {
             section: "terminals",
             label: "New terminal size",
+            summary: "How big a new terminal opens, in columns by rows.",
             kind: KnobKind::Text { parser: TextParser::TerminalSize },
             description: "The size a new terminal opens at, as COLSxROWS (like 100x30): the + button, wall.spawn, a split's new pane and an attached agent's terminal. A terminal that is already open keeps its size.",
+        },
+    ),
+    (
+        "menuSizes",
+        KnobDef {
+            section: "terminals",
+            label: "Sizes in the menu",
+            summary: "The sizes a terminal's right-click menu offers to resize it to.",
+            kind: KnobKind::Text { parser: TextParser::MenuSizes },
+            description: "The sizes a terminal's right-click menu offers to resize it to, as COLSxROWS separated by spaces (like 80x24 120x36); empty offers none.",
         },
     ),
     (
@@ -339,6 +237,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "terminals",
             label: "Hold to close",
+            summary: "How long you hold the close button before a terminal is closed.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -354,7 +253,8 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         "barButtonsMinPx",
         KnobDef {
             section: "terminals",
-            label: "Bar buttons from",
+            label: "Title-bar buttons from",
+            summary: "How tall a title bar must be on screen before its buttons show.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -370,7 +270,8 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         "panelOpacity",
         KnobDef {
             section: "terminals",
-            label: "Panel opacity",
+            label: "Terminal opacity",
+            summary: "How solid a terminal's backing is; lower lets the canvas show through.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -387,6 +288,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "terminals",
             label: "Cursor blink",
+            summary: "How fast the cursor blinks; 0 keeps it steady.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -399,115 +301,11 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         },
     ),
     (
-        "agentViewSide",
-        KnobDef {
-            section: "agent",
-            label: "Default side",
-            kind: KnobKind::Enum { options: AGENT_SIDE_OPTIONS },
-            description: "Which side of a terminal a newly opened Agent View attaches to (drag its header to move it to any side).",
-        },
-    ),
-    (
-        "agentViewWidth",
-        KnobDef {
-            section: "agent",
-            label: "Side width",
-            kind: KnobKind::Number {
-                min: Some(24.0),
-                above: None,
-                max: Some(300.0),
-                step: Some(2.0),
-                whole: false,
-                unit: Some("world units"),
-            },
-            description: "World width of an Agent View when attached to the left or right of its terminal.",
-        },
-    ),
-    (
-        "agentViewHeight",
-        KnobDef {
-            section: "agent",
-            label: "Top / bottom height",
-            kind: KnobKind::Number {
-                min: Some(16.0),
-                above: None,
-                max: Some(240.0),
-                step: Some(2.0),
-                whole: false,
-                unit: Some("world units"),
-            },
-            description: "World height of an Agent View when attached above or below its terminal.",
-        },
-    ),
-    (
-        "agentViewGap",
-        KnobDef {
-            section: "agent",
-            label: "Attachment gap",
-            kind: KnobKind::Number {
-                min: Some(0.0),
-                above: None,
-                max: Some(32.0),
-                step: Some(0.5),
-                whole: false,
-                unit: Some("world units"),
-            },
-            description: "World space between a terminal and its attached Agent View.",
-        },
-    ),
-    (
-        "fullscreenMinLinePx",
-        KnobDef {
-            section: "fullscreen",
-            label: "Smallest entry text",
-            kind: KnobKind::Number {
-                min: Some(4.0),
-                above: None,
-                max: Some(200.0),
-                step: Some(1.0),
-                whole: false,
-                unit: Some("px a row"),
-            },
-            description: "A terminal going fullscreen keeps the text size it had on the canvas, so it shows more text; from far out it starts at least this tall instead.",
-        },
-    ),
-    (
-        "fullscreenPad",
-        KnobDef {
-            section: "fullscreen",
-            label: "Edge room",
-            kind: KnobKind::Number {
-                min: Some(0.0),
-                above: None,
-                max: None,
-                step: Some(1.0),
-                whole: false,
-                unit: Some("px"),
-            },
-            description: "Space kept between a fullscreen terminal and the edge of the canvas (or a docked panel).",
-        },
-    ),
-    (
-        "fullscreenTextStep",
-        KnobDef {
-            section: "fullscreen",
-            label: "Text size step",
-            kind: KnobKind::Number {
-                min: Some(1.01),
-                above: None,
-                max: Some(3.0),
-                step: Some(0.01),
-                whole: false,
-                unit: Some("×"),
-            },
-            description: "How much one bigger or smaller text key (chord + = / chord + -) changes a fullscreen terminal's text; it re-wraps to the new size.",
-        },
-    ),
-    (
         "fontFamily",
         KnobDef {
             section: "text",
             label: "Font family",
+            summary: "The font terminals are drawn in.",
             kind: KnobKind::Text {
                 parser: TextParser::NonEmptyTrim,
             },
@@ -519,6 +317,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Font size",
+            summary: "How big terminal text is.",
             kind: KnobKind::Number {
                 min: Some(6.0),
                 above: None,
@@ -535,6 +334,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Line height",
+            summary: "The space between rows of text.",
             kind: KnobKind::Number {
                 min: Some(0.8),
                 above: None,
@@ -551,15 +351,34 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Bold is bright",
+            summary: "Draw bold text in the brighter version of its colour.",
             kind: KnobKind::Bool,
             description: "Bold text in one of the eight standard colours (red, green, …) is drawn in its bright twin as well as in the bold face. Off, bold changes only the face and the colour stays the one the program named.",
+        },
+    ),
+    (
+        "dimAlpha",
+        KnobDef {
+            section: "text",
+            label: "Dim text opacity",
+            summary: "How faint dim text is.",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: Some(1.0),
+                step: Some(0.02),
+                whole: false,
+                unit: None,
+            },
+            description: "How much of its opacity dim (faint) text keeps: 1 draws it like plain text, lower lets the background show through it, 0 hides it.",
         },
     ),
     (
         "lineThickness",
         KnobDef {
             section: "text",
-            label: "Line thickness",
+            label: "Underline thickness",
+            summary: "How thick underlines and strikethroughs are.",
             kind: KnobKind::Number {
                 min: None,
                 above: Some(0.0),
@@ -576,6 +395,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Underline raise",
+            summary: "Move underlines up or down.",
             kind: KnobKind::Number {
                 min: Some(-1.0),
                 above: None,
@@ -592,6 +412,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "text",
             label: "Curly underline height",
+            summary: "How tall the wave of a curly underline is.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -604,26 +425,11 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         },
     ),
     (
-        "dimAlpha",
-        KnobDef {
-            section: "text",
-            label: "Dim text opacity",
-            kind: KnobKind::Number {
-                min: Some(0.0),
-                above: None,
-                max: Some(1.0),
-                step: Some(0.02),
-                whole: false,
-                unit: None,
-            },
-            description: "How much of its opacity dim (faint) text keeps: 1 draws it like plain text, lower lets the background show through it, 0 hides it.",
-        },
-    ),
-    (
         "greekPx",
         KnobDef {
             section: "text",
-            label: "Greek below",
+            label: "Simplify text below",
+            summary: "Zoomed out, text smaller than this is drawn as plain bars.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -636,10 +442,139 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         },
     ),
     (
+        "background",
+        KnobDef {
+            section: "canvas",
+            label: "Background colour",
+            summary: "The colour behind everything on the canvas.",
+            kind: KnobKind::Color,
+            description: "The canvas colour behind every terminal and group.",
+        },
+    ),
+    (
+        "gridShow",
+        KnobDef {
+            section: "canvas",
+            label: "Show grid",
+            summary: "Draw the grid on the canvas.",
+            kind: KnobKind::Bool,
+            description: "Draw the drafting-paper grid on the canvas. Snapping works with the grid hidden too.",
+        },
+    ),
+    (
+        "snap",
+        KnobDef {
+            section: "canvas",
+            label: "Snap to grid",
+            summary: "Moves and resizes land on the grid.",
+            kind: KnobKind::Bool,
+            description: "Moving a terminal puts its top-left corner on a grid crossing; resizing lands the dragged edge on or just inside a line. Hold Ctrl (⌃) while dragging to do the opposite.",
+        },
+    ),
+    (
+        "gridMinor",
+        KnobDef {
+            section: "canvas",
+            label: "Grid spacing",
+            summary: "How far apart the grid lines are, which is also the snap step.",
+            kind: KnobKind::Number {
+                min: None,
+                above: Some(0.0),
+                max: None,
+                step: Some(1.0),
+                whole: false,
+                unit: Some("world units"),
+            },
+            description: "Distance between the fine grid lines — the step moves and resizes snap to.",
+        },
+    ),
+    (
+        "gridMajorEvery",
+        KnobDef {
+            section: "canvas",
+            label: "Major line every",
+            summary: "How often a brighter line is drawn.",
+            kind: KnobKind::Number {
+                min: Some(1.0),
+                above: None,
+                max: None,
+                step: Some(1.0),
+                whole: true,
+                unit: Some("lines"),
+            },
+            description: "Every Nth line is a major (brighter) line; 1 makes every line major.",
+        },
+    ),
+    (
+        "gridMinPx",
+        KnobDef {
+            section: "canvas",
+            label: "Hide lines closer than",
+            summary: "Zoomed out, lines packed tighter than this are left out.",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: None,
+                step: Some(1.0),
+                whole: false,
+                unit: Some("px"),
+            },
+            description: "Zoomed out, a level of lines packed closer than this on screen is not drawn, and snapping steps to the major lines.",
+        },
+    ),
+    (
+        "gridLinePx",
+        KnobDef {
+            section: "canvas",
+            label: "Line width",
+            summary: "How thick the lines are.",
+            kind: KnobKind::Number {
+                min: None,
+                above: Some(0.0),
+                max: None,
+                step: Some(1.0),
+                whole: false,
+                unit: Some("px"),
+            },
+            description: "How thick each grid line is on screen.",
+        },
+    ),
+    (
+        "gridMinorColor",
+        KnobDef {
+            section: "canvas",
+            label: "Line colour",
+            summary: "The colour of the grid lines.",
+            kind: KnobKind::Color,
+            description: "The colour of the fine grid lines.",
+        },
+    ),
+    (
+        "gridMajorColor",
+        KnobDef {
+            section: "canvas",
+            label: "Major line colour",
+            summary: "The colour of the brighter major lines.",
+            kind: KnobKind::Color,
+            description: "The colour of every major grid line.",
+        },
+    ),
+    (
+        "renderLoop",
+        KnobDef {
+            section: "canvas",
+            label: "Render loop",
+            summary: "Redraw only when something changes, or on every frame.",
+            kind: KnobKind::Enum { options: RENDER_LOOP_OPTIONS },
+            description: "demand draws the canvas only when something changed (input, output, a move) and idles the GPU otherwise; always draws every display frame — a check when something looks stale.",
+        },
+    ),
+    (
         "groupLayout",
         KnobDef {
             section: "groups",
             label: "New group layout",
+            summary: "How a new group arranges its terminals.",
             kind: KnobKind::Enum { options: GROUP_LAYOUT_OPTIONS },
             description: "A new group's layout: tile packs its members in columns; freeform leaves each where it is; split cuts their union into panes, each re-wrapped to fill its own.",
         },
@@ -649,6 +584,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "groups",
             label: "New group columns",
+            summary: "How many columns a new tiled group has; 0 picks for you.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -665,6 +601,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "groups",
             label: "Tile gap",
+            summary: "The space between the terminals of a tiled group.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -681,6 +618,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "groups",
             label: "Backdrop margin",
+            summary: "How far a group's backdrop reaches past its terminals.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -697,6 +635,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "groups",
             label: "Split gap",
+            summary: "The space between the panes of a split.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -712,7 +651,8 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         "splitBarRows",
         KnobDef {
             section: "groups",
-            label: "Split bar room",
+            label: "Split title-bar room",
+            summary: "The room kept above each pane of a split for its title bar.",
             kind: KnobKind::Number {
                 min: Some(0.5),
                 above: None,
@@ -729,15 +669,98 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "groups",
             label: "Split title bars",
+            summary: "Give each pane of a new split a title bar.",
             kind: KnobKind::Bool,
             description: "Whether a new split's panes each show a title bar; wall.group.bars (or the group's menu) turns one split's on or off.",
         },
     ),
     (
-        "restartNoticeMs",
+        "fullscreenMinLinePx",
         KnobDef {
-            section: "status",
-            label: "Restart notice after",
+            section: "fullscreen",
+            label: "Smallest fullscreen text",
+            summary: "The smallest text a terminal starts fullscreen with.",
+            kind: KnobKind::Number {
+                min: Some(4.0),
+                above: None,
+                max: Some(200.0),
+                step: Some(1.0),
+                whole: false,
+                unit: Some("px a row"),
+            },
+            description: "A terminal going fullscreen keeps the text size it had on the canvas, so it shows more text; from far out it starts at least this tall instead.",
+        },
+    ),
+    (
+        "fullscreenPad",
+        KnobDef {
+            section: "fullscreen",
+            label: "Fullscreen margin",
+            summary: "The space kept around a fullscreen terminal.",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: None,
+                step: Some(1.0),
+                whole: false,
+                unit: Some("px"),
+            },
+            description: "Space kept between a fullscreen terminal and the edge of the canvas (or a docked panel).",
+        },
+    ),
+    (
+        "fullscreenTextStep",
+        KnobDef {
+            section: "fullscreen",
+            label: "Text size step",
+            summary: "How much one press of the bigger or smaller text key changes fullscreen text.",
+            kind: KnobKind::Number {
+                min: Some(1.01),
+                above: None,
+                max: Some(3.0),
+                step: Some(0.01),
+                whole: false,
+                unit: Some("×"),
+            },
+            description: "How much one bigger or smaller text key (chord + = / chord + -) changes a fullscreen terminal's text; it re-wraps to the new size.",
+        },
+    ),
+    (
+        "selectionColor",
+        KnobDef {
+            section: "selection",
+            label: "Selection colour",
+            summary: "The highlight colour behind selected text.",
+            kind: KnobKind::Color,
+            description: "The fill behind selected text in every terminal. Ghostty's default: the terminal's own text colour, so a selection reads as the terminal's colours inverted.",
+        },
+    ),
+    (
+        "selectionForeground",
+        KnobDef {
+            section: "selection",
+            label: "Selected text colour",
+            summary: "The colour selected text is drawn in, or keep each character's own.",
+            kind: KnobKind::Text { parser: TextParser::SelectionForeground },
+            description: "The colour selected text is drawn in, as #rrggbb — or keep, and each cell keeps its own colour over the selection colour.",
+        },
+    ),
+    (
+        "selectionWordChars",
+        KnobDef {
+            section: "selection",
+            label: "Word boundaries",
+            summary: "The characters that end a word when you double-click.",
+            kind: KnobKind::Text { parser: TextParser::SelectionWordChars },
+            description: "The characters that end a word when you double-click, besides spaces and tabs: a double-click selects the run of other characters around the pointer (or, on one of these, the run of these). Ghostty's default.",
+        },
+    ),
+    (
+        "clickRepeatMs",
+        KnobDef {
+            section: "selection",
+            label: "Double-click time",
+            summary: "How quickly two clicks must follow each other to count as a double click.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -746,23 +769,27 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
                 whole: false,
                 unit: Some("ms"),
             },
-            description: "A termd brain restart shows its amber notice only once it has lasted this long; a quick one shows just the chip.",
+            description: "Presses on a terminal closer together than this (and within a few pixels) count as a double click (a word) or a triple click (a line).",
         },
     ),
     (
-        "errorsShown",
+        "copyOnSelect",
         KnobDef {
-            section: "status",
-            label: "Errors listed",
-            kind: KnobKind::Number {
-                min: Some(0.0),
-                above: None,
-                max: None,
-                step: Some(1.0),
-                whole: true,
-                unit: None,
-            },
-            description: "How many recent termd errors the status window lists, newest first.",
+            section: "selection",
+            label: "Copy on select",
+            summary: "Copy text as soon as you finish selecting it.",
+            kind: KnobKind::Enum { options: COPY_ON_SELECT_OPTIONS },
+            description: "What a selection is copied to as you finish it: true — the wall's own selection clipboard, which a middle-click on a terminal pastes (a browser page can't reach the system's primary selection); clipboard — that and the system clipboard; false — neither (the copy chord and the menu still copy).",
+        },
+    ),
+    (
+        "selectionClearOnTyping",
+        KnobDef {
+            section: "selection",
+            label: "Typing clears selection",
+            summary: "Typing into a terminal drops what was selected in it.",
+            kind: KnobKind::Bool,
+            description: "A key typed into a terminal drops its selection, as Ghostty does; off, the selection stays until its text changes.",
         },
     ),
     (
@@ -770,6 +797,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "input",
             label: "Option as Alt",
+            summary: "Whether the Option key acts as Alt in terminals.",
             kind: KnobKind::Enum { options: OPTION_AS_ALT_OPTIONS },
             description: "Whether ⌥/Alt is Alt for the terminal: auto sends Option's character when it made one (å), else Alt; true always Alt (Option+A is ESC a); false types characters. Takes the next key.",
         },
@@ -779,6 +807,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "input",
             label: "Zoom keys",
+            summary: "The keys that make the wheel zoom instead of pan.",
             kind: KnobKind::Text { parser: TextParser::ZoomKeys },
             description: "Held with the wheel, any of these zooms the canvas instead of panning it: ctrl, alt, meta, shift, separated by spaces. Keep ctrl for a trackpad pinch (it arrives as Ctrl+wheel); alt is Option and meta is ⌘ from a Mac.",
         },
@@ -788,6 +817,7 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "input",
             label: "Scroll speed",
+            summary: "How fast the wheel scrolls inside a terminal.",
             kind: KnobKind::Number {
                 min: None,
                 above: Some(0.0),
@@ -804,76 +834,78 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         KnobDef {
             section: "input",
             label: "Trace input",
+            summary: "Log every key, wheel and pointer event the wall receives.",
             kind: KnobKind::Bool,
             description: "Log every wheel, key and pointer press this page receives (its deltas, key, code, modifiers and the element it landed on) to the relay's log store, as [input] lines — to see what a remote desktop or a trackpad actually sends.",
         },
     ),
     (
-        "selectionColor",
+        "agentViewSide",
         KnobDef {
-            section: "selection",
-            label: "Selection colour",
-            kind: KnobKind::Color,
-            description: "The fill behind selected text in every terminal. Ghostty's default: the terminal's own text colour, so a selection reads as the terminal's colours inverted.",
+            section: "agent",
+            label: "Default side",
+            summary: "Which side of its terminal an Agent View opens on.",
+            kind: KnobKind::Enum { options: AGENT_SIDE_OPTIONS },
+            description: "Which side of a terminal a newly opened Agent View attaches to (drag its header to move it to any side).",
         },
     ),
     (
-        "selectionForeground",
+        "agentViewWidth",
         KnobDef {
-            section: "selection",
-            label: "Selected text colour",
-            kind: KnobKind::Text { parser: TextParser::SelectionForeground },
-            description: "The colour selected text is drawn in, as #rrggbb — or keep, and each cell keeps its own colour over the selection colour.",
+            section: "agent",
+            label: "Width at the side",
+            summary: "How wide an Agent View is beside its terminal.",
+            kind: KnobKind::Number {
+                min: Some(24.0),
+                above: None,
+                max: Some(300.0),
+                step: Some(2.0),
+                whole: false,
+                unit: Some("world units"),
+            },
+            description: "World width of an Agent View when attached to the left or right of its terminal.",
         },
     ),
     (
-        "selectionWordChars",
+        "agentViewHeight",
         KnobDef {
-            section: "selection",
-            label: "Word boundaries",
-            kind: KnobKind::Text { parser: TextParser::SelectionWordChars },
-            description: "The characters that end a word when you double-click, besides spaces and tabs: a double-click selects the run of other characters around the pointer (or, on one of these, the run of these). Ghostty's default.",
+            section: "agent",
+            label: "Height above or below",
+            summary: "How tall an Agent View is above or below its terminal.",
+            kind: KnobKind::Number {
+                min: Some(16.0),
+                above: None,
+                max: Some(240.0),
+                step: Some(2.0),
+                whole: false,
+                unit: Some("world units"),
+            },
+            description: "World height of an Agent View when attached above or below its terminal.",
         },
     ),
     (
-        "copyOnSelect",
+        "agentViewGap",
         KnobDef {
-            section: "selection",
-            label: "Copy on select",
-            kind: KnobKind::Enum { options: COPY_ON_SELECT_OPTIONS },
-            description: "What a selection is copied to as you finish it: true — the wall's own selection clipboard, which a middle-click on a terminal pastes (a browser page can't reach the system's primary selection); clipboard — that and the system clipboard; false — neither (the copy chord and the menu still copy).",
-        },
-    ),
-    (
-        "clickRepeatMs",
-        KnobDef {
-            section: "selection",
-            label: "Double-click time",
+            section: "agent",
+            label: "Gap to the terminal",
+            summary: "The space between a terminal and its Agent View.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
-                max: None,
-                step: Some(50.0),
+                max: Some(32.0),
+                step: Some(0.5),
                 whole: false,
-                unit: Some("ms"),
+                unit: Some("world units"),
             },
-            description: "Presses on a terminal closer together than this (and within a few pixels) count as a double click (a word) or a triple click (a line).",
-        },
-    ),
-    (
-        "selectionClearOnTyping",
-        KnobDef {
-            section: "selection",
-            label: "Typing clears it",
-            kind: KnobKind::Bool,
-            description: "A key typed into a terminal drops its selection, as Ghostty does; off, the selection stays until its text changes.",
+            description: "World space between a terminal and its attached Agent View.",
         },
     ),
     (
         "noticeMs",
         KnobDef {
-            section: "selection",
+            section: "status",
             label: "Notice time",
+            summary: "How long a notice stays at the top of the wall.",
             kind: KnobKind::Number {
                 min: Some(0.0),
                 above: None,
@@ -886,21 +918,47 @@ pub const KNOBS: &[(&str, KnobDef)] = &[
         },
     ),
     (
-        "menuHint",
+        "restartNoticeMs",
         KnobDef {
-            section: "menu",
-            label: "Second-click hint",
-            kind: KnobKind::Bool,
-            description: "Show the quiet line at the foot of the right-click menu saying a second right-click opens the browser's own menu.",
+            section: "status",
+            label: "Restart notice after",
+            summary: "How long termd must be restarting before a notice appears.",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: None,
+                step: Some(50.0),
+                whole: false,
+                unit: Some("ms"),
+            },
+            description: "A termd brain restart shows its amber notice only once it has lasted this long; a quick one shows just the chip.",
         },
     ),
     (
-        "menuSizes",
+        "errorsShown",
         KnobDef {
-            section: "menu",
-            label: "Terminal sizes",
-            kind: KnobKind::Text { parser: TextParser::MenuSizes },
-            description: "The sizes a terminal's right-click menu offers to resize it to, as COLSxROWS separated by spaces (like 80x24 120x36); empty offers none.",
+            section: "status",
+            label: "Errors listed",
+            summary: "How many recent termd errors the status window lists.",
+            kind: KnobKind::Number {
+                min: Some(0.0),
+                above: None,
+                max: None,
+                step: Some(1.0),
+                whole: true,
+                unit: None,
+            },
+            description: "How many recent termd errors the status window lists, newest first.",
+        },
+    ),
+    (
+        "menuHint",
+        KnobDef {
+            section: "status",
+            label: "Second-click hint",
+            summary: "Show the hint at the foot of the right-click menu.",
+            kind: KnobKind::Bool,
+            description: "Show the quiet line at the foot of the right-click menu saying a second right-click opens the browser's own menu.",
         },
     ),
 ];
@@ -1256,8 +1314,18 @@ pub fn hits_in<S: AsRef<str>>(text: &str, terms: &[S]) -> Hits {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemHits {
     pub label: Hits,
+    pub summary: Hits,
     pub key: Hits,
     pub description: Hits,
+}
+
+impl ItemHits {
+    /// Whether the search matched only what the window does not always
+    /// show (the key, the long description, or the section's title): the
+    /// row then shows where the match was.
+    pub fn only_in_the_details(&self) -> bool {
+        self.label.is_empty() && self.summary.is_empty()
+    }
 }
 
 /// One matching knob inside a [`SettingsGroup`].
@@ -1279,7 +1347,7 @@ pub struct SettingsGroup<'a> {
 /// Filter [`SECTIONS`] and [`KNOBS`] by `query` (`wallSettings.searchSettings`).
 ///
 /// Every whitespace-delimited word in `query` (case-insensitive) must appear in at least one of
-/// the knob's label, key, description, or section title. Sections with no matching knobs are
+/// the knob's label, one-line meaning, key, description, or section title. Sections with no matching knobs are
 /// omitted; an empty query returns every section that has knobs, with empty hit lists.
 pub fn search_settings(query: &str) -> Vec<SettingsGroup<'static>> {
     search_settings_in(query, SECTIONS, KNOBS)
@@ -1306,6 +1374,7 @@ pub fn search_settings_in<'a>(
             }
             let hay = [
                 def.label.to_lowercase(),
+                def.summary.to_lowercase(),
                 key.to_lowercase(),
                 def.description.to_lowercase(),
                 title_low.clone(),
@@ -1318,6 +1387,7 @@ pub fn search_settings_in<'a>(
                 def,
                 hits: ItemHits {
                     label: hits_in(def.label, &terms),
+                    summary: hits_in(def.summary, &terms),
                     key: hits_in(key, &terms),
                     description: hits_in(def.description, &terms),
                 },
@@ -1332,6 +1402,152 @@ pub fn search_settings_in<'a>(
         }
     }
     out
+}
+
+// ── the settings window ─────────────────────────────────────────────────────
+
+/// One line of the settings window's section list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionEntry {
+    pub section: SettingsSection,
+    /// The settings it holds; while searching, the ones that match.
+    pub count: usize,
+    /// Whether its settings are what the right-hand side shows.
+    pub selected: bool,
+}
+
+/// One setting on the right-hand side of the settings window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingRow<'a> {
+    pub key: &'a str,
+    pub def: KnobDef,
+    /// The section it is in.
+    pub section: SettingsSection,
+    /// Whether it is the first row of its section among the rows shown:
+    /// where a search's results name the section the rows under it are in.
+    pub starts_section: bool,
+    pub hits: ItemHits,
+}
+
+/// What the settings window shows for a query and a chosen section
+/// ([`settings_view`]): the list on its left and the settings on its right.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettingsView<'a> {
+    /// Whether a search is narrowing it (the query has a word in it).
+    pub searching: bool,
+    /// Every section with a setting to show, in order. While searching a
+    /// section nothing matched in stays in the list, with a count of 0.
+    pub sections: Vec<SectionEntry>,
+    /// The section the right-hand side is showing. `None`: every section's
+    /// matches, a search that was not narrowed to one.
+    pub shown: Option<&'static str>,
+    /// How many settings the search matched, over every section (all of
+    /// them when not searching).
+    pub matched: usize,
+    /// The settings on the right-hand side, top to bottom.
+    pub rows: Vec<SettingRow<'a>>,
+}
+
+/// Lay the settings window out (2026-11-27): a section list and the
+/// settings of one section, or of a search.
+///
+/// - **Browsing** (an empty `query`): the rows are the settings of
+///   `section`, or of the first section when `section` is `None` or names
+///   none that has settings.
+/// - **Searching**: every setting the query matches ([`search_settings`]),
+///   over every section, each run of rows starting with its section
+///   ([`SettingRow::starts_section`]). `section` narrows the rows to that
+///   section's matches, when it has any; the list's counts are the matches
+///   in each.
+///
+/// `hidden` are knobs the window does not show (the native wall hides the
+/// browser-only ones); a section left with none is not listed.
+pub fn settings_view(query: &str, section: Option<&str>, hidden: &[&str]) -> SettingsView<'static> {
+    let searching = !query.trim().is_empty();
+    let shown_of = |groups: Vec<SettingsGroup<'static>>| -> Vec<SettingsGroup<'static>> {
+        groups
+            .into_iter()
+            .filter_map(|mut group| {
+                group.items.retain(|it| !hidden.contains(&it.key));
+                (!group.items.is_empty()).then_some(group)
+            })
+            .collect()
+    };
+    // Every section with a setting to show, whatever the query.
+    let listed: Vec<SettingsSection> = shown_of(search_settings(""))
+        .into_iter()
+        .map(|g| g.section)
+        .collect();
+    let groups = shown_of(search_settings(query));
+    let matched: usize = groups.iter().map(|g| g.items.len()).sum();
+
+    let named = section.filter(|id| groups.iter().any(|g| g.section.id == *id));
+    let shown: Option<&'static str> = if searching {
+        named.and_then(|id| listed.iter().find(|s| s.id == id).map(|s| s.id))
+    } else {
+        named
+            .and_then(|id| listed.iter().find(|s| s.id == id))
+            .or(listed.first())
+            .map(|s| s.id)
+    };
+
+    let sections = listed
+        .iter()
+        .map(|&section| SectionEntry {
+            section,
+            count: groups
+                .iter()
+                .find(|g| g.section.id == section.id)
+                .map_or(0, |g| g.items.len()),
+            selected: shown == Some(section.id),
+        })
+        .collect();
+
+    let mut rows = Vec::new();
+    for group in groups {
+        if shown.is_some_and(|id| id != group.section.id) {
+            continue;
+        }
+        for (at, item) in group.items.into_iter().enumerate() {
+            rows.push(SettingRow {
+                key: item.key,
+                def: item.def,
+                section: group.section,
+                starts_section: at == 0,
+                hits: item.hits,
+            });
+        }
+    }
+
+    SettingsView {
+        searching,
+        sections,
+        shown,
+        matched,
+        rows,
+    }
+}
+
+/// The section after (`step > 0`) or before the one `view` shows, in the
+/// list's order and stopping at its ends: what the window's next-section
+/// and previous-section keys select. While a search shows every section's
+/// matches, the first step goes to the first section that has any.
+pub fn step_section(view: &SettingsView<'_>, step: i32) -> Option<&'static str> {
+    let with_rows: Vec<&'static str> = view
+        .sections
+        .iter()
+        .filter(|s| s.count > 0)
+        .map(|s| s.section.id)
+        .collect();
+    let at = view
+        .shown
+        .and_then(|id| with_rows.iter().position(|s| *s == id));
+    let next = match at {
+        None => 0,
+        Some(i) if step > 0 => (i + 1).min(with_rows.len().saturating_sub(1)),
+        Some(i) => i.saturating_sub(1),
+    };
+    with_rows.get(next).copied()
 }
 
 /// Assert the compile-time schema invariant from `wallSettings.js`: every entry in [`KNOBS`]
@@ -1366,6 +1582,27 @@ mod tests {
         for &(key, ref def) in KNOBS {
             assert!(sections.contains(def.section), "unknown section for {key}");
             assert!(!def.label.is_empty(), "empty label for {key}");
+            // One plain line: a sentence a person can read, which is not
+            // the knob's code name and does not lean on it.
+            assert!(
+                (12..=80).contains(&def.summary.chars().count()),
+                "{key}: a one-line meaning, not {:?}",
+                def.summary
+            );
+            assert!(def.summary.ends_with('.'), "{key}: {:?}", def.summary);
+            assert!(!def.summary.contains('\n'), "{key}: one line");
+            // (A verb's name has a dot inside a word: `wall.config`.)
+            let names_a_verb = def
+                .summary
+                .trim_end_matches('.')
+                .split_whitespace()
+                .any(|word| word.contains('.') && word.chars().any(char::is_alphabetic));
+            assert!(
+                !def.summary.contains(key) && !names_a_verb,
+                "{key}: its meaning names the knob or a verb: {:?}",
+                def.summary
+            );
+            assert_ne!(def.summary, def.description, "{key}");
             assert!(
                 def.description.chars().count() > 20,
                 "short description for {key}: {}",
@@ -1564,5 +1801,298 @@ mod tests {
         assert_eq!(width.hits.label, vec![[0, 4]]);
         assert_eq!(width.hits.key, vec![[0, 8]]);
         assert_eq!(hits_in("aaa", &["a", "aa"]), vec![[0, 3]]);
+    }
+
+    /// The knobs the native window leaves out (`NATIVE_HIDDEN_KNOBS`).
+    const HIDDEN: &[&str] = &["renderLoop", "traceInput", "menuHint"];
+
+    fn in_section(id: &str) -> Vec<&'static str> {
+        KNOBS
+            .iter()
+            .filter(|(_, d)| d.section == id)
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    #[test]
+    fn the_sections_hold_every_knob_once_under_plain_names() {
+        let titles: Vec<(&str, &str)> = SECTIONS.iter().map(|s| (s.id, s.title)).collect();
+        assert_eq!(
+            titles,
+            vec![
+                ("terminals", "Terminals"),
+                ("text", "Text"),
+                ("canvas", "Canvas & grid"),
+                ("groups", "Groups & splits"),
+                ("fullscreen", "Fullscreen"),
+                ("selection", "Selection & copy"),
+                ("input", "Keyboard & mouse"),
+                ("agent", "Agent View"),
+                ("status", "Notices"),
+            ]
+        );
+
+        // Every knob, by where it is now. Nothing is lost by the regrouping:
+        // the list is the 53 knobs of `WALL_CONFIG_KEYS`.
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "terminals",
+                &[
+                    "newTerminalSize",
+                    "menuSizes",
+                    "closeHoldMs",
+                    "barButtonsMinPx",
+                    "panelOpacity",
+                    "cursorBlinkMs",
+                ],
+            ),
+            (
+                "text",
+                &[
+                    "fontFamily",
+                    "fontSize",
+                    "lineHeight",
+                    "boldIsBright",
+                    "dimAlpha",
+                    "lineThickness",
+                    "underlineRaise",
+                    "curlyAmplitude",
+                    "greekPx",
+                ],
+            ),
+            (
+                "canvas",
+                &[
+                    "background",
+                    "gridShow",
+                    "snap",
+                    "gridMinor",
+                    "gridMajorEvery",
+                    "gridMinPx",
+                    "gridLinePx",
+                    "gridMinorColor",
+                    "gridMajorColor",
+                    "renderLoop",
+                ],
+            ),
+            (
+                "groups",
+                &[
+                    "groupLayout",
+                    "groupColumns",
+                    "groupGap",
+                    "groupPad",
+                    "splitGap",
+                    "splitBarRows",
+                    "splitBars",
+                ],
+            ),
+            (
+                "fullscreen",
+                &["fullscreenMinLinePx", "fullscreenPad", "fullscreenTextStep"],
+            ),
+            (
+                "selection",
+                &[
+                    "selectionColor",
+                    "selectionForeground",
+                    "selectionWordChars",
+                    "clickRepeatMs",
+                    "copyOnSelect",
+                    "selectionClearOnTyping",
+                ],
+            ),
+            (
+                "input",
+                &["optionAsAlt", "zoomKeys", "scrollMultiplier", "traceInput"],
+            ),
+            (
+                "agent",
+                &[
+                    "agentViewSide",
+                    "agentViewWidth",
+                    "agentViewHeight",
+                    "agentViewGap",
+                ],
+            ),
+            (
+                "status",
+                &["noticeMs", "restartNoticeMs", "errorsShown", "menuHint"],
+            ),
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for (id, keys) in expected {
+            assert_eq!(in_section(id), keys.to_vec(), "section {id}");
+            seen.extend(keys.iter());
+        }
+        // `KNOBS` is in the window's order: section by section.
+        let in_order: Vec<&str> = KNOBS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(in_order, seen);
+        let mut all = seen.clone();
+        all.sort_unstable();
+        let mut config: Vec<&str> = WALL_CONFIG_KEYS.to_vec();
+        config.sort_unstable();
+        assert_eq!(all, config);
+        assert_eq!(all.len(), 53);
+    }
+
+    #[test]
+    fn the_window_shows_one_section_or_a_search_over_all_of_them() {
+        let keys = |v: &SettingsView<'_>| -> Vec<&'static str> {
+            v.rows.iter().map(|r| KNOBS.iter().find(|(k, _)| *k == r.key).unwrap().0).collect()
+        };
+        let counts = |v: &SettingsView<'_>| -> Vec<(&'static str, usize)> {
+            v.sections.iter().map(|s| (s.section.id, s.count)).collect()
+        };
+        let selected = |v: &SettingsView<'_>| -> Vec<&'static str> {
+            v.sections
+                .iter()
+                .filter(|s| s.selected)
+                .map(|s| s.section.id)
+                .collect()
+        };
+
+        // Browsing: the first section until one is chosen.
+        let v = settings_view("", None, HIDDEN);
+        assert!(!v.searching);
+        assert_eq!(v.shown, Some("terminals"));
+        assert_eq!(keys(&v), in_section("terminals"));
+        assert_eq!(selected(&v), vec!["terminals"]);
+        assert_eq!(v.matched, 50);
+        // Each section's count is its settings, less the ones not shown.
+        assert_eq!(
+            counts(&v),
+            vec![
+                ("terminals", 6),
+                ("text", 9),
+                ("canvas", 9),
+                ("groups", 7),
+                ("fullscreen", 3),
+                ("selection", 6),
+                ("input", 3),
+                ("agent", 4),
+                ("status", 3),
+            ]
+        );
+        let starts: Vec<bool> = v.rows.iter().map(|r| r.starts_section).collect();
+        assert_eq!(starts, vec![true, false, false, false, false, false]);
+
+        let v = settings_view("", Some("text"), HIDDEN);
+        assert_eq!(v.shown, Some("text"));
+        assert_eq!(keys(&v), in_section("text"));
+        assert_eq!(selected(&v), vec!["text"]);
+        // A section that is not one (a name from before the regrouping)
+        // shows the first.
+        assert_eq!(settings_view("", Some("menu"), HIDDEN).shown, Some("terminals"));
+        assert_eq!(settings_view("   ", Some("nope"), HIDDEN).shown, Some("terminals"));
+
+        // Searching: every section's matches, in the list's order, each run
+        // starting with its section; the list counts the matches in each.
+        let v = settings_view("colour", None, HIDDEN);
+        assert!(v.searching);
+        assert_eq!(v.shown, None);
+        assert_eq!(
+            keys(&v),
+            vec![
+                "boldIsBright",
+                "background",
+                "gridMinorColor",
+                "gridMajorColor",
+                "selectionColor",
+                "selectionForeground",
+            ]
+        );
+        let tagged: Vec<(&str, bool)> = v
+            .rows
+            .iter()
+            .map(|r| (r.section.title, r.starts_section))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                ("Text", true),
+                ("Canvas & grid", true),
+                ("Canvas & grid", false),
+                ("Canvas & grid", false),
+                ("Selection & copy", true),
+                ("Selection & copy", false),
+            ]
+        );
+        assert_eq!(v.matched, 6);
+        assert!(selected(&v).is_empty());
+        assert_eq!(
+            counts(&v),
+            vec![
+                ("terminals", 0),
+                ("text", 1),
+                ("canvas", 3),
+                ("groups", 0),
+                ("fullscreen", 0),
+                ("selection", 2),
+                ("input", 0),
+                ("agent", 0),
+                ("status", 0),
+            ]
+        );
+
+        // Narrowed to one section's matches; the counts stay the search's.
+        let v = settings_view("colour", Some("canvas"), HIDDEN);
+        assert_eq!(v.shown, Some("canvas"));
+        assert_eq!(keys(&v), vec!["background", "gridMinorColor", "gridMajorColor"]);
+        assert_eq!(selected(&v), vec!["canvas"]);
+        assert_eq!(v.matched, 6);
+        assert_eq!(counts(&v)[2], ("canvas", 3));
+        // A section with no match does not narrow it to nothing.
+        let v = settings_view("colour", Some("agent"), HIDDEN);
+        assert_eq!(v.shown, None);
+        assert_eq!(v.rows.len(), 6);
+
+        // The search reads the one-line meaning too, and says when a match
+        // is only in what the row does not always show.
+        let v = settings_view("how fast", None, HIDDEN);
+        assert_eq!(keys(&v), vec!["cursorBlinkMs", "scrollMultiplier"]);
+        assert!(!v.rows[0].hits.summary.is_empty());
+        assert!(!v.rows[0].hits.only_in_the_details());
+        let v = settings_view("closehold", None, HIDDEN);
+        assert_eq!(keys(&v), vec!["closeHoldMs"]);
+        assert!(v.rows[0].hits.only_in_the_details());
+        assert_eq!(v.rows[0].hits.key, vec![[0, 9]]);
+
+        // A knob the window hides never shows; nothing matching is a list
+        // of sections at 0 and no rows.
+        for query in ["renderLoop", "zebra"] {
+            let v = settings_view(query, None, HIDDEN);
+            assert!(v.rows.is_empty(), "{query}");
+            assert_eq!((v.matched, v.shown), (0, None), "{query}");
+            assert_eq!(v.sections.len(), 9);
+            assert!(v.sections.iter().all(|s| s.count == 0 && !s.selected));
+        }
+        // A section with nothing left to show is not listed.
+        let agent = in_section("agent");
+        let v = settings_view("", Some("agent"), &agent);
+        assert!(v.sections.iter().all(|s| s.section.id != "agent"));
+        assert_eq!(v.shown, Some("terminals"));
+    }
+
+    #[test]
+    fn next_and_previous_section_walk_the_list_and_stop_at_its_ends() {
+        let browse = |id| settings_view("", Some(id), HIDDEN);
+        assert_eq!(step_section(&browse("terminals"), 1), Some("text"));
+        assert_eq!(step_section(&browse("text"), -1), Some("terminals"));
+        assert_eq!(step_section(&browse("terminals"), -1), Some("terminals"));
+        assert_eq!(step_section(&browse("agent"), 1), Some("status"));
+        assert_eq!(step_section(&browse("status"), 1), Some("status"));
+
+        // Searching, the sections with no match are stepped over, and the
+        // first step from all the results goes to the first with any.
+        let all = settings_view("colour", None, HIDDEN);
+        assert_eq!(step_section(&all, 1), Some("text"));
+        assert_eq!(step_section(&all, -1), Some("text"));
+        let found = |id| settings_view("colour", Some(id), HIDDEN);
+        assert_eq!(step_section(&found("text"), 1), Some("canvas"));
+        assert_eq!(step_section(&found("canvas"), 1), Some("selection"));
+        assert_eq!(step_section(&found("selection"), 1), Some("selection"));
+        assert_eq!(step_section(&found("canvas"), -1), Some("text"));
+        assert_eq!(step_section(&settings_view("zebra", None, HIDDEN), 1), None);
     }
 }

@@ -365,6 +365,10 @@ pub struct SettingsPanelState {
     /// 2026-11-27). A store written before it reads as the defaults.
     #[serde(default, skip_serializing_if = "PanelSize::is_default")]
     pub size: PanelSize,
+    /// The section the window shows (`wall.settings section <id>`,
+    /// 2026-11-27); unset, or a name that is no section, shows the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
 }
 
 impl Default for SettingsPanelState {
@@ -375,6 +379,7 @@ impl Default for SettingsPanelState {
             float: None,
             collapsed: Vec::new(),
             size: PanelSize::default(),
+            section: None,
         }
     }
 }
@@ -387,6 +392,7 @@ pub struct SettingsPanelPatch {
     pub float: Option<Option<Point>>,
     pub collapsed: Option<Vec<String>>,
     pub size: Option<PanelSize>,
+    pub section: Option<String>,
 }
 
 impl From<SettingsPanelState> for SettingsPanelPatch {
@@ -397,6 +403,9 @@ impl From<SettingsPanelState> for SettingsPanelPatch {
             float: Some(s.float),
             collapsed: Some(s.collapsed),
             size: Some(s.size),
+            // A patch can set the section, not unset it: a state with none
+            // leaves whatever the store has.
+            section: s.section,
         }
     }
 }
@@ -1138,6 +1147,9 @@ impl WallStore {
         if let Some(size) = p.size {
             self.settings.size = size;
         }
+        if let Some(section) = p.section {
+            self.settings.section = Some(section);
+        }
         self.persist();
     }
 
@@ -1320,6 +1332,11 @@ fn parse_settings_panel(raw: Option<&serde_json::Value>) -> SettingsPanelState {
         out.collapsed = collapsed;
     }
     out.size = parse_panel_size(obj, PanelKind::Settings);
+    out.section = obj
+        .get("section")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     out
 }
 

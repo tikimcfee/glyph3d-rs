@@ -107,11 +107,17 @@ impl PanelKind {
                 float_min_width: 300.0,
                 ..PanelLimits::COMMON
             },
+            // Floating, settings is a window: a section list beside one
+            // section's settings, at a height of its own so it does not
+            // jump as the sections change. Docked it is a column, as wide
+            // as the others until its edge is dragged.
             PanelKind::Settings => PanelLimits {
                 dock_default: DOCK_WIDTHS.settings,
                 dock_min: 300.0,
-                float_default_width: DOCK_WIDTHS.settings,
-                float_min_width: 300.0,
+                float_default_width: 780.0,
+                float_min_width: 360.0,
+                float_default_height: Some(560.0),
+                float_min_height: 240.0,
                 ..PanelLimits::COMMON
             },
             PanelKind::Help => PanelLimits {
@@ -147,6 +153,9 @@ pub struct PanelLimits {
     pub float_default_width: f64,
     pub float_min_width: f64,
     pub float_max_width: f64,
+    /// Floating height when none was set. `None`: as tall as what the
+    /// panel holds.
+    pub float_default_height: Option<f64>,
     pub float_min_height: f64,
     pub float_max_height: f64,
 }
@@ -160,6 +169,7 @@ impl PanelLimits {
         float_default_width: 320.0,
         float_min_width: 180.0,
         float_max_width: 4000.0,
+        float_default_height: None,
         float_min_height: 120.0,
         float_max_height: 4000.0,
     };
@@ -561,7 +571,14 @@ mod tests {
                 l.check_float_width(kind.name(), l.float_default_width).is_ok(),
                 "{kind:?}"
             );
+            if let Some(h) = l.float_default_height {
+                assert!(l.check_float_height(kind.name(), h).is_ok(), "{kind:?}");
+            }
         }
+        // Settings floats as a window of its own size; the rest are as
+        // tall as what they hold.
+        assert_eq!(PanelKind::Settings.limits().float_default_height, Some(560.0));
+        assert_eq!(PanelKind::Sidebar.limits().float_default_height, None);
         assert!(PALETTE_LIMITS
             .check_float_width("palette", PALETTE_LIMITS.float_default_width)
             .is_ok());

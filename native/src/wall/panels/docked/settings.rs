@@ -1,5 +1,15 @@
-//! Settings panel (`wall/SettingsPanel.jsx`): every wall knob in sections, searchable,
-//! keyboard-first, emitting `wall.config`, `wall.settings`, and `wall.settings.collapse` verbs.
+//! The settings window (2026-11-27; `wall/SettingsPanel.jsx` was one folding column).
+//!
+//! Search across the top, above everything; a list of sections down the
+//! left; the chosen section's settings on the right, each a plain label, one
+//! line saying what it does, and its control. A search reads every section
+//! and says which section each match is in; a click on a section narrows the
+//! results to it. Narrower than [`TWO_PANE_MIN_W`] (docked, until its edge is
+//! dragged), the sections are a row of chips above the settings.
+//!
+//! What is shown for a query and a section is `wall_core::settings::settings_view`;
+//! this file draws it and sends `wall.config <key> <value>`, `wall.settings
+//! section <id>` and the panel verbs (`wall.settings close|left|…`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -7,7 +17,9 @@ use wall_core::chord::chord_label;
 use wall_core::config::{check_config, default_knob_value, WallConfig};
 use wall_core::dock::PanelKind;
 use wall_core::input::Platform;
-use wall_core::settings::{search_settings, KnobDef, KnobKind, KnobValue, SettingsGroup};
+use wall_core::settings::{
+    settings_view, step_section, KnobDef, KnobKind, KnobValue, SettingRow, SettingsView,
+};
 use wall_core::store::{PanelSide, SettingsPanelState as SettingsPlacement};
 
 use super::super::resize::{self, ResizeSpec, ResizeState};
@@ -22,24 +34,11 @@ use super::{
 /// browser layouts round-trip without error, but hidden from the native Settings UI.
 const NATIVE_HIDDEN_KNOBS: &[&str] = &["renderLoop", "traceInput", "menuHint"];
 
-fn is_native_hidden_knob(key: &str) -> bool {
-    NATIVE_HIDDEN_KNOBS.contains(&key)
-}
-
-fn search_native_settings(query: &str) -> Vec<SettingsGroup<'static>> {
-    search_settings(query)
-        .into_iter()
-        .filter_map(|mut group| {
-            group.items.retain(|it| !is_native_hidden_knob(it.key));
-            (!group.items.is_empty()).then_some(group)
-        })
-        .collect()
-}
-
 /// Plain data read by [`show`] (`<Panel>Input` in `P-panels.md`).
 #[derive(Clone, Debug)]
 pub struct SettingsInput {
-    /// Open flag, side (`Left`/`Right`/`Float`), floating coordinates, and folded section ids.
+    /// Open flag, side (`Left`/`Right`/`Float`), floating coordinates, size,
+    /// and the section the window shows.
     pub placement: SettingsPlacement,
     /// Current validated knob values (`wall_core::config::WallConfig`).
     pub config: WallConfig,
@@ -86,8 +85,21 @@ pub type SettingsPanelInput = SettingsInput;
 pub struct SettingsState {
     /// Current search query (`SettingsPanel.jsx`'s `query`).
     pub query: String,
-    /// Index of the highlighted knob within the unfolded matching items (`SettingsPanel.jsx`'s `active`).
+    /// Index of the highlighted setting among the ones shown (`SettingsPanel.jsx`'s `active`).
     pub active: usize,
+    /// While searching: the one section the results are narrowed to, or
+    /// `None` for every section's. A new query un-narrows it.
+    pub scope: Option<String>,
+    /// A section a click chose that the wall has not answered yet: `(the
+    /// store's section when it was chosen, the one chosen)`. The window
+    /// shows the choice at once and drops it when the store's moves.
+    chosen: Option<(Option<String>, String)>,
+    /// The section whose settings were shown on the last pass (`None`: a
+    /// search over all of them).
+    pub shown_section: Option<String>,
+    /// The section list's lines (or chips) as drawn, by section id, and
+    /// [`ALL_RESULTS`] for a search's first line.
+    pub section_rects: BTreeMap<String, egui::Rect>,
     /// Whether the settings panel wants keyboard input this frame (`true` whenever open).
     pub wants_keyboard: bool,
     /// Floating header drag state (`useHeadDrag` in `Panel.jsx`).
@@ -113,7 +125,7 @@ pub struct SettingsState {
     pub last_rect: Option<egui::Rect>,
     /// Floating header drag rectangle when open.
     pub header_drag_rect: Option<egui::Rect>,
-    /// Number of visible unfolded matching knobs on the last open pass.
+    /// Number of settings shown on the last open pass.
     pub visible_count: usize,
     /// Rendered control rectangles keyed by knob identifier (`gridShow`, `gridMinor`, etc.).
     pub control_rects: BTreeMap<String, egui::Rect>,
@@ -126,6 +138,28 @@ impl SettingsState {
     /// Whether the panel wants keyboard events routed to egui instead of the focused terminal.
     pub const fn wants_keyboard(&self) -> bool {
         self.wants_keyboard
+    }
+
+    /// The section to show when browsing: the one a click chose until the
+    /// wall has stored it, else the stored one.
+    fn section_in_force(&mut self, stored: Option<&str>) -> Option<String> {
+        if let Some((seen, mine)) = &self.chosen {
+            if seen.as_deref() == stored {
+                return Some(mine.clone());
+            }
+            self.chosen = None;
+        }
+        stored.map(str::to_string)
+    }
+
+    /// Show section `id` from now on: at once here, and for the wall to
+    /// keep (`wall.settings section <id>`).
+    fn choose_section(&mut self, stored: Option<&str>, id: &str, out: &mut Vec<String>) {
+        if self.section_in_force(stored).as_deref() == Some(id) {
+            return;
+        }
+        self.chosen = Some((stored.map(str::to_string), id.to_string()));
+        out.push(format!("wall.settings section {id}"));
     }
 
     /// Surrender keyboard capture so the focused terminal receives keys while Settings remains open.
@@ -227,9 +261,29 @@ fn parse_hex_rgb(hex: &str) -> Option<[u8; 3]> {
     Some([r, g, b])
 }
 
-/// Draw the settings panel (`wall/SettingsPanel.jsx`).
+/// Below this width the window has no room for a section list beside the
+/// settings: the sections are a row of chips above them instead (a docked
+/// settings column, until its edge is dragged wider).
+const TWO_PANE_MIN_W: f32 = 560.0;
+/// The section list's width in the two-pane layout.
+const SECTION_LIST_W: f32 = 178.0;
+/// One line of the section list.
+const SECTION_ROW_H: f32 = 28.0;
+/// The key of the list's `all results` line in [`SettingsState::section_rects`].
+pub const ALL_RESULTS: &str = "all";
+
+/// What a click in the section list or on a results heading chose.
+enum SectionPick {
+    /// One section.
+    Section(&'static str),
+    /// Every section's matches (a search's `all results` line).
+    All,
+}
+
+/// Draw the settings window: the search, the section list, and the settings
+/// of one section or of the search (`wall_core::settings::settings_view`).
 ///
-/// Returns `true` when the panel wants keyboard input this frame (also stored on
+/// Returns `true` when the window wants keyboard input this frame (also stored on
 /// [`SettingsState::wants_keyboard`]).
 pub fn show(
     ctx: &egui::Context,
@@ -238,6 +292,7 @@ pub fn show(
     out: &mut Vec<String>,
 ) -> bool {
     state.control_rects.clear();
+    state.section_rects.clear();
     if !input.placement.open {
         state.was_open = false;
         state.wants_keyboard = false;
@@ -248,6 +303,9 @@ pub fn show(
         state.last_rect = None;
         state.header_drag_rect = None;
         state.visible_count = 0;
+        state.shown_section = None;
+        state.scope = None;
+        state.chosen = None;
         state.resize.reset();
         return false;
     }
@@ -262,7 +320,7 @@ pub fn show(
     }
     state.wants_keyboard = !state.blurred;
 
-    // Close chord (`⌘,` on macOS, `Ctrl+Alt+,` on Linux/Windows) closes from anywhere in the panel.
+    // Close chord (`⌘,` on macOS, `Ctrl+Alt+,` on Linux/Windows) closes from anywhere in the window.
     if ctx.input(|i| is_close_settings_chord(i, input.platform)) {
         ctx.input_mut(|i| {
             i.events.retain(|ev| {
@@ -299,18 +357,28 @@ pub fn show(
             PanelSide::Left | PanelSide::Right => limits.dock_default as f32,
         },
     );
-    // The height the panel is held to: the viewport's when docked; when
-    // floating, the one set on it, else none (as tall as its list).
+    // The height the window is held to: the viewport's when docked; when
+    // floating, the one set on it, else its own (a window that kept to its
+    // contents would jump as the sections changed).
     let held_height = match side {
-        PanelSide::Float => resize::float_height(&state.resize, &input.placement.size, viewport),
+        PanelSide::Float => resize::float_height(&state.resize, &input.placement.size, viewport)
+            .or(limits.float_default_height.map(|h| h as f32)),
         PanelSide::Left | PanelSide::Right => Some(max_height),
     };
     if side == PanelSide::Float {
+        if let Some(h) = held_height {
+            max_height = h.min((viewport.height() - 32.0).max(96.0));
+        }
+        // Until it has been put somewhere it opens in the middle, under the topbar.
+        if input.placement.float.is_none() && state.head_drag.drag_at.is_none() {
+            origin = egui::pos2(
+                (viewport.center().x - width * 0.5).max(viewport.left() + 8.0),
+                (viewport.top() + (viewport.height() - max_height) * 0.4)
+                    .max(viewport.top() + 46.0),
+            );
+        }
         if let Some(at) = resize::float_origin(&state.resize) {
             origin = at;
-        }
-        if let Some(h) = held_height {
-            max_height = h;
         }
         // Its bottom edge stays in the window, wherever it was put.
         max_height = max_height.min(resize::room_below(origin.y, viewport));
@@ -322,30 +390,32 @@ pub fn show(
     let width = width - 2.0 * rim;
     let max_height = max_height - 2.0 * rim;
 
-    let rounding = match side {
-        PanelSide::Float => egui::CornerRadius::same(7),
-        PanelSide::Left | PanelSide::Right => egui::CornerRadius::ZERO,
+    let panel_frame = match side {
+        PanelSide::Float => egui::Frame::NONE
+            .fill(settings_panel_bg())
+            .corner_radius(egui::CornerRadius::same(7))
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .shadow(egui::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(115),
+            }),
+        PanelSide::Left | PanelSide::Right => egui::Frame::NONE.fill(settings_panel_bg()),
     };
-    let frame_stroke = match side {
-        PanelSide::Float => egui::Stroke::new(1.0, BORDER),
-        PanelSide::Left | PanelSide::Right => egui::Stroke::NONE,
-    };
-
     let close_title = format!("close ({})", chord_label(input.platform, &[","], false));
 
     egui::Area::new(egui::Id::new("wall_settings_panel"))
         .fixed_pos(origin)
         .order(egui::Order::Foreground)
         .constrain(false)
+        // No fade: the wall draws on demand, and a window caught part-way
+        // in is a faint one until something else redraws it.
+        .fade_in(false)
         .show(ctx, |ui| {
             if ui.is_sizing_pass() {
                 ui.ctx().request_discard("wall_settings initial sizing");
             }
-            let panel_frame = egui::Frame::NONE
-                .fill(settings_panel_bg())
-                .corner_radius(rounding)
-                .stroke(frame_stroke);
-
             let frame_resp = panel_frame.show(ui, |ui| {
                 ui.set_width(width);
                 if held_height.is_some() {
@@ -353,77 +423,16 @@ pub fn show(
                 }
                 ui.set_max_height(max_height);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                let panel_top = ui.cursor().top();
 
-                // ── Header (`settings` + `⇤ ◫ ⇥ ×`) ──────────────────────────
-                let head_rect = egui::Frame::NONE
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 6,
-                        top: 5,
-                        bottom: 5,
-                    })
-                    .show(ui, |ui| {
-                        let header_w = (width - 16.0).max(40.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(header_w, 18.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                                dock_buttons_rtl(ui, "wall.settings", side, &close_title, out);
+                draw_header(ui, state, side, origin, width, &close_title, out);
 
-                                let avail = ui.available_width().max(24.0);
-                                let (title_rect, title_resp) = ui.allocate_exact_size(
-                                    egui::vec2(avail, 18.0),
-                                    if side == PanelSide::Float {
-                                        egui::Sense::drag()
-                                    } else {
-                                        egui::Sense::hover()
-                                    },
-                                );
-                                let galley = ui.painter().layout_no_wrap(
-                                    "settings".to_string(),
-                                    egui::FontId::monospace(12.0),
-                                    MUTED,
-                                );
-                                ui.painter().galley(
-                                    egui::pos2(
-                                        title_rect.left(),
-                                        title_rect.center().y - galley.size().y * 0.5,
-                                    ),
-                                    galley,
-                                    MUTED,
-                                );
-                                state.header_drag_rect = Some(title_rect);
-                                handle_head_drag(
-                                    ui,
-                                    &title_resp,
-                                    side,
-                                    origin,
-                                    &mut state.head_drag,
-                                    "wall.settings",
-                                    out,
-                                );
-                            },
-                        );
-                    })
-                    .response
-                    .rect;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(head_rect.left(), head_rect.bottom()),
-                        egui::pos2(head_rect.right(), head_rect.bottom()),
-                    ],
-                    egui::Stroke::new(1.0, HEAD_BORDER),
-                );
-
-                // ── Search input & keyboard navigation ───────────────────────
+                // ── Search, above everything, and the keys it leaves the list ──
                 let search_id = search_input_id();
                 if state.focus_search {
                     ui.memory_mut(|m| m.request_focus(search_id));
                     state.focus_search = false;
                 }
-
-                // Determine whether any per-knob text field currently holds focus.
                 let any_field_focused = state.focus_field.is_some()
                     || ui.memory(|m| {
                         wall_core::settings::KNOBS
@@ -435,6 +444,7 @@ pub fn show(
                 let mut pressed_up = false;
                 let mut pressed_enter = false;
                 let mut pressed_escape = false;
+                let mut section_step = 0;
                 if ui.memory(|m| m.has_focus(search_id)) || any_field_focused {
                     state.blurred = false;
                     state.wants_keyboard = true;
@@ -449,347 +459,164 @@ pub fn show(
                         pressed_up = i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp);
                         pressed_enter = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
                         pressed_escape = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                            section_step = 1;
+                        }
+                        if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                            section_step = -1;
+                        }
                     });
                 }
 
                 let prev_query = state.query.clone();
                 egui::Frame::NONE
                     .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 8,
-                        bottom: 4,
+                        left: 12,
+                        right: 12,
+                        top: 10,
+                        bottom: 10,
                     })
                     .show(ui, |ui| {
                         let field_frame = egui::Frame::NONE
                             .fill(FIELD_BG)
                             .stroke(egui::Stroke::new(1.0, BORDER))
                             .corner_radius(egui::CornerRadius::same(5))
-                            .inner_margin(egui::Margin::symmetric(8, 6));
+                            .inner_margin(egui::Margin::symmetric(9, 7));
                         field_frame.show(ui, |ui| {
-                            ui.set_width((width - 38.0).max(40.0));
+                            ui.set_width((width - 44.0).max(40.0));
                             ui.add(
                                 egui::TextEdit::singleline(&mut state.query)
                                     .id(search_id)
                                     .frame(egui::Frame::NONE)
-                                    .font(egui::FontId::monospace(12.5))
+                                    .font(egui::FontId::monospace(13.0))
                                     .text_color(BRIGHT)
                                     .hint_text(
                                         egui::RichText::new("search settings…")
-                                            .font(egui::FontId::monospace(12.5))
+                                            .font(egui::FontId::monospace(13.0))
                                             .color(MUTED),
                                     )
                                     .desired_width(f32::INFINITY),
                             );
                         });
                     });
+                let search_bottom = ui.cursor().top();
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    search_bottom,
+                    egui::Stroke::new(1.0, HEAD_BORDER),
+                );
 
-                if state.query != prev_query {
-                    state.active = 0;
-                }
-
+                // Escape clears a search first, and closes the window only
+                // when there is none.
                 if pressed_escape {
-                    if !state.query.is_empty() {
-                        state.query.clear();
-                        state.active = 0;
-                        ui.memory_mut(|m| m.request_focus(search_id));
-                    } else {
+                    if state.query.is_empty() {
                         out.push("wall.settings close".to_string());
+                    } else {
+                        state.query.clear();
+                        ui.memory_mut(|m| m.request_focus(search_id));
                     }
                 }
+                let was_searching = !prev_query.trim().is_empty();
+                if state.query != prev_query {
+                    state.active = 0;
+                    // A search that ends narrowed to one section leaves the
+                    // window in that section.
+                    if state.query.trim().is_empty() && was_searching {
+                        if let Some(id) = state.scope.take() {
+                            state.choose_section(input.placement.section.as_deref(), &id, out);
+                        }
+                    }
+                    state.scope = None;
+                }
 
-                let groups: Vec<SettingsGroup<'static>> = search_native_settings(&state.query);
+                // ── What the window shows ────────────────────────────────────
                 let searching = !state.query.trim().is_empty();
-                let is_folded = |section_id: &str| -> bool {
-                    !searching && input.placement.collapsed.iter().any(|c| c == section_id)
-                };
-                let visible_keys: Vec<(&'static str, KnobDef)> = groups
-                    .iter()
-                    .filter(|g| !is_folded(g.section.id))
-                    .flat_map(|g| g.items.iter().map(|it| (it.key, it.def)))
-                    .collect();
-                state.visible_count = visible_keys.len();
+                let mut view = current_view(state, input, searching);
+                if section_step != 0 {
+                    if let Some(id) = step_section(&view, section_step) {
+                        if view.shown != Some(id) {
+                            pick_section(state, input, searching, SectionPick::Section(id), out);
+                            view = current_view(state, input, searching);
+                        }
+                    }
+                }
+                state.visible_count = view.rows.len();
+                state.shown_section = view.shown.map(str::to_string);
 
-                let mut at = state.active.min(visible_keys.len().saturating_sub(1));
+                let mut at = state.active.min(view.rows.len().saturating_sub(1));
                 let mut moved_by_keys = false;
-                if pressed_down && !visible_keys.is_empty() {
-                    at = (at + 1).min(visible_keys.len() - 1);
-                    state.active = at;
+                if pressed_down && !view.rows.is_empty() {
+                    at = (at + 1).min(view.rows.len() - 1);
                     moved_by_keys = true;
                 } else if pressed_up {
                     at = at.saturating_sub(1);
-                    state.active = at;
                     moved_by_keys = true;
-                } else {
-                    state.active = at;
                 }
-
+                state.active = at;
                 if pressed_enter {
-                    if let Some(&(active_key, active_def)) = visible_keys.get(at) {
-                        activate_knob(active_key, &active_def, &input.config, state, out);
+                    if let Some(row) = view.rows.get(at) {
+                        activate_knob(row.key, &row.def, &input.config, state, out);
                     }
                 }
 
-                let active_key = visible_keys.get(at).map(|&(k, _)| k);
+                // ── Sections beside (or above) the settings ──────────────────
+                let body_h = (panel_top + max_height - ui.cursor().top()).max(60.0);
+                let (body_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(width, body_h), egui::Sense::hover());
+                let mut picked: Option<SectionPick> = None;
+                let detail_rect = if width >= TWO_PANE_MIN_W {
+                    let list_rect = egui::Rect::from_min_size(
+                        body_rect.min,
+                        egui::vec2(SECTION_LIST_W, body_rect.height()),
+                    );
+                    ui.painter().vline(
+                        list_rect.right(),
+                        body_rect.y_range(),
+                        egui::Stroke::new(1.0, HEAD_BORDER),
+                    );
+                    let mut list_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(list_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    list_ui.set_clip_rect(list_rect.intersect(ui.clip_rect()));
+                    draw_section_list(&mut list_ui, &view, state, &mut picked);
+                    egui::Rect::from_min_max(
+                        egui::pos2(list_rect.right() + 1.0, body_rect.top()),
+                        body_rect.max,
+                    )
+                } else {
+                    let mut chips_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(body_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    let used = draw_section_chips(&mut chips_ui, &view, state, &mut picked);
+                    egui::Rect::from_min_max(
+                        egui::pos2(body_rect.left(), (body_rect.top() + used).min(body_rect.bottom())),
+                        body_rect.max,
+                    )
+                };
 
-                // ── Scrollable body ──────────────────────────────────────────
-                let body_max_h = (max_height - 76.0).max(48.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("wall_settings_body")
-                    .max_height(body_max_h)
-                    .auto_shrink([false, held_height.is_none()])
-                    .show(ui, |ui| {
-                        ui.set_width(width);
-                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+                let mut detail_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(detail_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                detail_ui.set_clip_rect(detail_rect.intersect(ui.clip_rect()));
+                draw_settings(
+                    &mut detail_ui,
+                    &view,
+                    state,
+                    input,
+                    moved_by_keys,
+                    &mut picked,
+                    out,
+                );
 
-                        if groups.is_empty() {
-                            egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 26,
-                                    right: 10,
-                                    top: 8,
-                                    bottom: 10,
-                                })
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "no setting matches “{}”",
-                                            state.query
-                                        ))
-                                        .font(egui::FontId::monospace(12.0))
-                                        .color(MUTED),
-                                    );
-                                });
-                            return;
-                        }
-
-                        let mut flat_idx = 0usize;
-                        for group in &groups {
-                            let sec_id = group.section.id;
-                            let folded = is_folded(sec_id);
-
-                            // Section header row
-                            let sec_resp = egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 10,
-                                    right: 10,
-                                    top: 8,
-                                    bottom: 4,
-                                })
-                                .show(ui, |ui| {
-                                    ui.set_width((width - 20.0).max(40.0));
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-                                        let arrow = if searching {
-                                            " "
-                                        } else if folded {
-                                            "▸"
-                                        } else {
-                                            "▾"
-                                        };
-                                        ui.label(
-                                            egui::RichText::new(arrow)
-                                                .font(egui::FontId::monospace(11.0))
-                                                .color(MUTED),
-                                        );
-                                        ui.label(marked_layout_job(
-                                            group.section.title,
-                                            &group.title,
-                                            egui::FontId::monospace(12.0),
-                                            LABEL,
-                                        ));
-                                        // Cut to the row: a subtitle longer than the
-                                        // panel is wide made the panel's box wider
-                                        // than its slot, over whatever is docked
-                                        // beside it (and that panel's edge grip).
-                                        let room = (ui.available_width()
-                                            - if searching { 30.0 } else { 0.0 })
-                                        .max(0.0);
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(room, 16.0),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(
-                                                            group.section.subtitle,
-                                                        )
-                                                        .font(egui::FontId::monospace(11.0))
-                                                        .color(MUTED),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                            },
-                                        );
-                                        if searching {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            group.items.len().to_string(),
-                                                        )
-                                                        .font(egui::FontId::monospace(11.0))
-                                                        .color(MUTED),
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
-                                })
-                                .response;
-
-                            let sec_click = ui.interact(
-                                sec_resp.rect,
-                                ui.make_persistent_id(("wall_settings_sec", sec_id)),
-                                egui::Sense::click(),
-                            );
-                            if !searching {
-                                if sec_click.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if sec_click.clicked() {
-                                    out.push(format!("wall.settings.collapse {sec_id}"));
-                                }
-                            }
-
-                            if folded {
-                                continue;
-                            }
-
-                            for item in &group.items {
-                                let my_idx = flat_idx;
-                                flat_idx += 1;
-                                let is_active = active_key == Some(item.key);
-                                let is_dialled = input.dialled.contains(item.key);
-                                let current_val = input
-                                    .config
-                                    .get(item.key)
-                                    .or_else(|| default_knob_value(item.key))
-                                    .expect("every KNOBS entry has a default value");
-                                let refusal = input
-                                    .refused
-                                    .get(item.key)
-                                    .or_else(|| state.refused.get(item.key))
-                                    .cloned();
-
-                                let row_bg = if is_active {
-                                    ACTIVE_ROW_BG
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                };
-
-                                let item_resp = egui::Frame::NONE
-                                    .fill(row_bg)
-                                    .inner_margin(egui::Margin {
-                                        left: 26,
-                                        right: 10,
-                                        top: 5,
-                                        bottom: 6,
-                                    })
-                                    .show(ui, |ui| {
-                                        ui.set_width((width - 36.0).max(40.0));
-                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-
-                                        // Top line: label on the left, optional `↺` + control on the right.
-                                        ui.horizontal(|ui| {
-                                            ui.set_min_height(22.0);
-                                            ui.label(marked_layout_job(
-                                                item.def.label,
-                                                &item.hits.label,
-                                                egui::FontId::monospace(12.0),
-                                                LABEL,
-                                            ));
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.spacing_mut().item_spacing =
-                                                        egui::vec2(5.0, 0.0);
-                                                    render_knob_control(
-                                                        ui,
-                                                        item.key,
-                                                        &item.def,
-                                                        &current_val,
-                                                        state,
-                                                        out,
-                                                    );
-                                                    if is_dialled
-                                                        && icon_btn(
-                                                            ui,
-                                                            ("wall_settings_reset", item.key),
-                                                            ChromeIcon::Reset,
-                                                            false,
-                                                            "back to the default",
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        state.drafts.remove(item.key);
-                                                        emit_config_edit(
-                                                            item.key, "default", state, out,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-
-                                        // Description
-                                        ui.label(marked_layout_job(
-                                            item.def.description,
-                                            &item.hits.description,
-                                            egui::FontId::monospace(11.0),
-                                            DESC_TEXT,
-                                        ));
-
-                                        // The sizes on offer, a click each; the
-                                        // field above takes any other.
-                                        if item.key == "newTerminalSize" {
-                                            render_size_presets(
-                                                ui,
-                                                &input.config,
-                                                &current_val,
-                                                state,
-                                                out,
-                                            );
-                                        }
-
-                                        // Key identifier
-                                        ui.label(marked_layout_job(
-                                            item.key,
-                                            &item.hits.key,
-                                            egui::FontId::monospace(10.5),
-                                            KEY_TEXT,
-                                        ));
-
-                                        // Validation refusal, if any
-                                        if let Some(err_msg) = refusal {
-                                            ui.label(
-                                                egui::RichText::new(err_msg)
-                                                    .font(egui::FontId::monospace(11.0))
-                                                    .color(ERR_RED),
-                                            );
-                                        }
-                                    })
-                                    .response;
-
-                                if ui.rect_contains_pointer(item_resp.rect)
-                                    && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO)
-                                {
-                                    state.active = my_idx;
-                                }
-
-                                if is_active
-                                    && (moved_by_keys
-                                        || state.last_scrolled_key.as_deref() != Some(item.key))
-                                {
-                                    if moved_by_keys {
-                                        ui.scroll_to_rect(item_resp.rect, None);
-                                    }
-                                    state.last_scrolled_key = Some(item.key.to_string());
-                                }
-                            }
-                        }
-                    });
+                if let Some(pick) = picked {
+                    pick_section(state, input, searching, pick, out);
+                }
             });
 
             // Docked inner border (`borderRight` on left dock, `borderLeft` on right dock).
@@ -828,6 +655,625 @@ pub fn show(
         });
 
     true
+}
+
+/// The view for the query and the section in force: the search's own
+/// narrowing while searching, else the section chosen.
+fn current_view(
+    state: &mut SettingsState,
+    input: &SettingsInput,
+    searching: bool,
+) -> SettingsView<'static> {
+    let section = if searching {
+        state.scope.clone()
+    } else {
+        state.section_in_force(input.placement.section.as_deref())
+    };
+    settings_view(&state.query, section.as_deref(), NATIVE_HIDDEN_KNOBS)
+}
+
+/// Act on a choice of section: while searching it narrows the results (the
+/// window's own business); browsing, it is the section the window shows,
+/// which is the wall's to keep (`wall.settings section <id>`).
+fn pick_section(
+    state: &mut SettingsState,
+    input: &SettingsInput,
+    searching: bool,
+    pick: SectionPick,
+    out: &mut Vec<String>,
+) {
+    state.active = 0;
+    match pick {
+        SectionPick::All => state.scope = None,
+        SectionPick::Section(id) if searching => state.scope = Some(id.to_string()),
+        SectionPick::Section(id) => {
+            state.choose_section(input.placement.section.as_deref(), id, out);
+        }
+    }
+}
+
+/// The header: the title (the handle a floating window is moved by) and the
+/// dock and close buttons.
+fn draw_header(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    side: PanelSide,
+    origin: egui::Pos2,
+    width: f32,
+    close_title: &str,
+    out: &mut Vec<String>,
+) {
+    let head_rect = egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 6,
+            top: 6,
+            bottom: 5,
+        })
+        .show(ui, |ui| {
+            let header_w = (width - 18.0).max(40.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(header_w, 18.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                    dock_buttons_rtl(ui, "wall.settings", side, close_title, out);
+
+                    let avail = ui.available_width().max(24.0);
+                    let (title_rect, title_resp) = ui.allocate_exact_size(
+                        egui::vec2(avail, 18.0),
+                        if side == PanelSide::Float {
+                            egui::Sense::drag()
+                        } else {
+                            egui::Sense::hover()
+                        },
+                    );
+                    let galley = ui.painter().layout_no_wrap(
+                        "settings".to_string(),
+                        egui::FontId::monospace(12.0),
+                        MUTED,
+                    );
+                    ui.painter().galley(
+                        egui::pos2(
+                            title_rect.left(),
+                            title_rect.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        MUTED,
+                    );
+                    state.header_drag_rect = Some(title_rect);
+                    handle_head_drag(
+                        ui,
+                        &title_resp,
+                        side,
+                        origin,
+                        &mut state.head_drag,
+                        "wall.settings",
+                        out,
+                    );
+                },
+            );
+        })
+        .response
+        .rect;
+    ui.painter().line_segment(
+        [
+            egui::pos2(head_rect.left(), head_rect.bottom()),
+            egui::pos2(head_rect.right(), head_rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, HEAD_BORDER),
+    );
+}
+
+/// One line of the section list (or one chip, in the narrow layout).
+struct SectionLine {
+    /// Its key in [`SettingsState::section_rects`]: the section's id, or
+    /// [`ALL_RESULTS`].
+    key: &'static str,
+    title: String,
+    /// The matches in it, while searching.
+    count: Option<usize>,
+    selected: bool,
+    /// What a click on it chooses; `None` for a section a search found
+    /// nothing in.
+    pick: Option<SectionPick>,
+}
+
+/// The lines of the section list: a search's `all results` first, then
+/// every section.
+fn section_lines(view: &SettingsView<'_>) -> Vec<SectionLine> {
+    let mut lines = Vec::with_capacity(view.sections.len() + 1);
+    if view.searching {
+        lines.push(SectionLine {
+            key: ALL_RESULTS,
+            title: "All results".to_string(),
+            count: Some(view.matched),
+            selected: view.shown.is_none(),
+            pick: Some(SectionPick::All),
+        });
+    }
+    for entry in &view.sections {
+        let id = entry.section.id;
+        lines.push(SectionLine {
+            key: id,
+            title: entry.section.title.to_string(),
+            count: view.searching.then_some(entry.count),
+            selected: entry.selected,
+            pick: (!view.searching || entry.count > 0).then_some(SectionPick::Section(id)),
+        });
+    }
+    lines
+}
+
+/// The section list down the window's left: one line a section, the one
+/// shown lit. While searching each has the number of matches in it, a
+/// section with none is dimmed, and `all results` heads the list.
+fn draw_section_list(
+    ui: &mut egui::Ui,
+    view: &SettingsView<'_>,
+    state: &mut SettingsState,
+    picked: &mut Option<SectionPick>,
+) {
+    let list_w = ui.max_rect().width();
+    egui::ScrollArea::vertical()
+        .id_salt("wall_settings_sections")
+        .max_height(ui.max_rect().height())
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(list_w);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.add_space(6.0);
+            for SectionLine { key, title, count, selected, pick } in section_lines(view) {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(list_w, SECTION_ROW_H), egui::Sense::hover());
+                state.section_rects.insert(key.to_string(), rect);
+                let live = pick.is_some();
+                let resp = ui.interact(
+                    rect,
+                    ui.make_persistent_id(("wall_settings_section", key)),
+                    if live { egui::Sense::click() } else { egui::Sense::hover() },
+                );
+                if ui.is_rect_visible(rect) {
+                    if selected {
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::ZERO, ACTIVE_ROW_BG);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(rect.min, egui::vec2(2.0, rect.height())),
+                            egui::CornerRadius::ZERO,
+                            OK_GREEN,
+                        );
+                    } else if live && resp.hovered() {
+                        ui.painter()
+                            .rect_filled(rect, egui::CornerRadius::ZERO, HOVER_ROW_BG);
+                    }
+                    let fg = if selected {
+                        BRIGHT
+                    } else if live {
+                        LABEL
+                    } else {
+                        KEY_TEXT
+                    };
+                    let count_w = count.map_or(0.0, |n| {
+                        let galley = ui.painter().layout_no_wrap(
+                            n.to_string(),
+                            egui::FontId::monospace(11.0),
+                            if live { MUTED } else { KEY_TEXT },
+                        );
+                        let w = galley.size().x;
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.right() - 12.0 - w,
+                                rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            MUTED,
+                        );
+                        w + 8.0
+                    });
+                    let galley = crate::wall::panels::layout_elided(
+                        ui.painter(),
+                        &title,
+                        egui::FontId::monospace(12.5),
+                        fg,
+                        (list_w - 14.0 - 12.0 - count_w).max(20.0),
+                    );
+                    ui.painter().galley(
+                        egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y * 0.5),
+                        galley,
+                        fg,
+                    );
+                }
+                if live && resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    *picked = pick;
+                }
+            }
+            ui.add_space(6.0);
+        });
+}
+
+/// The narrow layout's section list: a wrapping row of chips above the
+/// settings. Returns the height it took.
+fn draw_section_chips(
+    ui: &mut egui::Ui,
+    view: &SettingsView<'_>,
+    state: &mut SettingsState,
+    picked: &mut Option<SectionPick>,
+) -> f32 {
+    let top = ui.cursor().top();
+    let full = ui.max_rect();
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 8,
+            bottom: 8,
+        })
+        .show(ui, |ui| {
+            ui.set_width((full.width() - 20.0).max(40.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for SectionLine { key, title, count, selected, pick } in section_lines(view) {
+                    let live = pick.is_some();
+                    let text = match count {
+                        Some(n) => format!("{title} {n}"),
+                        None => title,
+                    };
+                    let fg = if selected {
+                        BRIGHT
+                    } else if live {
+                        DESC_TEXT
+                    } else {
+                        KEY_TEXT
+                    };
+                    let galley =
+                        ui.painter()
+                            .layout_no_wrap(text, egui::FontId::monospace(11.5), fg);
+                    let (_id, rect) =
+                        ui.allocate_space(egui::vec2(galley.size().x + 14.0, 20.0));
+                    state.section_rects.insert(key.to_string(), rect);
+                    let resp = ui.interact(
+                        rect,
+                        ui.make_persistent_id(("wall_settings_section", key)),
+                        if live { egui::Sense::click() } else { egui::Sense::hover() },
+                    );
+                    if ui.is_rect_visible(rect) {
+                        if selected {
+                            ui.painter()
+                                .rect_filled(rect, egui::CornerRadius::same(4), BTN_ON_BG);
+                        } else if live && resp.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, egui::CornerRadius::same(4), HOVER_ROW_BG);
+                        } else {
+                            ui.painter().rect_stroke(
+                                rect,
+                                egui::CornerRadius::same(4),
+                                egui::Stroke::new(1.0, HEAD_BORDER),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.center().x - galley.size().x * 0.5,
+                                rect.center().y - galley.size().y * 0.5,
+                            ),
+                            galley,
+                            fg,
+                        );
+                    }
+                    if live && resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        *picked = pick;
+                    }
+                }
+            });
+        });
+    let bottom = ui.cursor().top();
+    ui.painter().hline(
+        full.x_range(),
+        bottom,
+        egui::Stroke::new(1.0, HEAD_BORDER),
+    );
+    bottom - top + 1.0
+}
+
+/// The right-hand side: what is shown (a section's name, or what a search
+/// found), then its settings, each a label, its one-line meaning and its
+/// control.
+fn draw_settings(
+    ui: &mut egui::Ui,
+    view: &SettingsView<'_>,
+    state: &mut SettingsState,
+    input: &SettingsInput,
+    moved_by_keys: bool,
+    picked: &mut Option<SectionPick>,
+    out: &mut Vec<String>,
+) {
+    let pane = ui.max_rect();
+    let pane_w = pane.width();
+    // Each section keeps its own place in its list.
+    let scroll_salt = ("wall_settings_body", view.shown.unwrap_or("search"));
+    egui::ScrollArea::vertical()
+        .id_salt(scroll_salt)
+        .max_height(pane.height())
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(pane_w);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+            // ── What this is a list of ───────────────────────────────────────
+            egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    left: 18,
+                    right: 16,
+                    top: 14,
+                    bottom: 10,
+                })
+                .show(ui, |ui| {
+                    ui.set_width((pane_w - 34.0).max(40.0));
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    let shown = view
+                        .shown
+                        .and_then(|id| view.sections.iter().find(|s| s.section.id == id));
+                    match (view.searching, shown) {
+                        (false, Some(entry)) => {
+                            ui.label(
+                                egui::RichText::new(entry.section.title)
+                                    .font(egui::FontId::monospace(15.0))
+                                    .color(BRIGHT),
+                            );
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(entry.section.subtitle)
+                                    .font(egui::FontId::monospace(11.5))
+                                    .color(MUTED),
+                            );
+                        }
+                        (true, _) if view.matched == 0 => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "no setting matches “{}”",
+                                    state.query
+                                ))
+                                .font(egui::FontId::monospace(12.5))
+                                .color(MUTED),
+                            );
+                        }
+                        (true, Some(entry)) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} of {} matches for “{}”, in {}",
+                                    view.rows.len(),
+                                    view.matched,
+                                    state.query,
+                                    entry.section.title
+                                ))
+                                .font(egui::FontId::monospace(12.5))
+                                .color(MUTED),
+                            );
+                        }
+                        (true, None) => {
+                            let noun = if view.matched == 1 { "setting matches" } else { "settings match" };
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {noun} “{}”",
+                                    view.matched, state.query
+                                ))
+                                .font(egui::FontId::monospace(12.5))
+                                .color(MUTED),
+                            );
+                        }
+                        (false, None) => {}
+                    }
+                });
+
+            for (my_idx, row) in view.rows.iter().enumerate() {
+                // A search over every section says which section each run
+                // of matches is in; a click on the name narrows to it.
+                if view.searching && view.shown.is_none() && row.starts_section {
+                    draw_results_heading(ui, pane_w, row, view, picked);
+                } else {
+                    let (line, _) =
+                        ui.allocate_exact_size(egui::vec2(pane_w, 1.0), egui::Sense::hover());
+                    ui.painter().hline(
+                        (line.left() + 18.0)..=(line.right() - 16.0),
+                        line.top(),
+                        egui::Stroke::new(1.0, HEAD_BORDER),
+                    );
+                }
+                let is_active = state.active == my_idx;
+                let item_rect = draw_setting_row(ui, pane_w, row, is_active, state, input, out);
+
+                if ui.rect_contains_pointer(item_rect)
+                    && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO)
+                {
+                    state.active = my_idx;
+                }
+                if is_active
+                    && (moved_by_keys || state.last_scrolled_key.as_deref() != Some(row.key))
+                {
+                    if moved_by_keys {
+                        ui.scroll_to_rect(item_rect, None);
+                    }
+                    state.last_scrolled_key = Some(row.key.to_string());
+                }
+            }
+            ui.add_space(10.0);
+        });
+}
+
+/// The heading over one section's run of matches in a search's results.
+fn draw_results_heading(
+    ui: &mut egui::Ui,
+    pane_w: f32,
+    row: &SettingRow<'_>,
+    view: &SettingsView<'_>,
+    picked: &mut Option<SectionPick>,
+) {
+    let count = view
+        .sections
+        .iter()
+        .find(|s| s.section.id == row.section.id)
+        .map_or(0, |s| s.count);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(pane_w, 30.0), egui::Sense::hover());
+    let resp = ui.interact(
+        rect,
+        ui.make_persistent_id(("wall_settings_results_heading", row.section.id)),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        ui.painter().hline(
+            (rect.left() + 18.0)..=(rect.right() - 16.0),
+            rect.top(),
+            egui::Stroke::new(1.0, HEAD_BORDER),
+        );
+        let fg = if resp.hovered() { BRIGHT } else { LABEL };
+        let title = ui.painter().layout_no_wrap(
+            row.section.title.to_string(),
+            egui::FontId::monospace(12.0),
+            fg,
+        );
+        let title_w = title.size().x;
+        let y = rect.bottom() - 6.0 - title.size().y;
+        ui.painter().galley(egui::pos2(rect.left() + 18.0, y), title, fg);
+        ui.painter().text(
+            egui::pos2(rect.left() + 18.0 + title_w + 8.0, y + 1.0),
+            egui::Align2::LEFT_TOP,
+            count.to_string(),
+            egui::FontId::monospace(11.0),
+            MUTED,
+        );
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp
+        .on_hover_text(format!("show only the matches in {}", row.section.title))
+        .clicked()
+    {
+        *picked = Some(SectionPick::Section(row.section.id));
+    }
+}
+
+/// One setting: its label and control on a line, its one-line meaning under
+/// them, and (only when they are why a search found it) its long
+/// description and key. Hovering the label shows all of it.
+fn draw_setting_row(
+    ui: &mut egui::Ui,
+    pane_w: f32,
+    row: &SettingRow<'_>,
+    is_active: bool,
+    state: &mut SettingsState,
+    input: &SettingsInput,
+    out: &mut Vec<String>,
+) -> egui::Rect {
+    let key = row.key;
+    let is_dialled = input.dialled.contains(key);
+    let current_val = input
+        .config
+        .get(key)
+        .or_else(|| default_knob_value(key))
+        .expect("every KNOBS entry has a default value");
+    let refusal = input
+        .refused
+        .get(key)
+        .or_else(|| state.refused.get(key))
+        .cloned();
+    let details = format!("{}\n\nwall.config {key}", row.def.description);
+
+    egui::Frame::NONE
+        .fill(if is_active {
+            ACTIVE_ROW_BG
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .inner_margin(egui::Margin {
+            left: 18,
+            right: 16,
+            top: 9,
+            bottom: 10,
+        })
+        .show(ui, |ui| {
+            ui.set_width((pane_w - 34.0).max(40.0));
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 3.0);
+
+            // Label on the left, optional `↺` + control on the right.
+            ui.horizontal(|ui| {
+                ui.set_min_height(22.0);
+                ui.label(marked_layout_job(
+                    row.def.label,
+                    &row.hits.label,
+                    egui::FontId::monospace(13.0),
+                    BRIGHT,
+                ))
+                .on_hover_text(&details);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(5.0, 0.0);
+                    render_knob_control(ui, key, &row.def, &current_val, state, out);
+                    if is_dialled
+                        && icon_btn(
+                            ui,
+                            ("wall_settings_reset", key),
+                            ChromeIcon::Reset,
+                            false,
+                            "back to the default",
+                        )
+                        .clicked()
+                    {
+                        state.drafts.remove(key);
+                        emit_config_edit(key, "default", state, out);
+                    }
+                });
+            });
+
+            // What it does, in one line.
+            ui.label(marked_layout_job(
+                row.def.summary,
+                &row.hits.summary,
+                egui::FontId::monospace(11.5),
+                DESC_TEXT,
+            ))
+            .on_hover_text(&details);
+
+            // The sizes on offer, a click each; the field takes any other.
+            if key == "newTerminalSize" {
+                render_size_presets(ui, &input.config, &current_val, state, out);
+            }
+
+            // Why a search found it, when that is not in the two lines above.
+            if !row.hits.description.is_empty() && row.hits.only_in_the_details() {
+                ui.label(marked_layout_job(
+                    row.def.description,
+                    &row.hits.description,
+                    egui::FontId::monospace(11.0),
+                    MUTED,
+                ));
+            }
+            if !row.hits.key.is_empty() {
+                ui.label(marked_layout_job(
+                    key,
+                    &row.hits.key,
+                    egui::FontId::monospace(10.5),
+                    MUTED,
+                ));
+            }
+
+            // Validation refusal, if any.
+            if let Some(err_msg) = refusal {
+                ui.label(
+                    egui::RichText::new(err_msg)
+                        .font(egui::FontId::monospace(11.0))
+                        .color(ERR_RED),
+                );
+            }
+        })
+        .response
+        .rect
 }
 
 fn activate_knob(
@@ -1399,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn simulated_clicks_fold_sections_reset_dialled_knobs_and_dock_panel() {
+    fn simulated_clicks_pick_sections_reset_dialled_knobs_and_dock_panel() {
         let ctx = egui::Context::default();
         let mut state = SettingsState::default();
         let mut input = open_input();
@@ -1454,7 +1900,7 @@ mod tests {
         let right_out = click_at(&ctx, egui::pos2(345.0, 14.0), &mut state, &input);
         assert_eq!(right_out, vec!["wall.settings right"]);
 
-        // Locate the `"Canvas"` section title (the first section in `SECTIONS`) and click it to fold.
+        // At this width the sections are chips above the settings: click `Canvas & grid`.
         let full = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1480,10 +1926,14 @@ mod tests {
             }
             shapes.iter().find_map(|cs| walk(&cs.shape, needle))
         }
-        let sec_pt = find_text_center(&full.shapes, "Canvas")
-            .expect("Canvas section header must be painted");
-        let fold_out = click_at(&ctx, sec_pt, &mut state, &input);
-        assert_eq!(fold_out, vec!["wall.settings.collapse canvas"]);
+        let sec_pt = find_text_center(&full.shapes, "Canvas & grid")
+            .expect("the Canvas & grid chip must be painted");
+        assert_eq!(state.section_rects["canvas"].center(), sec_pt);
+        let pick_out = click_at(&ctx, sec_pt, &mut state, &input);
+        assert_eq!(pick_out, vec!["wall.settings section canvas"]);
+        // It is shown on the next pass, before the wall has stored the choice.
+        run_frame(&ctx, Vec::new(), (1280.0, 900.0), &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("canvas"));
 
         // Focus `closeHoldMs` via Enter, type an invalid value `-5`, press Enter: emits verb and records refusal.
         state.query = "closeHoldMs".to_string();
@@ -1514,6 +1964,230 @@ mod tests {
             "expected refusal for closeHoldMs, got {:?}",
             state.refused
         );
+    }
+
+    fn click(
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        viewport: (f32, f32),
+        state: &mut SettingsState,
+        input: &SettingsInput,
+    ) -> Vec<String> {
+        let (mut out, _) = run_frame(
+            ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            viewport,
+            state,
+            input,
+        );
+        let (mut released, _) = run_frame(
+            ctx,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            viewport,
+            state,
+            input,
+        );
+        out.append(&mut released);
+        out
+    }
+
+    fn knobs_in(section: &str) -> Vec<&'static str> {
+        wall_core::settings::KNOBS
+            .iter()
+            .filter(|(k, d)| d.section == section && !NATIVE_HIDDEN_KNOBS.contains(k))
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    #[test]
+    fn the_window_is_a_section_list_beside_one_sections_settings() {
+        const VIEW: (f32, f32) = (1400.0, 900.0);
+        let ctx = egui::Context::default();
+        let mut state = SettingsState::default();
+        let mut input = open_input();
+
+        // Floating and never placed: a window of its own size, in the
+        // middle, under the topbar.
+        let (out, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert!(out.is_empty());
+        let rect = state.last_rect.unwrap();
+        assert_eq!((rect.width(), rect.height()), (780.0, 560.0));
+        assert_eq!(rect.center().x, 700.0);
+        assert!(rect.top() >= 46.0 && rect.bottom() <= 900.0, "{rect:?}");
+
+        // The list: every section, top to bottom, the first one shown.
+        let listed: Vec<&str> = {
+            let mut by_y: Vec<(&String, &egui::Rect)> = state.section_rects.iter().collect();
+            by_y.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+            by_y.into_iter().map(|(k, _)| k.as_str()).collect()
+        };
+        assert_eq!(
+            listed,
+            ["terminals", "text", "canvas", "groups", "fullscreen", "selection", "input", "agent", "status"]
+        );
+        // The list is a column down the left; the settings are right of it.
+        let list_right = state.section_rects["terminals"].right();
+        assert!(state.section_rects.values().all(|r| r.left() == rect.left() + 1.0));
+        assert_eq!(state.shown_section.as_deref(), Some("terminals"));
+        assert_eq!(state.visible_count, knobs_in("terminals").len());
+        for key in knobs_in("terminals") {
+            assert!(state.control_rects[key].left() > list_right, "{key}");
+        }
+        // The search is above both.
+        let search_text = texts.iter().any(|t| t == "search settings…");
+        assert!(search_text, "{texts:?}");
+
+        // Each setting: a plain label and one line saying what it does. The
+        // knob's key and its long description are not on the page.
+        for needle in [
+            "Terminals",
+            "New terminal size",
+            "How big a new terminal opens, in columns by rows.",
+            "Hold to close",
+            "How long you hold the close button before a terminal is closed.",
+        ] {
+            assert!(texts.iter().any(|t| t == needle), "missing {needle:?} in {texts:?}");
+        }
+        assert!(!texts.iter().any(|t| t == "closeHoldMs" || t == "newTerminalSize"));
+        assert!(!texts.iter().any(|t| t.contains("its ring fills over this time")));
+
+        // A click on a section sends the verb, and the window shows the
+        // section on the next pass without waiting for the wall.
+        let text_line = state.section_rects["text"].center();
+        assert_eq!(
+            click(&ctx, text_line, VIEW, &mut state, &input),
+            vec!["wall.settings section text"]
+        );
+        let (_, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("text"));
+        assert_eq!(state.visible_count, knobs_in("text").len());
+        assert!(texts.iter().any(|t| t == "The font terminals are drawn in."));
+        // The same click again asks for nothing.
+        assert!(click(&ctx, text_line, VIEW, &mut state, &input).is_empty());
+
+        // The wall's answer is what counts from then on: here it stored
+        // the choice, and later something else moved it.
+        input.placement.section = Some("text".to_string());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("text"));
+        input.placement.section = Some("groups".to_string());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("groups"));
+
+        // Page Down and Page Up step through the list, stopping at its ends.
+        let (out, _) = run_frame(&ctx, vec![key_press(egui::Key::PageDown)], VIEW, &mut state, &input);
+        assert_eq!(out, vec!["wall.settings section fullscreen"]);
+        input.placement.section = Some("terminals".to_string());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        let (out, _) = run_frame(&ctx, vec![key_press(egui::Key::PageUp)], VIEW, &mut state, &input);
+        assert!(out.is_empty(), "{out:?}");
+
+        // Dragged narrower than two panes have room for, the sections are
+        // chips above the settings, across the window.
+        input.placement.size.float_width = Some(480.0);
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        let rect = state.last_rect.unwrap();
+        assert_eq!(rect.width(), 480.0);
+        let chips_bottom = state
+            .section_rects
+            .values()
+            .map(|r| r.bottom())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(state.section_rects.len(), 9);
+        assert!(state.section_rects.values().any(|r| r.left() > rect.center().x));
+        for key in knobs_in("terminals") {
+            let control = state.control_rects[key];
+            assert!(control.top() > chips_bottom, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_search_reads_every_section_and_says_which_each_match_is_in() {
+        const VIEW: (f32, f32) = (1400.0, 900.0);
+        let ctx = egui::Context::default();
+        let mut state = SettingsState::default();
+        let mut input = open_input();
+        input.placement.section = Some("agent".to_string());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("agent"));
+
+        // Typing searches every section, whichever was shown.
+        run_frame(&ctx, vec![egui::Event::Text("colour".to_string())], VIEW, &mut state, &input);
+        let (_, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section, None);
+        assert_eq!(state.visible_count, 6);
+        assert!(texts.iter().any(|t| t == "6 settings match “colour”"), "{texts:?}");
+        // Each run of matches is under its section's name, and the list
+        // counts the matches in each section, `All results` first.
+        for heading in ["Text", "Canvas & grid", "Selection & copy", "All results"] {
+            assert!(texts.iter().any(|t| t == heading), "missing {heading:?} in {texts:?}");
+        }
+        let all = state.section_rects[ALL_RESULTS];
+        assert!(state
+            .section_rects
+            .iter()
+            .all(|(k, r)| k == ALL_RESULTS || r.top() > all.top()));
+        // The match is marked where it is: here in the label.
+        for key in ["boldIsBright", "background", "gridMinorColor", "gridMajorColor", "selectionColor", "selectionForeground"] {
+            assert!(state.control_rects.contains_key(key), "{key}");
+        }
+
+        // A click on a section narrows the results to it: the window's own
+        // business, so nothing is sent.
+        let canvas = state.section_rects["canvas"].center();
+        assert!(click(&ctx, canvas, VIEW, &mut state, &input).is_empty());
+        let (_, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("canvas"));
+        assert_eq!(state.visible_count, 3);
+        assert!(
+            texts.iter().any(|t| t == "3 of 6 matches for “colour”, in Canvas & grid"),
+            "{texts:?}"
+        );
+        // A section with no match is listed, dimmed, and a click on it does nothing.
+        let agent = state.section_rects["agent"].center();
+        assert!(click(&ctx, agent, VIEW, &mut state, &input).is_empty());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("canvas"));
+        // `All results` widens it again.
+        let all = state.section_rects[ALL_RESULTS].center();
+        assert!(click(&ctx, all, VIEW, &mut state, &input).is_empty());
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!((state.shown_section.clone(), state.visible_count), (None, 6));
+
+        // Narrowed again, then the search cleared: the window stays in that
+        // section, which is the wall's to keep.
+        let canvas = state.section_rects["canvas"].center();
+        click(&ctx, canvas, VIEW, &mut state, &input);
+        let (out, _) = run_frame(&ctx, vec![key_press(egui::Key::Escape)], VIEW, &mut state, &input);
+        assert_eq!(out, vec!["wall.settings section canvas"]);
+        assert_eq!(state.query, "");
+        run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.shown_section.as_deref(), Some("canvas"));
+        assert_eq!(state.visible_count, knobs_in("canvas").len());
+
+        // A match only in a knob's key or long description shows where it
+        // was: the key is on the page then, and only then.
+        state.query = "closehold".to_string();
+        let (_, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.visible_count, 1);
+        assert!(texts.iter().any(|t| t == "closeHoldMs"), "{texts:?}");
+        state.query = "ring fills".to_string();
+        let (_, texts) = run_frame(&ctx, Vec::new(), VIEW, &mut state, &input);
+        assert_eq!(state.visible_count, 1);
+        assert!(texts.iter().any(|t| t.contains("its ring fills over this time")), "{texts:?}");
     }
 
     #[test]

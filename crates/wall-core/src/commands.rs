@@ -17,18 +17,17 @@ use crate::geom::Point;
 use crate::router::{is_token_chars, CommandReply, CommandRouter, RegisterMeta};
 use crate::sidebar::SidebarMode;
 
-/// Validated settings panel section ids (`SECTIONS` in `wall/wallSettings.js`).
+/// Validated settings section ids ([`crate::settings::SECTIONS`], in its order).
 pub const SETTINGS_SECTION_IDS: &[&str] = &[
-    "canvas",
     "terminals",
-    "agent",
-    "fullscreen",
     "text",
+    "canvas",
     "groups",
-    "status",
-    "input",
+    "fullscreen",
     "selection",
-    "menu",
+    "input",
+    "agent",
+    "status",
 ];
 
 const AGENT_SIDES: &[&str] = &["right", "left", "top", "bottom"];
@@ -503,6 +502,10 @@ pub struct PanelPlacement {
     /// at its defaults.
     #[serde(default, skip_serializing_if = "PanelSize::is_default")]
     pub size: PanelSize,
+    /// The section the settings window shows (`wall.settings section`).
+    /// `None` for the other panels, and until one is chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
 }
 
 impl Default for PanelPlacement {
@@ -514,6 +517,7 @@ impl Default for PanelPlacement {
             collapsed: Vec::new(),
             mode: None,
             size: PanelSize::default(),
+            section: None,
         }
     }
 }
@@ -542,6 +546,8 @@ pub struct PanelPatch {
     pub mode: Option<String>,
     /// The panel's sizes, whole (`wall.<panel> width|size`).
     pub size: Option<PanelSize>,
+    /// The section the settings window shows.
+    pub section: Option<String>,
 }
 
 /// Which panel a panel-placement verb operates on.
@@ -2124,9 +2130,40 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
     reg(
         router,
         "wall.settings",
-        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]]",
-        "Open, close, place or size the settings panel (width: docked; size: floating; default resets)",
+        "[toggle|open|close|left|right|float [x y]|width <px>|size <w> [h]|section [id]]",
+        "Open, close, place or size the settings window (width: docked; size: floating; default resets), or show one of its sections",
         |args, wall| {
+            if args.first().map(String::as_str) == Some("section") {
+                let shown = |wall: &W| -> &'static str {
+                    let chosen = wall.panel(PanelKind::Settings).section;
+                    SETTINGS_SECTION_IDS
+                        .iter()
+                        .find(|id| chosen.as_deref() == Some(**id))
+                        .or(SETTINGS_SECTION_IDS.first())
+                        .copied()
+                        .unwrap_or("")
+                };
+                if let Some(id) = args.get(1) {
+                    let Some(known) = SETTINGS_SECTION_IDS.iter().find(|s| *s == id) else {
+                        return Err(format!(
+                            "no section '{id}' (sections: {})",
+                            SETTINGS_SECTION_IDS.join(", ")
+                        ));
+                    };
+                    wall.set_panel(
+                        PanelKind::Settings,
+                        PanelPatch {
+                            section: Some((*known).to_string()),
+                            ..PanelPatch::default()
+                        },
+                    );
+                }
+                let now = shown(wall);
+                return Ok(CommandReply::ok(
+                    format!("settings shows {now}"),
+                    Some(json!({ "section": now, "panel": wall.panel(PanelKind::Settings) })),
+                ));
+            }
             place_panel(wall, PanelKind::Settings, "settings panel", args)?;
             let now = wall.panel(PanelKind::Settings);
             let state = placement_words(&now);
@@ -2157,7 +2194,7 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
         router,
         "wall.settings.collapse",
         "<section> [toggle|on|off]",
-        "Fold or unfold a section of the settings panel",
+        "Mark a settings section folded (kept from the folding panel; the window shows one section at a time)",
         |args, wall| {
             let id = args.first().map_or("undefined", String::as_str);
             if !SETTINGS_SECTION_IDS.contains(&id) {
@@ -3221,6 +3258,9 @@ mod tests {
             if let Some(size) = patch.size {
                 cur.size = size;
             }
+            if let Some(section) = patch.section {
+                cur.section = Some(section);
+            }
             self.panels.insert(Self::panel_key(kind).to_string(), cur);
         }
 
@@ -3926,6 +3966,52 @@ mod tests {
         r.execute(["wall.sidebar", "close"]);
         r.execute(["wall.sidebar", "open"]);
         assert_eq!(r.context.panel(PanelKind::Sidebar).mode.as_deref(), Some("host"));
+    }
+
+    #[test]
+    fn the_settings_window_shows_the_section_it_is_told_to_and_says_which() {
+        // The verb's ids are the schema's, in its order.
+        let schema: Vec<&str> = crate::settings::SECTIONS.iter().map(|s| s.id).collect();
+        assert_eq!(SETTINGS_SECTION_IDS, schema.as_slice());
+
+        let mut r = wall_router();
+        // Until one is chosen it shows the first.
+        let asked = r.execute(["wall.settings", "section"]);
+        assert_eq!(asked.text, "OK: settings shows terminals");
+        assert_eq!(r.context.panel(PanelKind::Settings).section, None);
+
+        let text = r.execute(["wall.settings", "section", "text"]);
+        assert_eq!(text.text, "OK: settings shows text");
+        assert_eq!(text.data.unwrap()["section"], json!("text"));
+        assert_eq!(
+            r.context.panel(PanelKind::Settings).section.as_deref(),
+            Some("text")
+        );
+        // Choosing a section does not open the window, and closing it keeps
+        // the choice.
+        assert!(!r.context.panel(PanelKind::Settings).open);
+        r.execute(["wall.settings", "open"]);
+        r.execute(["wall.settings", "close"]);
+        assert_eq!(
+            r.execute(["wall.settings", "section"]).text,
+            "OK: settings shows text"
+        );
+
+        // A name that is no section (one from before the regrouping) is
+        // refused with the ones there are.
+        let bad = r.execute(["wall.settings", "section", "menu"]);
+        assert!(bad.is_err());
+        assert!(
+            bad.text.contains(
+                "no section 'menu' (sections: terminals, text, canvas, groups, fullscreen, selection, input, agent, status)"
+            ),
+            "{}",
+            bad.text
+        );
+        assert_eq!(
+            r.context.panel(PanelKind::Settings).section.as_deref(),
+            Some("text")
+        );
     }
 
     #[test]

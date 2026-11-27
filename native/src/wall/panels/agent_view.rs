@@ -3274,6 +3274,7 @@ mod tests {
                 collapsed: Vec::new(),
                 mode: None,
                 size: Default::default(),
+                section: None,
             }
         }
         fn set_panel(&mut self, _: PanelKind, _: PanelPatch) {}

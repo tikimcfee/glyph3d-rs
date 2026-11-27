@@ -3686,6 +3686,7 @@ impl WallApi for WallCore {
                     collapsed: s.collapsed.clone(),
                     mode: Some(s.mode.as_str().to_owned()),
                     size: s.size,
+                    section: None,
                 }
             }
             PanelKind::Status => {
@@ -3697,6 +3698,7 @@ impl WallApi for WallCore {
                     collapsed: Vec::new(),
                     mode: None,
                     size: s.size,
+                    section: None,
                 }
             }
             PanelKind::Settings => {
@@ -3708,6 +3710,7 @@ impl WallApi for WallCore {
                     collapsed: s.collapsed.clone(),
                     mode: None,
                     size: s.size,
+                    section: s.section.clone(),
                 }
             }
             PanelKind::Help => {
@@ -3719,6 +3722,7 @@ impl WallApi for WallCore {
                     collapsed: Vec::new(),
                     mode: None,
                     size: s.size,
+                    section: None,
                 }
             }
         }
@@ -3747,6 +3751,7 @@ impl WallApi for WallCore {
                 float: patch.float.map(Some),
                 collapsed: patch.collapsed,
                 size: patch.size,
+                section: patch.section,
             }),
             PanelKind::Help => self.model.set_help_panel(HelpPanelPatch {
                 open: patch.open,

@@ -880,6 +880,7 @@ fn import_settings_panel(
         float,
         collapsed,
         size: None,
+        section: None,
     });
     true
 }

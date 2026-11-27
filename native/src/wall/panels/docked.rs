@@ -36,8 +36,11 @@ pub(crate) const FIELD_BG: egui::Color32 = egui::Color32::from_rgb(0x0b, 0x0d, 0
 pub(crate) const BTN_ON_BG: egui::Color32 = egui::Color32::from_rgb(0x1d, 0x23, 0x30);
 pub(crate) const NOTICE_BG: egui::Color32 = egui::Color32::from_rgb(0x14, 0x18, 0x21);
 
+/// Opaque `#0e1118` (as the help panel's): the JS panel's 97 % let a bright
+/// terminal behind the window ghost through its text on the wall's
+/// linear-blended target.
 pub(crate) fn settings_panel_bg() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(14, 17, 24, 247)
+    egui::Color32::from_rgb(14, 17, 24)
 }
 
 pub(crate) fn status_panel_bg() -> egui::Color32 {

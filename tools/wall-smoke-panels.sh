@@ -415,7 +415,10 @@ else
     record_fail "sidebar (row, dock, fold, mode)" "${SB_CHECK#* }"
 fi
 
-# ── 6. Settings: search filter, boolean toggle + frame change, number field ──
+# ── 6. Settings: section list, search across sections, boolean toggle + frame change, number field ──
+# On the settings line of app.where: `section=` is the section shown (`all`: a search
+# over every section), `sections=` the section list's lines as drawn, `items=` the
+# settings shown, `controls=` their controls.
 ctl wall.fit >/dev/null
 W_SET_PRE="$(wait_settled)"
 SHOT_GRID_ON="$SHOT_DIR/grid-on.png"
@@ -423,7 +426,14 @@ SHOT_GRID_OFF="$SHOT_DIR/grid-off.png"
 ctl app.shot "$SHOT_GRID_ON" >/dev/null
 
 ctl wall.settings open >/dev/null
+ctl app.where >/dev/null
 W_SET0="$(ctl app.where)"
+# A click on a line of the section list shows that section, and the wall keeps the choice.
+read -r SEC_X SEC_Y < <(map_entry_center "panel settings " "sections" "text" "$W_SET0")
+ctl app.click "$SEC_X" "$SEC_Y" >/dev/null
+ctl app.where >/dev/null
+W_SET_SEC="$(ctl app.where)"
+SEC_REPLY="$(ctl wall.settings section 2>&1 || true)"
 ctl app.type "show grid" >/dev/null
 W_SET_BOOL_FILTER="$(ctl app.where)"
 read -r BOOL_X BOOL_Y < <(map_entry_center "panel settings " "controls" "gridShow" "$W_SET_BOOL_FILTER")
@@ -451,7 +461,15 @@ rm -f "$SHOT_GRID_ON.tmp" "$SHOT_GRID_OFF.tmp"
 SET_CHECK="$(python3 -c '
 import sys, struct, zlib
 
-s0, s_bf, s_off, s_nf, s_nd, p_on, p_off = sys.argv[1:8]
+s0, s_bf, s_off, s_nf, s_nd, p_on, p_off, s_sec, sec_reply = sys.argv[1:10]
+
+def tok_of(s, key):
+    for l in s.splitlines():
+        if l.startswith("panel settings "):
+            for tok in l.split():
+                if tok.startswith(key + "="):
+                    return tok[len(key) + 1:]
+    return ""
 
 def items_of(s):
     for l in s.splitlines():
@@ -514,20 +532,30 @@ def patch_colors(path):
         prev = row
     return len(seen)
 
-n_all, n_bf, n_nf = items_of(s0), items_of(s_bf), items_of(s_nf)
+n_open, n_text, n_bf, n_nf = items_of(s0), items_of(s_sec), items_of(s_bf), items_of(s_nf)
+listed = [e.split(":")[0] for e in tok_of(s0, "sections").split(";") if ":" in e]
+# It opens on its first section, with every section listed; the click showed Text
+# (stored by the wall); a search is over all of them, with `all` heading the list.
+sections_ok = (
+    len(listed) == 9 and listed[0] == "terminals"
+    and tok_of(s0, "section") == "terminals" and n_open > 0
+    and tok_of(s_sec, "section") == "text" and n_text > n_open
+    and "settings shows text" in sec_reply
+    and tok_of(s_bf, "section") == "all" and "all:" in tok_of(s_bf, "sections")
+)
 paper_off = "paper grid_show=false " in s_off
 paper_minor8 = "grid_minor=8" in s_nd
 c_on = patch_colors(p_on)
 c_off = patch_colors(p_off)
 frame_changed = (c_on > 1 and c_off == 1)
-ok = (n_all > 15 and 0 < n_bf < n_all and 0 < n_nf < n_all and paper_off and frame_changed and paper_minor8)
-print(f"{int(ok)} items={n_all}->{n_bf}/{n_nf} paper_colors={c_on}->{c_off} grid_minor8={paper_minor8}")
-' "$W_SET0" "$W_SET_BOOL_FILTER" "$W_SET_GRID_OFF" "$W_SET_NUM_FILTER" "$W_SET_NUM_DONE" "$SHOT_GRID_ON" "$SHOT_GRID_OFF")"
+ok = (sections_ok and 0 < n_bf < n_text and 0 < n_nf < n_text and paper_off and frame_changed and paper_minor8)
+print(f"{int(ok)} sections={len(listed)} items={n_open}->{n_text}(text)->{n_bf}/{n_nf}(search) paper_colors={c_on}->{c_off} grid_minor8={paper_minor8}")
+' "$W_SET0" "$W_SET_BOOL_FILTER" "$W_SET_GRID_OFF" "$W_SET_NUM_FILTER" "$W_SET_NUM_DONE" "$SHOT_GRID_ON" "$SHOT_GRID_OFF" "$W_SET_SEC" "$SEC_REPLY")"
 rm -f "$SHOT_GRID_ON" "$SHOT_GRID_OFF"
 if [[ "${SET_CHECK%% *}" == "1" ]]; then
-    record_pass "settings (search, bool, number)" "${SET_CHECK#* }"
+    record_pass "settings (sections, search, edit)" "${SET_CHECK#* }"
 else
-    record_fail "settings (search, bool, number)" "${SET_CHECK#* }"
+    record_fail "settings (sections, search, edit)" "${SET_CHECK#* }"
 fi
 
 # ── 7. Status: opens from topbar button and shows both terminals ─────────────

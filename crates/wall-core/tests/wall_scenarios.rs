@@ -4209,3 +4209,45 @@ fn a_resized_panel_moves_the_dock_layout_and_keeps_its_size_through_a_restart() 
     again.run_ok("wall.sidebar width default");
     assert_eq!(again.frame().panels.dock.widths, DOCK_WIDTHS);
 }
+
+// ── The settings window's section (`wall.settings section`) ──────────────────
+
+#[test]
+fn the_settings_section_shown_is_kept_through_a_restart() {
+    let storage = SharedStorage::default();
+    let opts = WallOptions {
+        platform: Platform::Mac,
+        geometry: CellGeometry {
+            stride: Point::new(0.6, 1.2),
+            padding: Point::new(0.4, 0.4),
+            scale_z: 1.0,
+        },
+        ..Default::default()
+    };
+    {
+        let mut h = Harness::with_storage(storage.clone(), "section-scope", opts.clone());
+        assert_eq!(h.frame().panels.settings_panel.section, None);
+        h.run_ok("wall.settings section groups");
+        assert_eq!(
+            h.frame().panels.settings_panel.section.as_deref(),
+            Some("groups")
+        );
+        // Placing or sizing the window leaves the section alone.
+        h.run_ok("wall.settings float 40 60");
+        h.run_ok("wall.settings size 900 600");
+        assert_eq!(
+            h.frame().panels.settings_panel.section.as_deref(),
+            Some("groups")
+        );
+        // A section that is not one is refused, and nothing changes.
+        assert!(h.wall.run("wall.settings section menu").is_err());
+    }
+    let mut again = Harness::with_storage(storage, "section-scope", opts);
+    let panel = again.frame().panels.settings_panel;
+    assert_eq!(panel.section.as_deref(), Some("groups"));
+    assert_eq!(panel.size.float_width, Some(900.0));
+    assert_eq!(
+        again.wall.run("wall.settings section").text,
+        "OK: settings shows groups"
+    );
+}

@@ -893,14 +893,30 @@ impl Panels {
             .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
             .collect();
         sp_ctrls.sort();
+        // As drawn: down the list (or along the rows of chips).
+        let mut sp_drawn: Vec<(&String, &egui::Rect)> =
+            self.settings.section_rects.iter().collect();
+        sp_drawn.sort_by(|a, b| {
+            a.1.top()
+                .total_cmp(&b.1.top())
+                .then(a.1.left().total_cmp(&b.1.left()))
+        });
+        let sp_sections: Vec<String> = sp_drawn
+            .into_iter()
+            .map(|(k, r)| format!("{k}:{}", fmt_rect(*r)))
+            .collect();
         lines.push(format!(
-            "panel settings open={} side={} query={:?} items={} rect={} header={} controls={} size={} grips={}",
+            "panel settings open={} side={} query={:?} items={} rect={} header={} section={} sections={} controls={} size={} grips={}",
             sp.open,
             dock_side_name(sp.side),
             self.settings.query,
             self.settings.visible_count,
             fmt_opt_rect(self.settings.last_rect),
             fmt_opt_rect(self.settings.header_drag_rect),
+            // The section shown (`all`: a search over every section) and the
+            // section list's lines as drawn, by id.
+            self.settings.shown_section.as_deref().unwrap_or("all"),
+            if sp_sections.is_empty() { "none".to_string() } else { sp_sections.join(";") },
             if sp_ctrls.is_empty() { "none".to_string() } else { sp_ctrls.join(";") },
             fmt_size(&sp.size),
             self.settings.resize.report(),
@@ -1907,5 +1923,68 @@ mod tests {
         let line = panels.format_where(&wall, &described);
         let palette_line = line.lines().find(|l| l.starts_with("palette ")).unwrap();
         assert!(palette_line.contains(" size=dock=-,float=700x380 grips=left:"), "{palette_line}");
+    }
+
+    #[test]
+    fn the_settings_window_shows_the_section_the_wall_holds_and_a_click_changes_it() {
+        let ctx = egui::Context::default();
+        configure_wall_context(&ctx, &crate::config::settings().wall);
+        let mut wall = test_wall();
+        let mut panels = Panels::new();
+        let mut now = 1.0;
+        let mut pass = |events: Vec<egui::Event>, panels: &mut Panels, wall: &mut Wall| {
+            now += 0.05;
+            run_pass_at(&ctx, now, events, panels, wall).0
+        };
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Opened, it shows its first section; told another, that one.
+        assert!(wall.run("wall.settings open").text.starts_with("OK"));
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.settings.shown_section.as_deref(), Some("terminals"));
+        assert_eq!(
+            wall.run("wall.settings section groups").text,
+            "OK: settings shows groups"
+        );
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.settings.shown_section.as_deref(), Some("groups"));
+
+        // A click on a line of its list goes to the wall as the verb, and
+        // the wall's store holds the choice.
+        let line = panels.settings.section_rects["selection"].center();
+        pass(vec![egui::Event::PointerMoved(line)], &mut panels, &mut wall);
+        pass(vec![button(line, true)], &mut panels, &mut wall);
+        let sent = pass(vec![button(line, false)], &mut panels, &mut wall);
+        assert_eq!(sent, vec!["wall.settings section selection".to_string()]);
+        assert_eq!(
+            wall.store().settings_panel().section.as_deref(),
+            Some("selection")
+        );
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.settings.shown_section.as_deref(), Some("selection"));
+
+        // `app.where` says the section shown and lists the sections as drawn.
+        let described = wall.frame();
+        let report = panels.format_where(&wall, &described);
+        let line = report
+            .lines()
+            .find(|l| l.starts_with("panel settings "))
+            .unwrap();
+        assert!(line.contains(" section=selection sections=terminals:"), "{line}");
+        assert!(line.contains(" items=6 "), "{line}");
+
+        // Closed and opened again, it is where it was left.
+        assert!(wall.run("wall.settings close").text.starts_with("OK"));
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert!(wall.run("wall.settings open").text.starts_with("OK"));
+        pass(Vec::new(), &mut panels, &mut wall);
+        pass(Vec::new(), &mut panels, &mut wall);
+        assert_eq!(panels.settings.shown_section.as_deref(), Some("selection"));
     }
 }
