@@ -1800,6 +1800,7 @@ dependencies = [
 name = "glyph3d-native"
 version = "0.1.0"
 dependencies = [
+ "agent-feed",
  "arboard",
  "ash",
  "bevy_ecs",

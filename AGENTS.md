@@ -32,16 +32,18 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   A bare `glyph3d-native` invocation (or `--wall`, 2026-11-26; `--launcher`
   opens the TUI launcher) opens **the terminal wall** (`native/src/wall/`): an
   infinite orthographic canvas of live `g3d-termd` terminals with no HTTP/WebSocket
-  relay. Its CPU/host modules (`camera`, `cell`, `chrome`, `describe`, `glyphs`
-  sparse emoji archive, `labels`, `metrics`, `paper`, `replay`, `shapes`,
-  `test_pattern`) compile under `--no-default-features`; `wgpu` adds `renderer`
-  (`WallRenderer`, `wall_{cells,paper,shapes}.wgsl`, runtime `GlyphSource`
-  atlas textures, offscreen PNG capture); `windowed` adds `app` (winit event
-  loop joining `Wall`, `Sessions`, `WallRenderer`, and `wall_control::Server`),
-  `keys`, `script` (`app.*` synthetic input/screenshot/state verbs), and
-  `session`; `egui-ui` adds `ui` (on-demand egui host + `F1` debug HUD), `mount`,
-  and `panels/` (`topbar`, `bar_buttons`, `palette`, `sidebar`,
-  `docked/{settings,status}`, `menus/{context_menu,help}`, `agent_view`).
+  relay. Its CPU/host modules (`agents` background `agent-feed` coordinator,
+  `camera`, `cell`, `chrome`, `describe`, `glyphs` sparse emoji archive,
+  `labels`, `metrics`, `paper`, `replay`, `shapes`, `test_pattern`) compile
+  under `--no-default-features`; `wgpu` adds `renderer` (`WallRenderer`,
+  `wall_{cells,paper,shapes}.wgsl`, runtime `GlyphSource` atlas textures,
+  offscreen PNG capture); `windowed` adds `app` (winit event loop joining `Wall`,
+  `Sessions`, `WallRenderer`, and `wall_control::Server`), `keys`, `perf`
+  (`WallPerf` frame/pump/idle probe), `script` (`app.*` synthetic
+  input/clipboard/screenshot/state verbs), and `session`; `egui-ui` adds `ui`
+  (on-demand egui host + `F1` debug HUD), `mount`, and `panels/` (`topbar`,
+  `bar_buttons`, `palette`, `sidebar`, `docked/{settings,status}`,
+  `menus/{context_menu,help}`, `agent_view`).
 - `glyph/` — the build/verify tool: the gate runner. (The launcher
   TUI moved into the renderer on 2026-10-10, C27: `native/src/launcher/`.)
 - `crates/` — the glyph field, split by render mode (2026-10): `glyph-field` is the
@@ -148,10 +150,10 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
     store import: must not depend on a window, GPU, emulator, or `termd-client`.
   - `crates/agent-feed` — background `gomuxai` subprocess followers
     (`FleetFollower` over `agent export --json --follow --all`, `SessionPoller`
-    over `agent sessions --json`, `TranscriptFollower` over `agent transcript
-    <id> --follow` with tail-window `load_earlier`). Depends on `std` and
-    `serde`/`serde_json` alone: must not depend on a window, GPU, or async
-    runtime.
+    over `agent sessions --json`, `TranscriptFollower` and `LineFollower` over
+    `agent transcript <id> --follow` with tail-window `load_earlier`). Depends
+    on `std` and `serde`/`serde_json` alone: must not depend on a window, GPU,
+    or async runtime.
   - `crates/term-session` — background per-terminal `Vt` worker threads, 16 ms /
     16 KiB leading-edge coalescer (with DECSET 2026 sync hold and outbound
     resize coalescing), lock-free window-owned `front_screen` swapped on
@@ -174,13 +176,16 @@ against `build.toml` that day; `cargo glyph gates` is the live list.)
   `glyph_schema.mjs`, generated from the schema.
 - `tools/` — check scripts, generators, `bench_hyper.py` performance harness,
   repro helpers, and the terminal-wall scripts (2026-11-26):
-  `tools/wall-smoke.sh` (end-to-end scratch-daemon + window + `wallctl` smoke
-  check), `tools/wall-relax.sh` (runs the wall under Makepad's `relax` JIT
+  `tools/wall-smoke.sh` and `tools/wall-smoke-text.sh` (end-to-end
+  scratch-daemon + window + `wallctl` gesture and selection-lifetime smoke
+  checks), `tools/wall-relax.sh` (runs the wall under Makepad's `relax` JIT
   against a scratch daemon with `GLYPH_WALL_SHADER_DIR=native/src/shaders` live
   shader reload), `tools/vt-diff.sh` (differential VT corpus check comparing
-  `glyph-vt` against reference emulators), and `tools/wall-bundle.sh` (packages
-  `target/bundle/Glyph3D Wall.app` on macOS with `glyph3d-native`, `wallctl`,
-  `Info.plist`, generated `.icns`, and bundled `assets/atlas/emoji-sheet.bin`).
+  `glyph-vt` against reference emulators), `tools/wall-perf.sh` (flood
+  throughput, wake-rate, and zero-frame idle CPU harness against scratch
+  daemons), and `tools/wall-bundle.sh` (packages `target/bundle/Glyph3D Wall.app`
+  on macOS with `glyph3d-native`, `wallctl`, `Info.plist`, generated `.icns`,
+  and bundled `assets/atlas/emoji-sheet.bin`).
 - `.agents/` — agent house rules (`rules/rust-engineering.md`), the operational testing skill
   (`skills/glyph-engine-testing/SKILL.md`), and the definition engine's
   answering skill (`skills/definition-engine/SKILL.md`, 2026-10-31).
@@ -1180,8 +1185,9 @@ and the union is not:
   headless egui panel passes) run inside `cargo-test`, and `cargo-build`,
   `cargo-clippy`, `cargo-doc`, `cargo-check-no-ui` (every feature rung), and
   `orphans` check its code; nothing in `pixel-ab` pixel-compares a wall frame
-  against a committed baseline, and `tools/wall-smoke.sh`, `tools/vt-diff.sh`,
-  and `tools/wall-bundle.sh` run outside `build.toml`.
+  against a committed baseline, and `tools/wall-smoke.sh`,
+  `tools/wall-smoke-text.sh`, `tools/vt-diff.sh`, `tools/wall-perf.sh`, and
+  `tools/wall-bundle.sh` run outside `build.toml`.
 - **PROVENANCE.md's prose is generated but only partially validated.** The
   fixture count is READ FROM build.toml at generation time — the generator
   refuses to write an unverifiable number — but the rest of the prose is

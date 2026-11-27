@@ -208,7 +208,11 @@ imports the others' internals:
   outbound resize coalescing). `Sessions::pump()` swaps dirty screens into
   window-owned `front_screen` buffers without locking the emulator and yields
   `News` (`Filled`, `Resized`, `Title`, `Modes`, `Ended`, `Disconnected`),
-  waking the event loop through `EventLoopProxy<Wake>`.
+  waking the event loop through `EventLoopProxy<Wake>`. `agents.rs`
+  (`WallAgents`) bridges `agent-feed` (`FleetFollower`, `SessionPoller`,
+  `LineFollower`) to `wall_core::agent_views::AgentViews` on a `Condvar`-parked
+  worker thread (zero subprocesses when no agent terminal, Agent View, sidebar,
+  or palette is active) using the same coalesced `Wake` gate.
 - **`wall_core::wall::WallFrame` → `describe.rs` → `chrome.rs` → `WallRenderer`
   + `WallUi` / `mount.rs`**: `Wall::frame()` produces a device-free description;
   `describe::describe_frame_chrome_with_scrollback` delegates every canvas
@@ -508,11 +512,17 @@ documentation.
   `termd_client::paths::find_termd` before searching sibling binaries, sibling
   `glyph3d-js/bin/g3d-termd`, or `PATH`.
 - `GLYPH_WALL_HUD=1` — windowed (`egui-ui`): opens the `F1` wall debug HUD on
-  startup (any non-empty value other than `"0"`).
-- `GLYPH_WALL_PERF=1` — windowed: logs `[wall-perf]` frame draw, `Sessions::pump`,
-  and `rows_uploaded` latency percentiles (`mean`/`p50`/`p95`/`max`) once per
-  second while frames are presented (`wallctl app.perf [reset]` queries the
-  same counters on demand).
+  startup (any non-empty value other than `"0"`; `wallctl app.hud` toggles it
+  live).
+- `GLYPH_WALL_PERF=1` (plus `GLYPH_WALL_PERF_MAX_MS`,
+  `GLYPH_WALL_PERF_IDLE_MS`, `GLYPH_WALL_PERF_SETTLE_MS`, `wall/perf.rs`) —
+  windowed: activates `WallPerf` per-frame `App::pump` vs `App::draw` CPU
+  timing, upload counters, optional idle zero-frame settle/measure window, and
+  optional flood stall watchdog, printing one `wall-perf:` summary line on exit
+  (`wallctl app.perf [reset]` queries live counters).
+- `GLYPH_WALL_CLIPBOARD=memory` — windowed: routes wall copy/paste and
+  `wallctl app.clipboard` through an in-process clipboard buffer instead of the
+  OS clipboard so smoke scripts never touch a user's clipboard.
 - `GLYPH_WALL_SHOT=<path.png>` — counted `--frames N` wall run: renders the
   final frame (`N`) offscreen (including the `egui` panel overlay) and saves it
   as an RGBA PNG (`wallctl app.shot <path.png>` captures a live window frame at
