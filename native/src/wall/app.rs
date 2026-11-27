@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use glam::Vec2;
 use term_cells::Screen;
-use wall_core::config::OptionAsAlt;
+use wall_core::config::{CopyOnSelect, OptionAsAlt};
 use wall_core::geom::Point;
 use wall_core::input::{Button, KeyEvent, Mods, Platform};
 use wall_core::keymap::FieldFocus;
@@ -34,8 +34,9 @@ use wall_core::keymap::KeyDecision;
 use wall_core::layout::{ResizeCursor, Size};
 use wall_core::menu::Verdict;
 use wall_core::model::{CellGeometry, WallEffect};
-use wall_core::pointer::{Buttons, CursorIcon, PointerEvent, WheelEvent};
+use wall_core::pointer::{Buttons, CursorIcon, GestureKind, PointerEvent, WheelEvent, DRAG_SLOP_PX};
 use wall_core::scroll::DeltaMode;
+use wall_core::store::FullscreenMode;
 use wall_core::wall::{screen_lookup, ScreenFillDelta, TerminalAppeared, Wall, WallFrame as Described, WallOptions as RulesOptions};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
@@ -114,15 +115,86 @@ impl Terminals {
     }
 }
 
+/// Linux `PRIMARY` selection bridge (middle-click paste & copy-on-select).
+///
+/// Speaks Wayland (`zwp_primary_selection_device_manager_v1` via `smithay-clipboard`) when the
+/// window owns a Wayland display handle, and X11 (`XA_PRIMARY` via a persistent `arboard::Clipboard`
+/// so selection ownership stays alive after `set_text`) otherwise.
+#[cfg(target_os = "linux")]
+struct LinuxPrimaryClipboard {
+    wayland: Option<smithay_clipboard::Clipboard>,
+    x11: Option<arboard::Clipboard>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxPrimaryClipboard {
+    fn new(window: &Window) -> Self {
+        use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+        if let Ok(handle) = window.display_handle() {
+            if let RawDisplayHandle::Wayland(wl) = handle.as_raw() {
+                // SAFETY: `Gfx` drops `linux_primary` before `window`, so `wl.display`
+                // stays valid for the full lifetime of `smithay_clipboard::Clipboard`.
+                let sc = unsafe { smithay_clipboard::Clipboard::new(wl.display.as_ptr()) };
+                return Self {
+                    wayland: Some(sc),
+                    x11: None,
+                };
+            }
+        }
+        Self {
+            wayland: None,
+            x11: arboard::Clipboard::new().ok(),
+        }
+    }
+
+    fn get(&mut self) -> Option<String> {
+        if let Some(wl) = &self.wayland {
+            return wl.load_primary().ok().filter(|s| !s.is_empty());
+        }
+        if let Some(x11) = &mut self.x11 {
+            use arboard::{GetExtLinux, LinuxClipboardKind};
+            return x11
+                .get()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text()
+                .ok()
+                .filter(|s| !s.is_empty());
+        }
+        None
+    }
+
+    fn set(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(wl) = &self.wayland {
+            wl.store_primary(text);
+            return;
+        }
+        if let Some(x11) = &mut self.x11 {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            if let Err(e) = x11
+                .set()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text(text)
+            {
+                log::warn!("primary selection write failed: {e}");
+            }
+        }
+    }
+}
+
 /// What exists once there is a window.
 ///
 /// Field order is drop order, and it matters on Wayland: the egui layer
-/// (whose clipboard worker borrows the display) and the surface must go
-/// before the window (found on workstation, 2026-11-26: a segfault in
-/// `wl_proxy_destroy` at every exit).
+/// and `linux_primary` (whose clipboard workers borrow `wl_display`) and the
+/// surface must go before the window (found on workstation, 2026-11-26: a
+/// segfault in `wl_proxy_destroy` at every exit).
 struct Gfx {
     #[cfg(feature = "egui-ui")]
     ui: WallUi,
+    #[cfg(target_os = "linux")]
+    linux_primary: LinuxPrimaryClipboard,
     renderer: WallRenderer,
     depth: wgpu::TextureView,
     surface: wgpu::Surface<'static>,
@@ -187,6 +259,18 @@ struct App {
     /// Process-local clipboard used when `GLYPH_WALL_CLIPBOARD=memory` is set so automated
     /// smoke tests never read or overwrite a user's live OS clipboard.
     memory_clipboard: Option<String>,
+    /// Process-local stand-in for Linux's `PRIMARY` selection when `GLYPH_WALL_CLIPBOARD=memory`.
+    memory_primary: Option<String>,
+    /// Last `wall.model().selection_clipboard()` value synced out to `PRIMARY`.
+    last_synced_selection_clip: String,
+    /// Where the middle mouse button went down, and whether it travelled past `DRAG_SLOP_PX`.
+    middle_press_pos: Option<Point>,
+    middle_dragged: bool,
+    /// External files currently hovering over the window (`WindowEvent::HoveredFile`).
+    hovered_files: Vec<PathBuf>,
+    /// External files dropped in the current event batch (`WindowEvent::DroppedFile`),
+    /// coalesced into one shell-quoted paste before `about_to_wait` sleeps.
+    pending_dropped_files: Vec<PathBuf>,
     use_memory_clipboard: bool,
 }
 
@@ -516,6 +600,95 @@ fn smart_zoom_target_at(described: &Described, pt: Point) -> SmartZoomTarget {
     SmartZoomTarget::Canvas
 }
 
+/// Quote `path` as a POSIX shell token suitable for pasting into an interactive shell.
+///
+/// Plain ASCII paths containing only `[A-Za-z0-9/._\-+@:,%=]` stay unquoted; every other path
+/// (spaces, quotes, `$`, globs, parens, backslashes, newlines, non-ASCII) is wrapped in single
+/// quotes with embedded `'` escaped as `'\''`.
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    let safe_unquoted = !raw.is_empty()
+        && raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'/' | b'.' | b'_' | b'-' | b'+' | b'@' | b':' | b',' | b'%' | b'='
+                )
+        });
+    if safe_unquoted {
+        raw.into_owned()
+    } else {
+        format!("'{}'", raw.replace('\'', r"'\''"))
+    }
+}
+
+/// Format one or more dropped file paths as a space-separated shell-quoted string with a
+/// trailing space (matching Terminal.app, Ghostty, kitty, and WezTerm).
+fn format_dropped_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut out = paths
+        .iter()
+        .map(|p| shell_quote_path(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push(' ');
+    out
+}
+
+fn hovered_drop_notice(paths: &[PathBuf]) -> Option<String> {
+    match paths {
+        [] => None,
+        [only] => {
+            let label = only
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| only.display().to_string());
+            Some(format!("drop to paste path: {label}"))
+        }
+        many => Some(format!("drop to paste {} paths", many.len())),
+    }
+}
+
+/// Find the terminal body hit by a middle-click paste at `pt`, matching `WallPointer::on_down`
+/// (`HitPart::Body` inside the 6 px resize-edge band on the open canvas, or the active pane in
+/// fullscreen).
+fn middle_paste_target_at(described: &Described, pt: Point) -> Option<String> {
+    const EDGE_GRAB_PX: f64 = 6.0;
+    if let Some(fb) = &described.fullscreen_backdrop {
+        if fb.mode == FullscreenMode::Single {
+            return Some(fb.target.clone());
+        }
+    }
+    let vw = described.viewport.w;
+    let vh = described.viewport.h;
+    let cam = described.camera;
+    let mut best: Option<(f64, &str)> = None;
+    for t in &described.terminals {
+        let sb = cam.to_screen_box(t.body_rect, vw, vh);
+        let inset_x = if sb.right - sb.left > EDGE_GRAB_PX * 3.0 {
+            EDGE_GRAB_PX
+        } else {
+            0.0
+        };
+        let inset_y = if sb.bottom - sb.top > EDGE_GRAB_PX * 3.0 {
+            EDGE_GRAB_PX
+        } else {
+            0.0
+        };
+        if pt.x >= sb.left + inset_x
+            && pt.x <= sb.right - inset_x
+            && pt.y >= sb.top + inset_y
+            && pt.y <= sb.bottom - inset_y
+            && best.is_none_or(|(z, _)| t.z >= z)
+        {
+            best = Some((t.z, t.id.as_str()));
+        }
+    }
+    best.map(|(_, id)| id.to_string())
+}
+
 impl App {
     fn scale_factor(&self) -> f64 {
         self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor())
@@ -648,6 +821,8 @@ impl App {
         renderer.style_mut().panel_padding = PANEL_PAD / cell_scale;
         #[cfg(feature = "egui-ui")]
         let ui = WallUi::new(&self.ctx.device, &window, format);
+        #[cfg(target_os = "linux")]
+        let linux_primary = LinuxPrimaryClipboard::new(&window);
         let sf = window.scale_factor();
 
         // The rules, at the renderer's cell size and the window's viewport.
@@ -701,6 +876,8 @@ impl App {
         self.gfx = Some(Gfx {
             #[cfg(feature = "egui-ui")]
             ui,
+            #[cfg(target_os = "linux")]
+            linux_primary,
             renderer,
             depth,
             surface,
@@ -894,6 +1071,83 @@ impl App {
         if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
             log::warn!("copy: the clipboard refused the text: {e}");
         }
+    }
+
+    fn read_primary_selection(&mut self) -> Option<String> {
+        if self.use_memory_clipboard {
+            return self.memory_primary.clone().filter(|s| !s.is_empty());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(g) = &mut self.gfx {
+            return g.linux_primary.get();
+        }
+        None
+    }
+
+    fn write_primary_selection(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.use_memory_clipboard {
+            self.memory_primary = Some(text);
+        } else {
+            #[cfg(target_os = "linux")]
+            if let Some(g) = &mut self.gfx {
+                g.linux_primary.set(text);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = text;
+        }
+    }
+
+    fn drop_files(&mut self, paths: &[PathBuf]) {
+        let payload = format_dropped_paths(paths);
+        if payload.is_empty() {
+            return;
+        }
+        if let Some(wall) = &mut self.wall {
+            if wall.menu().is_some() {
+                let _ = wall.run("wall.menu close");
+            }
+            let described = wall.frame();
+            let target = if let Some(fb) = &described.fullscreen_backdrop {
+                match fb.mode {
+                    FullscreenMode::Single => Some(fb.target.clone()),
+                    FullscreenMode::Group => match smart_zoom_target_at(&described, self.cursor) {
+                        SmartZoomTarget::Terminal(id) => {
+                            if wall.focused_id() != Some(id.as_str()) {
+                                let _ = wall.run(format!("terminal.focus {id}"));
+                            }
+                            Some(id)
+                        }
+                        _ => wall.focused_id().map(str::to_owned),
+                    },
+                }
+            } else {
+                match smart_zoom_target_at(&described, self.cursor) {
+                    SmartZoomTarget::Terminal(id) => {
+                        if wall.focused_id() != Some(id.as_str()) {
+                            let _ = wall.run(format!("terminal.focus {id}"));
+                        }
+                        Some(id)
+                    }
+                    _ => wall.focused_id().map(str::to_owned),
+                }
+            };
+            if let Some(id) = target {
+                wall.deliver_clipboard(&id, &payload);
+            }
+        }
+        self.apply_effects();
+        self.redraw();
+    }
+
+    fn flush_dropped_files(&mut self) {
+        if self.pending_dropped_files.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_dropped_files);
+        self.drop_files(&batch);
     }
 
     fn apply(&mut self, effect: WallEffect) {
@@ -1212,6 +1466,9 @@ impl App {
         if described.notice.is_none() {
             described.notice.clone_from(&self.offline_notice);
         }
+        if described.notice.is_none() {
+            described.notice = hovered_drop_notice(&self.hovered_files);
+        }
         let ids: Vec<(String, u64)> = described.terminals.iter().map(|t| (t.id.clone(), 0)).collect();
         let ids: Vec<(String, u64)> = ids.into_iter().map(|(id, _)| (id.clone(), self.render_id(&id))).collect();
 
@@ -1469,6 +1726,13 @@ impl App {
 
     fn move_cursor(&mut self, x: f64, y: f64) {
         self.cursor = Point::new(x, y);
+        if (self.buttons & Buttons::MIDDLE.0) != 0
+            && self
+                .middle_press_pos
+                .is_some_and(|p| (x - p.x).hypot(y - p.y) > DRAG_SLOP_PX)
+        {
+            self.middle_dragged = true;
+        }
         let ev = self.pointer(None);
         if let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) {
             let lookup = screen_lookup(|id| terms.screen(id));
@@ -1712,6 +1976,7 @@ impl App {
         if !focused {
             self.modifiers = ModifiersState::empty();
             self.ime_composing = false;
+            self.hovered_files.clear();
             let had_buttons = self.buttons != 0;
             self.buttons = 0;
             let now_ms = self.now_ms();
@@ -1909,6 +2174,27 @@ impl App {
                 self.smart_zoom();
                 format!("OK: doubletap at ({:.2}, {:.2})", self.cursor.x, self.cursor.y)
             }
+            ScriptCommand::Drop { at, paths } => {
+                if let Some((x, y)) = at {
+                    self.move_cursor(x, y);
+                }
+                self.hovered_files.clear();
+                self.pending_dropped_files.clear();
+                let count = paths.len();
+                self.drop_files(&paths);
+                format!("OK: dropped {count} file(s)")
+            }
+            ScriptCommand::HoverFile(paths) => {
+                let count = paths.len();
+                self.hovered_files = paths;
+                self.redraw();
+                format!("OK: hovering {count} file(s)")
+            }
+            ScriptCommand::CancelFile => {
+                self.hovered_files.clear();
+                self.redraw();
+                "OK: hover file cancelled".to_string()
+            }
             ScriptCommand::Key(k) => {
                 use super::script::{modifier_bit_of_physical, ScriptKeyPhase};
                 match k.phase {
@@ -2013,6 +2299,27 @@ impl App {
                     }
                 }
             }
+            ScriptCommand::Primary(clip_cmd) => {
+                use super::script::ScriptClipboard;
+                match clip_cmd {
+                    ScriptClipboard::Get => self.read_primary_selection().unwrap_or_default(),
+                    ScriptClipboard::Clear => {
+                        if self.use_memory_clipboard {
+                            self.memory_primary = None;
+                        }
+                        self.last_synced_selection_clip.clear();
+                        "OK: primary cleared".to_string()
+                    }
+                    ScriptClipboard::Set(text) => {
+                        if !self.use_memory_clipboard {
+                            "ERR: app.primary set requires GLYPH_WALL_CLIPBOARD=memory".to_string()
+                        } else {
+                            self.memory_primary = Some(text);
+                            "OK: primary set".to_string()
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2027,41 +2334,86 @@ impl App {
         }
         let ev = self.pointer(Some(b));
         let secondary = wall_core::menu::is_secondary_press(b, ev.mods, Platform::host());
-        let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
-        let lookup = screen_lookup(|id| terms.screen(id));
-        if pressed {
-            #[cfg(feature = "egui-ui")]
-            {
-                self.panels.blur_docked_inputs();
-                if let Some(g) = &self.gfx {
-                    g.ui.surrender_focus();
+        if pressed && b == Button::Middle {
+            self.middle_press_pos = Some(Point::new(ev.x, ev.y));
+            self.middle_dragged = false;
+        }
+        // On Linux (or in `GLYPH_WALL_CLIPBOARD=memory` tests), an un-dragged middle-click on a
+        // terminal body pastes the OS `PRIMARY` selection when non-empty (unless a focused DECSET
+        // mouse-reporting program claimed the middle press), falling back to the wall's internal
+        // `selection_clipboard` when `PRIMARY` is empty.
+        if !pressed && b == Button::Middle && !self.middle_dragged {
+            self.middle_press_pos = None;
+            let primary_target = self.wall.as_mut().and_then(|wall| {
+                if !matches!(
+                    wall.pointer().active_gesture(),
+                    Some(GestureKind::Pan | GestureKind::FsPaste)
+                ) {
+                    return None;
                 }
-            }
-            // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
-            // mouse-reporting program claims it; no browser-menu passthrough.
-            if secondary {
-                if wall.menu().is_some() {
-                    let _ = wall.run("wall.menu close");
-                }
-                if wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+                let described = wall.frame();
+                middle_paste_target_at(&described, Point::new(ev.x, ev.y))
+            });
+            if let Some(tid) = primary_target {
+                if let Some(primary_text) = self.read_primary_selection() {
+                    if let Some(wall) = &mut self.wall {
+                        wall.pointer_cancel(&ev);
+                        wall.deliver_clipboard(&tid, &primary_text);
+                    }
                     self.apply_effects();
                     self.redraw();
                     return;
                 }
             }
-            wall.pointer_down(&ev, &lookup);
-        } else {
-            wall.pointer_up(&ev, &lookup);
-            if b == Button::Left && !secondary {
-                let here = Point::new(ev.x, ev.y);
-                let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
-                if double {
-                    wall.pointer_double_click(&ev);
-                    self.last_release = None;
-                } else {
-                    self.last_release = Some((ev.time_ms, here));
+        }
+        let mut new_primary: Option<String> = None;
+        {
+            let (Some(wall), Some(terms)) = (&mut self.wall, &self.terms) else { return };
+            let lookup = screen_lookup(|id| terms.screen(id));
+            if pressed {
+                #[cfg(feature = "egui-ui")]
+                {
+                    self.panels.blur_docked_inputs();
+                    if let Some(g) = &self.gfx {
+                        g.ui.surrender_focus();
+                    }
+                }
+                // A secondary press (right-click, or Ctrl+left-click on macOS) opens (or moves) the wall's menu unless a focused
+                // mouse-reporting program claims it; no browser-menu passthrough.
+                if secondary {
+                    if wall.menu().is_some() {
+                        let _ = wall.run("wall.menu close");
+                    }
+                    if wall.context_menu(ev.x, ev.y, ev.mods).verdict != Verdict::Program {
+                        self.apply_effects();
+                        self.redraw();
+                        return;
+                    }
+                }
+                wall.pointer_down(&ev, &lookup);
+            } else {
+                wall.pointer_up(&ev, &lookup);
+                if b == Button::Left && !secondary {
+                    if wall.config().copy_on_select != CopyOnSelect::False {
+                        let sel_clip = wall.model().selection_clipboard();
+                        if !sel_clip.is_empty() && sel_clip != self.last_synced_selection_clip {
+                            self.last_synced_selection_clip = sel_clip.to_owned();
+                            new_primary = Some(sel_clip.to_owned());
+                        }
+                    }
+                    let here = Point::new(ev.x, ev.y);
+                    let double = self.last_release.is_some_and(|(t, p)| ev.time_ms - t <= DOUBLE_CLICK_MS && (p.x - here.x).abs() <= DOUBLE_CLICK_PX && (p.y - here.y).abs() <= DOUBLE_CLICK_PX);
+                    if double {
+                        wall.pointer_double_click(&ev);
+                        self.last_release = None;
+                    } else {
+                        self.last_release = Some((ev.time_ms, here));
+                    }
                 }
             }
+        }
+        if let Some(primary_text) = new_primary {
+            self.write_primary_selection(primary_text);
         }
         self.apply_effects();
         self.redraw();
@@ -2160,6 +2512,21 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::DoubleTapGesture { .. } if !ui_pointer => self.smart_zoom(),
             // Terminals on the wall sit strictly axis-aligned; two-finger rotation is a no-op.
             WindowEvent::RotationGesture { .. } => {}
+            WindowEvent::HoveredFile(path) if !ui_pointer => {
+                self.hovered_files.push(path);
+                self.redraw();
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if !self.hovered_files.is_empty() {
+                    self.hovered_files.clear();
+                    self.redraw();
+                }
+            }
+            WindowEvent::DroppedFile(path) if !ui_pointer => {
+                self.hovered_files.clear();
+                self.pending_dropped_files.push(path);
+                self.redraw();
+            }
             WindowEvent::Ime(ime) if !ui_keys => self.ime(&ime),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if !ui_keys => {
                 self.key(&event, event_loop);
@@ -2177,6 +2544,7 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.serve_control();
+        self.flush_dropped_files();
         if self.quit {
             event_loop.exit();
             return;
@@ -2281,6 +2649,12 @@ pub fn run(ctx: GpuContext, opts: WallOptions) {
         clock_offset_ms: 0.0,
         last_copied: None,
         memory_clipboard: None,
+        memory_primary: None,
+        last_synced_selection_clip: String::new(),
+        middle_press_pos: None,
+        middle_dragged: false,
+        hovered_files: Vec::new(),
+        pending_dropped_files: Vec::new(),
         use_memory_clipboard: std::env::var("GLYPH_WALL_CLIPBOARD")
             .is_ok_and(|v| v.eq_ignore_ascii_case("memory")),
     };
@@ -2714,5 +3088,76 @@ mod pointer_fidelity_tests {
         let world_after = wall.camera().to_world(pt);
         assert!((wall.camera().zoom() - 4.0 * (0.25_f64).exp()).abs() < 1e-6);
         assert!((world_after.x - world_before.x).hypot(world_after.y - world_before.y) < 1e-6);
+    }
+
+    #[test]
+    fn shell_quote_path_and_dropped_file_formatting_escape_unsafe_shell_metacharacters() {
+        use std::path::Path;
+
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/plain_file-1.2+ok@host:dir/a=b,c%d")),
+            "/tmp/plain_file-1.2+ok@host:dir/a=b,c%d"
+        );
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/my file's (1) $HOME & *.txt")),
+            r"'/tmp/my file'\''s (1) $HOME & *.txt'"
+        );
+        assert_eq!(shell_quote_path(Path::new("")), "''");
+        assert_eq!(
+            shell_quote_path(Path::new("/tmp/日本語.rs")),
+            "'/tmp/日本語.rs'"
+        );
+
+        let batch = vec![
+            PathBuf::from("/tmp/clean.rs"),
+            PathBuf::from("/tmp/two words'here.txt"),
+        ];
+        assert_eq!(
+            format_dropped_paths(&batch),
+            "/tmp/clean.rs '/tmp/two words'\\''here.txt' "
+        );
+        assert_eq!(
+            hovered_drop_notice(&batch[..1]).as_deref(),
+            Some("drop to paste path: clean.rs")
+        );
+        assert_eq!(
+            hovered_drop_notice(&batch).as_deref(),
+            Some("drop to paste 2 paths")
+        );
+    }
+
+    #[test]
+    fn middle_paste_target_hits_interior_body_and_excludes_resize_perimeter_and_empty_paper() {
+        let mut wall = Wall::in_memory(RulesOptions {
+            viewport: Size::new(1600.0, 1000.0),
+            scale_factor: 1.0,
+            ..RulesOptions::default()
+        });
+        wall.terminal_appeared(TerminalAppeared::new("t1", 80, 24));
+        wall.run("wall.fit");
+        for i in 1..=60 {
+            wall.tick(1.0 / 60.0, f64::from(i) * 16.0);
+        }
+        wall.pinch(800.0, 500.0, 0.5);
+        let described = wall.frame();
+        let sb = described.camera.to_screen_box(
+            described.terminals[0].body_rect,
+            described.viewport.w,
+            described.viewport.h,
+        );
+        let center = Point::new(0.5 * (sb.left + sb.right), 0.5 * (sb.top + sb.bottom));
+        assert_eq!(
+            middle_paste_target_at(&described, center).as_deref(),
+            Some("t1")
+        );
+        // Right on the outer resize edge (`sb.left + 2.0`) is `HitPart::Edge`, not `Body`.
+        assert_eq!(
+            middle_paste_target_at(&described, Point::new(sb.left + 2.0, center.y)),
+            None
+        );
+        assert_eq!(
+            middle_paste_target_at(&described, Point::new(20.0, 20.0)),
+            None
+        );
     }
 }
