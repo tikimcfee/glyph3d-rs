@@ -858,7 +858,27 @@ else
 fi
 
 # ── 19. Help-panel wall chords stay with the wall (including toggle-close) ───
-BEFORE_CHORDS="$(ctl app.text t2)"
+# What reached t2 between two marker bytes, typed before and after the chords. The terminal
+# keeps its input in order, so once the second marker is echoed everything a chord could have
+# leaked ahead of it has been echoed too. Until 2026-11-27 this compared t2's text before
+# and after with no wait at all: the "before" could be read while check 18's last bytes
+# (the paste's closing bracket) were still on their way, and those then read as a leak.
+t2_keys_after_marker() { # the bytes t2 echoed after its last `8` (0x38), as hex
+    ctl app.text t2 2>/dev/null | python3 -c '
+import re, sys
+keys = bytes.fromhex("".join(re.findall(r"K:([0-9a-f]+)", sys.stdin.read())))
+at = keys.rfind(b"8")
+print(keys[at + 1:].hex() if at >= 0 else "no-marker")
+'
+}
+ctl terminal.focus t2 >/dev/null
+ctl app.type "8" >/dev/null
+MARKED=0
+for _ in $(seq 1 100); do
+    # Settled: the marker is the last thing t2 has echoed.
+    [[ "$(t2_keys_after_marker)" == "" ]] && { MARKED=1; break; }
+    sleep 0.04
+done
 
 # Toggle Settings open & closed (`chord+,`), Help (`chord+/`), Sidebar (`chord+b`),
 # Status (`chord+s`), Palette (`chord+k`), Grid (`chord+shift+'`), Fullscreen (`chord+Enter`).
@@ -902,9 +922,23 @@ ctl app.key "shift+F10" >/dev/null
 KEY_MENU="$(ctl app.where | awk '/^menu / {print $2}')"
 ctl app.key Escape >/dev/null
 
-AFTER_CHORDS="$(ctl app.text t2)"
-CHORD_LEAKED=0
-[[ "$BEFORE_CHORDS" != "$AFTER_CHORDS" ]] && CHORD_LEAKED=1
+ctl app.type "9" >/dev/null
+BETWEEN="unseen"
+for _ in $(seq 1 100); do
+    BETWEEN="$(t2_keys_after_marker)"
+    # The second marker has been echoed: what precedes it is what leaked.
+    [[ "$BETWEEN" == *39 ]] && break
+    sleep 0.04
+done
+CHORD_LEAKED="marker never echoed (${BETWEEN})"
+if [[ "$MARKED" -eq 1 && "$BETWEEN" == *39 ]]; then
+    LEAKED_HEX="${BETWEEN%39}"
+    if [[ -z "$LEAKED_HEX" ]]; then
+        CHORD_LEAKED=0
+    else
+        CHORD_LEAKED="$LEAKED_HEX"
+    fi
+fi
 
 if [[ "$P_SET_ON" == *"settings=true"* && "$P_SET_OFF" == *"settings=false"* \
    && "$P_HLP_ON" == *"help=true"* && "$P_HLP_OFF" == *"help=false"* \
@@ -913,8 +947,8 @@ if [[ "$P_SET_ON" == *"settings=true"* && "$P_SET_OFF" == *"settings=false"* \
    && "$P_PAL_ON" == *"palette=true"* && "$P_PAL_OFF" == *"palette=false"* \
    && "$FS_ON" != "none" && "$FS_OFF" == "none" \
    && "$FOC_1" != "$FOC_0" && "$FOC_BACK" == "$FOC_0" \
-   && "$KEY_MENU" == "terminal:t2" && "$CHORD_LEAKED" -eq 0 ]]; then
-    record_pass "wall chords vs terminal" "panels/fullscreen/focus/menu chords acted; 0 bytes leaked to t2"
+   && "$KEY_MENU" == "terminal:t2" && "$CHORD_LEAKED" == "0" ]]; then
+    record_pass "wall chords vs terminal" "panels/fullscreen/focus/menu chords acted; 0 bytes reached t2 between the two markers"
 else
     record_fail "wall chords vs terminal" "set=($P_SET_ON->$P_SET_OFF) hlp=($P_HLP_ON->$P_HLP_OFF) pal=($P_PAL_ON->$P_PAL_OFF) fs=($FS_ON->$FS_OFF) foc=($FOC_0->$FOC_1->$FOC_BACK) menu=$KEY_MENU leaked=$CHORD_LEAKED"
 fi
