@@ -484,6 +484,7 @@ impl SparseEmojiSource {
         }
     }
 
+    #[cfg(feature = "wgpu")]
     fn archive_if_loaded(&self) -> Option<&EmojiSheetArchive> {
         match &self.archive {
             ArchiveBacking::Loaded(a) => Some(a.as_ref()),

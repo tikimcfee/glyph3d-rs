@@ -12,10 +12,10 @@
 //!      `/System/Library/Fonts/Supplemental`.
 //!    - **Linux:** `$XDG_DATA_HOME/fonts` (or `~/.local/share/fonts`), `~/.fonts`,
 //!      `/usr/local/share/fonts`, `/usr/share/fonts`.
-//!    Every `.ttf`, `.otf`, `.ttc`, and `.otc` file is inspected via `ttf-parser` across
-//!    all collection face indices, reading both Unicode (`platform 0/3`) and Macintosh Roman
-//!    (`platform 1, encoding 0`) `name` table entries (required on macOS for `Menlo.ttc`,
-//!    `Monaco.ttf`, and `Courier.ttc`).
+//!      Every `.ttf`, `.otf`, `.ttc`, and `.otc` file is inspected via `ttf-parser` across
+//!      all collection face indices, reading both Unicode (`platform 0/3`) and Macintosh Roman
+//!      (`platform 1, encoding 0`) `name` table entries (required on macOS for `Menlo.ttc`,
+//!      `Monaco.ttf`, and `Courier.ttc`).
 //! 3. **Linux `fc-list` fallback:** if direct directory scanning finds no match on Linux,
 //!    queries `fc-list : family file index` (when `fc-list` is on `PATH`) so custom
 //!    `fonts.conf` directories and fontconfig aliases work too.
@@ -178,10 +178,10 @@ fn scan_file_into(path: &Path, by_key: &mut HashMap<String, Vec<ScannedFace>>) {
                         keys.push(k);
                     }
                 }
-                name_id::SUBFAMILY | name_id::TYPOGRAPHIC_SUBFAMILY => {
-                    if subfamily.is_none() {
-                        subfamily = Some(trimmed.to_owned());
-                    }
+                name_id::SUBFAMILY | name_id::TYPOGRAPHIC_SUBFAMILY
+                    if subfamily.is_none() =>
+                {
+                    subfamily = Some(trimmed.to_owned());
                 }
                 _ => {}
             }
@@ -295,7 +295,7 @@ fn fc_list_candidates(name: &str) -> Vec<ScannedFace> {
     by_key.remove(&want).unwrap_or_default()
 }
 
-fn pick_best<'a>(faces: &'a [ScannedFace], want_italic: bool, target_weight: u16) -> Option<&'a ScannedFace> {
+fn pick_best(faces: &[ScannedFace], want_italic: bool, target_weight: u16) -> Option<&ScannedFace> {
     faces
         .iter()
         .filter(|f| f.italic == want_italic)
