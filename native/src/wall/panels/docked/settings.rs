@@ -4,7 +4,7 @@
 //! left; the chosen section's settings on the right, each a plain label, one
 //! line saying what it does, and its control. A search reads every section
 //! and says which section each match is in; a click on a section narrows the
-//! results to it. Narrower than [`TWO_PANE_MIN_W`] (docked, until its edge is
+//! results to it. Narrower than `TWO_PANE_MIN_W` (docked, until its edge is
 //! dragged), the sections are a row of chips above the settings.
 //!
 //! What is shown for a query and a section is `wall_core::settings::settings_view`;

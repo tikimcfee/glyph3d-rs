@@ -15,7 +15,7 @@
 //!
 //! A panel's edge can be dragged ([`panels::resize`]). The size reaches the
 //! wall on release, as a verb; until then the docked panels and the topbar
-//! are laid out with the dragged width ([`Panels::live_dock`]), so what is
+//! are laid out with the dragged width (`Panels::live_dock`), so what is
 //! stacked inside a panel follows its edge as it moves.
 
 use std::collections::BTreeMap;

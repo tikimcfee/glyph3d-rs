@@ -109,7 +109,7 @@
 # 1192 -> 1193 (2026-11-27): the sidebar's row names (1).
 # 1193 -> 1194 (2026-11-27): the count a green run printed; the floor was
 # already one behind at d76a4bf (1175 ran against 1174).
-test_floor = 1211
+test_floor = 1246
 # The longest any one process a gate runs may take, in seconds
 # (2026-11-01, glyph/src/bounded.rs): each test binary cargo-test runs, each
 # test target `test --relax` runs, each golden render, each kind = "cmd"
