@@ -227,6 +227,14 @@ fn fleet_snapshot_to_gomux(snap: &FleetSnapshot) -> GomuxSnapshot {
     }
 }
 
+/// The outage mark for a fleet last known current at `at`.
+fn bus_stale_at(at: std::time::SystemTime) -> BusStale {
+    let since_ms = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    BusStale { since_ms, clock: local_clock_hhmm(since_ms / 1000) }
+}
+
 /// `unix_secs` on this machine's wall clock, `HH:MM`: what a person reads beside
 /// "last seen". UTC where the C library cannot say (it always can on macOS and Linux).
 pub(crate) fn local_clock_hhmm(unix_secs: u64) -> String {
@@ -445,6 +453,9 @@ pub struct WallAgents {
     scrolled_rows: HashMap<String, u64>,
     live_meta: HashMap<String, LiveTerminalMeta>,
     last_fleet: Option<FleetSnapshot>,
+    /// The last pump at which a running feed had printed a snapshot and was up: when the
+    /// fleet in `last_fleet` was last known to be current.
+    fleet_seen_at: Option<std::time::SystemTime>,
     last_bus_reason: String,
     feed_requested: bool,
     bus_requested: bool,
@@ -496,6 +507,7 @@ impl WallAgents {
             scrolled_rows: HashMap::new(),
             live_meta: HashMap::new(),
             last_fleet: None,
+            fleet_seen_at: None,
             last_bus_reason: String::new(),
             feed_requested: false,
             bus_requested: false,
@@ -682,9 +694,25 @@ impl WallAgents {
             .as_ref()
             .map(|f| (f.snapshot(), f.last_error(), f.down_since()));
 
+        // No feed has printed this fleet yet: none is running (the sidebar closed) or
+        // one was started anew and has not read its first snapshot (the sidebar
+        // reopened, ~100 ms). The wall still holds the fleet the last feed printed,
+        // which must not read as live, so it says when that was. An outage already
+        // marked keeps its own moment.
+        let unconfirmed = fleet_obs.as_ref().is_none_or(|(snap, _, _)| snap.gen == 0);
+        if unconfirmed && self.last_fleet.is_some() && wall.bus_stale().is_none() {
+            let at = self.fleet_seen_at.unwrap_or_else(std::time::SystemTime::now);
+            if wall.set_bus_stale(Some(bus_stale_at(at))) {
+                bus_changed = true;
+            }
+        }
+
         if let Some((snap, err, down_since)) = fleet_obs {
             let reason = err.unwrap_or_default();
             if snap.gen > 0 {
+                if down_since.is_none() {
+                    self.fleet_seen_at = Some(std::time::SystemTime::now());
+                }
                 // The fleet itself is compared, not its generation: a follower started
                 // anew (the sidebar closed and opened again) counts from 1 again, so
                 // until 2026-11-27 its first snapshot could carry the generation the
@@ -702,12 +730,7 @@ impl WallAgents {
                 }
                 // The feed down: the fleet above is as it last was, and the wall says
                 // since when instead of showing a frozen list as live.
-                let stale = down_since.map(|at| {
-                    let since_ms = at
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                    BusStale { since_ms, clock: local_clock_hhmm(since_ms / 1000) }
-                });
+                let stale = down_since.map(bus_stale_at);
                 if wall.set_bus_stale(stale) {
                     bus_changed = true;
                 }
@@ -1940,18 +1963,32 @@ mod tests {
             let _ = agents.pump(&mut wall);
             agents.fleet_slot.lock().unwrap().is_none()
         }));
+        // With no feed running, the fleet the wall still holds is as of when the last
+        // one was up, and says so.
+        let _ = agents.pump(&mut wall);
+        let closed = wall.bus_stale().cloned();
+        assert!(closed.is_some(), "a fleet no feed is reading is marked stale");
 
         // Meanwhile the helper is cleaned up and another agent is at work.
         fs::write(&fleet, fleet_line("other", "waiting")).unwrap();
         assert!(wall.run("wall.sidebar open").text.starts_with("OK"));
+        let other = vec![("other@laptop-2".to_string(), "waiting".to_string())];
+        let mut shown_unmarked = None;
         assert!(
             wait_until(STUB_WAIT, || {
                 let _ = agents.pump(&mut wall);
-                bus_rows(&wall) == vec![("other@laptop-2".to_string(), "waiting".to_string())]
+                // Until the new follower's first snapshot the old list shows, and
+                // never as live: marked as of the moment the last feed was up.
+                if bus_rows(&wall) != other && wall.bus_stale() != closed.as_ref() {
+                    shown_unmarked.get_or_insert_with(|| (bus_rows(&wall), wall.bus_stale().cloned()));
+                }
+                bus_rows(&wall) == other
             }),
             "the reopened sidebar still lists {:?}",
             bus_rows(&wall)
         );
+        assert_eq!(shown_unmarked, None, "the old list, before the first snapshot, as (rows, stale)");
+        assert_eq!(wall.bus_stale(), None, "the first snapshot clears the mark");
         assert_eq!(agents.last_fleet.as_ref().map(|f| f.gen), Some(1), "the same generation, another fleet");
         agents.shutdown();
     }
