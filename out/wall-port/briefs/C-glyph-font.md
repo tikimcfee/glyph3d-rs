@@ -29,7 +29,7 @@ take any new text through it.
   clamps `coverage` where the JS shader takes `abs(coverage)` first; that is the
   renderer's to fix, but tell the lead if your curves depend on winding direction).
 - The encoder you are porting, in the JS repository (read-only):
-  `/Users/lugo/localdev/viz-web/glyph3d-js/packages/glyph3d-core/src/shaping/slugData.js`
+  `~/localdev/viz-web/glyph3d-js/packages/glyph3d-core/src/shaping/slugData.js`
   (outline to curves), `SlugEncoder` and `LiveSlugAtlas.js` beside it (how the live
   atlas grows), `FontChain.js` (families, faces, fallback routing),
   `core/cellMetrics.js` (the cell's size and why it is snapped), and

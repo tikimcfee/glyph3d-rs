@@ -169,10 +169,7 @@ fn parse_args() -> Args {
 }
 
 fn locate_termd_bin() -> Result<PathBuf, String> {
-    let local = PathBuf::from("/Users/lugo/.local/bin/g3d-termd");
-    if local.is_file() {
-        return Ok(local);
-    }
+    // `$G3D_TERMD_BIN`, beside this binary, `~/.local/bin`, `~/.cargo/bin`, then PATH.
     find_termd()
 }
 

@@ -1,6 +1,6 @@
 # JS-to-Rust Wall Parity Audit (2026-11-26)
 
-- **JS baseline**: `/Users/lugo/localdev/viz-web/glyph3d-js/wall/` (all 44 `.js`/`.jsx` files) + wall-used modules in `packages/glyph3d-core/src/` @ `7addab95`
+- **JS baseline**: `~/localdev/viz-web/glyph3d-js/wall/` (all 44 `.js`/`.jsx` files) + wall-used modules in `packages/glyph3d-core/src/` @ `7addab95`
 - **Rust target**: `glyph3d-rs` (`wall` @ `f5f5c35` + `wall-root` follow-ups & link rules)
 - **Scope**: Every user-visible or triggerable behaviour — verbs, chords, gestures, menu items, panel controls, settings, notices, animations, persistence rules, rendering/VT details, and edge cases.
 - **At a glance**:
@@ -246,7 +246,7 @@ All 49 `WallConfig` knobs are defined in `crates/wall-core/src/config.rs` and `s
 
 ## 3. Complete JS File-by-File Coverage Index
 
-### A. `/Users/lugo/localdev/viz-web/glyph3d-js/wall/` (All 44 `.js`/`.jsx` Files)
+### A. `~/localdev/viz-web/glyph3d-js/wall/` (All 44 `.js`/`.jsx` Files)
 
 | # | JS file | Rust counterpart(s) | Status |
 |---|---|---|---|

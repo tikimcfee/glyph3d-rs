@@ -3,13 +3,13 @@
 //! Combines the two halves that power an Agent View in the browser wall:
 //!
 //! 1. **Windowed reading & newline-scanning tail math** from
-//!    `/Users/lugo/localdev/viz-web/glyph3d-js/cli/agentevents.go` ([`tail_from`],
+//!    `glyph3d-js/cli/agentevents.go` ([`tail_from`],
 //!    [`read_transcript_window`]): computes the `--from` byte offset for the last ~256 KiB of a
 //!    transcript in O(window) I/O without parsing the transcript, treats a live session whose
 //!    transcript file has not yet been created on disk as `{lines: [], size: 0}`, and enforces
 //!    [`MAX_READ_BYTES`] (`64 MiB`).
 //! 2. **Stream folding, provisional-reply pruning, `load_earlier`, and orphan adoption** from
-//!    `/Users/lugo/localdev/viz-web/glyph3d-js/wall/WallAgentViews.js` ([`TranscriptState`],
+//!    `glyph3d-js/wall/WallAgentViews.js` ([`TranscriptState`],
 //!    [`TranscriptFollower`]):
 //!    - Hydrates the initial 256 KiB tail window, tracking each event's first-seen [`EventPos`],
 //!      placing `op: "update"` frames whose `add` preceded the window into `orphans`, and

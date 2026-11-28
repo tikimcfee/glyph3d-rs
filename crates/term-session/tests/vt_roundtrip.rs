@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -65,15 +66,41 @@ impl Drop for ScratchDaemon {
             reconnect_window: Duration::from_millis(100),
             ..ConnectOptions::default()
         };
+        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
+        let holder = holder_pid(&sock);
         if let Ok(c) = Termd::connect_with(&target, "vt-cleanup", opts, Box::new(|| {})) {
             let _ = c.stop();
         }
-        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while sock.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_the_holder_to_go(&sock, holder);
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The pid in a namespace's lock file: its holder's, while the namespace is held.
+fn holder_pid(sock: &Path) -> Option<u32> {
+    let text = fs::read_to_string(format!("{}.lock", sock.display())).ok()?;
+    text.trim().parse().ok().filter(|pid| *pid > 1)
+}
+
+/// Whether a process with this pid exists: `kill -0` signals nothing.
+fn process_exists(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Waits, up to 5 s, until a stopped namespace's socket has gone and its holder has too. The
+/// holder writes its last log lines after it removes its socket, and its logger writes a log
+/// that was removed under it anew, so a scratch directory removed while the holder is still
+/// leaving can be left behind holding those lines. One was, on 2026-11-27 at a load average
+/// of 19 (`/tmp/g3d-s-<pid>-resize-8`), from `session_live.rs`, whose cleanup this one
+/// shared: the stop had also outlasted the 500 ms both waited for the socket alone.
+fn wait_for_the_holder_to_go(sock: &Path, holder: Option<u32>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && (sock.exists() || holder.is_some_and(process_exists)) {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

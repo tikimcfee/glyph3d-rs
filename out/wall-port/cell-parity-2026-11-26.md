@@ -1,6 +1,6 @@
 # Cell renderer visual parity pass vs. the browser wall (2026-11-26)
 
-Visual and pixel-level audit of `native/src/wall/` (`WallRenderer`, `wall_cells.wgsl`, `glyph-font`) against the browser wall (`/Users/lugo/localdev/viz-web/glyph3d-js/packages/glyph3d-core/` and `wall/`) on real program captures recorded through a scratch `g3d-termd` daemon (`crates/termd-client/examples/termd_record.rs`) at the wall's default **`100×30`** terminal size (plus `80×24` for `term-test-pattern.vt`).
+Visual and pixel-level audit of `native/src/wall/` (`WallRenderer`, `wall_cells.wgsl`, `glyph-font`) against the browser wall (`~/localdev/viz-web/glyph3d-js/packages/glyph3d-core/` and `wall/`) on real program captures recorded through a scratch `g3d-termd` daemon (`crates/termd-client/examples/termd_record.rs`) at the wall's default **`100×30`** terminal size (plus `80×24` for `term-test-pattern.vt`).
 
 ## Fixtures captured and zooms inspected
 

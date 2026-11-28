@@ -511,7 +511,7 @@ for r in range(2, rows):
     bg = "\x1b[48;5;235m" if (r % 5 == 0) else ""
     txt = f" [{r:02d}] Compiling crate_{r:02d} v0.1.0 (src/module_{r:02d}.rs:{r*17}) -> ok"
     lines.append(f"{bg}\x1b[{fg}m{txt:<{cols}.{cols}}\x1b[0m")
-lines.append("\x1b[32mlugo@host\x1b[0m:\x1b[34m~/dev/glyph3d-rs\x1b[0m$ ")
+lines.append("\x1b[32muser@host\x1b[0m:\x1b[34m~/dev/glyph3d-rs\x1b[0m$ ")
 with open(path, "w", encoding="utf-8") as f:
     f.write("\r\n".join(lines))
 PY

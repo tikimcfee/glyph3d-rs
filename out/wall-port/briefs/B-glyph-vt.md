@@ -19,17 +19,17 @@ terminal core, and you are vendoring it and putting one seam in front of it.
 - `crates/term-cells/src/lib.rs` in this repo: the `Screen` you fill. It is the
   contract with the renderer; if it cannot express something a terminal shows, tell
   the lead instead of changing it.
-- `/Users/lugo/localdev/makepad/apps/terminal/src/term/` (start at `mod.rs`): the VT
+- `~/localdev/makepad/apps/terminal/src/term/` (start at `mod.rs`): the VT
   core. It says of itself "no Makepad, no PTY, no I/O". Its one outside dependency is
-  `/Users/lugo/localdev/makepad/libs/cell_width`. Licence: MIT (Ghostty's and
+  `~/localdev/makepad/libs/cell_width`. Licence: MIT (Ghostty's and
   makepad's), Unicode-3.0 for the width data.
 - `out/wall-port/review-carbon-2026-11-23.md`, "Decision 1" and "Risk 3": three gaps a
   reviewer found in that core when it is used as a passive client. Check each against
   the source before trusting it.
-- `/Users/lugo/localdev/viz-web/glyph3d-js/docs/termd/PROTOCOL.md`, sections `REPAINT`
+- `~/localdev/viz-web/glyph3d-js/docs/termd/PROTOCOL.md`, sections `REPAINT`
   and "Terminal queries are termd's to answer": what the bytes are, and why this
   emulator must never answer a query.
-- `/Users/lugo/localdev/viz-web/glyph3d-js/packages/glyph3d-core/src/collections/TerminalEmulator.js`
+- `~/localdev/viz-web/glyph3d-js/packages/glyph3d-core/src/collections/TerminalEmulator.js`
   (`readScreen`) and `docs/architecture/terminals.md` "Cells": how the JS app resolves
   a cell today (inverse, conceal, bold-is-bright, wide characters, clusters). Match
   its rules; they are what the user is used to.
@@ -68,7 +68,7 @@ terminal core, and you are vendoring it and putting one seam in front of it.
   wide character, a combining cluster, the cursor's position and shape, the alternate
   screen, a resize, soft-wrap flags, the title.
 - The 29 conformance snippets at
-  `/Users/lugo/localdev/viz-web/glyph3d-js/tools/fixtures/vt-conf/*.vt`: copy them
+  `~/localdev/viz-web/glyph3d-js/tools/fixtures/vt-conf/*.vt`: copy them
   into this crate's test data. For each, feeding it whole and feeding it one byte at a
   time must give the same `Screen` (frame boundaries mean nothing), and no snippet
   panics.

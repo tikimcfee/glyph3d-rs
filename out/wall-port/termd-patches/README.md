@@ -1,8 +1,8 @@
 # `g3d-termd` Differential-Fidelity Patches (`T1`–`T3`)
 
-Three standalone git patches against `glyph3d-js` (`crates/g3d-termd`, `crates/g3d-hold`, and `docs/termd/PROTOCOL.md`), produced from an isolated scratch copy without modifying `/Users/lugo/localdev/viz-web/glyph3d-js` or `~/.local/bin`.
+Three standalone git patches against `glyph3d-js` (`crates/g3d-termd`, `crates/g3d-hold`, and `docs/termd/PROTOCOL.md`), produced from an isolated scratch copy without modifying `~/localdev/viz-web/glyph3d-js` or `~/.local/bin`.
 
-Apply in `/Users/lugo/localdev/viz-web/glyph3d-js` with:
+Apply in `~/localdev/viz-web/glyph3d-js` with:
 
 ```sh
 git am out/wall-port/termd-patches/0001-t1-repaint-preserve-soft-wraps.patch \
@@ -58,7 +58,7 @@ git am out/wall-port/termd-patches/0001-t1-repaint-preserve-soft-wraps.patch \
 
 ## Verification
 
-1. **Red → Green per-patch tests** (built in an isolated scratch copy outside both repos, with zero edits to `/Users/lugo/localdev/viz-web/glyph3d-js` or `~/.local/bin`):
+1. **Red → Green per-patch tests** (built in an isolated scratch copy outside both repos, with zero edits to `~/localdev/viz-web/glyph3d-js` or `~/.local/bin`):
    - `T1`: `repaint_preserves_soft_wraps_and_reflows_identically` (`crates/g3d-termd/tests/daemon.rs`) — failed before fix (`REPAINT turned soft-wrapped rows into hard line breaks`), passed after (`0.21 s`).
    - `T2`: `resize_pulling_scrollback_onto_screen_repaints_zero_scrollback_viewer` (`crates/g3d-termd/tests/daemon.rs`) — failed before fix (`expected a live REPAINT after primary-screen resize with scrollback`), passed after (`0.18 s`).
    - `T3`: `pty_child_gets_clean_default_signals_flags_and_empty_mask` (`crates/g3d-hold/src/spawn.rs`) — failed before fix (`child signal check failed on sig/code=1` due to `SA_RESTART`), passed after (`0.21 s`), along with all 11 tests in `crates/g3d-termd/tests/env.rs` (`1.77 s`).

@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -57,15 +57,41 @@ impl Drop for ScratchDaemon {
             reconnect_window: Duration::from_millis(100),
             ..ConnectOptions::default()
         };
+        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
+        let holder = holder_pid(&sock);
         if let Ok(c) = Termd::connect_with(&target, "s-cleanup", opts, Box::new(|| {})) {
             let _ = c.stop();
         }
-        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while sock.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_the_holder_to_go(&sock, holder);
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The pid in a namespace's lock file: its holder's, while the namespace is held.
+fn holder_pid(sock: &Path) -> Option<u32> {
+    let text = fs::read_to_string(format!("{}.lock", sock.display())).ok()?;
+    text.trim().parse().ok().filter(|pid| *pid > 1)
+}
+
+/// Whether a process with this pid exists: `kill -0` signals nothing.
+fn process_exists(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Waits, up to 5 s, until a stopped namespace's socket has gone and its holder has too. The
+/// holder writes its last log lines after it removes its socket, and its logger writes a log
+/// that was removed under it anew, so a scratch directory removed while the holder is still
+/// leaving can be left behind holding those lines. One was, on 2026-11-27 at a load average
+/// of 19 (`/tmp/g3d-s-<pid>-resize-8`), when the stop also outlasted the 500 ms this once
+/// waited for the socket alone.
+fn wait_for_the_holder_to_go(sock: &Path, holder: Option<u32>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && (sock.exists() || holder.is_some_and(process_exists)) {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2104,7 +2130,8 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
     // A namespace that leaves on purpose (protocol 1.6) tells a status follower with a last
     // document, `daemon.exiting: true` (and, from a daemon that has it, `daemon.exit_reason`),
     // and then closes. `Sessions` follows status, and the wall reads the close by what that
-    // document said: the news must come in wire order.
+    // document said: the document's news must come before the close's, and so must the end
+    // of every terminal the namespace took with it.
     use term_session::News;
 
     let scratch = ScratchDaemon::new("stexit");
@@ -2148,13 +2175,21 @@ fn sessions_pump_hands_over_the_exiting_document_before_the_disconnect() {
         matches!(said.as_deref(), None | Some("stop")),
         "a stop's exit_reason is `stop`, or absent before the field: {said:?}"
     );
+    // The terminal's end and the document may come either way round. On the wire the end is
+    // first, but it reaches a pump through its session's worker thread and the document
+    // through the hub, and nothing the wall does with one reads the other. (Until 2026-11-27
+    // this required the end first. A daemon whose stop tells its connections at once, where
+    // the one before it waited 200 ms, hands the document over first whenever the worker is
+    // the slower: seen once in a full battery run.)
+    let disconnected =
+        format!("disconnected: {}", termd_client::namespace_left(said.as_deref()));
+    assert_eq!(order.last(), Some(&disconnected), "the close is the last news: {order:?}");
+    let mut before = order[..order.len() - 1].to_vec();
+    before.sort();
     assert_eq!(
-        order,
-        vec![
-            format!("ended {id}"),
-            "exiting document".to_string(),
-            format!("disconnected: {}", termd_client::namespace_left(said.as_deref())),
-        ]
+        before,
+        vec![format!("ended {id}"), "exiting document".to_string()],
+        "the terminal's end and the exiting document, once each, before the close: {order:?}"
     );
     eprintln!("the daemon under test said exit_reason = {said:?}");
 }

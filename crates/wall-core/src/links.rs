@@ -567,7 +567,7 @@ mod tests {
 
         // Rejected schemes & malformed URLs.
         assert!(!is_allowed_url_scheme("file:///etc/passwd"));
-        assert!(!is_allowed_url_scheme("FILE:///Users/lugo/secret"));
+        assert!(!is_allowed_url_scheme("FILE:///Users/user/secret"));
         assert!(!is_allowed_url_scheme("javascript:alert(1)"));
         assert!(!is_allowed_url_scheme("data:text/html,hi"));
         assert!(!is_allowed_url_scheme("ftp://example.com/file"));

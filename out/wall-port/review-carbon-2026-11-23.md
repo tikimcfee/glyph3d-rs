@@ -1,6 +1,6 @@
 # Critical Review of the Wall Port Survey & Plan (`wall-carbon`)
 
-**Reviewed document:** `/private/tmp/claude-501/-Users-lugo-localdev-glyph3d-rs/be544915-3925-4176-abd7-f71faca80827/scratchpad/wall-port/survey.md`  
+**Reviewed document:** `<session scratchpad>/wall-port/survey.md`  
 **Reviewer:** `wall-carbon` (read-only verification across `glyph3d-rs` branch `work`, `viz-web/glyph3d-js` branch `wall`, and `makepad` branch `work`)  
 **Date:** 2026-11-23
 
@@ -207,7 +207,7 @@ Every step below has an **automated self-check** executable by an unattended age
    - `wall.config fontFamily` switches live between `Monaspace Neon`, `Monaspace Argon`, and `Cousine`. If all three families (4 faces each) are prebaked into one combined Wall atlas with a per-family face table (`[family][bold | italic<<1]` -> glyph lookup table), switching font family is an instant uniform/LUT swap with zero atlas reload.
 
 6. **Live `gomuxai` Event Stream & Fleet Bus Architecture** `[Verified: viz-web/glyph3d-js:wall/WallAgentViews.js:24-130, wall/TerminalWall.js:27, 233; glyph3d-rs:native/src/agent_transcript.rs:35-39]`  
-   - In JS, the Go relay serves `agentSessions/*`, `agentEvents/read`, `agentEvents/follow`, and `WallBus` (`agent fleet --json`). Skipping the Go relay (§4) means **the Rust app must replace the relay's `gomuxai` RPCs natively** — spawning/polling `/Users/lugo/.local/bin/agent sessions --json` / `agent fleet --json` on a background worker and tailing `agent transcript` / transcript files incrementally without blocking the UI thread, plus porting `WallAgentViews`'s `shoveAside` canvas-footprint displacement (`TerminalWall.js:210-213`).
+   - In JS, the Go relay serves `agentSessions/*`, `agentEvents/read`, `agentEvents/follow`, and `WallBus` (`agent fleet --json`). Skipping the Go relay (§4) means **the Rust app must replace the relay's `gomuxai` RPCs natively** — spawning/polling `~/.local/bin/agent sessions --json` / `agent fleet --json` on a background worker and tailing `agent transcript` / transcript files incrementally without blocking the UI thread, plus porting `WallAgentViews`'s `shoveAside` canvas-footprint displacement (`TerminalWall.js:210-213`).
 
 7. **Persistence Path, Atomic Writes, and Multi-Window / Namespace Scoping** `[Verified: viz-web/glyph3d-js:wall/WallStore.js:73-109]`  
    - In the browser, `WallStore` scopes keys by `relayPort` in `localStorage`. Natively (with no relay port!), state must be scoped by **`termd` namespace** (e.g., `~/.config/glyph3d/wall.<namespace>.json` or XDG state dir), written atomically (`tmp` + `rename`) with debouncing during window drags so pan/move at 120 Hz never hammers disk I/O.

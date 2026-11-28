@@ -21,7 +21,7 @@ stops the scratch daemon and deletes `/tmp/g3d-rec-<pid>` on exit:
 #    conceal styles, SGR 58 underline colours, wide emoji on fills, combining marks):
 cargo run --release -p termd-client --example termd_record -- \
   --out native/fixtures/wall-replay/term-test-pattern.vt --size 80x24 \
-  -- /bin/sh /Users/lugo/localdev/viz-web/glyph3d-js/tools/term-test-pattern.sh
+  -- /bin/sh ~/localdev/viz-web/glyph3d-js/tools/term-test-pattern.sh
 
 # 2. Multi-column coloured directory listing (`ls --color`) of `tools/`:
 cargo run --release -p termd-client --example termd_record -- \

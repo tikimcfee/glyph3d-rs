@@ -611,6 +611,8 @@ pub struct BusView {
     pub snapshot_host: Option<String>,
     pub reason: String,
     pub hosts: Vec<BusHostGroup>,
+    /// `Some` while the feed is down: `hosts` is the fleet as it last was.
+    pub stale: Option<crate::sidebar::BusStale>,
 }
 
 /// Result of [`WallApi::attach_agent`] (`wall.attach`).
@@ -2288,6 +2290,14 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
             };
 
             let mut out = Vec::new();
+            // A list from a feed that is down says so first: it is not live.
+            if let Some(stale) = &bus.stale {
+                out.push(if bus.reason.is_empty() {
+                    format!("{} (the agents feed is down)", stale.label())
+                } else {
+                    format!("{} (the agents feed is down: {})", stale.label(), bus.reason)
+                });
+            }
             let mut hosts_json = Vec::new();
             for h in &bus.hosts {
                 let is_local = h.host.is_empty() || h.host == local_host;
@@ -2331,12 +2341,13 @@ pub fn register_wall_commands<W: WallApi + 'static>(router: &mut CommandRouter<W
                 }
                 hosts_json.push(json!({ "host": h.host, "agents": agents_json }));
             }
-            let text = if out.is_empty() {
+            let text = if bus.hosts.is_empty() {
                 "(no live agents)".to_string()
             } else {
                 out.join("\n")
             };
-            Ok(CommandReply { text, data: Some(json!({ "hosts": hosts_json })) })
+            let stale_json = bus.stale.as_ref().map(|st| json!({ "sinceMs": st.since_ms, "clock": st.clock }));
+            Ok(CommandReply { text, data: Some(json!({ "hosts": hosts_json, "stale": stale_json })) })
         },
     );
 
@@ -2795,6 +2806,7 @@ mod tests {
                     snapshot_host: None,
                     reason: "not connected to the relay".to_string(),
                     hosts: Vec::new(),
+                    stale: None,
                 },
                 attached_map: BTreeMap::new(),
                 agent_open: BTreeMap::new(),
@@ -3805,6 +3817,7 @@ mod tests {
                     },
                 ],
             }],
+            stale: None,
         };
 
         let attach_local = r.execute(["wall.attach", "local-agy"]);
@@ -3828,6 +3841,24 @@ mod tests {
         let bus_list = r.execute(["wall.bus"]);
         assert!(bus_list.text.contains("local-agy@laptop-2 waiting · prompt · on gx-local-agy"));
         assert!(bus_list.text.contains("dead-agy@laptop-2 ended (gone) · no live session"));
+        assert!(!bus_list.text.contains("last seen"), "a live list says nothing of when: {}", bus_list.text);
+
+        // The feed down: the same list, headed by when it was last seen and why.
+        r.context.bus.stale = Some(crate::sidebar::BusStale { since_ms: 1_795_000_000_000, clock: "14:32".into() });
+        r.context.bus.reason = "`agent export --follow` exited with exit status: 1".into();
+        let stale_list = r.execute(["wall.bus"]);
+        assert!(
+            stale_list.text.starts_with(
+                "agents: last seen 14:32 (the agents feed is down: `agent export --follow` exited with exit status: 1)\n"
+            ),
+            "{}",
+            stale_list.text
+        );
+        assert!(stale_list.text.contains("local-agy@laptop-2 waiting · prompt · on gx-local-agy"));
+        assert_eq!(stale_list.data.as_ref().unwrap()["stale"]["clock"], "14:32");
+        r.context.bus.stale = None;
+        r.context.bus.reason = String::new();
+        assert!(r.execute(["wall.bus"]).data.unwrap()["stale"].is_null());
 
         // wall.agent* verbs (wall-agent-view.test.mjs)
         r.context.focused_id = Some("t1".into());

@@ -3475,6 +3475,7 @@ mod tests {
                 snapshot_host: Some("local".to_string()),
                 reason: String::new(),
                 hosts: Vec::new(),
+                stale: None,
             }
         }
         fn terminals_attached_to(&self, _: &str) -> Vec<String> {
@@ -3966,7 +3967,7 @@ mod tests {
         no_sess.rows.clear();
         no_sess.total_count = 0;
         no_sess.visible_count = 0;
-        no_sess.missing = Some("no live Claude/Agy session in /Users/lugo/scratch".to_string());
+        no_sess.missing = Some("no live Claude/Agy session in /Users/user/scratch".to_string());
 
         // 3. Stream error / unavailable state.
         let mut unavailable = sample_descriptor("t3");

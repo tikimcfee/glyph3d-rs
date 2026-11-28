@@ -6,7 +6,7 @@ the piece everything else now waits on, and the least mechanical of the run.
 ## Where things stand
 
 The wall is an infinite canvas of live terminals; today a browser app (`wall/` in
-`/Users/lugo/localdev/viz-web/glyph3d-js`, read-only), being rebuilt natively here.
+`~/localdev/viz-web/glyph3d-js`, read-only), being rebuilt natively here.
 
 - A window exists (`native/src/wall/app.rs`): winit, a cell renderer, live terminals
   from the daemon. A person has typed into it. But it knows nothing of the wall's

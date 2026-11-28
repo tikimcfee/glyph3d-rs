@@ -476,10 +476,10 @@ fn host_events_bell_clipboard_pwd_hyperlinks_and_extended_modes() {
     // 1. Bell, OSC 52 write ('c') + read ('p'), OSC 7 pwd, OSC 9 notification.
     vt.feed(
         b"\x07\x1b]52;c;d2VsbCBoZWxsbyB0aGVyZSE=\x07\x1b]52;p;?\x1b\\\
-          \x1b]7;file://laptop-2/Users/lugo/work\x07\x1b]9;build done\x07",
+          \x1b]7;file://laptop-2/Users/user/work\x07\x1b]9;build done\x07",
     );
     assert!(vt.has_events());
-    assert_eq!(vt.pwd(), "file://laptop-2/Users/lugo/work");
+    assert_eq!(vt.pwd(), "file://laptop-2/Users/user/work");
     let events = vt.take_events();
     assert_eq!(
         events,
@@ -490,7 +490,7 @@ fn host_events_bell_clipboard_pwd_hyperlinks_and_extended_modes() {
                 text: "well hello there!".to_string(),
             },
             VtEvent::ClipboardRead { selection: b'p' },
-            VtEvent::PwdChanged("file://laptop-2/Users/lugo/work".to_string()),
+            VtEvent::PwdChanged("file://laptop-2/Users/user/work".to_string()),
             VtEvent::Notification {
                 title: String::new(),
                 body: "build done".to_string(),

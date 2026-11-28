@@ -2000,7 +2000,7 @@ fn accessors_expose_bus_snapshot_and_platform() {
             status: Some("processing".to_owned()),
             attached: Some(true),
             detail: Some("integrating".to_owned()),
-            cwd: Some("/Users/lugo/localdev/glyph3d-rs".to_owned()),
+            cwd: Some("/Users/user/localdev/glyph3d-rs".to_owned()),
             ..GomuxAgent::default()
         }],
     };

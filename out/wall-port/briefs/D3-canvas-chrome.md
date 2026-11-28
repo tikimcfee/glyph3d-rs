@@ -11,7 +11,7 @@ Start with `git merge wall` in this worktree.
 
 ## What the JS wall draws that is not terminal text
 
-From the inventory of `wall/` (paths under `/Users/lugo/localdev/viz-web/glyph3d-js/`):
+From the inventory of `wall/` (paths under `~/localdev/viz-web/glyph3d-js/`):
 
 - **The drafting paper** (`wall/WallPaper.js`): the canvas colour and a grid of minor
   lines with every Nth a major line, found by a full-screen fragment shader from the

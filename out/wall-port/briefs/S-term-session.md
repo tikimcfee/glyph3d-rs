@@ -26,7 +26,7 @@ tested against a scratch daemon.
   Under a flood the session coalesces: news after a quiet spell is published at once
   (a keystroke's echo must not wait), then at most once per interval or volume of
   bytes while output keeps coming. The browser wall's relay just gained the same rule
-  (`/Users/lugo/localdev/viz-web/glyph3d-js/cli/attach_unix.go`, uncommitted there: the
+  (`~/localdev/viz-web/glyph3d-js/cli/attach_unix.go`, uncommitted there: the
   leading-edge coalescing timer, 16 ms or 16 KiB): read it and match its behaviour.
   Synchronized output (mode 2026) should publish whole frames if the emulator exposes
   it.

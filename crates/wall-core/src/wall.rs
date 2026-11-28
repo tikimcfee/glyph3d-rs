@@ -634,6 +634,8 @@ struct WallCore {
     termd_epoch_anchor: Option<(u64, f64)>,
     bus: Option<GomuxSnapshot>,
     bus_reason: String,
+    /// `Some` while the host's fleet feed is down: `bus` is the fleet as it last was.
+    bus_stale: Option<crate::sidebar::BusStale>,
     /// True when the local `agents` extra `termd` namespace is connected (`--wall-extra-ns agents`),
     /// so `wall.attach` prefers direct local subscription (`gx-<name>`) over spawning a shell wrapper.
     agents_extra_connected: bool,
@@ -1420,6 +1422,7 @@ impl WallCore {
             termd_epoch_anchor: None,
             bus: None,
             bus_reason: "no gomuxai snapshot yet".to_owned(),
+            bus_stale: None,
             agents_extra_connected: false,
             agent_program: None,
             platform: opts.platform,
@@ -3914,6 +3917,7 @@ impl WallApi for WallCore {
                 snapshot_host: None,
                 reason: self.bus_reason.clone(),
                 hosts: Vec::new(),
+                stale: None,
             };
         };
         let hosts = bus_hosts(Some(snap))
@@ -3938,6 +3942,7 @@ impl WallApi for WallCore {
             snapshot_host: snap.host.clone(),
             reason: self.bus_reason.clone(),
             hosts,
+            stale: self.bus_stale.clone(),
         }
     }
 
@@ -5721,6 +5726,24 @@ impl Wall {
         self.router.context.model.notify_changed();
     }
 
+    /// Say that the host's fleet feed is down (`Some`, with since when) or up again (`None`).
+    /// While it is down the snapshot from [`Self::set_bus_snapshot`] is the fleet as it last
+    /// was, and the sidebar and `wall.bus` say so ([`crate::sidebar::BusStale`]) instead of
+    /// showing a frozen list as live. Returns whether anything changed.
+    pub fn set_bus_stale(&mut self, stale: Option<crate::sidebar::BusStale>) -> bool {
+        if self.router.context.bus_stale == stale {
+            return false;
+        }
+        self.router.context.bus_stale = stale;
+        self.router.context.model.notify_changed();
+        true
+    }
+
+    /// The feed's outage, while it is down ([`Self::set_bus_stale`]).
+    pub fn bus_stale(&self) -> Option<&crate::sidebar::BusStale> {
+        self.router.context.bus_stale.as_ref()
+    }
+
     /// Record whether the local `agents` extra `termd` namespace is currently connected
     /// (`--wall-extra-ns agents`), so `wall.attach` prefers direct local subscription (`gx-<name>`)
     /// over spawning an `agent attach` shell wrapper.
@@ -5842,11 +5865,13 @@ impl Wall {
                 host: String::new(),
                 reason: self.router.context.bus_reason.clone(),
                 agents: Vec::new(),
+                stale: None,
             };
         };
         crate::sidebar::BusSnapshot {
             host: snap.host.clone().unwrap_or_default(),
             reason: self.router.context.bus_reason.clone(),
+            stale: self.router.context.bus_stale.clone(),
             agents: snap
                 .agents
                 .iter()

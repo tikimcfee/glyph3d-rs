@@ -5,7 +5,7 @@ One patch for makepad's `relax` JIT, made on `upstream/work` 63f80c998 on 2026-1
     0001-relax-const_drain-makes-an-item-in-the-unit-that-not.patch
 
 It is commit 1c2756591 on the local branch `relax-const-drain-unit`, checked out in the worktree
-`/Users/lugo/localdev/makepad-upstream-work`. Nothing was pushed. `git apply --check` also passes
+`~/localdev/makepad-upstream-work`. Nothing was pushed. `git apply --check` also passes
 against the local `work` branch (7a258a352); it was not built or run there.
 
 ## The bug

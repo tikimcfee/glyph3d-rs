@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn short_title_and_terminal_name_follow_precedence_and_strip_prompt_prefix() {
-        assert_eq!(short_title("lugo@laptop-2: ~/src/glyph3d-rs"), "~/src/glyph3d-rs");
+        assert_eq!(short_title("user@laptop-2: ~/src/glyph3d-rs"), "~/src/glyph3d-rs");
         assert_eq!(short_title("root@workstation:/var/log"), "/var/log");
         assert_eq!(short_title("  user@host:~/keep-prefix "), "user@host:~/keep-prefix");
         assert_eq!(short_title("vim Cargo.toml"), "vim Cargo.toml");
@@ -707,15 +707,15 @@ mod tests {
 
         // Custom name > attached target > shortened shell title > terminal id.
         assert_eq!(
-            terminal_name("term-1", Some(" build "), Some("helper"), Some("lugo@m2:~/x")),
+            terminal_name("term-1", Some(" build "), Some("helper"), Some("user@far-host:~/x")),
             "build"
         );
         assert_eq!(
-            terminal_name("term-1", Some("   "), Some("helper@m2"), Some("lugo@m2:~/x")),
-            "helper@m2"
+            terminal_name("term-1", Some("   "), Some("helper@far-host"), Some("user@far-host:~/x")),
+            "helper@far-host"
         );
         assert_eq!(
-            terminal_name("term-1", None, None, Some("lugo@m2: ~/repo")),
+            terminal_name("term-1", None, None, Some("user@far-host: ~/repo")),
             "~/repo"
         );
         assert_eq!(terminal_name("term-1", None, None, Some("")), "term-1");

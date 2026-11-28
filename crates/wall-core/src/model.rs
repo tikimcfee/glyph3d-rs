@@ -3226,7 +3226,7 @@ mod tests {
         let reloaded = make_wall_with_storage(mem, "relay-9");
         assert_eq!(reloaded.snapshot().settings_panel, snap.settings_panel);
 
-        assert_eq!(short_title("lugo@laptop-2:~/dev/glyph3d "), "~/dev/glyph3d");
+        assert_eq!(short_title("user@laptop-2:~/dev/glyph3d "), "~/dev/glyph3d");
         assert_eq!(short_title("cargo test"), "cargo test");
     }
 
