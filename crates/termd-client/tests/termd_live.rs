@@ -96,31 +96,52 @@ impl Drop for ScratchDaemon {
             request_timeout: Duration::from_secs(3),
             reconnect_window: Duration::from_millis(100),
         };
+        // The holder's pid, read while it still holds the namespace.
+        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
+        let holder = holder_pid(&sock);
         if let Ok(cleaner) = Termd::connect_with(&target, "cleanup", opts, Box::new(|| {})) {
             let _ = cleaner.stop();
         }
         // Wait briefly for the socket to disappear; only if the socket is still present (meaning
         // `stop` could not complete) send SIGKILL to the holder pid recorded in `.lock`.
-        let sock = self.dir.join(format!("termd-{}.sock", self.ns));
-        let lock = PathBuf::from(format!("{}.lock", sock.display()));
         let deadline = Instant::now() + Duration::from_millis(1500);
         while sock.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
         if sock.exists() {
-            if let Ok(pid_text) = std::fs::read_to_string(&lock) {
-                if let Ok(pid) = pid_text.trim().parse::<u32>() {
-                    if pid > 1 {
-                        let _ = Command::new("/bin/kill")
-                            .args(["-KILL", &pid.to_string()])
-                            .stderr(std::process::Stdio::null())
-                            .status();
-                    }
-                }
+            if let Some(pid) = holder.or_else(|| holder_pid(&sock)) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
+        }
+        // The directory goes once the holder has. It writes its last log lines after it removes
+        // its socket, and its logger writes a log that was removed under it anew, so a
+        // directory removed while the holder is still leaving can be left behind holding those
+        // lines: term-session's live tests, whose cleanup had this shape, left one on
+        // 2026-11-27 at a load average of 19.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && holder.is_some_and(process_exists) {
+            std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The pid in a namespace's lock file: its holder's, while the namespace is held.
+fn holder_pid(sock: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("{}.lock", sock.display())).ok()?;
+    text.trim().parse().ok().filter(|pid| *pid > 1)
+}
+
+/// Whether a process with this pid exists: `kill -0` signals nothing.
+fn process_exists(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn fast_create(id: &str, cols: u16, rows: u16, argv: Vec<&str>) -> Create {
